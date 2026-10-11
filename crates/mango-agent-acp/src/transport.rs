@@ -1,50 +1,42 @@
-//! The `acp` transport: a host-owned child process, framed at the official SDK's channel boundary.
+//! The `acp` transport: a host-owned child process, framed as a message link.
 //!
-//! The official `agent-client-protocol` crate ships two carriers of its own — `AcpAgent`, which
-//! spawns the agent itself, and `Stdio`, which takes over this process's own stdio. Neither is
-//! usable here: the host owns the process, so the argv goes through
+//! The host owns the process, so the argv goes through
 //! [`ProcessLauncher`](mango_external_agents::ProcessLauncher) and the library only ever receives
 //! the pipes.
 //!
 //! [`ManagedProcess`] supplies a [`ByteSource`](mango_external_agents::ByteSource) and [`ByteSink`].
-//! [`LineStream`] frames them under the host's line limits. [`BoundedTransport`] additionally caps
-//! queued frame counts and bytes at the official SDK's [`agent_client_protocol::Channel`] boundary;
-//! its stock line adapter has unbounded actor queues. The official SDK still parses and routes the
-//! wire protocol. Pressure fails the connection so native cleanup can progress independently of a
-//! stalled physical writer or protocol handler.
+//! [`LineStream`] frames the child's stdout under the host's line limits, and [`frame`] hands both
+//! halves back as one [`Link`]: one JSON-RPC message per line, each way. The repository's own
+//! JSON-RPC peer ([`mango_external_agents::jsonrpc::Client`]) speaks over that link and enforces
+//! the queue budgets in both directions; the private `budget` module derives them from the host's
+//! [`Limits`](mango_external_agents::Limits). Pressure ends the connection, so native cleanup
+//! can progress independently of a stalled physical writer or protocol handler.
 //!
 //! The `Http` arm of [`AcpSpec`] is not implemented in 0.1. See the crate docs for why.
 
-use std::pin::Pin;
-
-mod bounded;
-pub use bounded::BoundedTransport;
-pub(crate) use bounded::{Overflow, OverflowSlot, outgoing_frame_limit};
-use futures::stream::BoxStream;
+mod budget;
+pub(crate) use budget::{Overflow, client_options, wire_options};
 use mango_external_agents::process::{ByteSink, LineStream};
 use mango_external_agents::{
-    AcpSpec, CancelReason, Error, HostContext, LaunchSpec, ManagedProcess, ProcessCleanupGuard,
-    Result,
+    AcpSpec, CancelReason, Error, HostContext, LaunchSpec, Link, LinkReceiver, LinkSender,
+    ManagedProcess, ProcessCleanupGuard, Result,
 };
 
-/// The outgoing half: one JSON-RPC message per line, written to the child's stdin.
-type OutgoingLines = Pin<Box<dyn futures::Sink<String, Error = std::io::Error> + Send>>;
-
-/// The incoming half: the child's stdout, framed by the core under the host's line caps.
-type IncomingLines = BoxStream<'static, std::io::Result<String>>;
-
-/// A launched agent: the transport the official connection rides, and the child behind it.
+/// A launched agent: the link its JSON-RPC connection rides, and the child behind it.
 ///
 /// The two are returned together because a connection alone cannot say why it ended. When the
-/// agent exits mid-turn the transport reports a closed stream and nothing else; the child's
+/// agent exits mid-turn the link reports a closed stream and nothing else; the child's
 /// [`stderr_tail`](mango_external_agents::ProcessControl::stderr_tail) is what turns that into a
 /// diagnostic, and its [`kill`](mango_external_agents::ProcessControl::kill) is what ends an agent
 /// that ignored a closed stdin.
 pub struct LaunchedAgent {
-    /// The bounded frame transport to hand the official client builder.
-    pub transport: BoundedTransport,
+    /// One JSON-RPC message per line in each direction, for
+    /// [`jsonrpc::Client::connect_with`](mango_external_agents::jsonrpc::Client::connect_with).
+    pub link: Link,
     /// The child's lifetime and diagnostics.
     pub control: std::sync::Arc<dyn mango_external_agents::ProcessControl>,
+    /// The host's outgoing byte budget, which the connection bounds its frames and queue by.
+    pub(crate) outbound_buffer_bytes: usize,
 }
 
 impl std::fmt::Debug for LaunchedAgent {
@@ -56,7 +48,7 @@ impl std::fmt::Debug for LaunchedAgent {
     }
 }
 
-/// Spawns `spec` through the host's launcher and frames its pipes for the official client.
+/// Spawns `spec` through the host's launcher and frames its pipes as a message link.
 ///
 /// `vendor_environment_keys` comes from the harness's own descriptor: the child receives the base
 /// allowlist plus those keys and nothing else.
@@ -146,55 +138,57 @@ pub fn frame(process: ManagedProcess, host: &HostContext) -> Result<LaunchedAgen
         message: String::from("a child without a writable stdin"),
     })?;
 
-    let incoming: IncomingLines =
-        Box::pin(incoming_lines(LineStream::new(stdout, host.limits().line)));
-    let outgoing: OutgoingLines = Box::pin(outgoing_lines(stdin));
-
     Ok(LaunchedAgent {
-        transport: BoundedTransport::new(outgoing, incoming, *host.limits())
-            .with_outbound_buffer_bytes(host.outbound_buffer_bytes()),
+        link: Link::new(
+            Box::new(LineSink { stdin }),
+            Box::new(LineSource {
+                lines: LineStream::new(stdout, host.limits().line),
+            }),
+        ),
         control,
+        outbound_buffer_bytes: host.outbound_buffer_bytes(),
     })
 }
 
-/// The child's stdout as lines, with the core's cap failures crossing as IO errors.
+/// Writes one JSON-RPC message per line into the child's stdin.
+struct LineSink {
+    stdin: Box<dyn ByteSink>,
+}
+
+#[async_trait::async_trait]
+impl LinkSender for LineSink {
+    async fn send(&mut self, mut message: String) -> Result<()> {
+        // One write, so a frame can never be split across two lines by another writer.
+        message.push('\n');
+        self.stdin.write_all(message.as_bytes()).await
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        self.stdin.close().await
+    }
+}
+
+/// Reads the child's stdout one line at a time, under the host's line caps.
 ///
-/// The official connection's only vocabulary for a broken transport is `std::io::Error`, so a line
-/// over the cap becomes `InvalidData` rather than being silently truncated: half a JSON frame
-/// parsed as a whole one is worse than a link that says it gave up.
-fn incoming_lines(source: LineStream) -> impl futures::Stream<Item = std::io::Result<String>> {
-    futures::stream::unfold(Some(source), async move |state| {
-        let mut source = state?;
-        match source.next_line().await {
-            Ok(Some(line)) => Some((Ok(line), Some(source))),
-            // End of stream: the state is dropped so the stream stays ended if polled again.
-            Ok(None) => None,
-            Err(error) => Some((Err(as_io_error(error)), None)),
-        }
-    })
+/// A line over the cap is an error rather than a truncated frame: half a JSON frame parsed as a
+/// whole one is worse than a link that says it gave up.
+struct LineSource {
+    lines: LineStream,
 }
 
-/// One JSON-RPC message per line into the child's stdin.
-fn outgoing_lines(
-    sink: Box<dyn ByteSink>,
-) -> impl futures::Sink<String, Error = std::io::Error> + Send {
-    futures::sink::unfold(
-        sink,
-        async move |mut sink: Box<dyn ByteSink>, line: String| {
-            let mut bytes = line.into_bytes();
-            bytes.push(b'\n');
-            sink.write_all(&bytes).await.map_err(as_io_error)?;
-            Ok(sink)
-        },
-    )
+#[async_trait::async_trait]
+impl LinkReceiver for LineSource {
+    async fn recv(&mut self) -> Result<Option<String>> {
+        // The reader takes a line, hands it to the connection's queue and comes straight back
+        // here, and a line already buffered is ready without waiting. A burst an agent writes in
+        // one go would then be counted whole against the queue budgets before the handler had
+        // run once. Yielding before each line lets the handler take the one just queued, so the
+        // budgets bound what waits for the client and not how much an agent may say. Nothing has
+        // been read yet at this point, so a caller that stops waiting here loses no line.
+        tokio::task::yield_now().await;
+        self.lines.next_line().await
+    }
 }
 
-/// A core failure as the only failure the official transport understands.
-fn as_io_error(error: Error) -> std::io::Error {
-    let kind = match &error {
-        Error::LimitExceeded { .. } => std::io::ErrorKind::InvalidData,
-        Error::Closed { .. } => std::io::ErrorKind::BrokenPipe,
-        _ => std::io::ErrorKind::Other,
-    };
-    std::io::Error::new(kind, error.to_string())
-}
+#[cfg(test)]
+mod tests;

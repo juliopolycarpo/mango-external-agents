@@ -1,26 +1,25 @@
 //! The client side of the connection: the driving model, the handlers, and the shared turn state.
 //!
-//! # Why the connection is driven from a task
+//! # How the connection is driven
 //!
-//! The official crate's connection is a scope, not an object:
-//! `Client.builder()…connect_with(transport, async |cx| …)` runs the dispatch loop for exactly as
-//! long as that closure, and the closure is the only place a [`ConnectionTo`] exists. A
-//! [`Session`](mango_external_agents::Session) outlives any one call, so the closure cannot *be* the
-//! session — instead the closure hands a clone of the connection out through a channel and then
-//! parks on a shutdown signal, and the whole thing runs on one spawned task per session. Returning
-//! from the closure is what closes the connection, which is why [`ConnectionHandle::shutdown`] is the
-//! only thing that ends it.
+//! The connection is the repository's own JSON-RPC peer,
+//! [`jsonrpc::Client`](mango_external_agents::jsonrpc::Client), over the line-framed link
+//! [`transport::frame`](crate::transport::frame) builds. The peer reads on a task of its own,
+//! hands each `session/update` to [`AcpHandler`] in arrival order on a second task, and answers
+//! each of the agent's questions on a task per question. A [`ConnectionHandle`] owns the peer and
+//! the child behind it; [`ConnectionHandle::shutdown`] is the one place both end.
 //!
-//! This works because 3.3.0's connection is `Send + Sync`: `ConnectTo` is `Send + 'static` and its
-//! future is `Send`, so nothing here needs a `LocalSet` or a thread of its own, and a
-//! `ConnectionTo<Agent>` sits inside a `Session` trait object directly.
+//! Every request this side makes asks for its answer behind the notifications that arrived before
+//! it. A `session/prompt` answer therefore reaches the prompt's owner only after the last
+//! `session/update` of the turn was reduced and emitted, and a `session/set_config_option` answer
+//! only after a `config_option_update` the agent sent ahead of it.
 //!
-//! # Why handlers leave the dispatch loop promptly
+//! # Why handlers return promptly
 //!
-//! The loop runs one handler to completion before the next message. [`EventSink::emit`] therefore
-//! only reserves bounded transcript capacity and returns; an overflow owns a terminal outcome
-//! instead of parking ACP dispatch behind a slow host. Permission callbacks likewise park their
-//! responder and move broker deliberation to a bounded task, because an answer may arrive through
+//! The peer awaits one notification call before the next. [`EventSink::emit`] therefore only
+//! reserves bounded transcript capacity and returns; an overflow owns a terminal outcome instead
+//! of parking the connection behind a slow host. A permission request likewise parks its reply
+//! and moves broker deliberation to a bounded task, because an answer may arrive through
 //! [`Session::respond`](mango_external_agents::Session::respond) on another task.
 //!
 //! No lock in this module is held across an await. [`Reducer`] is pure, so the events for one frame
@@ -28,94 +27,41 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::time::SystemTime;
 
-use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
 use agent_client_protocol_schema::v1::{
-    CancelNotification, RequestPermissionRequest, RequestPermissionResponse, SessionNotification,
-    SessionUpdate,
+    AGENT_METHOD_NAMES, CLIENT_METHOD_NAMES, CancelNotification, RequestPermissionRequest,
+    RequestPermissionResponse, SessionNotification, SessionUpdate,
 };
 use mango_external_agents::approval::ApprovalDeadline;
 use mango_external_agents::configuration::{
     Configuration, ConfigurationCatalog, ConfigurationState,
 };
 use mango_external_agents::event::{ActivityStatus, EventKind, SessionId};
+use mango_external_agents::jsonrpc::{self, CancellationHold, PeerHandler, ServerRequestOutcome};
 use mango_external_agents::permission::{
     ApprovalDecision, DecisionSource, PermissionBroker, PermissionLevel, PermissionResponse,
     broker_response,
 };
 use mango_external_agents::session::CancelReason;
 use mango_external_agents::{
-    Clock, Error, EventSink, HostContext, Limits, ProcessCleanupGuard, ProcessControl, Result,
-    VendorError, process::stop_process_with_limits,
+    Clock, Error, EventSink, HostContext, Limits, ProcessControl, Result, VendorError,
+    process::stop_process_with_limits,
 };
 
 use crate::approval_events::ApprovalEvents;
 use crate::error::vendor_error;
 use crate::permission;
 use crate::reducer::{Reducer, SessionFact};
-use crate::transport::LaunchedAgent;
+use crate::transport::{LaunchedAgent, Overflow};
 
-#[cfg(test)]
-struct DriveStartupHold {
-    control: Arc<dyn ProcessControl>,
-    release: tokio::sync::oneshot::Receiver<()>,
-    reached: tokio::sync::oneshot::Sender<()>,
-}
+mod reply;
+mod requests;
 
-#[cfg(test)]
-static DRIVE_STARTUP_HOLD: Mutex<Option<DriveStartupHold>> = Mutex::new(None);
-
-/// Holds the next driver before it creates the connection task.
-///
-/// The unit test uses this to cancel `drive` in the window where a launched child has no
-/// `ConnectionHandle` yet.
-#[cfg(test)]
-fn hold_next_drive_startup(
-    control: Arc<dyn ProcessControl>,
-) -> (
-    tokio::sync::oneshot::Sender<()>,
-    tokio::sync::oneshot::Receiver<()>,
-) {
-    let (release, release_rx) = tokio::sync::oneshot::channel();
-    let (reached_tx, reached) = tokio::sync::oneshot::channel();
-    *DRIVE_STARTUP_HOLD
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) = Some(DriveStartupHold {
-        control,
-        release: release_rx,
-        reached: reached_tx,
-    });
-    (release, reached)
-}
-
-#[cfg(test)]
-async fn wait_for_drive_startup_hold(child: &DriveShutdownGuard) {
-    let hold = {
-        let mut pending = DRIVE_STARTUP_HOLD
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if pending
-            .as_ref()
-            .is_some_and(|hold| Arc::ptr_eq(&hold.control, child.control()))
-        {
-            pending.take()
-        } else {
-            None
-        }
-    };
-    let Some(DriveStartupHold {
-        control: _,
-        release,
-        reached,
-    }) = hold
-    else {
-        return;
-    };
-    let _ = reached.send(());
-    let _ = release.await;
-}
+use reply::PermissionReply;
+use requests::RequestAdmission;
+pub(crate) use requests::{AgentRequest, PromptFailure, await_sent, send, submit, submit_prompt};
 
 /// Whether a host's answer reached the agent, or arrived after the question was already settled.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,13 +122,12 @@ const WITHDRAWN_OPTION_ID: &str = "withdrawn";
 /// A request remains harness-owned while a standing refusal or broker decision is in progress. Only
 /// an undecided request becomes host-answerable, immediately before its event is emitted.
 struct PendingApproval {
-    responder: Responder<RequestPermissionResponse>,
+    reply: PermissionReply,
     host_answerable: bool,
     question: mango_external_agents::PermissionRequest,
     announced: bool,
     deadline: ApprovalDeadline,
     expiry_option: Option<String>,
-    connection: ConnectionTo<Agent>,
     cancel: CancelNotification,
     turn: TurnHandle,
     /// Dropping a resolved question stops its timer task.
@@ -228,7 +173,7 @@ impl PendingApproval {
                 ),
             });
         }
-        let _ = self.responder.respond(permission::cancelled());
+        let _ = self.reply.respond(permission::cancelled());
     }
 
     /// Publish a successful decision before prompt completion can flush the terminal.
@@ -259,7 +204,7 @@ impl PendingApproval {
         };
         self.turn
             .approvals
-            .record_response(event, || self.responder.respond(response))
+            .record_response(event, || self.reply.respond(response))
     }
 }
 
@@ -275,7 +220,7 @@ impl TurnHandle {
     }
 }
 
-/// Everything the dispatch loop's handlers and the session's own methods share.
+/// Everything the connection's handlers and the session's own methods share.
 pub(crate) struct SessionState {
     session_id: SessionId,
     /// The core's own live session state, so a fact the reducer surfaces — the command catalog so
@@ -320,7 +265,7 @@ pub(crate) struct SessionState {
     /// the response coming back. Flattening it would report a shutdown or a withdrawn consent as
     /// "you stopped this turn".
     cancel_reason: Mutex<Option<CancelReason>>,
-    /// Touched only by the notification handler, which the dispatch loop runs one at a time.
+    /// Touched only by the notification handler, which the peer runs one call at a time.
     reducer: Mutex<Reducer>,
     /// Questions the agent is waiting on, keyed by [`SessionState::mint_approval_id`]'s id.
     ///
@@ -342,6 +287,11 @@ pub(crate) struct SessionState {
     /// Each session owns its own child, so a frame naming any other id is not this session's to
     /// act on. See [`Self::serves`].
     native_session: Mutex<NativeBinding>,
+    /// The connection these handlers serve, once it exists.
+    ///
+    /// Weak: the peer holds its handler, which holds this state, and a strong handle back would
+    /// keep a dropped session's connection alive. Unset in a state no connection was driven for.
+    peer: OnceLock<Weak<jsonrpc::Client>>,
 }
 
 impl std::fmt::Debug for SessionState {
@@ -382,7 +332,65 @@ impl SessionState {
             next_approval: AtomicU64::new(0),
             activity: tokio::sync::watch::channel(0).0,
             native_session: Mutex::new(NativeBinding::default()),
+            peer: OnceLock::new(),
         }
+    }
+
+    /// Names the connection this state's handlers serve. The first one stays.
+    fn attach_peer(&self, peer: &Arc<jsonrpc::Client>) {
+        let _ = self.peer.set(Arc::downgrade(peer));
+    }
+
+    /// Queues `session/cancel` on this state's connection, behind every frame queued before it.
+    ///
+    /// # Errors
+    ///
+    /// A JSON-RPC internal error naming what was expected when the connection is gone or would
+    /// not take the frame.
+    fn notify_cancel(
+        &self,
+        notification: CancelNotification,
+    ) -> agent_client_protocol_schema::v1::Result<()> {
+        let queued = self
+            .peer
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or(Error::Closed { subject: "link" })
+            .and_then(|peer| {
+                peer.submit_notification(AGENT_METHOD_NAMES.session_cancel, notification)
+            });
+        queued.map(drop).map_err(|error| {
+            let mut refused = agent_client_protocol_schema::v1::Error::internal_error();
+            refused.message = format!(
+                "expected an ACP connection that could carry session/cancel | received: {error}"
+            );
+            refused
+        })
+    }
+
+    /// Keeps the notification call this is made from whole until the returned hold is dropped,
+    /// for the stretch that takes a turn's reducer and questions and commits its terminal.
+    ///
+    /// The JSON-RPC peer stops the handler's task without draining its queue when the agent
+    /// passes an inbound budget and when the connection is closed, and it cancels the call in
+    /// progress at the await it had reached. Cut between taking what the turn owes and committing
+    /// the failure, the turn would be ended later by its prompt owner with a different cause and
+    /// without the closes of what it left running. Under a hold those ends wait for the stretch,
+    /// up to `shutdown_timeout`.
+    ///
+    /// Ask before the stretch, never inside it. When the cancellation has already been decided
+    /// this does not return: the call ends here with nothing taken. It holds nothing, and returns
+    /// at once, on a task that is not the peer's notification call or in a state no connection
+    /// was driven for.
+    ///
+    /// ```ignore
+    /// let hold = state.hold_terminal_commit().await;
+    /// // take, emit, commit
+    /// drop(hold);
+    /// ```
+    async fn hold_terminal_commit(&self) -> Option<CancellationHold> {
+        let peer = self.peer.get().and_then(Weak::upgrade)?;
+        Some(peer.hold_cancellation().await)
     }
 
     /// Binds this connection to one ACP session: the one being loaded, or the one opened.
@@ -814,8 +822,8 @@ impl SessionState {
     ///
     /// Called wherever a turn ends, not only on `close`, because a question cannot outlive the turn it
     /// belongs to: its answer would be emitted into a sink that is already finished, and the agent
-    /// would be told "allow" about a turn it stopped running. Dropping the responders instead would
-    /// say nothing at all — the SDK's drop guard only answers batch requests — so each is answered
+    /// would be told "allow" about a turn it stopped running. Dropping the replies instead would
+    /// leave the agent to whatever a dropped reply falls back to, so each is answered
     /// `Cancelled`, which is ACP's own outcome for a question that was withdrawn rather than refused.
     ///
     /// Taken out from under the lock in one statement, so nothing is held while the answers go out.
@@ -840,7 +848,7 @@ impl SessionState {
 
     /// Parks an agent question unless cancellation already won its race.
     ///
-    /// Cancellation holds the same guard before draining pending responders. A request that arrives
+    /// Cancellation holds the same guard before draining pending replies. A request that arrives
     /// after `session/cancel` must receive ACP's `Cancelled` outcome rather than wait forever for a
     /// host event that cancellation made obsolete.
     fn park_pending(
@@ -851,13 +859,13 @@ impl SessionState {
         let cancelling = self.lock_cancel_reason();
         if cancelling.is_some() {
             drop(cancelling);
-            pending.responder.respond(permission::cancelled())?;
+            pending.reply.respond(permission::cancelled())?;
             return Ok(false);
         }
         let mut parked = self.lock_pending();
         if parked.len() >= self.limits.max_pending_requests {
             drop(parked);
-            pending.responder.respond(permission::cancelled())?;
+            pending.reply.respond(permission::cancelled())?;
             return Ok(false);
         }
         parked.insert(id, pending);
@@ -898,7 +906,7 @@ impl SessionState {
         };
         self.touch();
         if cancelling.is_some() {
-            pending.responder.respond(permission::cancelled())?;
+            pending.reply.respond(permission::cancelled())?;
             return Ok(Answered::AlreadyResolved);
         }
         if !pending.deadline.is_elapsed() {
@@ -909,7 +917,7 @@ impl SessionState {
                 pending.respond_with_resolution(requested, option_id, source)?;
                 return Ok(Answered::Sent);
             }
-            pending.responder.respond(requested)?;
+            pending.reply.respond(requested)?;
             return Ok(Answered::Sent);
         }
 
@@ -920,7 +928,6 @@ impl SessionState {
             // `begin_cancellation`, take this same lock. The reason is already recorded, so a
             // late request or answer sees a cancelling turn whether or not the guard is held.
             drop(cancelling);
-            let connection = pending.connection.clone();
             let notification = pending.cancel.clone();
             let cancellation = pending.turn.cancellation.clone();
             // Every resolution is queued before anything reaches the agent that could end its
@@ -933,7 +940,7 @@ impl SessionState {
             // The agent may ignore `session/cancel`; this starts the kill-grace fallback that
             // reaps it, the same as a host `cancel` does.
             cancellation.cancel();
-            connection.send_notification(notification)?;
+            self.notify_cancel(notification)?;
             return Ok(Answered::AlreadyResolved);
         };
         let outcome = permission::selected(option_id);
@@ -953,7 +960,7 @@ impl SessionState {
         match pending {
             Some(pending) => {
                 self.touch();
-                pending.responder.respond(permission::cancelled())
+                pending.reply.respond(permission::cancelled())
             }
             None => Ok(()),
         }
@@ -1158,6 +1165,9 @@ async fn report_refused_event(state: &SessionState, turn: &TurnHandle, error: &E
     if !matches!(error, Error::InvalidVendorValue { .. }) || turn.sink.is_terminal() {
         return;
     }
+    // From taking what the turn owes to committing its terminal in one piece: see
+    // `hold_terminal_commit`. Nothing below waits on the agent or on the host's reader.
+    let _hold = state.hold_terminal_commit().await;
     if let Some((_, _, mut closing)) = state.prepare_terminal_matching(turn) {
         let _ = turn.approvals.flush(&turn.sink).await;
         for kind in closing.finish_with(ActivityStatus::Failed) {
@@ -1175,8 +1185,8 @@ async fn report_refused_event(state: &SessionState, turn: &TurnHandle, error: &E
 
 /// One `session/request_permission` request, brokered.
 ///
-/// Never waits for a person: the dispatch loop is held for as long as this returns nothing, and the
-/// answer arrives on another task. It first parks the question under the cancellation guard, then
+/// Never waits for a person: it parks the question and returns, and the answer arrives on another
+/// task. It first parks the question under the cancellation guard, then
 /// asks the two things that can answer without a person:
 ///
 /// 1. **The level.** Under [`PermissionLevel::ReadOnly`] the answer is a refusal, every time. That
@@ -1191,25 +1201,24 @@ async fn report_refused_event(state: &SessionState, turn: &TurnHandle, error: &E
 async fn on_request_permission(
     state: &Arc<SessionState>,
     request: RequestPermissionRequest,
-    responder: Responder<RequestPermissionResponse>,
-    connection: ConnectionTo<Agent>,
+    reply: PermissionReply,
 ) -> agent_client_protocol_schema::v1::Result<()> {
     if !state.serves(&request.session_id) {
         // Another session's question. Refused rather than shown: this host's answer would grant
         // work in a conversation it never opened.
-        return responder.respond(permission::cancelled());
+        return reply.respond(permission::cancelled());
     }
     let id = state.mint_approval_id();
     let Some(turn) = state.turn() else {
         // No turn: nobody is reading, and an unanswered request would hold the agent forever.
-        return responder.respond(permission::cancelled());
+        return reply.respond(permission::cancelled());
     };
     if turn.is_finished() {
         // The turn's terminal has gone out — a `close` is in progress, and its `session/close`
         // handshake is the window this arrives in. Withdrawn rather than parked or decided: nothing
-        // may grant a permission while the session is being torn down, and a responder parked now
-        // would be left waiting when the transport goes.
-        return responder.respond(permission::cancelled());
+        // may grant a permission while the session is being torn down, and a reply parked now
+        // would be left waiting when the connection goes.
+        return reply.respond(permission::cancelled());
     }
 
     // One read, reused below: a second `state.now()` call to translate `expires_at` back into a
@@ -1217,7 +1226,7 @@ async fn on_request_permission(
     // monotonic approval window past what the wire advertised.
     let now = state.now();
     let Ok(expires_at) = state.limits.approval_expires_at(now) else {
-        return responder.respond(permission::cancelled());
+        return reply.respond(permission::cancelled());
     };
     let question = permission::request_from(
         &request,
@@ -1230,16 +1239,16 @@ async fn on_request_permission(
         Ok(question) => question,
         // A question nobody could render — no options, or an id that cannot survive bounding — is
         // withdrawn on its own rather than ending the turn it belongs to.
-        Err(_) => return responder.respond(permission::cancelled()),
+        Err(_) => return reply.respond(permission::cancelled()),
     };
 
     let Some(deadline) = ApprovalDeadline::new(question.expires_at(), now) else {
-        return responder.respond(permission::cancelled());
+        return reply.respond(permission::cancelled());
     };
     let (timer_done, done) = tokio::sync::oneshot::channel();
     let (broker_settled, settled) = tokio::sync::oneshot::channel();
     let pending = PendingApproval {
-        responder,
+        reply,
         host_answerable: false,
         question: question.clone(),
         announced: false,
@@ -1249,7 +1258,6 @@ async fn on_request_permission(
         // only `RejectOnce` here would leave an agent that offers `reject_always` alone with no
         // expiry answer, and the branch below cancels the whole turn when there is none.
         expiry_option: question.deny().ok().map(|refusal| refusal.option_id),
-        connection,
         cancel: CancelNotification::new(request.session_id),
         turn: turn.clone(),
         _timer_done: timer_done,
@@ -1265,7 +1273,7 @@ async fn on_request_permission(
     Ok(())
 }
 
-/// Resolves one parked permission away from ACP's serialized dispatch loop.
+/// Resolves one parked permission away from the task that received it.
 ///
 /// The broker call lives exactly as long as its question is parked. `settled` resolves when the
 /// pending map lets go of the question, however it does — answered, withdrawn, expired, cancelled or
@@ -1357,24 +1365,90 @@ fn standing_refusal(
     )
 }
 
+/// What the JSON-RPC peer hands the agent's traffic to.
+///
+/// - `session/update` is reduced and emitted, one call at a time, in arrival order.
+/// - `session/request_permission` is brokered; its call returns when the question is settled.
+/// - Any other request is refused with JSON-RPC `-32601`, which is what the capabilities this
+///   client advertises promise: no filesystem, no terminal, nothing else an agent may ask for.
+/// - Any other notification is dropped without an answer.
+struct AcpHandler {
+    state: Arc<SessionState>,
+    /// Cancelled once the connection ended under this side, for whoever watches it.
+    ended: mango_external_agents::CancelToken,
+}
+
+#[async_trait::async_trait]
+impl PeerHandler for AcpHandler {
+    async fn on_notification(&self, method: String, params: serde_json::Value) {
+        if method != CLIENT_METHOD_NAMES.session_update {
+            return;
+        }
+        // A `session/update` this client cannot read is dropped like a notification it does not
+        // know: there is no request to answer, and one unreadable frame is not the turn's end.
+        let Ok(notification) = serde_json::from_value::<SessionNotification>(params) else {
+            return;
+        };
+        on_session_update(&self.state, notification).await;
+    }
+
+    async fn on_request(
+        &self,
+        method: String,
+        params: serde_json::Value,
+        _id: jsonrpc::RequestId,
+    ) -> ServerRequestOutcome {
+        if method != CLIENT_METHOD_NAMES.session_request_permission {
+            return refusal(agent_client_protocol_schema::v1::Error::method_not_found());
+        }
+        let request = match serde_json::from_value::<RequestPermissionRequest>(params) {
+            Ok(request) => request,
+            Err(error) => {
+                let mut unreadable = agent_client_protocol_schema::v1::Error::invalid_params();
+                // serde's own description of the shape it wanted; none of the agent's values.
+                unreadable.data = Some(serde_json::Value::String(error.to_string()));
+                return refusal(unreadable);
+            }
+        };
+        let (reply, question) = PermissionReply::parked();
+        // An answer that could not be handed over is the connection ending under the question,
+        // and the peer answers for a closing connection itself.
+        let _ = on_request_permission(&self.state, request, reply).await;
+        question.answer().await
+    }
+
+    async fn on_terminated(&self, _termination: jsonrpc::PeerTermination) {
+        // Only a signal: whoever owns the connection reads why from `Client::ended` and tears it
+        // down from its own task. Closing from here would wait on this very call.
+        self.ended.cancel();
+    }
+}
+
+/// An ACP error as the answer the peer writes for one of the agent's requests.
+///
+/// For example, `refusal(Error::method_not_found())` writes
+/// `{"error":{"code":-32601,"message":"Method not found"}}` on the id the agent used.
+fn refusal(error: agent_client_protocol_schema::v1::Error) -> ServerRequestOutcome {
+    ServerRequestOutcome::Failure(jsonrpc::JsonRpcError {
+        code: i64::from(i32::from(error.code)),
+        message: error.message,
+        data: error.data,
+    })
+}
+
 /// A live connection to one agent, and the child behind it.
 pub(crate) struct ConnectionHandle {
-    connection: ConnectionTo<Agent>,
+    /// The JSON-RPC peer. Shared with nothing that outlives this handle: the handlers reach it
+    /// through a weak reference.
+    client: Arc<jsonrpc::Client>,
     control: Arc<dyn ProcessControl>,
     /// The one owner shared with lifecycle watchers that may also need to reap the child.
     child_reaper: ChildReaper,
-    shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    driver: Mutex<Option<tokio::task::JoinHandle<agent_client_protocol_schema::v1::Result<()>>>>,
-    /// Host-owned bounds for tearing down the dispatch loop and child process.
+    /// Host-owned bounds for tearing down the connection and child process.
     limits: mango_external_agents::Limits,
-    /// Fires once the dispatch loop is over, whichever way it ended.
-    ///
-    /// Separate from `driver` because both are needed at once: `shutdown` takes the join handle to
-    /// bound its own wind-down, and the session's lifecycle watcher has to observe the same event
-    /// without competing for it.
-    driver_done: mango_external_agents::CancelToken,
-    /// Filled by the bounded transport when a queue budget failed the connection.
-    overflow: crate::transport::OverflowSlot,
+    /// Fires once the connection is over, whichever way it ended: the agent exited, the link
+    /// failed, a budget was passed, this handle shut it down, or this handle was dropped.
+    ended: mango_external_agents::CancelToken,
     shutdown_started: AtomicBool,
     shutdown_complete: mango_external_agents::CancelToken,
     /// The one teardown outcome every close waiter observes. `Error` is intentionally reduced to
@@ -1387,93 +1461,9 @@ pub(crate) struct ConnectionHandle {
     /// How many shutdown tasks `begin_shutdown` started; the single-flight guard keeps it at one.
     #[cfg(test)]
     shutdown_runs: std::sync::atomic::AtomicUsize,
-    /// Bounds non-turn ACP requests before they enter the SDK's unbounded pending-request queue.
-    /// A prompt has its own single-turn admission in `SessionState` and does not use this permit.
+    /// Bounds the requests that are not prompts. A prompt has its own single-turn admission in
+    /// `SessionState` and does not use this permit.
     requests: RequestAdmission,
-}
-
-/// Admission in front of ACP's unbounded SDK request queue.
-struct RequestAdmission {
-    permits: tokio::sync::Semaphore,
-    limit: usize,
-    state: Mutex<RequestAdmissionState>,
-}
-
-#[derive(Default)]
-struct RequestAdmissionState {
-    closed: bool,
-}
-
-impl RequestAdmission {
-    fn new(limit: usize) -> Self {
-        Self {
-            // A host may set a huge count to mean "no cap"; a semaphore panics above
-            // `MAX_PERMITS`, and this runs after the child is launched. `limit` itself stays as
-            // the host set it, for the refusal message.
-            permits: tokio::sync::Semaphore::new(limit.min(tokio::sync::Semaphore::MAX_PERMITS)),
-            limit,
-            state: Mutex::new(RequestAdmissionState::default()),
-        }
-    }
-
-    fn submit<T>(&self, send: impl FnOnce() -> T) -> Result<(tokio::sync::SemaphorePermit<'_>, T)> {
-        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.closed {
-            return Err(Error::Closed {
-                subject: "ACP connection",
-            });
-        }
-        let permit = self
-            .permits
-            .try_acquire()
-            .map_err(|_| Error::LimitExceeded {
-                subject: "outstanding ACP requests",
-                limit: self.limit,
-                received: self.limit.saturating_add(1),
-            })?;
-        let sent = send();
-        drop(state);
-        Ok((permit, sent))
-    }
-
-    fn close(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .closed = true;
-    }
-}
-
-/// Starts owned teardown if a generic request leaves ACP's pending-reply map without a response.
-struct RequestAbandonment {
-    connection: Arc<ConnectionHandle>,
-    armed: bool,
-}
-
-impl RequestAbandonment {
-    fn new(connection: Arc<ConnectionHandle>) -> Self {
-        Self {
-            connection,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for RequestAbandonment {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        // The SDK only sends a cancellation notification when a sent request is dropped; it keeps
-        // that request's reply slot until a response or EOF. Close admission synchronously, then
-        // let the connection's owned shutdown task force EOF and release the SDK's pending map.
-        self.connection
-            .begin_shutdown(mango_external_agents::CancelReason::Shutdown);
-    }
 }
 
 /// Reaps one child once without letting cancellation abandon its launched kill task.
@@ -1530,49 +1520,6 @@ struct ReapCompletion(mango_external_agents::CancelToken);
 impl Drop for ReapCompletion {
     fn drop(&mut self) {
         self.0.cancel();
-    }
-}
-
-/// Reaps a child if cancellation drops `drive` before it can return a connection handle.
-pub(crate) struct DriveShutdownGuard {
-    control: Arc<dyn ProcessControl>,
-    cleanup: Option<ProcessCleanupGuard>,
-}
-
-impl DriveShutdownGuard {
-    /// Claims a launched child before the asynchronous connection driver is first polled.
-    pub(crate) fn from_launched(launched: &LaunchedAgent, limits: Limits) -> Self {
-        let control = Arc::clone(&launched.control);
-        Self {
-            cleanup: Some(ProcessCleanupGuard::new(
-                Arc::clone(&control),
-                limits,
-                mango_external_agents::CancelReason::Shutdown,
-            )),
-            control,
-        }
-    }
-
-    fn disarm(&mut self) -> Arc<dyn ProcessControl> {
-        self.cleanup
-            .take()
-            .expect("drive guard owns the child until a connection handle exists")
-            .into_control()
-    }
-
-    /// Completes pre-handle cleanup before `drive` reports a connection-start failure.
-    async fn finish(mut self) -> Result<()> {
-        self.cleanup
-            .take()
-            .expect("drive guard owns the child until cleanup completes")
-            .finish()
-            .await
-            .map(|_| ())
-    }
-
-    #[cfg(test)]
-    fn control(&self) -> &Arc<dyn ProcessControl> {
-        &self.control
     }
 }
 
@@ -1645,137 +1592,68 @@ impl std::fmt::Debug for ConnectionHandle {
     }
 }
 
-/// Starts the dispatch loop for one agent and hands back the connection it opened.
-///
-/// # Errors
-///
-/// [`Error::Vendor`] when the connection ended before it produced a handle, under
-/// `acp-link-closed`, carrying which of the three shapes it was and the child's redacted stderr
-/// tail — which is what an agent that printed a usage message and exited looks like from here.
-///
-/// A [`VendorError`] rather than an [`Error::Link`], because the tail has to reach a host and this
-/// is the only path where it cannot reach one any other way: no `Session` and no
-/// [`ProcessControl`] are returned, so [`StderrTail`](mango_external_agents::StderrTail) is out of
-/// reach. `VendorError::message` is the field that exists for vendor text a host reads and
-/// `Display` never writes, which is exactly the shape this needs; `Error::Link`'s summary is
-/// written verbatim and could not carry it.
-///
-/// The one exception is a transport budget: when the agent overflows a message or byte budget
-/// before the connection opens, this returns the recorded [`Error::LimitExceeded`], naming the
-/// limit and the received value, instead of `acp-link-closed`.
-pub(crate) async fn drive(
-    launched: LaunchedAgent,
-    state: Arc<SessionState>,
-    client_name: String,
-    mut child: DriveShutdownGuard,
-) -> Result<ConnectionHandle> {
-    #[cfg(test)]
-    wait_for_drive_startup_hold(&child).await;
+impl Drop for ConnectionHandle {
+    /// Wakes whoever watches this connection when the handle goes without a shutdown.
+    ///
+    /// Dropping the peer takes its tasks down without telling its handler, so the handler's own
+    /// signal never comes on this path. The session's watcher holds the child's reaper and no
+    /// handle, and this is what lets it reap a session that was dropped while idle.
+    fn drop(&mut self) {
+        self.ended.cancel();
+    }
+}
 
-    let LaunchedAgent { transport, .. } = launched;
-    let overflow = transport.overflow();
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-
-    let notifications = Arc::clone(&state);
-    let approvals = Arc::clone(&state);
-    let driver_done = mango_external_agents::CancelToken::new();
-    let loop_over = driver_done.clone();
-    let connecting = Client
-        .builder()
-        .name(client_name)
-        .on_receive_notification(
-            async move |notification: SessionNotification, _cx| {
-                on_session_update(&notifications, notification).await;
-                Ok(())
-            },
-            agent_client_protocol::on_receive_notification!(),
-        )
-        .on_receive_request(
-            async move |request: RequestPermissionRequest, responder, cx| {
-                on_request_permission(&approvals, request, responder, cx).await
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        // All supported handlers are installed before connecting. The SDK's v1 default would
-        // retain unknown session messages for a future dynamic handler, without a queue cap.
-        .on_receive_dispatch(
-            async |message: agent_client_protocol::Dispatch, _cx| match message {
-                agent_client_protocol::Dispatch::Request(_, responder) => {
-                    responder.respond_with_error(
-                        agent_client_protocol_schema::v1::Error::method_not_found(),
-                    )
-                }
-                agent_client_protocol::Dispatch::Notification(_) => Ok(()),
-                agent_client_protocol::Dispatch::Response(result, router) => {
-                    router.route_with_result(result)
-                }
-            },
-            agent_client_protocol::on_receive_dispatch!(),
-        )
-        .connect_with(transport, async move |connection: ConnectionTo<Agent>| {
-            // The closure *is* the connection's lifetime, so it hands a clone out and parks.
-            // Returning here shuts the dispatch loop down, which is why only `shutdown` does.
-            let _ = ready_tx.send(connection.clone());
-            let _ = shutdown_rx.await;
-            Ok(())
-        });
-    let driver = tokio::spawn(async move {
-        let outcome = connecting.await;
-        // Signalled whatever the outcome. An agent that exited or a transport that failed ends the
-        // loop without anyone having called `close`, and that is precisely the case a session's
-        // lifecycle would otherwise never hear about.
-        loop_over.cancel();
-        outcome
-    });
-
-    let Ok(connection) = ready_rx.await else {
-        // The closure never ran, so the transport failed first. Nothing is returned from this
-        // path — no session, no control handle — so the child's stderr has nowhere else to go, and
-        // an agent that exited printing a usage message has said the only useful thing there is.
-        // `VendorError::message` is the field for exactly that: vendor text a host reads and
-        // `Display` never writes.
-        let shape = match driver.await {
-            Ok(Err(_)) => "a transport that failed before the connection opened",
-            Ok(Ok(())) => "a connection that closed before it opened",
-            Err(_) => "a connection task that did not finish",
-        };
-        let error = match overflow.get() {
-            Some(overflow) => overflow.error(),
-            None => Error::Vendor(link_failure(with_stderr(shape, child.control.as_ref()))),
-        };
-        child.finish().await?;
-        return Err(error);
-    };
-
-    let control = child.disarm();
-    let child_reaper = ChildReaper::new(Arc::clone(&control), state.limits);
-    Ok(ConnectionHandle {
-        connection,
+/// Starts the connection to one launched agent and hands back the handle that owns it.
+///
+/// Nothing here waits: the peer starts reading and writing on tasks of its own, and an agent
+/// that exits or floods before it answers anything fails the first request made of it, naming
+/// why. Must be called on the runtime the connection is to live on.
+///
+/// ```ignore
+/// let launched = transport::connect(host, &spec, keys).await?;
+/// let connection = Arc::new(client::drive(launched, Arc::clone(&state)));
+/// ```
+pub(crate) fn drive(launched: LaunchedAgent, state: Arc<SessionState>) -> ConnectionHandle {
+    let LaunchedAgent {
+        link,
         control,
-        child_reaper,
-        shutdown: Mutex::new(Some(shutdown_tx)),
-        driver: Mutex::new(Some(driver)),
-        limits: state.limits,
-        driver_done,
-        overflow,
+        outbound_buffer_bytes,
+    } = launched;
+    let limits = state.limits;
+    let ended = mango_external_agents::CancelToken::new();
+    let handler = Arc::new(AcpHandler {
+        state: Arc::clone(&state),
+        ended: ended.clone(),
+    });
+    let client = Arc::new(jsonrpc::Client::connect_with(
+        link,
+        handler,
+        crate::transport::client_options(&limits),
+        crate::transport::wire_options(&limits, outbound_buffer_bytes),
+    ));
+    state.attach_peer(&client);
+    ConnectionHandle {
+        client,
+        child_reaper: ChildReaper::new(Arc::clone(&control), limits),
+        control,
+        limits,
+        ended,
         shutdown_started: AtomicBool::new(false),
         shutdown_complete: mango_external_agents::CancelToken::new(),
         shutdown_result: Mutex::new(None),
-        // `drive` is async and has already spawned the dispatch loop, so a runtime is current.
         runtime: tokio::runtime::Handle::current(),
         #[cfg(test)]
         shutdown_runs: std::sync::atomic::AtomicUsize::new(0),
-        requests: RequestAdmission::new(state.limits.max_pending_requests),
-    })
+        requests: RequestAdmission::new(limits.max_pending_requests),
+    }
 }
 
 impl ConnectionHandle {
     /// Starts bounded shutdown in an owned task so dropping the initiating session future cannot
     /// abandon the child. Later callers join the same completion signal.
     pub(crate) fn begin_shutdown(self: &Arc<Self>, reason: mango_external_agents::CancelReason) {
-        // Serialised with `RequestAdmission::submit`, so no request can enter the SDK queue after
-        // a caller has begun teardown.
+        // Serialised with `RequestAdmission::submit`, so no request can be queued after a caller
+        // has begun teardown.
         self.requests.close();
         if self.shutdown_started.swap(true, Ordering::AcqRel) {
             return;
@@ -1816,14 +1694,6 @@ impl ConnectionHandle {
             )))),
         })
     }
-    /// The connection, for a request a session method sends.
-    ///
-    /// Calls from a session method run outside the dispatch loop, which is the condition
-    /// `SentRequest::block_task` documents: awaiting a response there is safe, and awaiting one
-    /// inside a handler would deadlock the loop that has to route it.
-    pub(crate) fn connection(&self) -> &ConnectionTo<Agent> {
-        &self.connection
-    }
 
     /// The child, for diagnostics and for ending it.
     pub(crate) fn control(&self) -> &Arc<dyn ProcessControl> {
@@ -1835,175 +1705,104 @@ impl ConnectionHandle {
         self.child_reaper.clone()
     }
 
-    /// Fires once the dispatch loop is over, whichever way it ended.
+    /// Fires once the connection is over, whichever way it ended.
     ///
-    /// Not the same event as [`ConnectionTo::incoming_closed`]: a clean EOF closes the incoming
-    /// half while the loop stays up, because its outgoing and task actors live for as long as any
-    /// [`ConnectionTo`] clone does — and this handle holds one. A transport that *failed* ends the
-    /// loop itself, and only this reports that. Anything watching for a dead agent wants both.
-    pub(crate) fn driver_done(&self) -> &mango_external_agents::CancelToken {
-        &self.driver_done
+    /// One signal for every end: the agent closing its output, a failed link, a budget passed in
+    /// either direction, this handle's own shutdown, and the handle being dropped. Anything
+    /// watching for a dead agent waits on this.
+    pub(crate) fn ended(&self) -> &mango_external_agents::CancelToken {
+        &self.ended
     }
 
-    /// The transport budget that failed this connection, if one did.
+    /// The queue budget that ended this connection, if one did.
     ///
-    /// Set before the SDK reports the closed connection, so a request or turn that observed the
-    /// failure can read it. For example, a prompt ended by an oversized frame reports this instead
-    /// of a cancellation.
-    pub(crate) fn overflow(&self) -> Option<crate::transport::Overflow> {
-        self.overflow.get().copied()
+    /// On record before any request is failed with it, so a request or turn that observed the
+    /// failure can read it. For example, a prompt ended by an oversized frame from the agent
+    /// reports this instead of a cancellation. The first cause of an end is kept, so a close that
+    /// follows an overflow does not replace it.
+    pub(crate) fn overflow(&self) -> Option<Overflow> {
+        match self.client.ended()? {
+            jsonrpc::ConnectionEnd::Peer(termination) => Overflow::from_termination(&termination),
+            _ => None,
+        }
     }
 
-    /// Ends the dispatch loop and the child. Idempotent.
+    /// Queues `session/cancel` for `session_id`, behind every frame queued before it.
+    ///
+    /// A notification, so there is no answer to wait for: the agent reports the outcome on the
+    /// prompt's own response. Synchronous, which is what keeps a cancel behind the prompt it
+    /// stops when both are queued under one guard.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the connection refused the frame with: it is closed, its link is unusable, or
+    /// its outgoing queue is full.
+    ///
+    /// ```ignore
+    /// connection.cancel_prompt(native_session_id.clone())?;
+    /// ```
+    pub(crate) fn cancel_prompt(
+        &self,
+        session_id: agent_client_protocol_schema::v1::SessionId,
+    ) -> Result<()> {
+        self.client
+            .submit_notification(
+                AGENT_METHOD_NAMES.session_cancel,
+                CancelNotification::new(session_id),
+            )
+            .map(drop)
+    }
+
+    /// The failure of a request the connection ended under, or refused because it had ended.
+    ///
+    /// The budget that ended the connection when one did, and otherwise `acp-link-closed` naming
+    /// the method, with the child's redacted stderr. For example, an agent that printed a usage
+    /// message and exited under `initialize` yields
+    /// `a transport that closed under initialize; the agent's stderr: usage: …`.
+    fn link_closed_under(&self, method: &str) -> Error {
+        if let Some(overflow) = self.overflow() {
+            return overflow.error();
+        }
+        Error::Vendor(link_failure(with_stderr(
+            &format!("a transport that closed under {method}"),
+            self.control.as_ref(),
+        )))
+    }
+
+    /// What a request the connection would not queue is reported as.
+    ///
+    /// - A frame over the outgoing budget is that budget, marked not submitted: the refusal is of
+    ///   this request alone.
+    /// - On a connection that has ended, the same failure a request in flight would have had.
+    /// - Anything else as the peer gave it.
+    fn refused(&self, method: &str, error: Error) -> Error {
+        if let Some(overflow) = Overflow::from_refused_frame(&error) {
+            return overflow
+                .error()
+                .with_dispatch(mango_external_agents::Dispatch::NotSubmitted);
+        }
+        if self.client.ended().is_some() {
+            return self.link_closed_under(method);
+        }
+        error
+    }
+
+    /// Ends the connection and the child. Idempotent.
     ///
     /// Closing the connection first is what lets a well-behaved agent see its stdin end and exit on
     /// its own; the kill is the escalation for one that does not, and it is the launcher's own —
     /// this only asks, with the reason.
+    ///
+    /// The close is given `shutdown_timeout`. The peer's own bound is twice that, for a
+    /// connection that has both answers to write and frames queued; past the first one the close
+    /// is given up, which leaves the link unusable and the child to the reaper. A close that
+    /// reports an error is not a failed teardown either: a blocked writer makes it report one
+    /// after the child is gone, and process cleanup is the fact that decides.
     pub(crate) async fn shutdown(&self, reason: mango_external_agents::CancelReason) -> Result<()> {
-        let signal = self
-            .shutdown
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(signal) = signal {
-            let _ = signal.send(());
-        }
-        let driver = self
-            .driver
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(mut driver) = driver {
-            match tokio::time::timeout(self.limits.shutdown_timeout, &mut driver).await {
-                Ok(Ok(Ok(()))) => {}
-                // The transport commonly reports its own close as an error. The driver has still
-                // joined, and process cleanup is the fact that decides whether teardown succeeded.
-                Ok(Ok(Err(_)) | Err(_)) => {}
-                Err(_) => {
-                    driver.abort();
-                    let _ = driver.await;
-                    // The task has now joined. A successful bounded process cleanup below proves
-                    // the session is no longer live, so reporting an incomplete close would leave
-                    // the host permanently at `Closing` despite a reaped child.
-                }
-            }
-        }
+        let _ = tokio::time::timeout(self.limits.shutdown_timeout, self.client.close()).await;
+        self.ended.cancel();
         self.child_reaper.reap(reason).await
     }
-}
-
-/// Sends one request under the host's own deadline and maps whatever came back.
-///
-/// Every request this harness sends goes through here **except** `session/prompt`, which is a turn
-/// and may legitimately take as long as the agent needs. The rest are handshakes and bookkeeping: an
-/// agent that accepted the pipe and never answered `initialize` would otherwise hold `open_session`
-/// open for the life of the process, which looks to a host exactly like a hung machine rather than a
-/// misbehaving agent. `Limits::request_timeout` is the number the host already set for this.
-///
-/// # Errors
-///
-/// [`Error::Timeout`] when the deadline passed, [`Error::Vendor`] with the child's redacted stderr
-/// when the transport closed, and otherwise whatever [`request_error`](crate::error::request_error)
-/// made of the agent's answer. An opening call returns no session or control handle, so this is the
-/// only path that preserves the tail for a host to inspect.
-pub(crate) async fn send<Request>(
-    connection: &Arc<ConnectionHandle>,
-    profile: &crate::profile::AcpProfile,
-    timeout: Duration,
-    method: &'static str,
-    request: Request,
-) -> Result<Request::Response>
-where
-    Request: agent_client_protocol::JsonRpcRequest,
-    Request::Response: Send,
-{
-    let sent = submit(connection, request)?;
-    await_sent(connection, profile, timeout, method, sent).await
-}
-
-/// A request admitted before submission, with cleanup owned until its response arrives.
-pub(crate) struct SubmittedRequest<'a, Response> {
-    sent: agent_client_protocol::SentRequest<Response>,
-    _permit: tokio::sync::SemaphorePermit<'a>,
-    abandonment: RequestAbandonment,
-}
-
-/// Submits synchronously so callers can bind catalog revision and request admission together.
-pub(crate) fn submit<Request>(
-    connection: &Arc<ConnectionHandle>,
-    request: Request,
-) -> Result<SubmittedRequest<'_, Request::Response>>
-where
-    Request: agent_client_protocol::JsonRpcRequest,
-{
-    let (permit, sent) = connection
-        .requests
-        .submit(|| connection.connection().send_request(request))?;
-    Ok(SubmittedRequest {
-        sent,
-        _permit: permit,
-        abandonment: RequestAbandonment::new(Arc::clone(connection)),
-    })
-}
-
-/// Awaits an admitted request already submitted under a synchronous lifecycle claim.
-pub(crate) async fn await_sent<Response>(
-    connection: &ConnectionHandle,
-    profile: &crate::profile::AcpProfile,
-    timeout: Duration,
-    method: &'static str,
-    submitted: SubmittedRequest<'_, Response>,
-) -> Result<Response>
-where
-    Response: Send,
-{
-    let SubmittedRequest {
-        sent,
-        _permit,
-        mut abandonment,
-    } = submitted;
-    let answered = tokio::time::timeout(timeout, sent.block_task()).await;
-    let Ok(answered) = answered else {
-        return Err(Error::Timeout {
-            operation: format!("{method} on an ACP agent"),
-            after: timeout,
-        });
-    };
-    abandonment.disarm();
-    answered.map_err(|error| {
-        if is_link_closure(&error)
-            && let Some(overflow) = connection.overflow()
-        {
-            return overflow.error();
-        }
-        // Both shapes, not only the EOF one: a reply dropped with the dispatch loop is the same
-        // closed link seen from the other side, and nothing the agent said.
-        if is_link_closure(&error) {
-            return Error::Vendor(link_failure(with_stderr(
-                &format!("a transport that closed under {method}"),
-                connection.control().as_ref(),
-            )));
-        }
-        crate::error::request_error(method, &error, &profile.login_text())
-    })
-}
-
-/// Whether the SDK failed a request because the link went away, rather than the agent answering.
-///
-/// Two local shapes: the SDK's `incoming transport closed` reason, and its `never received` error
-/// when the connection's reply channel was dropped with the request pending. Only these may be
-/// explained by a connection-wide transport budget; an agent's own refusal is kept as it came.
-/// For example, a `set_config_option` refusal stays a vendor error even after a later overflow.
-pub(crate) fn is_link_closure(error: &agent_client_protocol_schema::v1::Error) -> bool {
-    if agent_client_protocol::is_incoming_transport_closed(error) {
-        return true;
-    }
-    let Some(detail) = error.data.as_ref().and_then(serde_json::Value::as_str) else {
-        return false;
-    };
-    error.code == agent_client_protocol_schema::v1::ErrorCode::InternalError
-        && detail.starts_with("response to `")
-        && detail.contains("` never received: ")
 }
 
 /// A message with the child's stderr appended, when it wrote any.
@@ -2043,9 +1842,6 @@ pub(crate) fn overflow_failure(overflow: crate::transport::Overflow) -> VendorEr
 }
 
 #[cfg(test)]
-mod connection_tests;
-
-#[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2053,15 +1849,12 @@ mod tests {
 
     use mango_external_agents::testing::{FakeLauncher, FakeProcess};
     use mango_external_agents::{
-        AttemptId, ByteSink, ByteSource, CancelReason, Configuration, Error, EventSink, ExitStatus,
-        HarnessIdentity, HostContext, LaunchSpec, ManagedProcess, ProcessControl, ProcessLauncher,
-        Result, SessionIds, SessionSnapshot, TransportKind, TransportSelection, TurnId,
+        AttemptId, CancelReason, Configuration, Error, EventSink, ExitStatus, HarnessIdentity,
+        HostContext, LaunchSpec, ProcessControl, ProcessLauncher, Result, SessionIds,
+        SessionSnapshot, TransportKind, TransportSelection, TurnId,
     };
 
-    use super::{
-        DriveShutdownGuard, PermissionLevel, RequestAdmission, SessionId, SessionState, drive,
-        hold_next_drive_startup,
-    };
+    use super::{PermissionLevel, SessionId, SessionState, drive};
 
     /// A process control that records how many cleanup claims reach the injected child.
     struct CountingProcessControl {
@@ -2075,18 +1868,6 @@ mod tests {
         release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
         completed: AtomicBool,
     }
-
-    /// A process control whose first bounded cleanup fails and whose next one succeeds.
-    struct RetryableCleanupControl {
-        failed_once: AtomicBool,
-        kills: AtomicUsize,
-    }
-
-    /// A child stdout that fails before ACP can hand `drive` a connection handle.
-    struct FailingStartupSource;
-
-    /// The unused writable half of a deliberately broken startup transport.
-    struct InertStartupSink;
 
     #[async_trait::async_trait]
     impl ProcessControl for HeldKillProcessControl {
@@ -2120,53 +1901,6 @@ mod tests {
                 let _ = release.await;
             }
             self.completed.store(true, Ordering::Release);
-            Ok(())
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ProcessControl for RetryableCleanupControl {
-        fn pid(&self) -> Option<u32> {
-            None
-        }
-
-        fn stderr_tail(&self) -> String {
-            String::new()
-        }
-
-        async fn wait(&self) -> Result<ExitStatus> {
-            Ok(ExitStatus::default())
-        }
-
-        async fn kill(&self, _reason: CancelReason) -> Result<()> {
-            self.kills.fetch_add(1, Ordering::AcqRel);
-            if self.failed_once.swap(false, Ordering::AcqRel) {
-                return Err(Error::Launch {
-                    program: String::from("fake ACP agent"),
-                    message: String::from("the first cleanup attempt failed"),
-                });
-            }
-            Ok(())
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ByteSource for FailingStartupSource {
-        async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
-            Err(Error::Link {
-                peer: String::from("fake ACP agent"),
-                message: String::from("the startup pipe failed"),
-            })
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ByteSink for InertStartupSink {
-        async fn write_all(&mut self, _bytes: &[u8]) -> Result<()> {
-            Ok(())
-        }
-
-        async fn close(&mut self) -> Result<()> {
             Ok(())
         }
     }
@@ -2376,48 +2110,6 @@ mod tests {
         );
     }
 
-    /// A generic request must acquire admission before the ACP SDK can queue it, and releasing the
-    /// completed request's RAII permit must admit the next caller.
-    #[test]
-    fn generic_request_admission_is_bounded_and_releases_after_completion() {
-        let admission = RequestAdmission::new(1);
-        let first = admission
-            .submit(|| ())
-            .expect("expected the first request permit");
-        let refused = admission
-            .submit(|| ())
-            .expect_err("expected the second outstanding request to be refused");
-        assert!(
-            matches!(
-                refused,
-                Error::LimitExceeded {
-                    subject: "outstanding ACP requests",
-                    limit: 1,
-                    received: 2,
-                }
-            ),
-            "received {refused:?}"
-        );
-        drop(first.0);
-        let _next = admission
-            .submit(|| ())
-            .expect("expected the completed request to release admission");
-        admission.close();
-        let closed = admission
-            .submit(|| ())
-            .expect_err("expected closed admission to refuse before queuing");
-        assert!(
-            matches!(
-                closed,
-                Error::Closed {
-                    subject: "ACP connection"
-                }
-            ),
-            "received {closed:?}"
-        );
-    }
-
-    /// Cancelling `drive` before its connection task exists still reaps the child it was handed.
     #[test]
     fn an_overflow_failure_names_the_code_the_limit_and_the_received_count() {
         let overflow = crate::transport::Overflow::incoming_messages(8, 50);
@@ -2428,153 +2120,6 @@ mod tests {
             "expected at most 8 JSON-RPC messages queued from the ACP agent, received 50",
             "expected the typed limit text, received {:?}",
             failure.message
-        );
-    }
-
-    #[tokio::test]
-    async fn a_cancelled_driver_startup_kills_its_injected_child_once() {
-        let launcher = FakeLauncher::new();
-        launcher.push(FakeProcess::responding(|_| Vec::new()));
-        let (state, host) = state();
-        let mut process = launcher
-            .spawn(LaunchSpec {
-                argv: vec![String::from("fake-acp")],
-                cwd: host.cwd().to_path_buf(),
-                env: Default::default(),
-                stdin: true,
-                hide_window: true,
-            })
-            .await
-            .expect("expected the fake child to launch");
-        let kills = Arc::new(AtomicUsize::new(0));
-        let control: Arc<dyn ProcessControl> = Arc::new(CountingProcessControl {
-            inner: Arc::clone(&process.control),
-            kills: Arc::clone(&kills),
-        });
-        process.control = Arc::clone(&control);
-        let launched = crate::transport::frame(process, &host).expect("expected framed child");
-        let cleanup = DriveShutdownGuard::from_launched(&launched, *host.limits());
-        let (_release, reached) = hold_next_drive_startup(Arc::clone(&control));
-        let task = tokio::spawn(drive(
-            launched,
-            Arc::new(state),
-            String::from("acp-client-tests"),
-            cleanup,
-        ));
-        reached
-            .await
-            .expect("expected the driver to stop before connection startup");
-        task.abort();
-        let _ = task.await;
-        tokio::time::timeout(Duration::from_secs(1), control.wait())
-            .await
-            .expect("expected cancellation to reap the held-startup child")
-            .expect("expected child cleanup to succeed");
-        assert_eq!(
-            kills.load(Ordering::Acquire),
-            1,
-            "expected the pre-drive guard to claim cleanup exactly once"
-        );
-    }
-
-    /// A pre-handle failure has no session owner, so its explicit bounded cleanup must return the
-    /// host's control when the first stop attempt fails.
-    #[tokio::test]
-    async fn a_failed_pre_handle_cleanup_returns_control_for_host_recovery() {
-        let concrete = Arc::new(RetryableCleanupControl {
-            failed_once: AtomicBool::new(true),
-            kills: AtomicUsize::new(0),
-        });
-        let control: Arc<dyn ProcessControl> = concrete.clone();
-        let cleanup = DriveShutdownGuard {
-            control: control.clone(),
-            cleanup: Some(mango_external_agents::ProcessCleanupGuard::new(
-                control.clone(),
-                mango_external_agents::Limits::default(),
-                CancelReason::Shutdown,
-            )),
-        };
-
-        let error = cleanup
-            .finish()
-            .await
-            .expect_err("expected the first pre-handle cleanup attempt to fail");
-        assert!(
-            matches!(error, Error::CleanupRequired { .. }),
-            "expected a recoverable cleanup error, received {error:?}"
-        );
-        let recovered = error
-            .cleanup_control()
-            .expect("expected the failed drive cleanup to retain its process control");
-        mango_external_agents::process::stop_process_with_limits(
-            recovered.as_ref(),
-            CancelReason::Shutdown,
-            &mango_external_agents::Limits::default(),
-        )
-        .await
-        .expect("expected host cleanup retry to reap the child");
-        assert!(
-            Arc::ptr_eq(&control, &recovered),
-            "expected recovery to retain the originally launched control"
-        );
-        assert_eq!(
-            concrete.kills.load(Ordering::Acquire),
-            2,
-            "expected one failed guard cleanup and one host retry"
-        );
-    }
-
-    /// A transport that fails before ACP opens a connection has no session owner. `drive` must
-    /// explicitly finish bounded cleanup and return its recovery control instead of the link error.
-    #[tokio::test]
-    async fn a_drive_startup_failure_returns_control_for_host_recovery() {
-        let (state, host) = state();
-        let concrete = Arc::new(RetryableCleanupControl {
-            failed_once: AtomicBool::new(true),
-            kills: AtomicUsize::new(0),
-        });
-        let control: Arc<dyn ProcessControl> = concrete.clone();
-        let launched = crate::transport::frame(
-            ManagedProcess {
-                stdout: Box::new(FailingStartupSource),
-                stdin: Some(Box::new(InertStartupSink)),
-                control: control.clone(),
-            },
-            &host,
-        )
-        .expect("expected a framed startup transport");
-        let cleanup = DriveShutdownGuard::from_launched(&launched, *host.limits());
-
-        let error = drive(
-            launched,
-            Arc::new(state),
-            String::from("acp-client-tests"),
-            cleanup,
-        )
-        .await
-        .expect_err("expected the startup transport to fail before connection ownership");
-        assert!(
-            matches!(error, Error::CleanupRequired { .. }),
-            "expected cleanup recovery to take precedence, received {error:?}"
-        );
-        let recovered = error
-            .cleanup_control()
-            .expect("expected a recovery control after failed startup cleanup");
-        mango_external_agents::process::stop_process_with_limits(
-            recovered.as_ref(),
-            CancelReason::Shutdown,
-            host.limits(),
-        )
-        .await
-        .expect("expected host recovery to reap the startup child");
-        assert!(
-            Arc::ptr_eq(&control, &recovered),
-            "expected drive to retain the launched child control"
-        );
-        assert_eq!(
-            concrete.kills.load(Ordering::Acquire),
-            2,
-            "expected one failed drive cleanup and one host retry"
         );
     }
 
@@ -2631,15 +2176,7 @@ mod tests {
             kills: Arc::clone(&kills),
         });
         let launched = crate::transport::frame(process, &host).expect("expected framed child");
-        let cleanup = DriveShutdownGuard::from_launched(&launched, *host.limits());
-        let connection = drive(
-            launched,
-            Arc::new(state),
-            String::from("acp-client-tests"),
-            cleanup,
-        )
-        .await
-        .expect("expected a connection handle");
+        let connection = drive(launched, Arc::new(state));
         (Arc::new(connection), kills, launcher)
     }
 

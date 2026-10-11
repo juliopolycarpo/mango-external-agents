@@ -517,25 +517,17 @@ impl Harness for AcpHarness {
             accepted_axes(&configuration),
             session_state.clone(),
         ));
-        let cleanup = client::DriveShutdownGuard::from_launched(&launched, *host.limits());
-        let connection = Arc::new(
-            client::drive(
-                launched,
-                Arc::clone(&connection_state),
-                host.client_info().name.clone(),
-                cleanup,
-            )
-            .await?,
-        );
+        // No await separates the launch from the connection that owns its child, so there is no
+        // point at which a dropped `open_session` could leave the child unowned.
+        let connection = Arc::new(client::drive(launched, Arc::clone(&connection_state)));
         // Opening has no session yet to own cleanup. Keep the live connection in a scope so a
         // caller dropping `open_session` while initialize, new, load, or configuration is pending
-        // still closes the dispatch loop and reaps the child.
+        // still closes the connection and reaps the child.
         let mut connection = client::ConnectionShutdownGuard::new(connection);
 
         // Every failure from here on ends the child. A `Err` returned with the connection still up
-        // would leave an agent running with nothing driving it: the dispatch loop only winds down
-        // when the shutdown channel drops, so the process would outlive the call that started it by
-        // however long the drop took to reach it.
+        // would leave an agent running with nothing driving it: the process would outlive the call
+        // that started it by however long the drop took to reach it.
         //
         // The host's token ends the handshake too: an agent that never answers `initialize` would
         // otherwise hold the caller for the full request timeout after the host asked to stop.
@@ -594,13 +586,12 @@ impl Harness for AcpHarness {
 
         // Cheap clones taken before the session takes ownership; the watcher they feed is spawned
         // only once every refusal below is behind us.
-        let watched = connection.connection().clone();
-        let driver_done = connection.driver_done().clone();
+        let connection_ended = connection.ended().clone();
         let watched_connection = Arc::downgrade(&connection);
         let child_reaper = connection.child_reaper();
         let closing_state = session_state.clone();
-        // Weak for the same reason the connection is: a parked question's connection clone inside
-        // this state would otherwise keep the loop this watcher waits on alive.
+        // Weak for the same reason the connection is: this watcher must not keep alive what it
+        // waits to see end.
         let turn_state = Arc::downgrade(&connection_state);
         let settle_limit = host.limits().shutdown_timeout;
         let host_cancel = host.cancel().clone();
@@ -655,22 +646,19 @@ impl Harness for AcpHarness {
         // `Ready` while every request failed against a dead connection. Spawned rather than folded
         // into `close`, because the whole point is the path `close` never runs.
         //
-        // Both signals, because neither covers the other: a clean EOF closes the incoming half and
-        // leaves the loop running, and a failed transport ends the loop without a clean EOF.
+        // One signal covers every end: the agent closing its output, a failed link, a queue budget
+        // passed, and the handle itself going away.
         //
-        // The task holds a connection clone and the child's shared reaper rather than the handle, so it
-        // cannot outlive what it is watching: a session dropped without a close releases the loop's
-        // shutdown channel with the handle, the loop winds down, and this wakes and ends. A
-        // `ChildReaper` holds no connection, so keeping one here cannot keep the loop alive; the
-        // session's own `SessionState` would, through a parked question's connection clone, which
-        // is why the pending questions a teardown owes are not settled from here.
+        // The task holds that signal and the child's shared reaper rather than the handle, so it
+        // cannot outlive what it is watching: a session dropped without a close drops the handle,
+        // which fires the signal, and this wakes and ends. A `ChildReaper` holds no connection, so
+        // keeping one here cannot keep the connection alive.
         //
         // An explicit close has its own task which owns terminal settlement and status publication.
         // This watcher is only the no-close path where a peer disappeared on its own.
         tokio::spawn(async move {
             let host_cancelled = tokio::select! {
-                () = watched.incoming_closed() => false,
-                () = driver_done.cancelled() => false,
+                () = connection_ended.cancelled() => false,
                 // The host's shutdown signal winds down a session nobody asked to close, like a
                 // peer that vanished. The connection stays weak here, so this arm cannot keep a
                 // dropped session's child alive.
@@ -697,15 +685,15 @@ impl Harness for AcpHarness {
                 }
             }
             // `Closing` first, and `Closed` only after the owned connection cleanup succeeds:
-            // neither EOF nor a dead dispatch loop proves the agent process is gone.
+            // a connection that ended does not prove the agent process is gone.
             closing_state.set_status(mango_external_agents::SessionStatus::Closing);
             let cleanup = if let Some(connection) = watched_connection.upgrade() {
                 connection.begin_shutdown(mango_external_agents::CancelReason::Shutdown);
                 connection.wait_shutdown().await
             } else {
-                // Dropping the last session handle releases the ACP closure before this watcher
-                // wakes, so no `ConnectionHandle` remains to own the host process control. The
-                // watcher then becomes the last owner and applies the same bounded cleanup.
+                // Dropping the last session handle is what woke this watcher, so no
+                // `ConnectionHandle` remains to own the host process control. The watcher then
+                // becomes the last owner and applies the same bounded cleanup.
                 child_reaper
                     .reap(mango_external_agents::CancelReason::Shutdown)
                     .await
@@ -763,10 +751,7 @@ impl Harness for AcpHarness {
             Configuration::unknown(),
             snapshot,
         ));
-        let cleanup = client::DriveShutdownGuard::from_launched(&launched, *host.limits());
-        let connection = Arc::new(
-            client::drive(launched, state, host.client_info().name.clone(), cleanup).await?,
-        );
+        let connection = Arc::new(client::drive(launched, state));
         let mut connection = client::ConnectionShutdownGuard::new(connection);
         let page = async {
             let handshake = self.initialize(connection.connection(), host).await?;
@@ -821,7 +806,6 @@ impl AcpHarness {
             .open(
                 connection,
                 connection_state,
-                host,
                 request,
                 &handshake,
                 host.cwd().to_path_buf(),
@@ -904,8 +888,6 @@ impl AcpHarness {
         let response = self
             .request(
                 connection,
-                host,
-                "initialize",
                 InitializeRequest::new(ProtocolVersion::V1)
                     .client_capabilities(Self::client_capabilities())
                     // The host's own name, never the library's: an agent reading its logs should see
@@ -934,7 +916,6 @@ impl AcpHarness {
         &self,
         connection: &Arc<client::ConnectionHandle>,
         connection_state: &client::SessionState,
-        host: &HostContext,
         request: &OpenSession,
         handshake: &Handshake,
         cwd: std::path::PathBuf,
@@ -942,14 +923,14 @@ impl AcpHarness {
         let mcp_servers = map_mcp_servers(&request.mcp_servers, &handshake.capabilities)?;
         let Some(resume) = &request.resume else {
             return self
-                .new_session(connection, connection_state, host, cwd, mcp_servers)
+                .new_session(connection, connection_state, cwd, mcp_servers)
                 .await;
         };
 
         if !handshake.capabilities.load_session {
             if resume.mode == ResumeMode::Fallback {
                 let mut opened = self
-                    .new_session(connection, connection_state, host, cwd, mcp_servers)
+                    .new_session(connection, connection_state, cwd, mcp_servers)
                     .await?;
                 opened.fallback_reason = Some(String::from(
                     "the ACP agent did not advertise loadSession for the requested resume",
@@ -975,14 +956,7 @@ impl AcpHarness {
             );
             (revision, sent)
         });
-        let loaded = client::await_sent(
-            connection,
-            &self.profile,
-            host.limits().request_timeout,
-            "session/load",
-            sent?,
-        )
-        .await;
+        let loaded = client::await_sent(connection, &self.profile, sent?).await;
         match loaded {
             Ok(loaded) => Ok(Opened {
                 session_id: AcpSessionId::new(resume.native_session_id.clone()),
@@ -999,7 +973,7 @@ impl AcpHarness {
                 let reason = resume_fallback_reason("session/load", &error);
                 connection_state.abandon_native_session();
                 let mut opened = self
-                    .new_session(connection, connection_state, host, cwd, mcp_servers)
+                    .new_session(connection, connection_state, cwd, mcp_servers)
                     .await?;
                 opened.fallback_reason = Some(reason);
                 Ok(opened)
@@ -1012,7 +986,6 @@ impl AcpHarness {
         &self,
         connection: &Arc<client::ConnectionHandle>,
         connection_state: &client::SessionState,
-        host: &HostContext,
         cwd: std::path::PathBuf,
         mcp_servers: Vec<AcpMcpServer>,
     ) -> Result<Opened> {
@@ -1023,14 +996,7 @@ impl AcpHarness {
             );
             (revision, sent)
         });
-        let response = client::await_sent(
-            connection,
-            &self.profile,
-            host.limits().request_timeout,
-            "session/new",
-            sent?,
-        )
-        .await?;
+        let response = client::await_sent(connection, &self.profile, sent?).await?;
         Ok(Opened {
             session_id: response.session_id,
             resumed: false,
@@ -1045,22 +1011,12 @@ impl AcpHarness {
     async fn request<Request>(
         &self,
         connection: &Arc<client::ConnectionHandle>,
-        host: &HostContext,
-        method: &'static str,
         request: Request,
     ) -> Result<Request::Response>
     where
-        Request: agent_client_protocol::JsonRpcRequest,
-        Request::Response: Send,
+        Request: client::AgentRequest,
     {
-        client::send(
-            connection,
-            &self.profile,
-            host.limits().request_timeout,
-            method,
-            request,
-        )
-        .await
+        client::send(connection, &self.profile, request).await
     }
 
     /// The agent's own mode id for this configuration, when one has to be sent.
