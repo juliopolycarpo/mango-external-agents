@@ -275,9 +275,30 @@ behind, holds the read open after the Claude process is gone. The pump watches
 `ProcessControl::wait` beside the read. When the exit arrives it keeps reading for one
 `Limits::kill_grace`, counted from the exit, because what the child wrote before it left is still
 in the pipe and can be the `result`. Then the turn ends as it does at end of stream, with the exit
-status in its error, and the stop that follows ends the helper. A line that is already there is
-always read, so a `kill_grace` of zero still takes what the pipe holds and waits for nothing more.
-A host control that fails to report an exit leaves the read to the idle timer.
+status in its error, and the stop that follows ends the helper. A line the read already has is always taken. When the grace runs out the pump yields to the
+runtime once and asks the read one more time, because a pipe's read is ready only after the
+runtime's I/O driver has reported the bytes. That is what a `kill_grace` of zero comes to: no wait,
+and one more pass. It covers bytes the driver reports in that pass, which Tokio's driver does for
+bytes already in the kernel but does not promise, so a host that must not lose the tail of a run
+leaves the grace above zero. A host control that fails to report an exit leaves the read to the
+idle timer.
+
+**The process the control waits on has to be the one that writes.** Since the exit starts the
+grace, a launcher whose leader exits while the real CLI keeps running would cut every turn one
+`kill_grace` after that exit. No launch path of the core `TokioLauncher` has such a leader:
+
+- On Unix it runs the program directly. The native install is the `claude` binary. The npm
+  install is a script with a `node` shebang, which the kernel runs in the same process. A shell
+  wrapper that calls `claude` as a foreground command, with or without `exec`, stays until it
+  returns.
+- On Windows it runs `claude.exe` when the native install put one on `PATH`. When there is none,
+  as with the npm install's `claude.ps1`, it runs `powershell.exe -File` on that script, and
+  PowerShell stays until the `node` it started exits. A host that pins a `.cmd` shim gets
+  `cmd.exe`, which waits the same way.
+
+Those are read from the launcher and from the shape of the shims, and no test starts a real CLI. A
+host launcher, or a wrapper that starts the CLI in the background and returns, has to make
+`ProcessControl::wait` answer for the process that owns stdout.
 
 ### Deadlines
 
@@ -342,8 +363,12 @@ What each path does, and what a host sees when a bound runs out:
   `Error::Cancelled`.
 - **`close` with a turn active.** The stop, then the artifact removal. A stop that fails leaves
   the session `Closing` and busy, and the artifact on disk. A removal that fails or runs out of
-  time leaves the session `Closed`. A blocking removal cannot be cancelled, so it carries on in
-  the background and the artifact goes when the host's mount answers.
+  time leaves the session `Closed`. A blocking removal cannot be cancelled, so it carries on
+  on the runtime's blocking pool and the artifact goes when the host's mount answers. The wait
+  has moved, not gone: dropping a Tokio `Runtime` waits for every blocking task it started, so a
+  removal that never answers now holds up the host's shutdown where it used to hold up `close`. A
+  host that sees this error ends its runtime with `Runtime::shutdown_timeout` or
+  `Runtime::shutdown_background`.
 - **`close` while the launch is pending.** The close waits one `shutdown_timeout` for the launcher.
   If the child arrives in that time the close waits for its stop and removes the artifact. If it
   does not, the close fails and the session stays `Closing`, even after the child is later reaped,
