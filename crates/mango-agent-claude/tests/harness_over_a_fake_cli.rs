@@ -3949,6 +3949,170 @@ mod mcp_passthrough {
         );
     }
 
+    /// A launcher that never hands the child back is the host's to answer for, and a close that
+    /// waited on it had no bound at all. The wait is one shutdown stage: the close reports the
+    /// launch it stopped waiting for, and the start that owns the launch still reaps the child
+    /// when it arrives and removes the artifact that child was configured with.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_stops_waiting_for_a_pending_launch_at_the_shutdown_timeout() {
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_help(HELP_2_1_270)
+                .with_turn(Run::stalling::<[String; 0], String>([])),
+        );
+        let gate = launcher.gate_turn_spawns();
+        let limits = Limits::default();
+        let session: Arc<dyn Session> = Arc::from(open_with_servers(&launcher).await);
+
+        let starting = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move {
+                session
+                    .start_turn(TurnRequest::new("turn-1", "start something long"))
+                    .await
+                    .map(drop)
+            }
+        });
+        gate.wait_for_spawn().await;
+
+        let began = tokio::time::Instant::now();
+        let closed = tokio::time::timeout(
+            Duration::from_secs(60 * 60),
+            session.close(CloseReason::Requested),
+        )
+        .await;
+        let waited = began.elapsed();
+        let error = closed
+            .unwrap_or_else(|_| {
+                panic!(
+                    "expected the close to stop waiting for the launch after shutdown_timeout ({:?}) | received a close still pending after {waited:?}",
+                    limits.shutdown_timeout
+                )
+            })
+            .expect_err("expected the close to report the launch it stopped waiting for");
+        assert!(
+            matches!(
+                error.cause(),
+                Error::Timeout { operation, after }
+                    if operation == "a pending Claude launch" && *after == limits.shutdown_timeout
+            ),
+            "expected Error::Timeout {{ operation: \"a pending Claude launch\", after: {:?} }} | received {error:?}",
+            limits.shutdown_timeout
+        );
+        assert_eq!(
+            waited, limits.shutdown_timeout,
+            "expected the close to return after exactly shutdown_timeout | received {waited:?}"
+        );
+        assert_eq!(
+            session.snapshot().status,
+            SessionStatus::Closing,
+            "expected a close that never saw its child reaped to stay Closing | received {:?}",
+            session.snapshot().status
+        );
+        assert_eq!(
+            launcher.kill_requests(),
+            0,
+            "expected no stop request before the launcher returned a child | received {}",
+            launcher.kill_requests()
+        );
+
+        gate.release();
+        let outcome = starting.await.expect("expected the start task to finish");
+        assert!(
+            matches!(outcome, Err(ref error) if matches!(error.cause(), Error::Closed { .. })),
+            "expected the closed session to refuse the turn | received {outcome:?}"
+        );
+        assert_eq!(
+            (launcher.kill_requests(), launcher.all_children_ended()),
+            (1, true),
+            "expected the late child to be stopped once and reaped | received (kill requests, all ended) = ({}, {})",
+            launcher.kill_requests(),
+            launcher.all_children_ended()
+        );
+        assert_eq!(
+            launcher.mcp_config_at_kill(),
+            vec![true],
+            "expected the late child to keep its MCP configuration until it was killed | received {:?}",
+            launcher.mcp_config_at_kill()
+        );
+        let argv = launcher.turn_argvs().pop().expect("expected a turn launch");
+        let path = std::path::PathBuf::from(
+            value_after(&argv, "--mcp-config").expect("expected the config argument"),
+        );
+        assert!(
+            !path.exists(),
+            "expected the start that reaped the late child to remove its artifact | received {} still on disk",
+            path.display()
+        );
+
+        let again = session
+            .close(CloseReason::Requested)
+            .await
+            .expect_err("expected a second close to replay the first close's outcome");
+        assert!(
+            matches!(again.cause(), Error::Timeout { .. }),
+            "expected the stored Error::Timeout | received {again:?}"
+        );
+    }
+
+    /// The same close, over a start whose caller already went away. Nobody is left to poll that
+    /// start, so the guard it left behind is what reaps the child once the launcher returns it.
+    #[tokio::test(start_paused = true)]
+    async fn a_launch_that_returns_after_its_start_and_its_close_gave_up_is_still_reaped() {
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_help(HELP_2_1_270)
+                .with_turn(Run::stalling::<[String; 0], String>([])),
+        );
+        let gate = launcher.gate_turn_spawns();
+        let session: Arc<dyn Session> = Arc::from(open_with_servers(&launcher).await);
+
+        let starting = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move {
+                session
+                    .start_turn(TurnRequest::new("turn-1", "start something long"))
+                    .await
+                    .map(drop)
+            }
+        });
+        gate.wait_for_spawn().await;
+        starting.abort();
+        let _ = starting.await;
+
+        let error = session
+            .close(CloseReason::Requested)
+            .await
+            .expect_err("expected the close to report the launch it stopped waiting for");
+        assert!(
+            matches!(error.cause(), Error::Timeout { operation, .. } if operation == "a pending Claude launch"),
+            "expected Error::Timeout naming a pending Claude launch | received {error:?}"
+        );
+        assert_eq!(
+            launcher.kill_requests(),
+            0,
+            "expected no stop request before the launcher returned a child | received {}",
+            launcher.kill_requests()
+        );
+
+        gate.release();
+        // No clock is involved: the guard's task only has to be polled, and this fake's kill ends
+        // the child at once. A bounded number of passes, so a child nobody reaps fails here.
+        for _ in 0..256 {
+            if launcher.kill_requests() == 1 && launcher.all_children_ended() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            (launcher.kill_requests(), launcher.all_children_ended()),
+            (1, true),
+            "expected the abandoned start's guard to stop the late child once and reap it | received (kill requests, all ended) = ({}, {})",
+            launcher.kill_requests(),
+            launcher.all_children_ended()
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn failed_native_close_keeps_the_mcp_artifact_after_the_session_drops() {
         let launcher = Arc::new(

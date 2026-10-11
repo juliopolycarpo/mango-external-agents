@@ -338,6 +338,19 @@ pub(crate) async fn remove_on_close(
 /// What an [`Error::Timeout`] names when a close stopped waiting for the artifact's removal.
 pub(crate) const REMOVAL_OPERATION: &str = "MCP configuration removal";
 
+/// Gives up one reference to the artifact without waiting for anything.
+///
+/// For a close that stopped waiting for a pending launch: the start that owns the launch holds a
+/// lease of its own and removes the file after it has reaped the child. A reference that is not
+/// the last is released where it stands, which touches no filesystem. One that turned out to be
+/// the last, because that start finished in the same instant, is handed to the blocking pool like
+/// every other removal.
+pub(crate) fn release_lease(file: Option<std::sync::Arc<ConfigFile>>) {
+    if let Some(last) = file.and_then(std::sync::Arc::into_inner) {
+        release_on_drop(last);
+    }
+}
+
 /// Keeps an MCP artifact on disk after native cleanup failed.
 ///
 /// A still-running Claude child may read this file after a bounded process stop reports failure.

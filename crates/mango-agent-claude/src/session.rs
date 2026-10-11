@@ -101,6 +101,23 @@ impl Teardown {
         }
     }
 
+    /// Waits for the retained outcome, but for a launch that is still pending only `bound`.
+    ///
+    /// A teardown with no worker has no child to stop yet: its turn is still inside the host's
+    /// launcher, and only that launcher decides when it returns. `None` says the launch outlasted
+    /// `bound`. Once a worker owns a child the stop it runs is bounded stage by stage, so its
+    /// outcome is waited for whatever `bound` says: cutting a stop short would report a failure
+    /// for a child that is about to be reaped.
+    async fn wait_past_launch(&self, bound: Duration) -> Option<Result<()>> {
+        if let Ok(outcome) = tokio::time::timeout(bound, self.wait()).await {
+            return Some(outcome);
+        }
+        if !self.worker_started.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(self.wait().await)
+    }
+
     fn starts_worker(&self) -> bool {
         !self.worker_started.swap(true, Ordering::AcqRel)
     }
@@ -538,24 +555,41 @@ fn finish_unstarted_teardown(shared: &Shared, end: &Arc<TurnEnd>) {
     }
 }
 
+/// What an [`Error::Timeout`] names when a close stopped waiting for the host's launcher.
+const PENDING_LAUNCH_OPERATION: &str = "a pending Claude launch";
+
 /// Completes one close after its active child and MCP artifact are both gone.
+///
+/// Every wait here is a shutdown stage with the host's `shutdown_timeout` on it: the launch a turn
+/// is still inside, and the artifact's removal. The stop between them is bounded by
+/// [`stop_process_with_limits`].
 async fn run_close_teardown(
     shared: &Shared,
     close: &Teardown,
     active: Option<Arc<Teardown>>,
     mut mcp_config: crate::mcp::Prepared<Arc<ConfigFile>>,
 ) {
+    let bound = shared.host.limits().shutdown_timeout;
     let native = match active {
-        Some(teardown) => teardown.wait().await,
-        None => Ok(()),
+        Some(teardown) => teardown.wait_past_launch(bound).await,
+        None => Some(Ok(())),
+    };
+    let Some(native) = native else {
+        // The launcher has not handed back a child, so there is nothing here to stop and no
+        // proof that nothing will start. The session stays `Closing`. The start that owns the
+        // launch reaps the child if one arrives, and it holds its own lease on the artifact until
+        // it has, so this reference is given up rather than preserved: preserving would keep the
+        // file after the last process that could read it is gone.
+        crate::mcp::release_lease(mcp_config.take());
+        close.finish(Err(Error::Timeout {
+            operation: String::from(PENDING_LAUNCH_OPERATION),
+            after: bound,
+        }));
+        return;
     };
     let result = match native {
         Ok(()) => {
-            let result = crate::mcp::remove_on_close(
-                mcp_config.take(),
-                shared.host.limits().shutdown_timeout,
-            )
-            .await;
+            let result = crate::mcp::remove_on_close(mcp_config.take(), bound).await;
             // Close is terminal after native cleanup, even when the host's scratch mount refuses
             // the final unlink or never answers it. The typed error still tells the caller which
             // resource remained, and the wait for it is one more shutdown stage.
