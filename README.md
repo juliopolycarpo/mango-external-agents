@@ -31,7 +31,7 @@ a typed error before anything is spawned.
 | [`mango-external-agents`](crates/mango-external-agents) | Core: traits, events, permission matrix, host ports, stdio and websocket, `testing`    |
 | [`mango-agent-claude`](crates/mango-agent-claude)       | Claude Code through `claude -p --output-format stream-json --input-format stream-json` |
 | [`mango-agent-codex`](crates/mango-agent-codex)         | OpenAI Codex through `codex app-server` (JSON-RPC over lines)                          |
-| [`mango-agent-acp`](crates/mango-agent-acp)             | Any ACP agent through the official `agent-client-protocol` crate, with profiles        |
+| [`mango-agent-acp`](crates/mango-agent-acp)             | Any ACP agent over the core JSON-RPC peer and the official schema crate, with profiles |
 | `examples/mea`                                          | Unpublished CLI for smoke runs and fixture capture                                     |
 
 Versions are lockstep: one tag releases the four crates.

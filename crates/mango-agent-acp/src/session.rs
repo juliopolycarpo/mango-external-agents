@@ -44,7 +44,7 @@ use crate::{content, prompt_size, reducer};
 pub struct AcpSession {
     profile: Arc<AcpProfile>,
     host: HostContext,
-    /// The dispatch loop's own shared state: the running turn, pending approvals, the inherited
+    /// The connection handlers' own shared state: the running turn, pending approvals, the inherited
     /// configuration and a handle to `session_state` for publishing session facts as they arrive.
     connection_state: Arc<client::SessionState>,
     /// The core's live, observable session state — the one thing [`Session::state`] hands back.

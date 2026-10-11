@@ -247,13 +247,14 @@ inside it is refused before it is written, as it is inside a notification. Witho
 answered by `on_request` on a task of its own, and its answer is written when that task has the
 link.
 
-ACP also bounds its SDK frame boundary by queued JSON-RPC messages, the larger of
-`turn_channel_capacity` and `max_pending_requests` (1,024 by default, batch members counted
-individually), and `turn_buffer_bytes` serialized incoming bytes. Outgoing frames and the writer
-queue use `host.outbound_buffer_bytes()`, which defaults to `turn_buffer_bytes`; the optional
-builder override changes outgoing bytes without raising incoming or event caps. Output byte
-accounting includes the active physical write, and an oversized batch or queue fails the
-connection. Generic outgoing ACP requests reserve admission before entering the SDK queue. See
+ACP sets those bounds from `Limits`: queued JSON-RPC messages by the larger of
+`turn_channel_capacity` and `max_pending_requests` (1,024 by default, batch members that are
+notifications or questions counted individually), and incoming bytes by `turn_buffer_bytes`. One
+outgoing frame may be `host.outbound_buffer_bytes()` bytes, which defaults to `turn_buffer_bytes`,
+and the outgoing queue twice that; the optional builder override changes outgoing bytes without
+raising incoming or event caps. Output byte accounting includes the active physical write. An
+oversized frame is refused alone; an oversized batch or queue ends the connection. Generic
+outgoing ACP requests reserve admission before they are queued. See
 [the ACP transport guide](harness-acp.md#transport) for retained-buffer accounting and exclusions.
 
 Framed transports also enforce `Limits::line`, and stderr has its own bounded tail. These are
@@ -268,7 +269,8 @@ callback byte cap on `ClientOptions`, not a `Limits` field; `ClientOptions::with
 counts do not bound it either: one large message is a single event however much it expands once
 parsed. How much a message expands depends on its shape and on the build. As a lower bound, a
 `serde_json::Value` is 32 bytes, or 72 bytes when any crate in the build enables
-`serde_json/preserve_order`; `mango-agent-acp` does, through the `agent-client-protocol` crate.
+`serde_json/preserve_order`; `mango-agent-acp` does, through the `agent-client-protocol-schema`
+crate, which enables it for its own types.
 Object members, array capacity and allocator rounding come on top. In one measurement of a 1 MB
 message on x86_64 (release build, `serde_json` 1.0.151), a single string parsed to about 1 MB,
 while a 1 MB array of `0`, `[]` or `{}` elements held about 17 MB (32-byte values) or 38 MB

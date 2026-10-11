@@ -158,11 +158,14 @@ pub struct Limits {
     /// How many payload events one turn holds before reporting overflow and stopping native work.
     /// Interaction events have a count reserve of their own, twice [`Self::max_pending_requests`].
     ///
-    /// ACP also uses it, or [`Self::max_pending_requests`] when larger, as the message cap at its
-    /// SDK boundary: at most that many JSON-RPC messages (batch members counted individually)
-    /// queue per direction of the connection. Messages and turn events are related but not one to
-    /// one; [`Self::turn_buffer_bytes`] bounds incoming queued bytes and defaults the outgoing
+    /// ACP also uses it, or [`Self::max_pending_requests`] when larger, as the message cap of its
+    /// connection: at most that many JSON-RPC messages (batch members counted individually)
+    /// queue per direction. Messages and turn events are related but not one to one;
+    /// [`Self::turn_buffer_bytes`] bounds incoming queued bytes and defaults the outgoing
     /// budget. A host can set the latter independently with [`HostContextBuilder::outbound_buffer_bytes`].
+    /// That outgoing budget bounds one ACP frame; the frames queued for an agent, the one being
+    /// written included, may hold twice it, so a host's memory bound for outgoing ACP frames is
+    /// twice that number.
     pub turn_channel_capacity: usize,
     /// Maximum serialized bytes queued per turn, excluding its reserved terminal.
     ///
@@ -226,6 +229,12 @@ pub struct Limits {
     /// to the teardown. Each stage of that teardown is bounded by [`Self::kill_grace`] or
     /// [`Self::shutdown_timeout`], and together they add up to the teardown row of the same
     /// table: 36 seconds at the defaults.
+    ///
+    /// In the ACP harness `close` is at most 29 seconds at the defaults: one
+    /// [`Self::shutdown_timeout`] for `session/close` when the agent advertised it, one for the
+    /// connection, the process stop (two [`Self::kill_grace`] and two
+    /// [`Self::shutdown_timeout`]), and one more [`Self::shutdown_timeout`] for a turn another
+    /// task is still settling. `docs/harness-acp.md` has that table.
     ///
     /// For example, a host whose tools can take minutes to abort raises this without lengthening
     /// every protocol request: `Limits { cancel_settle_timeout: Duration::from_secs(300),
