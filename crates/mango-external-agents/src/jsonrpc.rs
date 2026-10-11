@@ -560,6 +560,9 @@ pub trait PeerHandler: Send + Sync {
     ///
     /// A handler can release state that only a complete vendor turn would otherwise clear. This
     /// callback is never made for [`Client::close`], whose caller already owns that shutdown.
+    /// Nor is it made for a peer's exit, a failed link or a budget passed that a close
+    /// overtook: the end on record first owns the connection's end, and [`Client::ended`]
+    /// reports it as the close.
     ///
     /// Made once, after the handler's task has stopped. A [`Client::close`] that arrives while
     /// the connection is ending this way waits for this call to return, within the time a close
@@ -1178,7 +1181,10 @@ pub struct Client {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConnectionEnd {
-    /// This side ended it: [`Client::close`] was called, or the client was dropped.
+    /// This side ended it: [`Client::close`] was called, or the client was dropped. It is also
+    /// what a connection reports when the peer exited, the link failed or a budget was passed in
+    /// the moment the close was put on record: the end on record first is the one reported, and
+    /// the handler is told of no termination for it.
     Closed,
     /// It ended under this side, for the reason the handler's
     /// [`on_terminated`](PeerHandler::on_terminated) is given: the peer exited, the link failed,
@@ -3177,7 +3183,7 @@ impl Client {
     /// holding a failure can ask this for the cause. That is a moment before
     /// [`is_closed`](Self::is_closed) turns true. It is the reason the handler's
     /// [`on_terminated`](PeerHandler::on_terminated) is given when the end came from under this
-    /// side.
+    /// side, and [`ConnectionEnd::Closed`] when a close was on record first.
     ///
     /// ```no_run
     /// # fn example(client: &mango_external_agents::jsonrpc::Client) {

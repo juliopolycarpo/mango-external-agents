@@ -475,16 +475,13 @@ async fn an_inbound_overflow_that_a_close_overtakes_while_it_is_recorded_is_not_
     .await;
     asked.client.close().await.expect("expected a clean close");
 
-    let told = asked
-        .handler
-        .terminations
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .len();
-    let observed = (told, asked.client.ended());
+    // The close drops the call and refuses the peer, as it does when nothing raced it.
+    let after = asked.after_the_end().await;
+    let observed = (after, asked.client.ended());
     assert_eq!(
         observed,
-        (0, Some(ConnectionEnd::Closed)),
-        "expected the handler told nothing and the close reported: (0, Some(Closed)) | received {observed:?}"
+        ((1, refused_as_closed(), 0), Some(ConnectionEnd::Closed)),
+        "expected the call dropped by the close, the peer refused, the handler told nothing and the close reported: ((1, {:?}, 0), Some(Closed)) | received {observed:?}",
+        refused_as_closed()
     );
 }

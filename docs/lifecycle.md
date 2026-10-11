@@ -197,7 +197,10 @@ A close overlaps that wait with the one for the answers it owes the peer, so its
 way, for up to one `shutdown_timeout` more. A hold belongs to its call: one kept, moved or
 forgotten stops counting when the call is over.
 
-`on_terminated` is made once, after the handler's task has stopped. A `Client::close` that arrives
+`on_terminated` is made once, after the handler's task has stopped, and not at all for an end a
+close put on record first: when the peer's exit, a failed link or a budget passed on either side
+is found with a close already on record, `Client::ended` reports `Closed` and the handler is told
+nothing. A `Client::close` that arrives
 while a connection is ending under this side waits for that call to return, within the bound of a
 close, where it used to take the reader down under it. Dropping the `Client` cannot wait: the
 call in progress is cancelled whatever it holds, and `on_terminated` may not be made at all.
