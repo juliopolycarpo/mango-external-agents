@@ -572,7 +572,8 @@ async fn an_agents_own_error_on_the_prompt_fails_the_turn_as_its_refusal() {
 
 /// A request that passed its deadline ends the connection under a turn that was still running.
 /// Nobody asked to stop that turn, so it ends as the closed link and not as a cancellation the
-/// host never requested.
+/// host never requested. The message says which request's deadline closed the link, so the
+/// turn does not fail for no visible reason.
 #[tokio::test(start_paused = true)]
 async fn a_request_past_its_deadline_fails_the_turn_in_flight_as_a_closed_link() {
     let deadline = Duration::from_secs(5);
@@ -608,7 +609,7 @@ async fn a_request_past_its_deadline_fails_the_turn_in_flight_as_a_closed_link()
     let Some(EventKind::Error { error }) = events.last() else {
         unreachable!("the events above end in an error");
     };
-    let expected = "fake: a transport that closed under session/prompt";
+    let expected = "fake: a transport that closed under session/prompt after session/list got no answer within 5s";
     assert_eq!(
         error.message, expected,
         "expected the failure message: {expected:?} | received: {:?}",
