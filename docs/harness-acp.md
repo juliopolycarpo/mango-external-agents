@@ -169,9 +169,12 @@ One stretch on the notification call must run whole: a `session/update` whose ev
 refuses to publish fails the turn there, taking the turn's reducer and questions and then
 committing `acp-refused-event`. The peer cancels a notification call when the agent passes an
 inbound budget and when the connection is closed, so that stretch asks for
-`Client::hold_cancellation` first, and those ends wait for it, up to `shutdown_timeout`. Apart
-from that and the stream's own overflow terminal, which `emit` commits where it is called, every
-terminal is committed off the notification call, by the prompt's own task or by `close`.
+`Client::hold_cancellation` first, and those ends wait for it, up to `shutdown_timeout`. A hold
+asked for after the end was decided is refused: the call ends at the ask, before it has taken the
+turn's reducer or its questions, and nobody waits for it. The turn's owner then finds the running
+calls to close and the questions to withdraw, as it does for any end, and writes the one terminal.
+Apart from that and the stream's own overflow terminal, which `emit` commits where it is called,
+every terminal is committed off the notification call, by the prompt's own task or by `close`.
 
 Every request asks for its answer behind the notifications read before it
 (`RequestOptions::after_earlier_notifications`). A `session/prompt` answer reaches the prompt's

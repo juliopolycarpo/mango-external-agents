@@ -7,7 +7,7 @@ Mango Protocol, HTTP server, database or recovery loop is required.
 
 [`tests/standalone-current`](../tests/standalone-current/README.md) is a small consumer with its own
 workspace and lockfile. Its four SDK dependencies are exact registry pins at the current published
-release (`=0.5.0`), with no path override. Copy that directory anywhere and run:
+release (`=0.6.0`), with no path override. Copy that directory anywhere and run:
 
 ```sh
 cargo test --locked
@@ -113,12 +113,19 @@ let host = HostContext::builder()
    Harnesses read them back through
    `host.limits()`, and a host constructing `TokioLauncher` hands it the same ones with
    `TokioLauncher::with_limits`, so one setting governs a bound wherever it is enforced.
+   Teardown is bounded by these limits, not by a fixed constant: before wrapping your own timeout
+   around `close` or `cancel`, read the worst cases in the Deadlines tables of
+   [harness-acp.md](harness-acp.md#deadlines) and [harness-claude.md](harness-claude.md#deadlines),
+   and in the stop-a-turn deadlines of
+   [harness-codex.md](harness-codex.md#sessions-turns-and-steering).
 
-For ACP, outgoing prompts and the writer queue default to `Limits::turn_buffer_bytes`. Set
+For ACP, one outgoing frame may be `Limits::turn_buffer_bytes` by default, and the writer queue
+holds twice that, counting the frame being written, so a full-size prompt can still be followed by
+its cancel. Set
 `HostContext::builder().outbound_buffer_bytes(16 * 1024 * 1024)` when the host authorizes larger
 encoded prompts while retaining smaller incoming and turn-event caps. The override is optional,
 validated at `build`, and read through `host.outbound_buffer_bytes()`. It budgets serialized bytes,
-not heap use; queued and in-flight frames share the allowance. See
+not heap use. See
 [harness-acp.md](harness-acp.md#transport) for the concrete queue accounting and exclusions.
 
 The override lives on the builder rather than the exhaustive public `Limits` struct, so existing
@@ -172,8 +179,8 @@ already logged into with the vendor's own CLI.
 - `AgentEvent { session_id, turn_id, attempt, at, kind }`. The `kind` is turn-scoped, always:
   turn started, text and reasoning deltas with their block markers, the activity lifecycle,
   approval requested and resolved, question asked and resolved, usage, thread usage, account
-  limits, cancelled, completed and error. `AgentEvent::is_terminal` answers "is this turn over"
-  without a match, and `AgentEvent::operation()` answers "whose work was this".
+  limits, notices, cancelled, completed and error. `AgentEvent::is_terminal` answers "is this turn
+  over" without a match, and `AgentEvent::operation()` answers "whose work was this".
 
 Session facts are **not** turn events. The vendor's own session handle and the slash-command
 catalog are read from the snapshot, because they change between turns and before the first one —
@@ -261,6 +268,11 @@ a retry. Decide using the existing queries together:
 | `cause()`                   | Match the typed underlying cause. A caller's oversized prompt needs changed input; Link/Timeout need recovery rather than a caller-error label. |
 | `cleanup_control()`         | Retain and finish bounded process cleanup even when submission never happened.                                                                  |
 | `session.snapshot().status` | Session usability is separate from the error. A nonretryable error does not prove the session remains healthy.                                  |
+
+An ACP agent's readable JSON-RPC error answer to a prompt ends that turn only: the session stays
+`Ready`, and a host that treats the failure as fatal for the conversation calls `close` itself. An
+answer the client cannot read, or a link that closes before one, ends the session. See
+[harness-acp.md](harness-acp.md#turns) for both.
 
 The reference host withdraws one reservation for `NotSubmitted`, then retries Busy or a retryable
 vendor refusal only while the session is usable. Deterministic input/configuration refusals settle
