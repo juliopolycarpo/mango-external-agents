@@ -1508,17 +1508,6 @@ impl PeerHandler for AcpHandler {
         on_session_update(&self.state, notification).await;
     }
 
-    /// Not asked on this connection, which hands its questions over. Answered as a question
-    /// past the cap is, so nothing could ever be parked here.
-    async fn on_request(
-        &self,
-        method: String,
-        _params: serde_json::Value,
-        _id: jsonrpc::RequestId,
-    ) -> ServerRequestOutcome {
-        reply::past_cap(method == CLIENT_METHOD_NAMES.session_request_permission)
-    }
-
     /// Runs on the notification worker, in wire order: a permission is parked, or settled,
     /// before anything the agent sent after it is handled and before a later response reaches
     /// its caller. Nothing here waits for a person.
