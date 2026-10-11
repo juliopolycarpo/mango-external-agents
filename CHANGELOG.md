@@ -4,6 +4,48 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.6.0] - 2026-10-11
+
+### 🚀 Features
+
+- **(core)** Hold a hand-off's cancellation off and settle the last close race (#168)
+- **(core)** Name the outbound bound an error or an end is about, by type (#165)
+- **(core)** Say when a peer's error member could not be read (#164)
+- **(core)** Answer JSON that is not a request with an invalid-request error (#160)
+- [**breaking**] **(acp)** Run on the in-house JSON-RPC peer and drop the SDK (#159)
+- **(core)** Hand the peer's questions over in order with a responder (#158)
+- **(core)** Read batches, answer parse errors and cancel on abandon (#157)
+- **(core)** Let a notification call hold its cancellation off (#153)
+- **(core)** Let one request wait without a deadline, outside the pending budget (#151)
+- [**breaking**] **(core)** Queue outgoing frames in call order under an outbound budget (#149)
+- **(core)** Let a request ask for its answer after earlier notifications (#145)
+- **(acp)** Surface session notices and compaction (#147)
+- **(acp)** Name a tool call by its own name when the agent sends one (#144)
+- **(mea)** Cancel a turn after a delay (#143)
+
+### 🐛 Bug Fixes
+
+- **(acp)** End the session when the agent's error cannot be read (#166)
+- **(claude)** Bound every wait of a close and state the deadlines (#162)
+- **(acp)** Answer JSON that is not a request as an invalid request (#163)
+- **(acp)** Keep the session after an agent's error on a prompt (#161)
+- **(codex)** Finish a turn's terminal when the connection is cut under it (#156)
+- **(core)** Begin nothing queued once an end has been decided (#155)
+- **(codex)** Settle a cancel that races a steer or a poisoned session (#152)
+- **(codex)** Read a turn's completion before answering a late interrupt (#150)
+- **(acp)** Report an agent that died mid-prompt as a closed link (#148)
+
+### ♻️ Refactor
+
+- **(acp)** Read the peer's outbound bounds by type (#167)
+- **(acp)** Import the wire types from the schema crate (#154)
+
+### 🧪 Testing
+
+- **(acp)** Pin connection behaviour through the public surface (#146)
+- **(core)** Wait for the handler in the notification order tests (#142)
+- **(core)** Pin the registry consumer to the published 0.5.0 (#141)
+
 ## [0.5.0] - 2026-10-10
 
 ### 🐛 Bug Fixes

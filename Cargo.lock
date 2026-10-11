@@ -593,7 +593,7 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
 name = "hub-host"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "mango-external-agents",
@@ -760,7 +760,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "mango-agent-acp"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "agent-client-protocol-schema",
  "async-trait",
@@ -775,7 +775,7 @@ dependencies = [
 
 [[package]]
 name = "mango-agent-claude"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "mango-external-agents",
@@ -788,7 +788,7 @@ dependencies = [
 
 [[package]]
 name = "mango-agent-codex"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "http",
@@ -801,7 +801,7 @@ dependencies = [
 
 [[package]]
 name = "mango-external-agents"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "mea"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "clap",
