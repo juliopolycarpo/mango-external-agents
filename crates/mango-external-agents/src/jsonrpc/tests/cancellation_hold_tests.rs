@@ -2176,6 +2176,11 @@ async fn deciding_the_end_through_the_seam_says_when_a_stretch_is_held() {
 
 /// A close made from inside the handler's own call is cut short by its own abort of that call,
 /// before it reaches the link. A second close, from outside, finishes it.
+///
+/// A characterisation test: it pins what the cut leaves behind and was not written to fail
+/// first. That the link is open is asked of the sender itself, the child's input, which bypasses
+/// the client's own refusal of writes; see `abandoned_close_tests` for the same cut asked of the
+/// client.
 #[tokio::test(start_paused = true)]
 async fn a_close_made_from_inside_a_call_is_finished_by_a_second_from_outside() {
     let link = ScriptedLink::new();

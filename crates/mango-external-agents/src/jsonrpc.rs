@@ -1679,6 +1679,15 @@ struct ClientState {
     /// can queue a frame exactly there.
     #[cfg(test)]
     after_seal: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once as an end of the connection begins to mark it closed, before the queue is
+    /// sealed, so a test can queue a frame at the moment a close is on record and the queue
+    /// still takes frames.
+    #[cfg(test)]
+    before_seal: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once when a frame has been refused for want of room in the queue, before the
+    /// overflow is put on record, so a test can have a close land exactly there.
+    #[cfg(test)]
+    before_overflow_recorded: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     /// The connection's runtime also owns cleanup when a request is dropped on another thread.
     runtime: tokio::runtime::Handle,
     options: ClientOptions,
@@ -2520,6 +2529,10 @@ impl Client {
             after_turn_decided: StdMutex::new(None),
             #[cfg(test)]
             after_seal: StdMutex::new(None),
+            #[cfg(test)]
+            before_seal: StdMutex::new(None),
+            #[cfg(test)]
+            before_overflow_recorded: StdMutex::new(None),
             runtime: tokio::runtime::Handle::current(),
             options,
             next_id: AtomicU64::new(1),
@@ -3718,6 +3731,8 @@ impl ClientState {
     /// measured against the queue's bounds, and one that found the queue full would be taken
     /// for a peer that stopped reading and end a connection that is only closing.
     fn mark_closed(&self) {
+        #[cfg(test)]
+        Self::run_hook(&self.before_seal);
         self.outbox.seal();
         #[cfg(test)]
         Self::run_hook(&self.after_seal);
@@ -3730,6 +3745,8 @@ impl ClientState {
     /// call is failed with, the typed reason the handler is told, and a link no later frame may
     /// use. The pump does the ending, as for any failed write.
     fn outbound_overflow(&self, subject: &'static str, limit: usize, received: usize) -> Error {
+        #[cfg(test)]
+        Self::run_hook(&self.before_overflow_recorded);
         let termination = PeerTermination::OutboundBackpressure {
             subject,
             limit,
