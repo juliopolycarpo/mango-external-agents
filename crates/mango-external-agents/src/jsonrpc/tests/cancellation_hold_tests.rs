@@ -1993,16 +1993,20 @@ async fn work_reached_after_the_end_was_decided_is_not_begun() {
         );
         // The task gets on before it is stopped: its call returns, with more queued behind.
         handler.inside.add_permits(8);
-        eventually(
-            "the handler's task to stop",
-            client.state.worker_stopped.cancelled(),
-        )
-        .await;
-        let observed = (handler.progress(), HoldingHandler::count(&handler.asked));
+        // A task that took up what was queued is left waiting for more, so its stopping is
+        // given a bound and is part of what is asserted.
+        let stopped = tokio::time::timeout(GRACE, client.state.worker_stopped.cancelled())
+            .await
+            .is_ok();
+        let observed = (
+            stopped,
+            handler.progress(),
+            HoldingHandler::count(&handler.asked),
+        );
         assert_eq!(
             observed,
-            ((1, 0, 1), 0),
-            "expected the call in progress returned and nothing queued begun: ((1, 0, 1), 0) | received {observed:?}"
+            (true, (1, 0, 1), 0),
+            "expected the task stopped after the call in progress, nothing queued begun: (true, (1, 0, 1), 0) | received {observed:?}"
         );
         client.close().await.expect("expected a clean close");
     }
@@ -2017,7 +2021,8 @@ async fn an_overflow_tells_the_handler_after_its_task_stopped_when_a_close_holds
     let link = ScriptedLink::new();
     let (handler, client) = connect(&link, NOT_HOLDING);
     inside_the_stretch(&link, &handler).await;
-    // What a close does first to stop the task, stopped short of stopping it.
+    // A close that has the task's handle and is waiting for the task to stop, as the reader
+    // finds it: the handle is gone from the record, and the task has only been asked to stop.
     let taken = client
         .state
         .notifications
@@ -2059,7 +2064,9 @@ async fn a_calls_end_racing_a_hold_dropped_on_another_thread_counts_it_off_once(
     for round in 1..=500 {
         link.push_line(UPDATE);
         // The call hands its hold over and runs on to its end, three turns of the scheduler
-        // away; this thread drops the hold as soon as it finds it.
+        // away. This thread drops the hold at once, or a varying moment later, or after the
+        // call has ended, so that each of the two gets there first in some rounds.
+        let looking = std::time::Instant::now();
         let elsewhere = loop {
             let found = handler
                 .kept
@@ -2069,21 +2076,45 @@ async fn a_calls_end_racing_a_hold_dropped_on_another_thread_counts_it_off_once(
             if let Some(hold) = found {
                 break hold;
             }
+            assert!(
+                looking.elapsed() < Duration::from_secs(5),
+                "expected the call to hand its hold over within 5s (round {round}) | received nothing"
+            );
             std::hint::spin_loop();
         };
+        match round % 3 {
+            0 => {}
+            1 => {
+                for _ in 0..(round * 37 % 2000) {
+                    std::hint::spin_loop();
+                }
+            }
+            _ => {
+                until("the call to end before its hold is dropped", || {
+                    HoldingHandler::count(&handler.ended) == round
+                })
+                .await;
+            }
+        }
         drop(elsewhere);
-        until("the call to return", || handler.progress().2 == round).await;
-        until("the call's record to be let go", || {
+        until("the call to end", || {
             HoldingHandler::count(&handler.ended) == round
         })
         .await;
-        let left = client.state.holds.out.load(Ordering::SeqCst);
-        assert_eq!(
-            left, 0,
-            "expected the hold counted off exactly once (round {round}): 0 | received {left}"
-        );
+        // The call's record is let go a step after its future: the count settles at zero.
+        until("the hold to be counted off", || {
+            client.state.holds.out.load(Ordering::SeqCst) == 0
+        })
+        .await;
     }
+    let holds = Arc::clone(&client.state.holds);
     within("the close", client.close())
         .await
         .expect("expected a clean close");
+    // Every call is over and its record gone: a hold counted off twice anywhere shows here.
+    let left = holds.out.load(Ordering::SeqCst);
+    assert_eq!(
+        left, 0,
+        "expected every hold counted off exactly once over 500 calls: 0 | received {left}"
+    );
 }
