@@ -94,7 +94,7 @@ Unset preserves existing default and custom `Limits::turn_buffer_bytes` behavior
 The frame count is sized so that what this side queues by itself always fits. With `r` for
 `max_pending_requests` that is at most 2`r` + 3 counted frames at one moment: the prompt, the
 `r` requests beside it, the answers to `r` parked questions withdrawn at once by a cancel, and
-`session/cancel` with its one repeat. `$/cancel_request` and `-32700` are queued beside the
+`session/cancel` with its one repeat. `$/cancel_request`, `-32700` and `-32600` are queued beside the
 bounds and count for nothing. The incoming message limit is added on top for answers the agent
 asks for and this side gives on the spot (`-32601`, a question past the cap). Only those can
 fill the frame count, so a host's own `cancel` or `close` never passes it, and a frame-count
@@ -190,11 +190,12 @@ budget.
 
 What the peer writes that the agent did not ask for, all JSON-RPC 2.0:
 
-| Frame                            | When                                                              |
-| -------------------------------- | ----------------------------------------------------------------- |
-| `-32700`, `id: null`             | a line that is not JSON, not quoted back; at most 8 wait at once  |
-| `$/cancel_request` (`requestId`) | a request this side gave up after its write began                 |
-| nothing                          | a line that is JSON and not a frame, an empty batch, a blank line |
+| Frame                            | When                                                                                                                                                                                                                           |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `-32700`, `id: null`             | a line that is not JSON, not quoted back; at most 8 wait at once                                                                                                                                                               |
+| `$/cancel_request` (`requestId`) | a request this side gave up after its write began                                                                                                                                                                              |
+| `-32600`                         | JSON that is not a request: a bare value, an empty batch, an object with no usable `method` or `id`. The id is echoed when the object carried a usable one of at most 128 bytes, and is null otherwise. At most 8 wait at once |
+| nothing                          | a blank line                                                                                                                                                                                                                   |
 
 Request ids are decimal strings counting up from `"1"`. An id is the client's to choose and an
 agent only echoes it.

@@ -168,7 +168,7 @@ pub struct Limits {
     /// That outgoing budget bounds one ACP frame; the frames queued for an agent, the one being
     /// written included, may hold twice it, so a host's memory bound for outgoing ACP frames is
     /// twice that number, apart from the few small frames the connection queues beside its
-    /// bounds (`$/cancel_request`, `-32700`).
+    /// bounds (`$/cancel_request`, `-32700`, `-32600`).
     pub turn_channel_capacity: usize,
     /// Maximum serialized bytes queued per turn, excluding its reserved terminal.
     ///
