@@ -133,9 +133,11 @@ impl Deadlines {
     /// ```
     #[must_use]
     pub fn process_stop(&self) -> Duration {
-        self.kill_grace()
+        // Core's `stop_process_with_limits`: two `kill_grace` and two `shutdown_timeout`.
+        self.limits
+            .kill_grace
             .saturating_mul(2)
-            .saturating_add(self.shutdown().saturating_mul(2))
+            .saturating_add(self.limits.shutdown_timeout.saturating_mul(2))
     }
 
     /// The teardown of a child, counted from the moment the teardown begins.

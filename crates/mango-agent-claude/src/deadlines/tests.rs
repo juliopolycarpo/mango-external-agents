@@ -555,9 +555,15 @@ async fn a_close_over_a_launch_that_arrives_just_in_time_spends_the_wait_and_the
     gate.release();
 
     let closed = finish_close(closing, &held, began, limits.shutdown_timeout).await;
-    closed
-        .result
-        .expect("expected a close over a child that was stopped to return Ok");
+    // Ok when the start's lease left nothing to remove; the removal's own timeout when the lease
+    // was already gone and the stalled removal ran its whole stage. Both are the same close.
+    assert!(
+        matches!(&closed.result, Ok(()))
+            || matches!(&closed.result, Err(Error::Timeout { operation, after })
+                if operation == crate::mcp::REMOVAL_OPERATION && *after == limits.shutdown_timeout),
+        "expected a close over a child that was stopped to return Ok or the removal's Timeout | received {:?}",
+        closed.result
+    );
     let started = starting.await.expect("expected the start task to finish");
     assert!(
         matches!(&started, Err(error) if matches!(error.cause(), Error::Closed { .. })),

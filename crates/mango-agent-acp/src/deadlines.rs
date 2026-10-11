@@ -79,7 +79,7 @@ impl Deadlines {
     /// use mango_external_agents::Limits;
     ///
     /// let deadlines = Deadlines::from_limits(&Limits::default());
-    /// assert_eq!(deadlines, Deadlines::from_limits(&Limits::default()));
+    /// assert_eq!(deadlines.close_worst_case().as_secs(), 29);
     /// ```
     #[must_use]
     pub fn from_limits(limits: &Limits) -> Self {

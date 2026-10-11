@@ -1013,7 +1013,7 @@ async fn an_agent_exit_during_a_hold_is_told_to_the_handler_after_two_shutdown_t
     assert_reaches(
         "the handler to be told of the exit (two shutdown_timeout)",
         told_after,
-        crate::deadlines::exit_notice_bound(&limits) + SLACK,
+        crate::deadlines::exit_notice_bound(&limits),
         2 * SLACK,
     );
     assert!(
@@ -1023,7 +1023,7 @@ async fn an_agent_exit_during_a_hold_is_told_to_the_handler_after_two_shutdown_t
     assert_reaches(
         "the exit's teardown to end (Deadlines::exit_to_closed less shutdown_timeout)",
         cleaned_after,
-        deadlines.exit_to_closed() - limits.shutdown_timeout + SLACK,
+        deadlines.exit_to_closed() - limits.shutdown_timeout,
         2 * SLACK,
     );
 }
