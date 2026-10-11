@@ -101,6 +101,23 @@ impl Teardown {
         }
     }
 
+    /// Waits for the retained outcome, but for a launch that is still pending only `bound`.
+    ///
+    /// A teardown with no worker has no child to stop yet: its turn is still inside the host's
+    /// launcher, and only that launcher decides when it returns. `None` says the launch outlasted
+    /// `bound`. Once a worker owns a child the stop it runs is bounded stage by stage, so its
+    /// outcome is waited for whatever `bound` says: cutting a stop short would report a failure
+    /// for a child that is about to be reaped.
+    async fn wait_past_launch(&self, bound: Duration) -> Option<Result<()>> {
+        if let Ok(outcome) = tokio::time::timeout(bound, self.wait()).await {
+            return Some(outcome);
+        }
+        if !self.worker_started.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(self.wait().await)
+    }
+
     fn starts_worker(&self) -> bool {
         !self.worker_started.swap(true, Ordering::AcqRel)
     }
@@ -538,22 +555,45 @@ fn finish_unstarted_teardown(shared: &Shared, end: &Arc<TurnEnd>) {
     }
 }
 
+/// What an [`Error::Timeout`] names when a close stopped waiting for the host's launcher.
+const PENDING_LAUNCH_OPERATION: &str = "a pending Claude launch";
+
 /// Completes one close after its active child and MCP artifact are both gone.
+///
+/// Every wait here is a shutdown stage with the host's `shutdown_timeout` on it: the launch a turn
+/// is still inside, and the artifact's removal. The stop between them is bounded by
+/// [`stop_process_with_limits`].
 async fn run_close_teardown(
     shared: &Shared,
     close: &Teardown,
     active: Option<Arc<Teardown>>,
     mut mcp_config: crate::mcp::Prepared<Arc<ConfigFile>>,
 ) {
+    let bound = shared.host.limits().shutdown_timeout;
     let native = match active {
-        Some(teardown) => teardown.wait().await,
-        None => Ok(()),
+        Some(teardown) => teardown.wait_past_launch(bound).await,
+        None => Some(Ok(())),
+    };
+    let Some(native) = native else {
+        // The launcher has not handed back a child, so there is nothing here to stop and no
+        // proof that nothing will start. The session stays `Closing`. The start that owns the
+        // launch stops the child if one arrives and holds its own lease on the artifact until
+        // that stop has an outcome: it removes the file after a reap and keeps it after a stop
+        // that failed. So this reference is given up rather than preserved here, which would
+        // keep the file after the last process that could read it is gone.
+        crate::mcp::release_lease(mcp_config.take());
+        close.finish(Err(Error::Timeout {
+            operation: String::from(PENDING_LAUNCH_OPERATION),
+            after: bound,
+        }));
+        return;
     };
     let result = match native {
         Ok(()) => {
-            let result = crate::mcp::remove_on_close(mcp_config.take()).await;
+            let result = crate::mcp::remove_on_close(mcp_config.take(), bound).await;
             // Close is terminal after native cleanup, even when the host's scratch mount refuses
-            // the final unlink. The typed error still tells the caller which resource remained.
+            // the final unlink or never answers it. The typed error still tells the caller which
+            // resource remained, and the wait for it is one more shutdown stage.
             shared.core_state.set_status(SessionStatus::Closed);
             result
         }
@@ -571,6 +611,11 @@ impl Drop for ClaudeSession {
     /// The stream pump holds `Shared`, not `ClaudeSession`, so waiting for `Shared::drop` would
     /// leave a running child alive precisely when no host session can cancel it. The synchronous
     /// claim ensures a pump that is already completing cannot be stopped twice.
+    ///
+    /// The stop is asynchronous and runs on the runtime that opened the session. If that runtime
+    /// has shut down, nothing can run it and no stop is sent: the session releases the host's
+    /// control, and the child's fate is that control's own `Drop`. See the Deadlines section of
+    /// `docs/harness-claude.md`.
     fn drop(&mut self) {
         let claim = {
             let mut state = self.shared.lock();
@@ -640,9 +685,9 @@ fn active_turn(state: &Mutable) -> Option<TakenTurn> {
 ///
 /// The awaits between installing a child and returning its stream are the problem this exists
 /// for. A caller that times out or drops `start_turn` at one of them leaves a started child that
-/// no pump owns yet. A [`ProcessControl`](mango_external_agents::ProcessControl) that is merely
-/// dropped is not killed — the launcher sets no kill-on-drop — so this guard joins the session's
-/// shared teardown or starts it itself. Session drop records the same teardown, and a late child
+/// no pump owns yet. Dropping a [`ProcessControl`](mango_external_agents::ProcessControl) is not
+/// a stop the trait promises: the core launcher's control ends its tree when dropped, and a
+/// host's own need not. So this guard joins the session's shared teardown or starts it itself. Session drop records the same teardown, and a late child
 /// becomes the guard's owned input to that one cleanup worker.
 ///
 /// Disarmed once the pump owns the child, which is the moment something else is responsible for it.
@@ -757,8 +802,7 @@ impl Drop for AbandonedStart {
                 true,
             )
             .await;
-            crate::mcp::release_off_worker(lease).await;
-            let _ = outcome;
+            crate::mcp::release_after_stop(lease, outcome.is_ok()).await;
         });
     }
 }
@@ -1100,9 +1144,10 @@ impl mango_external_agents::Session for ClaudeSession {
             .await;
             // After the kill, never before: the child read `--mcp-config` at startup. And off the
             // worker, because a close that won the race left this lease holding the last
-            // reference, so this is where the `remove_dir_all` happens.
-            crate::mcp::release_off_worker(mcp_lease.take()).await;
-            crate::mcp::release_off_worker(abandoned.mcp_lease.take()).await;
+            // reference, so this is where the `remove_dir_all` happens. A stop that failed left a
+            // child that may still read the file, so that outcome keeps it on disk instead.
+            crate::mcp::release_after_stop(mcp_lease.take(), outcome.is_ok()).await;
+            crate::mcp::release_after_stop(abandoned.mcp_lease.take(), outcome.is_ok()).await;
             outcome.map_err(|error| error.with_dispatch(Dispatch::Accepted))?;
             abandoned.disarm();
             return Err((if self.shared.lifecycle.is_closed() {
@@ -1407,6 +1452,130 @@ async fn finish_prompt_io(
     settle_owner(shared, end);
 }
 
+/// The child's own exit, watched while its stdout is read.
+///
+/// A pipe ends when its last writer closes it, not when the process this harness spawned exits.
+/// A helper that inherited stdout, such as a background Bash task the run left behind, holds the
+/// read open after Claude itself is gone, and a pump that only read would sit there until the
+/// idle timer. [`ProcessControl::wait`](mango_external_agents::ProcessControl::wait) reports the
+/// exit without consuming the child, so the pump watches it beside the read.
+///
+/// The exit does not end the read. Whatever the child wrote before it left is still in the pipe,
+/// and that can be the `result` that completes the turn, so reading goes on for one more
+/// `grace`, counted from the exit, and stops there whether or not the pipe has closed.
+struct ExitWatch {
+    /// `None` once the exit was seen, or once the host's control failed to report one.
+    exited: Option<ChildExit>,
+    grace: Duration,
+    /// Where reading stops. Set when the exit is seen.
+    drain_until: Option<tokio::time::Instant>,
+}
+
+type ChildExit = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<mango_external_agents::ExitStatus>> + Send>,
+>;
+
+impl ExitWatch {
+    fn new(control: &Arc<dyn mango_external_agents::ProcessControl>, grace: Duration) -> Self {
+        let control = Arc::clone(control);
+        Self {
+            exited: Some(Box::pin(async move { control.wait().await })),
+            grace,
+            drain_until: None,
+        }
+    }
+
+    /// Lets go of the wait on the host's control, before the pump starts or joins a stop.
+    ///
+    /// A stop waits on the same control and asks it to kill. A host control may serialise its
+    /// calls, and a wait this watch still held would then keep that kill out for a whole shutdown
+    /// stage. A deadline an exit already set stays in force.
+    fn release(&mut self) {
+        self.exited = None;
+    }
+
+    /// Resolves once, when the child's exit is first seen, and never again.
+    ///
+    /// The wait itself lives in `self`, so dropping this future loses nothing. A control that
+    /// fails to report an exit leaves the read to the idle timer, as it was before this existed.
+    async fn seen(&mut self) {
+        let Some(exited) = self.exited.as_mut() else {
+            return std::future::pending().await;
+        };
+        let status = exited.await;
+        self.exited = None;
+        if status.is_ok() {
+            self.drain_until = Some(tokio::time::Instant::now() + self.grace);
+        }
+    }
+}
+
+/// What one read of the child's stdout came to.
+enum Read {
+    Line(String),
+    /// The pipe closed, or the child exited and its grace to be read ran out.
+    Ended,
+    Failed(Error),
+    /// Nothing arrived for the whole idle timeout from a child that has not exited.
+    Idle,
+}
+
+/// Reads the next line, under the idle timeout and under the grace an observed exit starts.
+///
+/// One `recv` is polled to completion however many times the loop turns, so the exit arriving
+/// mid-read never abandons a read that may already hold part of a line. A line that is ready
+/// wins over either deadline: the grace exists so that what the child wrote before it left is
+/// read. The deadline is fixed at the exit, so a helper that writes now and then does not move
+/// it. One that never stops writing keeps the read busy, as a turn that never stops talking
+/// always could.
+///
+/// When the grace runs out the read gets one more pass of the runtime before it is given up. A
+/// read of a real pipe is ready only once the runtime's I/O driver has reported the bytes, and
+/// with a `kill_grace` of zero the grace is over in the same instant the exit is seen: bytes the
+/// child wrote just before it left can be in the kernel and not yet reported. Yielding lets the
+/// driver run, and the read is then asked once more.
+async fn next_line(
+    receiver: &mut dyn mango_external_agents::LinkReceiver,
+    exit: &mut ExitWatch,
+    idle_timeout: Duration,
+) -> Read {
+    let received = receiver.recv();
+    tokio::pin!(received);
+    let idle = tokio::time::sleep(idle_timeout);
+    tokio::pin!(idle);
+    loop {
+        let drain_until = exit.drain_until;
+        let drained = async {
+            match drain_until {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            () = exit.seen() => {}
+            received = &mut received => return match received {
+                Ok(Some(line)) => Read::Line(line),
+                Ok(None) => Read::Ended,
+                Err(error) => Read::Failed(error),
+            },
+            () = drained => break,
+            () = &mut idle => return Read::Idle,
+        }
+    }
+    tokio::task::yield_now().await;
+    let last = tokio::select! {
+        biased;
+        received = &mut received => received,
+        () = std::future::ready(()) => return Read::Ended,
+    };
+    match last {
+        Ok(Some(line)) => Read::Line(line),
+        Ok(None) => Read::Ended,
+        Err(error) => Read::Failed(error),
+    }
+}
+
 /// One turn, from the prompt to the terminal event.
 ///
 /// The only thing in this harness that emits.
@@ -1497,28 +1666,31 @@ async fn pump(
     }
 
     let mut failure = None;
+    let mut exit = ExitWatch::new(&control, exit_grace);
     loop {
-        let line = tokio::select! {
+        let read = tokio::select! {
             () = sink.closed() => {
+                exit.release();
                 stop_pump(&shared, &end, CancelReason::Requested, true).await;
                 settle_owner(&shared, &end);
                 return;
             }
             () = cancel_token.cancelled() => {
+                exit.release();
                 stop_pump(&shared, &end, CancelReason::Shutdown, false).await;
                 break;
             }
             () = stop.cancelled() => break,
-            received = tokio::time::timeout(idle_timeout, receiver.recv()) => received,
+            read = next_line(receiver.as_mut(), &mut exit, idle_timeout) => read,
         };
-        let line = match line {
-            Ok(Ok(Some(line))) => line,
-            Ok(Ok(None)) => break,
-            Ok(Err(error)) => {
+        let line = match read {
+            Read::Line(line) => line,
+            Read::Ended => break,
+            Read::Failed(error) => {
                 failure = Some(error);
                 break;
             }
-            Err(_elapsed) => {
+            Read::Idle => {
                 failure = Some(Error::Timeout {
                     operation: String::from("a stream-json record"),
                     after: idle_timeout,
@@ -1559,6 +1731,7 @@ async fn pump(
         if native_finished {
             // Publish native completion before the bounded event send so cancellation joins
             // teardown without discarding the confirmed resumable continuation.
+            exit.release();
             let _ = start_terminal_teardown(&shared, &end, &control, true);
         }
         let mut room_for_closes = true;
@@ -1573,6 +1746,7 @@ async fn pump(
                 // The host dropped the stream. There is nobody to tell, and a turn nobody is
                 // reading is a turn to stop feeding.
                 Err(Error::Closed { .. }) => {
+                    exit.release();
                     stop_pump(&shared, &end, CancelReason::Requested, true).await;
                     settle_owner(&shared, &end);
                     return;
@@ -1581,6 +1755,7 @@ async fn pump(
                 // No later vendor frame may follow that terminal, and a process whose output the
                 // stream rejected must not keep working for an absent consumer.
                 Err(_) if sink.is_terminal() => {
+                    exit.release();
                     stop_pump(&shared, &end, CancelReason::Requested, true).await;
                     settle_owner(&shared, &end);
                     return;
@@ -1592,6 +1767,10 @@ async fn pump(
             break;
         }
     }
+
+    // The watch holds a wait on the host's control. The stop below waits on the same control, so
+    // the first is let go before the second begins, here as before every stop inside the loop.
+    exit.release();
 
     // An EOF, idle timeout, or broken link can end before any conversation record arrives. It is
     // still a failed strict verification: cleanup only tells us that the child stopped, never
@@ -1955,8 +2134,9 @@ fn no_result_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveTurn, Mutable, StopClaim, TurnEnd, claim_stop, install_teardown_locked,
-        no_result_error, prompt_line, record_stop_locked, request_stop, settle_owner_locked,
+        ActiveTurn, ClaudeSession, Mutable, StopClaim, TurnEnd, claim_stop,
+        install_teardown_locked, no_result_error, prompt_line, record_stop_locked, request_stop,
+        settle_owner_locked,
     };
     use mango_external_agents::{CancelReason, CancelToken, ExitStatus};
     use std::sync::Arc;
@@ -2156,6 +2336,128 @@ mod tests {
             );
         });
 
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A host scratch mount that takes the removal and does not answer it until it is released.
+    ///
+    /// It gives up by itself after ten real seconds. A paused clock cannot bound a close that is
+    /// parked on the blocking pool, so without that a close with no bound of its own would hang
+    /// the test instead of failing it. A close that has its bound returns long before, and the
+    /// test then releases the removal at once.
+    struct StalledRemover {
+        arrived: Arc<tokio::sync::Notify>,
+        released: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl crate::mcp::DirectoryRemover for StalledRemover {
+        fn remove(&self, directory: &std::path::Path) -> std::io::Result<()> {
+            self.arrived.notify_one();
+            let _ = self
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(std::time::Duration::from_secs(10));
+            std::fs::remove_dir_all(directory)
+        }
+    }
+
+    /// A session opened over a launcher that is never asked for a child.
+    fn session_holding(
+        config: crate::mcp::ConfigFile,
+        limits: mango_external_agents::Limits,
+    ) -> ClaudeSession {
+        use mango_external_agents::testing::{FakeLauncher, FrozenClock};
+        use mango_external_agents::{
+            EnvSource, ExecutablePath, HarnessIdentity, HostContext, SessionId, SessionIds,
+            SessionSnapshot, SessionState, TransportKind, TransportSelection,
+        };
+
+        let host = HostContext::builder()
+            .launcher(Arc::new(FakeLauncher::new()))
+            .cwd(std::env::temp_dir())
+            .scratch(std::env::temp_dir())
+            .environment(EnvSource::from_pairs([("PATH", "/usr/bin")]))
+            .client_info("mea-tests", "0.0.0")
+            .clock(Arc::new(FrozenClock::default()))
+            .limits(limits)
+            .build()
+            .expect("expected a host");
+        let snapshot = SessionSnapshot::opening(
+            SessionIds {
+                session_id: SessionId::new("chat-1"),
+                native_session_id: String::from("00000000-0000-4000-8000-000000000000"),
+            },
+            HarnessIdentity::claude(),
+            TransportSelection::new(None, TransportKind::Stdio),
+            host.now(),
+        );
+        let state = SessionState::new(Arc::clone(host.clock()), snapshot);
+        ClaudeSession::new(
+            host,
+            ExecutablePath::default(),
+            state,
+            crate::permissions::ModeAvailability::default(),
+            None,
+            false,
+            Some(config),
+        )
+    }
+
+    /// A removal the host's filesystem never answers is one stage of a close, so it gets a
+    /// shutdown stage's bound. `spawn_blocking` cannot be cancelled, so the close stops waiting
+    /// and says the artifact may still be there; before the bound existed it never returned.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_stops_waiting_for_a_stalled_artifact_removal_at_the_shutdown_timeout() {
+        use mango_external_agents::{CloseReason, Error, Limits, Session, SessionStatus};
+
+        let scratch =
+            std::env::temp_dir().join(format!("mea-stalled-close-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&scratch).expect("expected a scratch root");
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let file = crate::mcp::ConfigFile::write(&servers(), &scratch)
+            .await
+            .expect("expected a written artifact")
+            .expect("expected servers to produce one")
+            .with_remover(StalledRemover {
+                arrived: Arc::clone(&arrived),
+                released: std::sync::Mutex::new(released),
+            });
+        let limits = Limits::default();
+        let session = Arc::new(session_holding(file, limits));
+
+        let closing = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move { session.close(CloseReason::Requested).await }
+        });
+        arrived.notified().await;
+        tokio::time::advance(limits.shutdown_timeout).await;
+
+        let error = closing
+            .await
+            .expect("expected the close task to finish")
+            .expect_err("expected the close to return an error once shutdown_timeout had passed | received a close that waited for the removal to finish");
+        assert!(
+            matches!(
+                error.cause(),
+                Error::Timeout { operation, after }
+                    if operation == crate::mcp::REMOVAL_OPERATION && *after == limits.shutdown_timeout
+            ),
+            "expected Error::Timeout {{ operation: \"MCP configuration removal\", after: {:?} }} | received {error:?}",
+            limits.shutdown_timeout
+        );
+        assert_eq!(
+            session.snapshot().status,
+            SessionStatus::Closed,
+            "expected a session whose native cleanup finished to be Closed | received {:?}",
+            session.snapshot().status
+        );
+
+        // The removal is the host's blocking call and still owns the directory; let it finish so
+        // the runtime's blocking pool can shut down.
+        drop(release);
+        drop(session);
         let _ = std::fs::remove_dir_all(&scratch);
     }
 

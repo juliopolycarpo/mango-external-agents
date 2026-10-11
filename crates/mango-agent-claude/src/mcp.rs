@@ -34,6 +34,24 @@ impl FileWriter for PrivateFileWriter {
     }
 }
 
+/// Removes one session's artifact directory from the host's scratch root.
+///
+/// Injected for the same reason [`FileWriter`] is: the root is the host's, it may be a FUSE,
+/// container or network mount, and the only way to test what a close does about a removal that
+/// never answers is to hand it one.
+pub(crate) trait DirectoryRemover: Send + Sync {
+    /// Removes `directory` and everything in it.
+    fn remove(&self, directory: &Path) -> std::io::Result<()>;
+}
+
+struct ScratchRemover;
+
+impl DirectoryRemover for ScratchRemover {
+    fn remove(&self, directory: &Path) -> std::io::Result<()> {
+        std::fs::remove_dir_all(directory)
+    }
+}
+
 /// The name of the file inside each session's own directory.
 const FILE_NAME: &str = "mcp-servers.json";
 
@@ -47,6 +65,8 @@ pub struct ConfigFile {
     /// The file's path, as the string `--mcp-config` takes. UTF-8 was already proven when this was
     /// written, so [`path`](Self::path) can hand it back as a [`Path`] without a second check.
     argument: String,
+    /// What a close removes the directory through.
+    remover: Box<dyn DirectoryRemover>,
 }
 
 impl std::fmt::Debug for ConfigFile {
@@ -151,6 +171,7 @@ impl ConfigFile {
             removed: false,
             preserve: std::sync::atomic::AtomicBool::new(false),
             argument,
+            remover: Box::new(ScratchRemover),
         };
         file.populate(&document, writer)?;
         Ok(Some(file))
@@ -164,6 +185,13 @@ impl ConfigFile {
             .write_new(path, contents.as_bytes())
             .map_err(|error| scratch_failure("write the MCP configuration", &error))?;
         Ok(())
+    }
+
+    /// Replaces what a close removes the directory through, for a test that needs it to stall.
+    #[cfg(test)]
+    pub(crate) fn with_remover(mut self, remover: impl DirectoryRemover + 'static) -> Self {
+        self.remover = Box::new(remover);
+        self
     }
 
     /// The path `--mcp-config` is given.
@@ -189,10 +217,12 @@ impl ConfigFile {
     /// [`Error::HostConfiguration`] when the removal failed, naming the I/O error kind.
     fn remove(mut self) -> Result<()> {
         self.removed = true;
-        std::fs::remove_dir_all(&self.directory).map_err(|error| Error::HostConfiguration {
-            expected: "a scratch directory the session can remove when it closes",
-            received: format!("a removal failure ({:?})", error.kind()),
-        })
+        self.remover
+            .remove(&self.directory)
+            .map_err(|error| Error::HostConfiguration {
+                expected: "a scratch directory the session can remove when it closes",
+                received: format!("a removal failure ({:?})", error.kind()),
+            })
     }
 }
 
@@ -269,23 +299,70 @@ pub(crate) fn release_on_drop<T: Send + 'static>(value: T) {
 /// Only the last reference removes anything: a start still holding its lease removes the file when
 /// it finishes, and this close has nothing to report about it.
 ///
+/// The removal is one stage of a close, so it waits at most `bound`, which a close passes the
+/// host's [`Limits::shutdown_timeout`](mango_external_agents::Limits). The host owns the scratch
+/// root, and a FUSE, container or network mount can take a `remove_dir_all` and never answer it. A
+/// blocking call cannot be cancelled, so on expiry it is left running on the blocking pool and the
+/// caller is told the artifact may still be on disk: it either goes later, when the mount answers,
+/// or stays for the host to reclaim.
+///
 /// # Errors
 ///
 /// [`Error::HostConfiguration`] when the removal failed, or when the blocking pool could not run
-/// it. The session is closed either way — this says what was left on disk.
-pub(crate) async fn remove_on_close(file: Option<std::sync::Arc<ConfigFile>>) -> Result<()> {
+/// it, and [`Error::Timeout`] naming the removal when it had not finished after `bound`. The
+/// session is closed either way: each says what may be left on disk.
+pub(crate) async fn remove_on_close(
+    file: Option<std::sync::Arc<ConfigFile>>,
+    bound: std::time::Duration,
+) -> Result<()> {
     let Some(file) = file else {
         return Ok(());
     };
     let Some(file) = std::sync::Arc::into_inner(file) else {
         return Ok(());
     };
-    tokio::task::spawn_blocking(move || file.remove())
-        .await
-        .map_err(|_| Error::HostConfiguration {
-            expected: "a blocking pool that can remove the MCP configuration",
-            received: String::from("a blocking task that did not finish"),
-        })?
+    let Ok(removal) =
+        tokio::time::timeout(bound, tokio::task::spawn_blocking(move || file.remove())).await
+    else {
+        return Err(Error::Timeout {
+            operation: String::from(REMOVAL_OPERATION),
+            after: bound,
+        });
+    };
+    removal.map_err(|_| Error::HostConfiguration {
+        expected: "a blocking pool that can remove the MCP configuration",
+        received: String::from("a blocking task that did not finish"),
+    })?
+}
+
+/// What an [`Error::Timeout`] names when a close stopped waiting for the artifact's removal.
+pub(crate) const REMOVAL_OPERATION: &str = "MCP configuration removal";
+
+/// Gives up one reference to the artifact without waiting for anything.
+///
+/// For a close that stopped waiting for a pending launch: the start that owns the launch holds a
+/// lease of its own and removes the file after it has reaped the child. A reference that is not
+/// the last is released where it stands, which touches no filesystem. One that turned out to be
+/// the last, because that start finished in the same instant, is handed to the blocking pool like
+/// every other removal.
+pub(crate) fn release_lease(file: Option<std::sync::Arc<ConfigFile>>) {
+    if let Some(last) = file.and_then(std::sync::Arc::into_inner) {
+        release_on_drop(last);
+    }
+}
+
+/// Releases a start's lease once the stop of the child it launched has an outcome.
+///
+/// A stop that reaped the child leaves nothing that can read the file, so the lease goes the way
+/// every lease does. A stop that failed leaves a child that may still read it, and this lease can
+/// be the last reference when a close already gave its own up. The file is then marked to stay on
+/// disk before the reference is dropped, exactly as a close does for a stop that failed under it.
+pub(crate) async fn release_after_stop(file: Option<std::sync::Arc<ConfigFile>>, reaped: bool) {
+    if let Some(file) = file.as_ref().filter(|_| !reaped) {
+        file.preserve
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    release_off_worker(file).await;
 }
 
 /// Keeps an MCP artifact on disk after native cleanup failed.
@@ -924,6 +1001,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
+    /// A reference a close gives up touches no filesystem while another holder remains, and
+    /// removes the artifact when it turns out to be the last one.
+    #[test]
+    fn a_lease_given_up_removes_the_artifact_only_when_it_is_the_last() {
+        use std::sync::Arc;
+
+        let scratch = tempdir();
+        let file = Arc::new(
+            ConfigFile::write_with(&servers(), &scratch, &super::PrivateFileWriter)
+                .expect("expected a file")
+                .expect("expected servers to produce one"),
+        );
+        let directory = file
+            .path()
+            .parent()
+            .expect("a file sits in a directory")
+            .to_path_buf();
+
+        super::release_lease(Some(Arc::clone(&file)));
+        assert!(
+            directory.exists(),
+            "expected the artifact to stay while another lease holds it | received {directory:?} gone"
+        );
+        // No runtime on this thread, so the last reference is dropped where it stands.
+        super::release_lease(Some(file));
+        assert!(
+            !directory.exists(),
+            "expected the last lease to remove the artifact | received {directory:?} still on disk"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A lease released after a stop that failed leaves the file for the host, even as the last.
+    #[tokio::test]
+    async fn a_lease_released_after_a_failed_stop_keeps_the_artifact() {
+        use std::sync::Arc;
+
+        let scratch = tempdir();
+        let file = ConfigFile::write(&servers(), &scratch)
+            .await
+            .expect("expected a file")
+            .expect("expected servers to produce one");
+        let directory = file
+            .path()
+            .parent()
+            .expect("a file sits in a directory")
+            .to_path_buf();
+
+        super::release_after_stop(Some(Arc::new(file)), false).await;
+        assert!(
+            directory.exists(),
+            "expected a failed stop to keep the artifact | received {directory:?} gone"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
     /// A close that could not remove the artifact says so: the file holds host-configured secrets.
     #[tokio::test]
     async fn a_close_reports_a_removal_that_did_not_happen() {
@@ -944,7 +1077,7 @@ mod tests {
         std::fs::remove_dir_all(&directory)
             .expect("expected the scratch directory to be removable");
 
-        let error = super::remove_on_close(Some(Arc::new(file)))
+        let error = super::remove_on_close(Some(Arc::new(file)), std::time::Duration::from_secs(5))
             .await
             .expect_err("expected the close to report the removal it could not do");
         assert!(
@@ -973,7 +1106,7 @@ mod tests {
             .expect("a file sits in a directory")
             .to_path_buf();
 
-        super::remove_on_close(Some(file))
+        super::remove_on_close(Some(file), std::time::Duration::from_secs(5))
             .await
             .expect("expected a close holding a lease out to report nothing");
         assert!(
