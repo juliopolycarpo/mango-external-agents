@@ -193,8 +193,8 @@ pub enum PeerTermination {
 
 /// Which of the bounds on what this side holds for the peer was passed.
 ///
-/// Each is set on [`WireOptions`]. A frame larger than one frame may be is refused where it
-/// is given and the connection goes on; a queue that is full ends the connection as
+/// Each is set on [`WireOptions`]. A frame larger than the bound on one frame is refused
+/// where it is given and the connection goes on; a queue that is full ends the connection as
 /// [`PeerTermination::OutboundBackpressure`]. Both are told as an [`Error::LimitExceeded`]
 /// whose `subject` is text; this says which bound that text names, so that nothing has to
 /// read it. It does not say whether the connection ended: a queue bound of nothing refuses

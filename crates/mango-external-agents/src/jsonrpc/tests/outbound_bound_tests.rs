@@ -54,7 +54,7 @@ fn each_bound_is_named_by_its_own_subject_and_read_back_from_it() {
     );
 }
 
-/// A frame larger than one frame may be is refused where it is submitted, and the refusal
+/// A frame larger than the bound on one frame is refused where it is submitted, and the refusal
 /// names the frame bound, as it was returned and without its dispatch annotation. Nothing
 /// ended, so the handler is told of no end.
 #[tokio::test]
