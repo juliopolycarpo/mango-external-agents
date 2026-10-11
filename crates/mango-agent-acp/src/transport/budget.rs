@@ -150,11 +150,12 @@ fn outgoing_budget(subject: &str) -> Option<Budget> {
     }
 }
 
-/// The most JSON-RPC messages queued in either direction.
+/// The most notifications and requests from the agent that may wait for the handler.
 ///
-/// The queue carries `session/update` notifications and the frames of the requests admitted
-/// under `max_pending_requests`, so it holds at least as many messages as either. For example,
-/// the default limits allow 1,024 queued messages.
+/// The larger of the two counts a host sets, so a burst of `session/update` notifications is
+/// not held to the request limit and never to less than one. The outgoing frame count builds
+/// on it ([`outgoing_frame_limit`]). For example, the default limits allow 1,024 queued
+/// messages.
 fn message_limit(limits: &Limits) -> usize {
     limits
         .turn_channel_capacity
@@ -253,8 +254,9 @@ fn queued_bytes_limit(outbound_buffer_bytes: usize) -> usize {
 ///   connection ends, a turn in flight fails with `acp-transport-overflow`, and a request still
 ///   waiting fails as `LimitExceeded` naming "bytes queued for the ACP agent".
 ///
-/// The frame count is bounded by the same number as the incoming queue, and passing it ends the
-/// connection the same way, naming "frames queued for the ACP agent".
+/// The frame count is bounded by [`outgoing_frame_limit`], the incoming message limit plus
+/// room for this side's own frames, and passing it ends the connection the same way, naming
+/// "frames queued for the ACP agent".
 ///
 /// ACP is JSON-RPC 2.0, so a batch is read member by member, a line that is not JSON is
 /// answered with `-32700`, and a request this side gives up is followed by `$/cancel_request`.
