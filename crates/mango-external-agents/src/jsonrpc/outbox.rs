@@ -315,15 +315,15 @@ impl WireOptions {
     /// | `[]`, with [`with_batch_decoding`](Self::with_batch_decoding) | answered once, `id` null | dropped |
     /// | a member of a batch that is not an object | answered, `id` null; the other members are handled | passed over |
     /// | an array, without [`with_batch_decoding`](Self::with_batch_decoding) | answered once, `id` null | dropped |
-    /// | an object with no `result` and no `error`, whose `method` is missing or not a string | answered | see below |
+    /// | an object with no `result` and no `error`, whose `method` is not a string, or is missing with no `id` that is a string or a number | answered | see below |
     /// | an object with no `result` and no `error`, whose `id` is not a string, a number or null | answered, `id` null | see below |
-    /// | an object with only an `id` that is a string or a number | the response it always was, with no result | the same |
+    /// | an object with no `method`, no `result`, no `error`, and an `id` that is a string or a number, whatever else it holds | the response it always was, with no result | the same |
     /// | an object with `result` or `error` | a response, never answered | the same |
     /// | an object with a `method` that is a string and an `id` that can be one, or none | a request or a notification, whatever its `params` or `jsonrpc` say | the same |
     /// | a line that is not JSON | [`with_parse_error_replies`](Self::with_parse_error_replies)'s to answer | the same |
     ///
-    /// An object is answered under its own `id` when that is a string or a number, and under
-    /// null otherwise. So `{}`, `{"jsonrpc":"2.0"}`, `{"method":1}` and `{"id":null}` are
+    /// An object is answered under its own `id` when that is a number or a string of at most
+    /// 128 bytes, and under null otherwise: a reply stays small whatever it answers. So `{}`, `{"jsonrpc":"2.0"}`, `{"method":1}` and `{"id":null}` are
     /// answered under null, `{"id":4,"method":5}` under `4`, and `{"method":"x","id":{}}`
     /// under null. Without this option the first four are dropped, the fifth is read as the
     /// response to call `4` with no result, and the last is put to the handler and answered
@@ -334,12 +334,16 @@ impl WireOptions {
     /// that both answer invalid requests cannot answer each other for ever.
     ///
     /// Each reply is a frame of its own, for the members of a batch as well: they are not
-    /// gathered into one array. The reply does not quote what it answers.
+    /// gathered into one array. Apart from such an id, the reply quotes nothing of what it
+    /// answers.
     ///
     /// At most `max_queued` such replies wait to be written at a time, and input that would
-    /// be answered while that many wait is dropped; `0` answers none. One batch is answered
-    /// for at most `max_queued` of its members, however fast the replies are written, and a
-    /// batch refused whole for passing the handoff budget is answered for none. The bound is
+    /// be answered while that many wait is dropped. `0` answers none and is the same as not
+    /// asking: every object is routed as it is without this. One batch is answered for at
+    /// most `max_queued` of its members, however fast the replies are written, and a batch
+    /// refused whole for passing the handoff budget is answered for none. A member of a batch
+    /// that is answered this way is not counted against that budget, nor against the byte
+    /// budget. The bound is
     /// this option's own, apart from the one on parse-error replies. The replies are held
     /// beside the bounds of the outbound queue and go through the queue, and a reply is a
     /// write, with what [`with_parse_error_replies`](Self::with_parse_error_replies) says

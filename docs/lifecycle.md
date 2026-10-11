@@ -213,13 +213,13 @@ request with `-32600`, under a bound of its own and beside the queue's bounds in
 each reply a frame of its own. Answered under a null id: a line that is a number, a string,
 `true`, `false` or `null`; where batches are read, an empty batch and each member of a batch that
 is not an object; where they are not, a line that is an array, once. Answered under its own id
-when that is a string or a number, and under null otherwise: an object with neither `result` nor
+when that is a number or a string of at most 128 bytes, and under null otherwise: an object with neither `result` nor
 `error` whose `method` is missing or not a string, or whose `id` is something an id cannot be.
 Never answered: an object with `result` or `error`, which is a response, this side's own replies
-among them, so two peers that answer invalid requests cannot loop; an object with only an id that
+among them, so two peers that answer invalid requests cannot loop; an object with no `method` and an id that
 could name a call, which is read as that call's response as before; and a request or notification
 with a `method` that is a string, whatever its `params` or `jsonrpc` say. One batch is answered
-for at most `max_queued` of its members, and a batch refused whole is answered for none. Without
+for at most `max_queued` of its members, and a batch refused whole is answered for none. A bound of nothing answers nothing and reroutes nothing. Without
 the option every object is routed exactly as before: `{"id":4,"method":5}` is the response to
 call `4`, and `{"method":"x","id":{}}` is put to the handler.
 `with_cancel_on_abandon(method)` queues a notification

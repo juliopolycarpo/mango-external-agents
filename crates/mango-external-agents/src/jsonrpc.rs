@@ -1269,13 +1269,30 @@ impl UnaskedReplies {
     fn held(&self) -> usize {
         self.0.lock().unwrap_or_else(PoisonError::into_inner).len()
     }
+
+    /// Lets go of every reply, as the list would once the writer had written them all.
+    #[cfg(test)]
+    fn forget(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
 }
 
+/// The longest string an invalid request's id may be and still be sent back, in bytes.
+///
+/// A reply is otherwise some seventy bytes whatever it answers, and is held beside every
+/// bound on what this side queues. An id sent back whole would make it as large as the
+/// peer's line, with nothing counting it.
+const ECHOED_ID_BYTES: usize = 128;
+
 /// The id an invalid request is answered under: the one it came with when that can name a
-/// request, and null otherwise.
+/// request and is short enough to send back, and null otherwise.
 fn echoed_id(id: Option<&Value>) -> Value {
     match id {
-        Some(id @ (Value::String(_) | Value::Number(_))) => id.clone(),
+        Some(Value::String(id)) if id.len() <= ECHOED_ID_BYTES => Value::String(id.clone()),
+        Some(id @ Value::Number(_)) => id.clone(),
         _ => Value::Null,
     }
 }
@@ -1285,8 +1302,9 @@ fn echoed_id(id: Option<&Value>) -> Value {
 ///
 /// It is one that is not a response and cannot be a request: it has neither `result` nor
 /// `error`, and its `method` is missing or not a string, or its `id` is something an id
-/// cannot be. One exception is kept from before there was any such answer: an object with
-/// nothing but an id that could name a call is read as that call's response with no result.
+/// cannot be. One exception is kept from before there was any such answer: an object with no
+/// `method` and an id that could name a call, whatever else it holds, is read as that call's
+/// response with no result.
 ///
 /// Every reply this side sends for it carries `error`, so two peers that both answer invalid
 /// requests cannot answer each other for ever.
@@ -1473,6 +1491,10 @@ struct ClientState {
     /// response on, so a test can have the caller give the call up exactly there.
     #[cfg(test)]
     after_response_claimed: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once after a member of a batch has been answered as an invalid request, so a
+    /// test can have the writer's work done exactly there.
+    #[cfg(test)]
+    after_batch_member_answered: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs once when the reader lets a write failure go because a close is on record, so a
     /// test can tell that from the reader never having heard of the failure.
     #[cfg(test)]
@@ -2252,6 +2274,8 @@ impl Client {
             after_response_matched: StdMutex::new(None),
             #[cfg(test)]
             after_response_claimed: StdMutex::new(None),
+            #[cfg(test)]
+            after_batch_member_answered: StdMutex::new(None),
             #[cfg(test)]
             after_write_failure_ignored: StdMutex::new(None),
             #[cfg(test)]
@@ -3767,8 +3791,13 @@ impl ClientState {
 
     /// The id to answer `frame` under, if it is an object owed an invalid-request error and
     /// this client was asked to answer those. See [`invalid_request`].
+    ///
+    /// A bound of nothing answers nothing, and so takes nothing out of the way it was always
+    /// routed: an object diverted and then not answered would only be lost.
     fn invalid_request(&self, frame: &Map<String, Value>) -> Option<Value> {
-        self.outbox.wire().invalid_request_replies()?;
+        if self.outbox.wire().invalid_request_replies()? == 0 {
+            return None;
+        }
         invalid_request(frame)
     }
 
@@ -4250,9 +4279,17 @@ async fn dispatch_batch(
         if owed > 0 {
             owed -= 1;
             state.answer_invalid_request(id);
+            #[cfg(test)]
+            ClientState::run_hook(&state.after_batch_member_answered);
         }
     };
-    let mut work = members.iter().filter(|member| is_peer_work(member)).count();
+    // What the handler will see of the batch. A member with a method that is answered as an
+    // invalid request is not among it, and takes no place and no bytes.
+    let is_work = |member: &Value| match member {
+        Value::Object(frame) => is_peer_work(member) && state.invalid_request(frame).is_none(),
+        _ => false,
+    };
+    let mut work = members.iter().filter(|member| is_work(member)).count();
     let mut held = None;
     if work > 0 {
         let queued = state.peer_work_queued(notifications);
@@ -4268,6 +4305,10 @@ async fn dispatch_batch(
             answer_invalid(Value::Null);
             continue;
         };
+        if let Some(id) = state.invalid_request(&frame) {
+            answer_invalid(id);
+            continue;
+        }
         let mine = if frame.get("method").is_some_and(Value::is_string) {
             work -= 1;
             match work {
@@ -4277,12 +4318,6 @@ async fn dispatch_batch(
         } else {
             None
         };
-        if let Some(id) = state.invalid_request(&frame) {
-            // Its share of the bytes, if it was counted for one, goes back as it is let go.
-            drop(mine);
-            answer_invalid(id);
-            continue;
-        }
         // A response holds nothing of the byte budget.
         let bytes = mine.map_or(PeerBytes::Line(0), PeerBytes::Share);
         dispatch_frame(state, notifications, frame, bytes).await?;

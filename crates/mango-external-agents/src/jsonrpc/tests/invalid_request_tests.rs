@@ -245,7 +245,9 @@ async fn an_empty_batch_and_each_member_that_is_not_an_object_are_answered() {
 async fn a_batch_to_a_client_that_reads_none_is_answered_once() {
     let (link, handler, client) = connect(WireOptions::new().with_invalid_request_replies(8));
     link.push_line("[]");
-    link.push_line(json!([notification("in a batch"), 5, 6]).to_string());
+    link.push_line(
+        json!([{ "jsonrpc": "2.0", "method": "in a batch", "params": {} }, 5, 6]).to_string(),
+    );
     link.push_line(notification("after"));
 
     let handled = handler.wait_for_notifications(1).await;
@@ -669,4 +671,190 @@ async fn an_invalid_request_reply_the_peer_never_reads_ends_the_connection_at_th
     );
     // The link is unusable by now; what the close makes of that is not this test's subject.
     let _ = client.close().await;
+}
+
+/// One batch is answered for as many of its members as the bound and no more, whatever has
+/// been written meanwhile. With every reply let go the moment the first is queued, as a writer
+/// on another thread could have it, the count of what still waits starts again from nothing,
+/// and the batch's own count is what stops at two.
+#[tokio::test]
+async fn the_bound_on_one_batch_does_not_start_again_as_its_replies_are_written() {
+    let (link, handler, client) = connect(
+        WireOptions::new()
+            .with_batch_decoding()
+            .with_invalid_request_replies(2),
+    );
+    {
+        let state = Arc::clone(&client.state);
+        *client
+            .state
+            .after_batch_member_answered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(Box::new(move || state.invalid_request_replies.forget()));
+    }
+    link.push_line(json!([1, 2, 3, 4]).to_string());
+    link.push_line(notification("after"));
+    handler.wait_for_notifications(1).await;
+
+    let (written, queued, closed) = up_to_a_probe(&link, &client).await;
+    let observed = (written.len() - 1, queued, closed);
+    assert_eq!(
+        observed,
+        (2, 0, false),
+        "expected two of the batch's four members answered, the bound counted for the batch: (2, 0, false) | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// The rest of the table, with the option on. A request whose id is null is a request, put to
+/// the handler and answered under null. A response whose result is null is a response, and so
+/// is an object with an id and no method, whatever else it holds. A number is sent back as it
+/// came, negative or fractional. A string longer than 128 bytes is not sent back: the reply is
+/// under null and stays small.
+#[tokio::test]
+async fn ids_are_read_and_sent_back_for_what_they_are() {
+    let (link, handler, client) = connect(WireOptions::new().with_invalid_request_replies(8));
+    let (written, reply) = client
+        .submit_request("ask", json!({}), RequestOptions::new())
+        .expect("expected the request queued")
+        .into_parts();
+    within("the request written", written)
+        .await
+        .expect("expected the request written");
+    link.push_line(json!({ "jsonrpc": "2.0", "id": 1, "result": null }).to_string());
+    let answer = within("the reply", reply).await;
+    link.push_line(json!({ "jsonrpc": "2.0", "id": 2, "extra": true }).to_string());
+    link.push_line(json!({ "method": "question", "id": null }).to_string());
+    link.push_line(json!({ "id": -1.5, "method": 7 }).to_string());
+    link.push_line(json!({ "id": "s".repeat(128), "method": 7 }).to_string());
+    link.push_line(json!({ "id": "s".repeat(129), "method": 7 }).to_string());
+    link.push_line(notification("after"));
+
+    let handled = handler.wait_for_notifications(1).await;
+    sent(&link, 5).await;
+    let (written, queued, closed) = up_to_a_probe(&link, &client).await;
+    // The handler answers on a task of its own, so its answer has no fixed place among the
+    // errors, which the reader queues in the order it read what they answer.
+    let (answers, errors): (Vec<Value>, Vec<Value>) = written[1..]
+        .iter()
+        .filter(|frame| frame.get("method").is_none())
+        .cloned()
+        .partition(|frame| frame.get("result").is_some());
+    let observed = (
+        answer.ok(),
+        methods_seen(&handled),
+        answers,
+        errors,
+        queued,
+        closed,
+    );
+    let expected = (
+        Some(Value::Null),
+        vec!["after"],
+        vec![json!({ "jsonrpc": "2.0", "id": null, "result": "yes" })],
+        vec![
+            invalid_request(json!(-1.5)),
+            invalid_request(json!("s".repeat(128))),
+            invalid_request(Value::Null),
+        ],
+        0,
+        false,
+    );
+    assert_eq!(
+        observed, expected,
+        "expected the response read as one, the question with a null id answered by the handler, and each id sent back or not for what it is: {expected:?} | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// A bound of nothing is the same as not asking: nothing is answered, and every object is
+/// routed as it is without the option. The question with an id that cannot be one still
+/// reaches the handler, and the id with a method that is not a string still answers its call.
+#[tokio::test]
+async fn a_bound_of_nothing_routes_every_object_as_before() {
+    let (link, handler, client) = connect(WireOptions::new().with_invalid_request_replies(0));
+    let (written, reply) = client
+        .submit_request("ask", json!({}), RequestOptions::new())
+        .expect("expected the request queued")
+        .into_parts();
+    within("the request written", written)
+        .await
+        .expect("expected the request written");
+    link.push_line(json!({ "id": "1", "method": 5 }).to_string());
+    link.push_line(json!({ "method": "x", "id": {} }).to_string());
+    link.push_line("5");
+    link.push_line("{}");
+    link.push_line(notification("after"));
+
+    let answer = within("the reply", reply).await;
+    let handled = handler.wait_for_notifications(1).await;
+    sent(&link, 2).await;
+    let (written, queued, closed) = up_to_a_probe(&link, &client).await;
+    let observed = (
+        answer.ok(),
+        methods_seen(&handled),
+        written[1..].to_vec(),
+        queued,
+        closed,
+    );
+    let expected = (
+        Some(Value::Null),
+        vec!["after"],
+        vec![
+            json!({ "jsonrpc": "2.0", "id": {}, "result": "yes" }),
+            probe(),
+        ],
+        0,
+        false,
+    );
+    assert_eq!(
+        observed, expected,
+        "expected the call answered, the question put to the handler, and no invalid-request error: {expected:?} | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// A member of a batch that is answered as an invalid request is not something for the
+/// handler, though it has a method: it takes none of the handoff budget and none of the byte
+/// budget. A batch of two notifications and such a member fits a budget of two.
+#[tokio::test]
+async fn a_batch_member_answered_as_invalid_takes_none_of_the_handlers_budget() {
+    let link = ScriptedLink::new();
+    let handler = RecordingHandler::arc(None);
+    let client = Client::connect_with(
+        link.clone().into_link(),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        options().with_max_pending_notifications(2),
+        WireOptions::new()
+            .with_batch_decoding()
+            .with_invalid_request_replies(8),
+    );
+    let bytes = client.state.peer_bytes.available_permits();
+    link.push_line(
+        json!([
+            { "jsonrpc": "2.0", "method": "one" },
+            { "method": "x", "id": {} },
+            { "jsonrpc": "2.0", "method": "two" },
+        ])
+        .to_string(),
+    );
+
+    let handled = handler.wait_for_notifications(2).await;
+    sent(&link, 1).await;
+    until("the batch's bytes to be given back", || {
+        client.state.peer_bytes.available_permits() == bytes
+    })
+    .await;
+    let observed = (methods_seen(&handled), frames(&link), client.is_closed());
+    let expected = (
+        vec!["one", "two"],
+        vec![invalid_request(Value::Null)],
+        false,
+    );
+    assert_eq!(
+        observed, expected,
+        "expected both notifications handled within a budget of two, the third member answered, and the connection open: {expected:?} | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
 }
