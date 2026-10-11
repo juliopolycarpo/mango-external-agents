@@ -270,7 +270,7 @@ counts do not bound it either: one large message is a single event however much 
 parsed. How much a message expands depends on its shape and on the build. As a lower bound, a
 `serde_json::Value` is 32 bytes, or 72 bytes when any crate in the build enables
 `serde_json/preserve_order`; `mango-agent-acp` does, through the `agent-client-protocol-schema`
-crate, which enables it for its own types.
+crate, whose manifest enables it for the whole build.
 Object members, array capacity and allocator rounding come on top. In one measurement of a 1 MB
 message on x86_64 (release build, `serde_json` 1.0.151), a single string parsed to about 1 MB,
 while a 1 MB array of `0`, `[]` or `{}` elements held about 17 MB (32-byte values) or 38 MB

@@ -56,8 +56,8 @@ It is a library, not a daemon: no listener, no service, no telemetry, no login h
 - **TLS is `ring` everywhere.** `deny.toml` bans `aws-lc-rs` and `openssl`; `scripts/check-tls.sh`
   proves the tree is clean. ACP runs on the core JSON-RPC peer: `agent-client-protocol-schema`
   stays inside `mango-agent-acp`, pinned exactly, with every feature off, and `deny.toml` bans the
-  SDK itself (`agent-client-protocol`, `futures-concurrency`) and the executors it brought
-  (`async-io`, `async-process`, `blocking`).
+  SDK (`agent-client-protocol`), `futures-concurrency`, which only it needed, and the executors
+  it brought (`async-io`, `async-process`, `blocking`).
 - **Vendor fixtures are captured by `mea capture`, never hand-edited.** In a capture directory that
   carries a `manifest.json`, that rule is enforced: the manifest holds a SHA-256 digest per file
   beside it and `mea`'s test suite recomputes them, so an edited file there fails `scripts/check.sh`.

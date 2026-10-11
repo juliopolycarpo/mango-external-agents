@@ -31,6 +31,7 @@ down would mean sending v1 messages to an agent that answered something else.
 | Configuration | `session/set_config_option`; complete `configOptions` replies           | [session config options](https://agentclientprotocol.com/protocol/v1/session-config-options) |
 | Listing       | `session/list`, when `sessionCapabilities.list`                         | [session setup](https://agentclientprotocol.com/protocol/v1/session-setup)                   |
 | Close         | `session/close`, when `sessionCapabilities.close`                       | [session setup](https://agentclientprotocol.com/protocol/v1/session-setup)                   |
+| Give up       | `$/cancel_request`, for a request given up after its write began        | [cancellation](https://agentclientprotocol.com/protocol/v1/cancellation)                     |
 
 `authenticate` is **never sent**. See [Auth](#auth).
 
@@ -42,8 +43,8 @@ dependency: its connection, its process spawner and its stdio adapter are all th
 the core already own, and `deny.toml` bans the crate so it cannot come back through another one.
 Only its schema crate is used, pinned exactly, with `schemars` and `tracing` off.
 
-The core's `LineStream` and `ByteSink` frame the pipes under `Limits::line`, one JSON-RPC message
-per line each way, and `transport::frame` hands them back as a `Link`. The core's
+The core's `LineStream` and `ByteSink` frame the pipes, one JSON-RPC message per line each way
+and incoming lines under `Limits::line`, and `transport::frame` hands them back as a `Link`. The core's
 `jsonrpc::Client` speaks over that link and enforces every queue bound:
 
 | Bound                    | Limit                                                                    | Unit                                | Default           | Passing it               |
@@ -52,7 +53,7 @@ per line each way, and `transport::frame` hands them back as a `Link`. The core'
 | Queued incoming bytes    | `Limits::turn_buffer_bytes`                                              | serialized bytes                    | 8 MiB (8,388,608) | ends the connection      |
 | One outgoing frame       | `HostContext::outbound_buffer_bytes()` (defaults to `turn_buffer_bytes`) | serialized bytes, excluding newline | 8 MiB (8,388,608) | refuses that frame alone |
 | Queued outgoing bytes    | twice `HostContext::outbound_buffer_bytes()`                             | serialized bytes, excluding newline | 16 MiB            | ends the connection      |
-| Queued outgoing frames   | the incoming message limit + 3 x `max_pending_requests` + 4              | frames                              | 1,220             | ends the connection      |
+| Queued outgoing frames   | the incoming message limit + 2 x `max_pending_requests` + 3              | frames                              | 1,155             | ends the connection      |
 
 Incoming messages are counted individually: a batch is charged one message per member that is a
 notification or a request, and the whole batch is counted before any of it is handled, so a batch
@@ -68,8 +69,8 @@ request admission semaphore are clamped to what tokio can allocate rather than p
 value).
 
 The incoming budgets bound what waits for the handler, not how much an agent may write. The
-reader yields before each line, so on a current-thread runtime each line is handled before the
-next is counted, and a burst many times the budget costs nothing. On a multi-thread runtime the
+reader yields before each line, so on a current-thread runtime a line is normally handled
+before the next is counted, and a burst many times the budget costs nothing. On a multi-thread runtime the
 reader and the handler run at once: the budget has to absorb how far the reader gets ahead, and
 nothing makes the reader wait. The handler never waits on the host (see below), so in practice
 it keeps up; the default 1,024 messages is the margin.
@@ -88,20 +89,26 @@ Unset preserves existing default and custom `Limits::turn_buffer_bytes` behavior
 - **The queue may hold twice that**, counting the frame being written until its write returns.
   That is room for the largest frame and as much again behind it, so a prompt that fills the
   frame budget can still be followed by its `session/cancel`. A frame that would pass it, or the
-  frame count, means the agent has stopped reading: the connection ends.
+  frame count, ends the connection.
 
 The frame count is sized so that what this side queues by itself always fits. With `r` for
-`max_pending_requests` that is at most 3`r` + 4 frames at one moment: the prompt and the
-`$/cancel_request` that follows it when it is given up, the `r` requests beside it and theirs,
-the answers to `r` parked questions withdrawn at once by a cancel, and `session/cancel` with its
-one repeat. The incoming message limit is added on top for answers the agent asks for and this
-side gives on the spot (`-32601`, a question past the cap). Only those can fill the queue, so
-an outgoing overflow is always an agent that keeps asking and reads nothing, and it is reported
-as `acp-transport-overflow` even when the host had asked for the turn to stop: the session is
-gone, and that is why. A host's own `cancel` or `close` never overflows it.
+`max_pending_requests` that is at most 2`r` + 3 counted frames at one moment: the prompt, the
+`r` requests beside it, the answers to `r` parked questions withdrawn at once by a cancel, and
+`session/cancel` with its one repeat. `$/cancel_request` and `-32700` are queued beside the
+bounds and count for nothing. The incoming message limit is added on top for answers the agent
+asks for and this side gives on the spot (`-32601`, a question past the cap). Only those can
+fill the frame count, so a host's own `cancel` or `close` never passes it, and a frame-count
+overflow is always an agent that keeps asking and reads nothing.
+
+The byte bound has no such guarantee. It counts every frame whatever its source, so with
+`outbound_buffer_bytes` set smaller than what this side has to say at once (a cancel's withdrawn
+answers, say, behind an agent that is not reading) this side's own frames can pass it. Either
+overflow is reported as `acp-transport-overflow` even when the host had asked for the turn to
+stop: the session is gone, and that is why.
 
 So the outgoing ACP frames a host holds for one session are bounded by twice
-`outbound_buffer_bytes`, 16 MiB at the defaults, not by that number itself. String allocation
+`outbound_buffer_bytes`, 16 MiB at the defaults, not by that number itself, apart from the few
+small frames queued beside the bounds. String allocation
 capacity, parsed messages, attachments and host-supplied sinks are outside that accounting, so
 this is not a hard memory bound either.
 
@@ -162,8 +169,9 @@ One stretch on the notification call must run whole: a `session/update` whose ev
 refuses to publish fails the turn there, taking the turn's reducer and questions and then
 committing `acp-refused-event`. The peer cancels a notification call when the agent passes an
 inbound budget and when the connection is closed, so that stretch asks for
-`Client::hold_cancellation` first, and those ends wait for it, up to `shutdown_timeout`. Every
-other terminal is committed by the prompt's own task or by `close`, off the notification call.
+`Client::hold_cancellation` first, and those ends wait for it, up to `shutdown_timeout`. Apart
+from that and the stream's own overflow terminal, which `emit` commits where it is called, every
+terminal is committed off the notification call, by the prompt's own task or by `close`.
 
 Every request asks for its answer behind the notifications read before it
 (`RequestOptions::after_earlier_notifications`). A `session/prompt` answer reaches the prompt's
@@ -173,7 +181,8 @@ answer only after the replay.
 
 Every request except `session/prompt` is bounded by `Limits::request_timeout` and fails with
 `Error::Timeout` naming the method. The prompt is a turn and may take as long as the agent needs:
-it has no deadline and stands outside the request budget, in both directions. Timing out or
+its answer has no deadline and it stands outside the request budget, in both directions. Its
+frame, like every frame, must still be written within `request_timeout` of being queued. Timing out or
 abandoning a generic request seals request admission, tells the agent which request was given up
 (`$/cancel_request` naming its id) and starts owned connection cleanup. Returning the permit
 while keeping the connection open would allow an unresponsive agent to defeat the pending-request
@@ -183,8 +192,8 @@ What the peer writes that the agent did not ask for, all JSON-RPC 2.0:
 
 | Frame                            | When                                                              |
 | -------------------------------- | ----------------------------------------------------------------- |
-| `-32700`, `id: null`             | a line that is not JSON; the line is not quoted back              |
-| `$/cancel_request` (`requestId`) | a request this side gave up after it was written                  |
+| `-32700`, `id: null`             | a line that is not JSON, not quoted back; at most 8 wait at once  |
+| `$/cancel_request` (`requestId`) | a request this side gave up after its write began                 |
 | nothing                          | a line that is JSON and not a frame, an empty batch, a blank line |
 
 Request ids are decimal strings counting up from `"1"`. An id is the client's to choose and an
@@ -230,8 +239,9 @@ through `tool_call_update`, so a silent one is not a working one.
 
 An agent that answers `session/prompt` with a JSON-RPC error has refused the prompt: the turn
 ends with one `EventKind::Error` coded `acp-request-failed`, with `request_id` `session/prompt`,
-the agent's code as `vendor_code` and its message. The connection is ended after it, as after
-any prompt that did not complete.
+the agent's code as `vendor_code` and its message, or `-32603` for a result this client could
+not read. The connection is torn down before the event is written, as for any prompt that did
+not complete; a stop reason such as `refusal` or `max_tokens` is a result and does not end it.
 
 A turn ends as `Cancelled` in two cases. The agent answered its prompt with
 `stop_reason: cancelled`, which is believed and reported as `Requested` when no reason was
@@ -253,11 +263,13 @@ end the turn with `acp-link-closed` naming that write.
 A request the session refuses before queueing anything is marked `Dispatch::NotSubmitted`: one
 made after teardown began (`Error::Closed`), one past `max_pending_requests`
 (`expected at most N outstanding ACP requests, received N + 1`), one whose frame is too large,
-and one made on a connection that had already ended.
+and one made on a connection that had already ended. A prompt on an ended connection is the
+exception: it is accepted and its stream ends as the closed link.
 
 A request other than the prompt that was still waiting when the connection went away fails the
 same way, as `acp-link-closed` with `a transport that closed under <method>` and the stderr tail,
-whichever way the connection ended. It is never reported as the agent's own refusal.
+unless a queue budget ended the connection, when it fails with that `LimitExceeded`. It is never
+reported as the agent's own refusal.
 
 Steering is `Error::NotSupported` on every profile: ACP v1 has no surface for adding to a turn that is
 already running.
@@ -852,6 +864,7 @@ Nothing in ACP v1 bounds a stop, so every stage is bounded by the host's `Limits
 | Stage                       | Bound                                                 | On expiry                                                          |
 | --------------------------- | ----------------------------------------------------- | ------------------------------------------------------------------ |
 | Request other than a prompt | `request_timeout`, from when it is queued             | `Error::Timeout`; the connection is torn down                      |
+| Any frame's write           | `request_timeout`, from when it is queued             | the write fails and the connection ends                            |
 | Silent turn                 | `idle_timeout`, paused while a question waits         | `session/cancel`, then the cancel stages                           |
 | Parked question             | `approval_timeout`                                    | the refusing option is sent, or the turn is cancelled              |
 | Cancel honoured             | `kill_grace`, from the `session/cancel`               | the connection is torn down                                        |
@@ -869,7 +882,7 @@ The stages add up. With `rt` for `request_timeout`, `st` for `shutdown_timeout` 
 | `close`                             | `st` + `T` + `st`                  | 29 s            |
 | Cancel, to the turn's terminal      | `kg` + `T`                         | 21 s            |
 | Request timeout, to `Closed`        | `rt` + `T` + `st`                  | 144 s           |
-| Agent exit or overflow, to `Closed` | `st` + `T` + `st`                  | 29 s            |
+| Agent exit or overflow, to `Closed` | `st` + `st` + `T` + `st`           | 34 s            |
 | Dropped session mid-turn            | `T`                                | 19 s            |
 
 The teardown's terms are the connection's close and the process stop (a graceful interrupt and
@@ -877,7 +890,8 @@ its wait, then the kill and its wait). `close` adds the `session/close` handshak
 wait for a turn another task is still settling behind. `cancel` itself returns as soon as
 `session/cancel` is queued; the row is how long the turn can then take to end when the agent
 ignores it. An agent that exits is told to the handler after the peer has drained what it read,
-which the first `st` of that row bounds.
+which the first `st` of that row bounds; the second is for a stretch held under
+`hold_cancellation` at that moment, and is not spent otherwise.
 
 The peer bounds its own close at twice `shutdown_timeout`: once for the answers it still owes the
 agent and for a notification call that holds its cancellation off, once to write its queue and

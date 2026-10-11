@@ -1226,7 +1226,7 @@ async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotif
 /// What a `session/update` this client cannot read still does: the turn's host is told once.
 ///
 /// There is no request to answer, and one frame in a shape this build does not know is not the
-/// turn's end, so the frame itself is dropped, as the SDK this crate used to run on dropped it.
+/// turn's end, so the frame itself is dropped, as it always was.
 /// Dropped silently, it left a host with an empty turn and nothing to say why, so the first one
 /// in a turn is announced as a warning notice, in this crate's own words and with nothing of
 /// the frame in it. Later ones in the same turn say nothing more.

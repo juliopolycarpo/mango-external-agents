@@ -159,13 +159,16 @@ pub struct Limits {
     /// Interaction events have a count reserve of their own, twice [`Self::max_pending_requests`].
     ///
     /// ACP also uses it, or [`Self::max_pending_requests`] when larger, as the message cap of its
-    /// connection: at most that many JSON-RPC messages (batch members counted individually)
-    /// queue per direction. Messages and turn events are related but not one to one;
+    /// connection: at most that many notifications and requests from the agent (batch members
+    /// counted individually) wait for the handler, and the outgoing frame count is that plus
+    /// twice [`Self::max_pending_requests`] plus 3. Messages and turn events are related but
+    /// not one to one;
     /// [`Self::turn_buffer_bytes`] bounds incoming queued bytes and defaults the outgoing
     /// budget. A host can set the latter independently with [`HostContextBuilder::outbound_buffer_bytes`].
     /// That outgoing budget bounds one ACP frame; the frames queued for an agent, the one being
     /// written included, may hold twice it, so a host's memory bound for outgoing ACP frames is
-    /// twice that number.
+    /// twice that number, apart from the few small frames the connection queues beside its
+    /// bounds (`$/cancel_request`, `-32700`).
     pub turn_channel_capacity: usize,
     /// Maximum serialized bytes queued per turn, excluding its reserved terminal.
     ///
