@@ -152,7 +152,10 @@ impl WireOptions {
     /// Passing it ends the connection the way
     /// [`with_max_outbound_queued_bytes`](Self::with_max_outbound_queued_bytes) describes. A
     /// bound of zero is not passed by anything the peer did: it refuses every queued frame
-    /// alone, and leaves the connection to callers that wait for their own writes. The frames
+    /// alone, and leaves the connection to callers that wait for their own writes. Not so
+    /// with [`with_request_handoff`](Self::with_request_handoff), whose answers are queued
+    /// frames: a queue that takes none cannot answer the peer's first question, and the
+    /// connection ends there. The frames
     /// [`with_parse_error_replies`](Self::with_parse_error_replies) and
     /// [`with_cancel_on_abandon`](Self::with_cancel_on_abandon) send are not held to this
     /// bound, whatever it is.

@@ -3591,7 +3591,9 @@ impl ClientState {
         };
         // Refused for its size, or by a queue that takes nothing: the question cannot be
         // answered in any form, and the peer is not left waiting on a connection that looks
-        // well. A full queue has already ended it, and a closed one has nobody to tell.
+        // well. A full queue is refused in the same shape and has already ended the
+        // connection with its own cause, which the pump reports ahead of this one. A closed
+        // connection is not told anything.
         if matches!(error.cause(), Error::LimitExceeded { .. }) {
             self.signal_write_failure(&error);
         }
