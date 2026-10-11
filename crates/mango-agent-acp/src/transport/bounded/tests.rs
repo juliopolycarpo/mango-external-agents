@@ -37,7 +37,7 @@ impl<R: Role> ConnectTo<R> for FinishedPeer {
     async fn connect_to(
         self,
         _transport: impl ConnectTo<R::Counterpart>,
-    ) -> agent_client_protocol::Result<()> {
+    ) -> agent_client_protocol_schema::v1::Result<()> {
         Ok(())
     }
 }
@@ -67,8 +67,8 @@ async fn a_finished_direct_peer_does_not_wait_for_physical_input_eof() {
 /// the SDK's teardown, so the driver stays the opaque kind.
 #[tokio::test(start_paused = true)]
 async fn a_finished_sdk_connection_does_not_wait_for_a_stalled_writer() {
-    use agent_client_protocol::schema::v1::CancelNotification;
     use agent_client_protocol::{Agent, Client, ConnectionTo};
+    use agent_client_protocol_schema::v1::CancelNotification;
 
     let sink = GatedSink::default();
     let transport = BoundedTransport::new(

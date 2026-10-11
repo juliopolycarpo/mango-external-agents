@@ -21,8 +21,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol_schema::ProtocolVersion;
+use agent_client_protocol_schema::v1::{
     AgentCapabilities, BooleanConfigOptionCapabilities, ClientCapabilities,
     ClientSessionCapabilities, CompactionCapabilities, EnvVariable, FileSystemCapabilities,
     HttpHeader, Implementation, InitializeRequest, LoadSessionRequest, McpServer as AcpMcpServer,
@@ -801,7 +801,7 @@ struct Opened {
     resumed: bool,
     fallback_reason: Option<String>,
     modes: Option<SessionModeState>,
-    config_options: Option<Vec<agent_client_protocol::schema::v1::SessionConfigOption>>,
+    config_options: Option<Vec<agent_client_protocol_schema::v1::SessionConfigOption>>,
     catalog_revision: u64,
 }
 

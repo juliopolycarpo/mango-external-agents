@@ -1,4 +1,4 @@
-use agent_client_protocol::schema::v1::SessionUpdate;
+use agent_client_protocol_schema::v1::SessionUpdate;
 use serde_json::json;
 
 use super::super::Reducer;

@@ -99,7 +99,7 @@ impl Overflow {
     /// Recorded here, before the error returns and the incoming sender drops, so a request the
     /// SDK fails on another worker already finds the budget. For example,
     /// `return Err(overflow.fail(&slot, message))`.
-    fn fail(self, slot: &OverflowSlot, message: String) -> agent_client_protocol::Error {
+    fn fail(self, slot: &OverflowSlot, message: String) -> agent_client_protocol_schema::v1::Error {
         let _ = slot.set(self);
         failure(message)
     }
@@ -133,7 +133,7 @@ impl BoundedTransport {
         self,
     ) -> (
         Channel,
-        BoxFuture<'static, agent_client_protocol::Result<()>>,
+        BoxFuture<'static, agent_client_protocol_schema::v1::Result<()>>,
     ) {
         let (transport, client) = Channel::duplex();
         let Self {
@@ -168,7 +168,7 @@ impl<R: Role> ConnectTo<R> for BoundedTransport {
     async fn connect_to(
         mut self,
         client: impl ConnectTo<R::Counterpart>,
-    ) -> agent_client_protocol::Result<()> {
+    ) -> agent_client_protocol_schema::v1::Result<()> {
         let stop_input = mango_external_agents::CancelToken::new();
         let input_stopped = stop_input.clone();
         self.incoming = Box::pin(self.incoming.take_until(async move {
@@ -211,7 +211,7 @@ async fn read_frames(
     target: futures::channel::mpsc::UnboundedSender<TransportFrame>,
     limits: Limits,
     slot: &OverflowSlot,
-) -> agent_client_protocol::Result<()> {
+) -> agent_client_protocol_schema::v1::Result<()> {
     let mut charges: VecDeque<(usize, usize)> = VecDeque::new();
     let mut bytes = 0_usize;
     let mut messages = 0_usize;
@@ -272,7 +272,7 @@ async fn queue_output(
     budget: Arc<Semaphore>,
     byte_limit: usize,
     slot: &OverflowSlot,
-) -> agent_client_protocol::Result<()> {
+) -> agent_client_protocol_schema::v1::Result<()> {
     while let Some(frame) = frames.next().await {
         let line = frame.to_json()?;
         if line.len() > byte_limit {
@@ -324,7 +324,7 @@ async fn queue_output(
 async fn write_frames(
     mut output: OutgoingLines,
     mut pending: mpsc::Receiver<PendingFrame>,
-) -> agent_client_protocol::Result<()> {
+) -> agent_client_protocol_schema::v1::Result<()> {
     while let Some(frame) = pending.recv().await {
         output
             .send(frame.line)
@@ -371,8 +371,8 @@ fn outgoing_capacity(limits: &Limits) -> usize {
     frame_limit(limits).min(Semaphore::MAX_PERMITS)
 }
 
-fn failure(message: impl Into<String>) -> agent_client_protocol::Error {
-    let mut error = agent_client_protocol::Error::internal_error();
+fn failure(message: impl Into<String>) -> agent_client_protocol_schema::v1::Error {
+    let mut error = agent_client_protocol_schema::v1::Error::internal_error();
     error.message = message.into();
     error
 }

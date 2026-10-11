@@ -9,8 +9,8 @@
 
 use std::io;
 
-use agent_client_protocol::schema::v1::{ContentBlock, PromptRequest, RequestId, SessionId};
 use agent_client_protocol::{JsonRpcMessage, RawJsonRpcMessage, TransportFrame};
+use agent_client_protocol_schema::v1::{ContentBlock, PromptRequest, RequestId, SessionId};
 use mango_external_agents::{Error, Result};
 
 use crate::transport::{Overflow, outgoing_frame_limit};
@@ -91,7 +91,7 @@ pub(crate) fn prompt_frame_bytes(session_id: &SessionId, prompt: &[ContentBlock]
     Ok(envelope - "[]".len() + counter.bytes)
 }
 
-fn unserialisable(error: agent_client_protocol::Error) -> Error {
+fn unserialisable(error: agent_client_protocol_schema::v1::Error) -> Error {
     Error::Protocol {
         expected: String::from("a serialisable session/prompt request"),
         received: format!("{error}"),
@@ -117,7 +117,7 @@ impl io::Write for ByteCounter {
 
 #[cfg(test)]
 mod tests {
-    use agent_client_protocol::schema::v1::{
+    use agent_client_protocol_schema::v1::{
         BlobResourceContents, EmbeddedResource, EmbeddedResourceResource, ImageContent,
         TextContent, TextResourceContents,
     };

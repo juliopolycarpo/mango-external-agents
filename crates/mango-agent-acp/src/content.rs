@@ -11,7 +11,7 @@
 //! The library never reads a file: the bytes arrive on
 //! [`Attachment`] from the host, which owns the filesystem.
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol_schema::v1::{
     BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource, ImageContent,
     PromptCapabilities, TextContent, TextResourceContents,
 };
@@ -139,7 +139,7 @@ fn encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::prompt;
-    use agent_client_protocol::schema::v1::{
+    use agent_client_protocol_schema::v1::{
         ContentBlock, EmbeddedResourceResource, PromptCapabilities,
     };
     use mango_external_agents::session::TURN_MAX_ATTACHMENTS;

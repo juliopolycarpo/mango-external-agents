@@ -13,7 +13,7 @@
 //!
 //! ACP v1 reference: <https://agentclientprotocol.com/protocol/v1/initialization>
 
-use agent_client_protocol::schema::v1::ErrorCode as AcpErrorCode;
+use agent_client_protocol_schema::v1::ErrorCode as AcpErrorCode;
 use mango_external_agents::error::jsonrpc_code_is_retryable;
 use mango_external_agents::{Error, ErrorCode, VendorError};
 
@@ -22,7 +22,7 @@ use mango_external_agents::{Error, ErrorCode, VendorError};
 /// # Example
 ///
 /// ```
-/// use agent_client_protocol::schema::v1::Error as AcpError;
+/// use agent_client_protocol_schema::v1::Error as AcpError;
 /// use mango_agent_acp::error::vendor_error;
 ///
 /// let failure = vendor_error("session/prompt", &AcpError::internal_error());
@@ -31,7 +31,7 @@ use mango_external_agents::{Error, ErrorCode, VendorError};
 /// assert!(!failure.retryable, "the reserved range is this client's own mistake");
 /// ```
 #[must_use]
-pub fn vendor_error(method: &str, error: &agent_client_protocol::Error) -> VendorError {
+pub fn vendor_error(method: &str, error: &agent_client_protocol_schema::v1::Error) -> VendorError {
     let code = i32::from(error.code);
     VendorError::new(ErrorCode::from_static("acp-request-failed"), message(error))
         .with_request_id(method)
@@ -48,7 +48,7 @@ pub fn vendor_error(method: &str, error: &agent_client_protocol::Error) -> Vendo
 /// # Example
 ///
 /// ```
-/// use agent_client_protocol::schema::v1::Error as AcpError;
+/// use agent_client_protocol_schema::v1::Error as AcpError;
 /// use mango_agent_acp::error::request_error;
 /// use mango_external_agents::Error;
 ///
@@ -58,7 +58,7 @@ pub fn vendor_error(method: &str, error: &agent_client_protocol::Error) -> Vendo
 #[must_use]
 pub fn request_error(
     method: &str,
-    error: &agent_client_protocol::Error,
+    error: &agent_client_protocol_schema::v1::Error,
     login_hint: &str,
 ) -> Error {
     if error.code == AcpErrorCode::AuthRequired {
@@ -78,7 +78,7 @@ pub fn request_error(
 /// An explicit `"data": null` says nothing, so it reads as no data. SDK 3.x keeps that null as
 /// `Some(Null)` where 2.x dropped it while parsing; without this arm the message would grow a
 /// `(null)` suffix.
-fn message(error: &agent_client_protocol::Error) -> String {
+fn message(error: &agent_client_protocol_schema::v1::Error) -> String {
     match &error.data {
         Some(data) if !data.is_null() => format!("{} ({data})", error.message),
         _ => error.message.clone(),
@@ -88,7 +88,7 @@ fn message(error: &agent_client_protocol::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::{request_error, vendor_error};
-    use agent_client_protocol::schema::v1::Error as AcpError;
+    use agent_client_protocol_schema::v1::Error as AcpError;
     use mango_external_agents::Error;
 
     /// The reserved range says this client sent something wrong, so an identical retry fails
