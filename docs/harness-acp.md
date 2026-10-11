@@ -925,25 +925,62 @@ Nothing in ACP v1 bounds a stop, so every stage is bounded by the host's `Limits
 | Process stop                | `kill_grace` twice, then `shutdown_timeout` twice     | `Error::CleanupRequired` carrying the host's process control       |
 | Turn another task settles   | `shutdown_timeout`                                    | `Error::Timeout` naming the turn slot; the session stays `Closing` |
 
-The stages add up. With `rt` for `request_timeout`, `st` for `shutdown_timeout` and `kg` for
-`kill_grace`, the worst cases are:
+The stages add up. `mango_agent_acp::deadlines::Deadlines::from_limits(host.limits())` gives each
+sum below as a `Duration`, computed from the same `Limits` the harness enforces, so a host reads
+the bound instead of re-deriving it. With `rt` for `request_timeout`, `st` for `shutdown_timeout`
+and `kg` for `kill_grace`, the worst cases are:
 
-| Path                                | Worst case                         | At the defaults |
-| ----------------------------------- | ---------------------------------- | --------------- |
-| Teardown `T`                        | `st` + (`kg` + `kg` + `st` + `st`) | 19 s            |
-| `close`                             | `st` + `T` + `st`                  | 29 s            |
-| Cancel, to the turn's terminal      | `kg` + `T`                         | 21 s            |
-| Request timeout, to `Closed`        | `rt` + `T` + `st`                  | 144 s           |
-| Agent exit or overflow, to `Closed` | `st` + `st` + `T` + `st`           | 34 s            |
-| Dropped session mid-turn            | `T`                                | 19 s            |
+| Path, and what it is measured from                           | Worst case                | At the defaults | API                                               |
+| ------------------------------------------------------------ | ------------------------- | --------------- | ------------------------------------------------- |
+| Process stop, from its start                                 | `kg` + `kg` + `st` + `st` | 14 s            | `Deadlines::process_stop`                         |
+| Teardown `T`, from its start                                 | `st` + process stop       | 19 s            | `Deadlines::teardown`                             |
+| `close`, from the call to `close`                            | `st` + `T` + `st`         | 29 s            | `Deadlines::close`, `Deadlines::close_worst_case` |
+| Cancel, from the queued `session/cancel` to the terminal     | `kg` + `T`                | 21 s            | `Deadlines::cancel_to_terminal`                   |
+| Request timeout, from when it is queued to `Closed`          | `rt` + `T` + `st`         | 144 s           | `Deadlines::request_timeout_to_closed`            |
+| Agent exit or overflow, from that event to `Closed`          | `st` + `st` + `T` + `st`  | 34 s            | `Deadlines::exit_to_closed`                       |
+| Dropped session mid-turn, from the drop to the turn terminal | `T`                       | 19 s            | `Deadlines::dropped_session_mid_turn`             |
 
 The teardown's terms are the connection's close and the process stop (a graceful interrupt and
-its wait, then the kill and its wait). `close` adds the `session/close` handshake in front and the
-wait for a turn another task is still settling behind. `cancel` itself returns as soon as
-`session/cancel` is queued; the row is how long the turn can then take to end when the agent
-ignores it. An agent that exits is told to the handler after the peer has drained what it read,
-which the first `st` of that row bounds; the second is for a stretch held under
-`hold_cancellation` at that moment, and is not spent otherwise.
+its wait, then the kill and its wait). The process stop is the figure that holds for any
+launcher; the built-in launcher finishes sooner, a host's own `ProcessControl` may use all of it.
+`close` adds the `session/close` handshake in front and the wait for a turn another task is still
+settling behind. `cancel` itself returns as soon as `session/cancel` is queued; the row is how
+long the turn can then take to end when the agent ignores it. An agent that exits is told to the
+handler after the peer has drained what it read, which the first `st` of that row bounds; the
+second is for a stretch held under `hold_cancellation` at that moment, and is not spent
+otherwise. The dropped-session row ends at the held stream's terminal; the session's `Closed`
+follows within one more `st`.
+
+`close` and an agent's exit are measured from different events, which is why one figure is 29 s
+and the other 34 s. Measured from the call to `close`, the bound is 29 s whichever path the close
+joins: `close` begins the teardown itself after at most one `st` for `session/close`, and it never
+waits for the exit to be noticed. A close that joins a teardown the watcher, a given-up request
+or an earlier close began ends sooner, never later, and so does a second call to `close`.
+Measured from the agent's exit, with nobody calling `close`, the handler can be told up to two
+`st` late, and the teardown and the turn wait follow: 34 s. A close called at that exit does not
+wait for the 34 s. A host that puts a timeout around `close` should use
+`Deadlines::close_worst_case` (the same figure as `Deadlines::close`); a host that waits for
+`Closed` after an exit with no `close` should allow `Deadlines::exit_to_closed`. The wait for a
+turn that ends `close`, `request_timeout_to_closed` and `exit_to_closed` runs only after a cleanup
+that succeeded: a stage that runs out its bound fails the cleanup, the close returns that failure
+after `st` + `T` and the session stays `Closing`, so the figures are upper bounds that stages
+finishing just inside their limits approach. They leave out time the host itself spends, such as a stream consumer that stops
+reading: the harness never waits for one.
+
+The figures are asserted on a paused clock, with the limits set to 3 s, 7 s and 101 s so that no
+term can stand in for another. `crates/mango-agent-acp/src/deadlines/tests.rs` holds every
+default to this table, the formulas to distinct limits and `Duration::MAX` to saturation.
+`crates/mango-agent-acp/tests/session/deadlines.rs` drives the stages against the real session,
+with the agent's input blocked and its child ignoring the interrupt and slow to be killed and
+reaped: the process stop (against the core function the reaper calls), the teardown and the
+dropped-session row (to the turn's terminal), `cancel_to_terminal`, `close` and
+`request_timeout_to_closed` (each all but its last `st`), and a close that joins the watcher's
+teardown or meets the agent's exit part-way. `crates/mango-agent-acp/src/client/commit_hold_tests.rs`
+drives the exit: the handler told after exactly two `st`, and the teardown after it. The last `st`
+of `close`, `request_timeout_to_closed` and `exit_to_closed` is driven only on its own, to its
+bound, in `src/deadlines/tests.rs`: the prompt task frees the slot right after the cleanup it
+joined, so no fake holds it there. The exit row is therefore driven in two parts, not as one run
+to `Closed`, and the watcher's own settle wait is not driven at all.
 
 The peer bounds its own close at twice `shutdown_timeout`: once for the answers it still owes the
 agent and for a notification call that holds its cancellation off, once to write its queue and
