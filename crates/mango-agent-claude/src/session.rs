@@ -551,9 +551,14 @@ async fn run_close_teardown(
     };
     let result = match native {
         Ok(()) => {
-            let result = crate::mcp::remove_on_close(mcp_config.take()).await;
+            let result = crate::mcp::remove_on_close(
+                mcp_config.take(),
+                shared.host.limits().shutdown_timeout,
+            )
+            .await;
             // Close is terminal after native cleanup, even when the host's scratch mount refuses
-            // the final unlink. The typed error still tells the caller which resource remained.
+            // the final unlink or never answers it. The typed error still tells the caller which
+            // resource remained, and the wait for it is one more shutdown stage.
             shared.core_state.set_status(SessionStatus::Closed);
             result
         }
@@ -1955,8 +1960,9 @@ fn no_result_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveTurn, Mutable, StopClaim, TurnEnd, claim_stop, install_teardown_locked,
-        no_result_error, prompt_line, record_stop_locked, request_stop, settle_owner_locked,
+        ActiveTurn, ClaudeSession, Mutable, StopClaim, TurnEnd, claim_stop,
+        install_teardown_locked, no_result_error, prompt_line, record_stop_locked, request_stop,
+        settle_owner_locked,
     };
     use mango_external_agents::{CancelReason, CancelToken, ExitStatus};
     use std::sync::Arc;
@@ -2156,6 +2162,145 @@ mod tests {
             );
         });
 
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A host scratch mount that takes the removal and never answers it.
+    struct StalledRemover {
+        arrived: Arc<tokio::sync::Notify>,
+        released: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl crate::mcp::DirectoryRemover for StalledRemover {
+        fn remove(&self, directory: &std::path::Path) -> std::io::Result<()> {
+            self.arrived.notify_one();
+            let _ = self
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv();
+            std::fs::remove_dir_all(directory)
+        }
+    }
+
+    /// A session opened over a launcher that is never asked for a child.
+    fn session_holding(
+        config: crate::mcp::ConfigFile,
+        limits: mango_external_agents::Limits,
+    ) -> ClaudeSession {
+        use mango_external_agents::testing::{FakeLauncher, FrozenClock};
+        use mango_external_agents::{
+            EnvSource, ExecutablePath, HarnessIdentity, HostContext, SessionId, SessionIds,
+            SessionSnapshot, SessionState, TransportKind, TransportSelection,
+        };
+
+        let host = HostContext::builder()
+            .launcher(Arc::new(FakeLauncher::new()))
+            .cwd(std::env::temp_dir())
+            .scratch(std::env::temp_dir())
+            .environment(EnvSource::from_pairs([("PATH", "/usr/bin")]))
+            .client_info("mea-tests", "0.0.0")
+            .clock(Arc::new(FrozenClock::default()))
+            .limits(limits)
+            .build()
+            .expect("expected a host");
+        let snapshot = SessionSnapshot::opening(
+            SessionIds {
+                session_id: SessionId::new("chat-1"),
+                native_session_id: String::from("00000000-0000-4000-8000-000000000000"),
+            },
+            HarnessIdentity::claude(),
+            TransportSelection::new(None, TransportKind::Stdio),
+            host.now(),
+        );
+        let state = SessionState::new(Arc::clone(host.clock()), snapshot);
+        ClaudeSession::new(
+            host,
+            ExecutablePath::default(),
+            state,
+            crate::permissions::ModeAvailability::default(),
+            None,
+            false,
+            Some(config),
+        )
+    }
+
+    /// Lets every task that is ready run, and says whether `task` finished without the clock
+    /// moving. A bounded number of passes rather than a wait: a close that is still parked on the
+    /// blocking pool has nothing left to run, and under a paused clock nothing would wake it.
+    async fn finished_without_time<T>(task: &tokio::task::JoinHandle<T>) -> bool {
+        for _ in 0..64 {
+            if task.is_finished() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        task.is_finished()
+    }
+
+    /// A removal the host's filesystem never answers is one stage of a close, so it gets a
+    /// shutdown stage's bound. `spawn_blocking` cannot be cancelled, so the close stops waiting
+    /// and says the artifact may still be there; before the bound existed it never returned.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_stops_waiting_for_a_stalled_artifact_removal_at_the_shutdown_timeout() {
+        use mango_external_agents::{CloseReason, Error, Limits, Session, SessionStatus};
+
+        let scratch =
+            std::env::temp_dir().join(format!("mea-stalled-close-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&scratch).expect("expected a scratch root");
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let file = crate::mcp::ConfigFile::write(&servers(), &scratch)
+            .await
+            .expect("expected a written artifact")
+            .expect("expected servers to produce one")
+            .with_remover(StalledRemover {
+                arrived: Arc::clone(&arrived),
+                released: std::sync::Mutex::new(released),
+            });
+        let limits = Limits::default();
+        let session = Arc::new(session_holding(file, limits));
+
+        let closing = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move { session.close(CloseReason::Requested).await }
+        });
+        arrived.notified().await;
+        assert!(
+            !finished_without_time(&closing).await,
+            "expected the close to wait for the removal inside its bound | received a close that returned at once"
+        );
+        tokio::time::advance(limits.shutdown_timeout).await;
+        assert!(
+            finished_without_time(&closing).await,
+            "expected the close to return once shutdown_timeout ({:?}) had passed | received a close still waiting on the removal",
+            limits.shutdown_timeout
+        );
+
+        let error = closing
+            .await
+            .expect("expected the close task to finish")
+            .expect_err("expected the close to report the removal it stopped waiting for");
+        assert!(
+            matches!(
+                error.cause(),
+                Error::Timeout { operation, after }
+                    if operation == crate::mcp::REMOVAL_OPERATION && *after == limits.shutdown_timeout
+            ),
+            "expected Error::Timeout {{ operation: \"MCP configuration removal\", after: {:?} }} | received {error:?}",
+            limits.shutdown_timeout
+        );
+        assert_eq!(
+            session.snapshot().status,
+            SessionStatus::Closed,
+            "expected a session whose native cleanup finished to be Closed | received {:?}",
+            session.snapshot().status
+        );
+
+        // The removal is the host's blocking call and still owns the directory; let it finish so
+        // the runtime's blocking pool can shut down.
+        drop(release);
+        drop(session);
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
