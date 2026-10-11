@@ -158,7 +158,8 @@ impl WireOptions {
     /// with [`with_request_handoff`](Self::with_request_handoff), whose answers are queued
     /// frames: a queue that takes none cannot answer the peer's first question, and the
     /// connection ends there. The frames
-    /// [`with_parse_error_replies`](Self::with_parse_error_replies) and
+    /// [`with_parse_error_replies`](Self::with_parse_error_replies),
+    /// [`with_invalid_request_replies`](Self::with_invalid_request_replies) and
     /// [`with_cancel_on_abandon`](Self::with_cancel_on_abandon) send are not held to this
     /// bound, whatever it is.
     ///
