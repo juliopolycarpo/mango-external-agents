@@ -523,6 +523,11 @@ async fn a_write_made_on_an_idle_link_follows_an_invalid_request_reply_still_que
 
 /// A bound of nothing answers nothing, and a batch with more members to answer than the bound
 /// allows gets as many answers as the bound and no more.
+///
+/// This holds on a current-thread runtime whichever way the bound is counted: the replies are
+/// not written while the batch is read, so the number still waiting stops the batch as well as
+/// the count kept for it does. The test that shows the count kept for the batch is what stops
+/// it is `the_bound_on_one_batch_does_not_start_again_as_its_replies_are_written`.
 #[tokio::test]
 async fn the_bound_holds_at_nothing_and_inside_one_batch() {
     for bound in [0, 2] {
@@ -550,6 +555,12 @@ async fn the_bound_holds_at_nothing_and_inside_one_batch() {
 /// threads, with a peer that reads at once, the writer takes each answer as it is queued, so
 /// the count of what still waits never reaches the bound; the batch is answered for as many
 /// members as the bound all the same, round after round, and not for the hundreds it holds.
+///
+/// A stress companion of the test that proves it: whether the writer takes an answer before
+/// the next member is read is a matter of scheduling, so a run of this test does not by itself
+/// show that the count kept for the batch is what holds the bound. That is shown by
+/// `the_bound_on_one_batch_does_not_start_again_as_its_replies_are_written`, which lets every
+/// waiting reply go at the moment it is queued.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_batch_is_answered_for_no_more_members_than_the_bound_however_fast_it_is_written() {
     const ROUNDS: usize = 40;
@@ -630,7 +641,14 @@ async fn a_batch_refused_whole_is_not_answered_for_its_invalid_members() {
     link.push_line(Value::Array(members).to_string());
 
     let termination = one_termination(&handler).await;
-    let observed = (&termination, link.sent().len(), client.state.outbox.aside());
+    // The list the bound is kept on is read as well as the wire: a reply queued ahead of the
+    // refusal would sit in it whether or not the writer had got to it before the end.
+    let observed = (
+        &termination,
+        link.sent().len(),
+        client.state.outbox.aside(),
+        client.state.invalid_request_replies.held(),
+    );
     assert!(
         matches!(
             &observed,
@@ -641,10 +659,11 @@ async fn a_batch_refused_whole_is_not_answered_for_its_invalid_members() {
                     ..
                 },
                 0,
+                0,
                 0
             )
         ),
-        "expected the batch refused for its three notifications, with nothing written or queued for its other members: (NotificationBackpressure {{ limit: 2, received: 3 }}, 0, 0) | received {observed:?}"
+        "expected the batch refused for its three notifications, with nothing written, queued or kept for its other members: (NotificationBackpressure {{ limit: 2, received: 3 }}, 0, 0, 0) | received {observed:?}"
     );
     let _ = client.close().await;
 }
@@ -958,6 +977,108 @@ async fn a_method_that_is_a_string_decides_even_beside_a_result() {
     assert_eq!(
         observed, expected,
         "expected the question answered by the handler and the notification handled, with no invalid-request error: {expected:?} | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// An object with an id and nothing else that says what it is, such as `{"id":"1","extra":true}`,
+/// is the response to the call that id names, with no result, whether or not the client was
+/// asked to answer invalid requests: it is not an invalid request, and is not diverted.
+/// A pin of what a client always did.
+#[tokio::test]
+async fn an_object_with_an_id_and_nothing_else_is_a_response_whether_or_not_replies_are_asked_for()
+{
+    for wire in [
+        WireOptions::new(),
+        WireOptions::new().with_invalid_request_replies(8),
+    ] {
+        let asked = wire.invalid_request_replies();
+        let (link, _handler, client) = connect(wire);
+        let (written, reply) = client
+            .submit_request("ask", json!({}), RequestOptions::new())
+            .expect("expected the request queued")
+            .into_parts();
+        within("the request written", written)
+            .await
+            .expect("expected the request written");
+        link.push_line(json!({ "id": "1", "extra": true }).to_string());
+
+        let answer = within("the reply", reply).await;
+        let observed = (answer.ok(), link.sent().len(), client.state.outbox.aside());
+        assert_eq!(
+            observed,
+            (Some(Value::Null), 1, 0),
+            "expected the call answered with no result and nothing written for it (invalid-request replies asked for: {asked:?}): (Some(Null), 1, 0) | received {observed:?}"
+        );
+        client.close().await.expect("expected a clean close");
+    }
+}
+
+/// An object with a method that is a string is put to the handler even beside a `result`,
+/// when the client was not asked to answer invalid requests as well as when it was. A pin of
+/// what a client always did; the other half of it is
+/// `a_method_that_is_a_string_decides_even_beside_a_result`.
+#[tokio::test]
+async fn a_method_that_is_a_string_decides_beside_a_result_without_the_option_too() {
+    let (link, handler, client) = connect(WireOptions::new());
+    link.push_line(json!({ "id": 1, "method": "asked", "result": 1 }).to_string());
+    link.push_line(json!({ "method": "told", "error": {} }).to_string());
+
+    let handled = handler.wait_for_notifications(1).await;
+    sent(&link, 1).await;
+    let observed = (methods_seen(&handled), up_to_a_probe(&link, &client).await);
+    let expected = (
+        vec!["told"],
+        (
+            vec![
+                json!({ "jsonrpc": "2.0", "id": 1, "result": "yes" }),
+                probe(),
+            ],
+            0,
+            false,
+        ),
+    );
+    assert_eq!(
+        observed, expected,
+        "expected the question answered by the handler and the notification handled, with no invalid-request error: {expected:?} | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// A line that is not JSON is answered by the parse-error reply, and by that alone. A client
+/// asked to answer invalid requests but not parse errors drops it, and goes on reading.
+#[tokio::test]
+async fn a_line_that_is_not_json_is_dropped_when_only_invalid_requests_are_answered() {
+    let (link, handler, client) = connect(WireOptions::new().with_invalid_request_replies(8));
+    link.push_line("{oops");
+    link.push_line(notification("after"));
+
+    let handled = handler.wait_for_notifications(1).await;
+    let observed = (methods_seen(&handled), up_to_a_probe(&link, &client).await);
+    let expected = (vec!["after"], (vec![probe()], 0, false));
+    assert_eq!(
+        observed, expected,
+        "expected the line dropped, with no reply of either kind and the next frame handled: {expected:?} | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// An empty array is dropped by a client that reads no batches and was not asked to answer
+/// invalid requests, and so is an array holding one. A pin of what a client always did; the
+/// non-empty array is pinned in `wire_options_tests`.
+#[tokio::test]
+async fn an_empty_array_is_dropped_by_a_client_that_reads_no_batches_and_answers_nothing() {
+    let (link, handler, client) = connect(WireOptions::new());
+    link.push_line("[]");
+    link.push_line("[[]]");
+    link.push_line(notification("after"));
+
+    let handled = handler.wait_for_notifications(1).await;
+    let observed = (methods_seen(&handled), up_to_a_probe(&link, &client).await);
+    let expected = (vec!["after"], (vec![probe()], 0, false));
+    assert_eq!(
+        observed, expected,
+        "expected both arrays dropped, nothing written and the next frame handled: {expected:?} | received {observed:?}"
     );
     client.close().await.expect("expected a clean close");
 }
