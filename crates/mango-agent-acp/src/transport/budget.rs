@@ -10,9 +10,6 @@ use agent_client_protocol_schema::v1::PROTOCOL_LEVEL_METHOD_NAMES;
 use mango_external_agents::Limits;
 use mango_external_agents::jsonrpc::{ClientOptions, PeerTermination, WireOptions};
 
-/// What the peer's refusal of one oversized outgoing frame counts, as its error names it.
-const REFUSED_FRAME_SUBJECT: &str = "bytes of one outgoing JSON-RPC frame";
-
 /// How many `-32700` replies may wait to be written at once.
 ///
 /// One reply answers one line that was not JSON. An agent that prints a burst of them while it is
@@ -79,12 +76,16 @@ impl Overflow {
     /// `LimitExceeded { subject: "bytes of one outgoing JSON-RPC frame", limit: 8, received: 9 }`,
     /// which is `Overflow::outgoing_frame(8, 9)` here.
     pub(crate) fn from_refused_frame(error: &mango_external_agents::Error) -> Option<Self> {
-        match error.cause() {
-            mango_external_agents::Error::LimitExceeded {
-                subject: REFUSED_FRAME_SUBJECT,
-                limit,
-                received,
-            } => Some(Self::outgoing_frame(*limit, *received)),
+        let mango_external_agents::Error::LimitExceeded {
+            subject,
+            limit,
+            received,
+        } = error.cause()
+        else {
+            return None;
+        };
+        match outgoing_budget(subject)? {
+            Budget::OutgoingFrameBytes => Some(Self::outgoing_frame(*limit, *received)),
             _ => None,
         }
     }
@@ -107,7 +108,7 @@ impl Overflow {
                 limit,
                 received,
                 ..
-            } => (outgoing_budget(subject), *limit, *received),
+            } => (outgoing_budget(subject)?, *limit, *received),
             _ => return None,
         };
         Some(Self {
@@ -130,16 +131,22 @@ impl Overflow {
     }
 }
 
-/// Which outgoing queue budget the peer's own subject names.
+/// Which outgoing budget one of the peer's own subjects names, or `None` for a subject this
+/// crate does not know.
 ///
-/// The peer counts its outbound queue in bytes and in frames and says which in a subject that
-/// carries the unit first. For example, `"bytes of outgoing JSON-RPC frames awaiting their
-/// write"` is the byte budget and `"outgoing JSON-RPC frames awaiting their write"` the frame
-/// budget.
-fn outgoing_budget(subject: &str) -> Budget {
-    match subject.starts_with("bytes") {
-        true => Budget::OutgoingBytes,
-        false => Budget::OutgoingFrames,
+/// The one place this crate reads the peer's wording. The peer says what it counted in the
+/// `subject` of its `LimitExceeded` and of its `OutboundBackpressure`, as text, and has no type
+/// for it. The three it uses are matched whole, so a subject the peer rewords stops matching
+/// and the failure reads as a closed link instead of as the wrong budget;
+/// `the_peers_own_subjects_are_the_ones_matched` ends a real connection each way and fails when
+/// that happens. For example, `"outgoing JSON-RPC frames awaiting their write"` is the frame
+/// count of the queue.
+fn outgoing_budget(subject: &str) -> Option<Budget> {
+    match subject {
+        "bytes of one outgoing JSON-RPC frame" => Some(Budget::OutgoingFrameBytes),
+        "bytes of outgoing JSON-RPC frames awaiting their write" => Some(Budget::OutgoingBytes),
+        "outgoing JSON-RPC frames awaiting their write" => Some(Budget::OutgoingFrames),
+        _ => None,
     }
 }
 
@@ -229,11 +236,16 @@ pub(crate) fn wire_options(limits: &Limits, outbound_buffer_bytes: usize) -> Wir
 
 #[cfg(test)]
 mod tests {
+    use super::Budget;
     use super::{
         Overflow, client_options, message_limit, outgoing_budget, queued_bytes_limit, wire_options,
     };
-    use mango_external_agents::Limits;
-    use mango_external_agents::jsonrpc::PeerTermination;
+    use mango_external_agents::jsonrpc::{
+        Client, ClientOptions, ConnectionEnd, PeerHandler, PeerTermination, ServerRequestOutcome,
+        WireOptions,
+    };
+    use mango_external_agents::{Limits, Link, LinkReceiver, LinkSender};
+    use std::sync::Arc;
 
     /// The three fields of the `LimitExceeded` an overflow displays as.
     fn fields(overflow: Overflow) -> (&'static str, usize, usize) {
@@ -269,29 +281,117 @@ mod tests {
         }
     }
 
-    /// Core's own terminations carry `#[non_exhaustive]` variants, so they are made by ending a
-    /// real connection rather than written out here; see `tests/session/pins/budgets.rs` and
-    /// `tests/session/burst.rs` for each one arriving through a session. What is pinned here is
-    /// the reading of the subject, which is the one thing a core rewording could change silently.
-    #[test]
-    fn the_outgoing_subject_is_read_by_its_unit() {
-        let cases = [
-            (
-                "bytes of outgoing JSON-RPC frames awaiting their write",
-                "bytes queued for the ACP agent",
-            ),
-            (
-                "outgoing JSON-RPC frames awaiting their write",
-                "frames queued for the ACP agent",
-            ),
-        ];
-        for (subject, expected) in cases {
-            let received = outgoing_budget(subject).subject();
-            assert_eq!(
-                received, expected,
-                "expected the budget for {subject:?}: {expected:?} | received: {received:?}"
-            );
+    /// A peer that never takes a write: the first frame stays in flight and the rest queue.
+    struct StalledAgent;
+
+    #[async_trait::async_trait]
+    impl LinkSender for StalledAgent {
+        async fn send(&mut self, _message: String) -> mango_external_agents::Result<()> {
+            std::future::pending().await
         }
+
+        async fn close(&mut self) -> mango_external_agents::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A peer that never says anything.
+    struct SilentAgent;
+
+    #[async_trait::async_trait]
+    impl LinkReceiver for SilentAgent {
+        async fn recv(&mut self) -> mango_external_agents::Result<Option<String>> {
+            std::future::pending().await
+        }
+    }
+
+    /// A handler nothing is ever sent to.
+    struct Unused;
+
+    #[async_trait::async_trait]
+    impl PeerHandler for Unused {
+        async fn on_notification(&self, _method: String, _params: serde_json::Value) {}
+
+        async fn on_request(
+            &self,
+            _method: String,
+            _params: serde_json::Value,
+            _id: mango_external_agents::jsonrpc::RequestId,
+        ) -> ServerRequestOutcome {
+            ServerRequestOutcome::Answer(serde_json::Value::Null)
+        }
+    }
+
+    fn stalled_client(wire: WireOptions) -> Client {
+        Client::connect_with(
+            Link::new(Box::new(StalledAgent), Box::new(SilentAgent)),
+            Arc::new(Unused),
+            ClientOptions::new("ACP agent"),
+            wire,
+        )
+    }
+
+    /// Queues notifications of `padding` bytes on `client` until one is refused, and returns
+    /// the budget the connection then says it ended for.
+    fn overflow_after_filling(client: &Client, padding: usize) -> Option<(&'static str, usize)> {
+        let params = serde_json::json!({ "pad": "x".repeat(padding) });
+        let refused = (0..64).any(|_| client.submit_notification("ping", &params).is_err());
+        assert!(
+            refused,
+            "expected a queued notification refused within 64 | received: none refused"
+        );
+        let Some(ConnectionEnd::Peer(termination)) = client.ended() else {
+            panic!(
+                "expected a connection ended by its peer | received: {:?}",
+                client.ended()
+            );
+        };
+        Overflow::from_termination(&termination).map(|overflow| {
+            let (subject, limit, _) = fields(overflow);
+            (subject, limit)
+        })
+    }
+
+    /// The peer names what it counted as text. Each of its three outgoing subjects is produced
+    /// here by a real connection and has to come back as this crate's own budget; a subject the
+    /// peer reworded comes back as `None` and fails this by name.
+    #[tokio::test]
+    async fn the_peers_own_subjects_are_the_ones_matched() {
+        let one_frame = stalled_client(WireOptions::new().with_max_outbound_frame_bytes(64));
+        let refused = one_frame
+            .submit_notification("ping", serde_json::json!({ "pad": "x".repeat(128) }))
+            .expect_err("expected a frame over the bound refused");
+        let received = Overflow::from_refused_frame(&refused).map(|overflow| fields(overflow).0);
+        let expected = Some("bytes in one frame to the ACP agent");
+        assert_eq!(
+            received, expected,
+            "expected the budget of a refused frame: {expected:?} | received: {received:?} from {refused:?}"
+        );
+
+        let bytes = stalled_client(WireOptions::new().with_max_outbound_queued_bytes(256));
+        let received = overflow_after_filling(&bytes, 64);
+        let expected = Some(("bytes queued for the ACP agent", 256));
+        assert_eq!(
+            received, expected,
+            "expected the budget of a queue over its bytes: {expected:?} | received: {received:?}"
+        );
+
+        let frames = stalled_client(WireOptions::new().with_max_outbound_queued_frames(2));
+        let received = overflow_after_filling(&frames, 8);
+        let expected = Some(("frames queued for the ACP agent", 2));
+        assert_eq!(
+            received, expected,
+            "expected the budget of a queue over its frame count: {expected:?} | received: {received:?}"
+        );
+    }
+
+    #[test]
+    fn a_subject_the_peer_does_not_use_names_no_budget() {
+        let received = outgoing_budget("bytes of something else").map(Budget::subject);
+        assert_eq!(
+            received, None,
+            "expected no budget for an unknown subject | received: {received:?}"
+        );
     }
 
     #[test]
