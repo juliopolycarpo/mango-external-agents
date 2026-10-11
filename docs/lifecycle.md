@@ -226,7 +226,13 @@ and the second returns the link's `Timeout` after `shutdown_timeout` without hav
 dropping the first lets a later close finish. If it is parked in its wait for `on_terminated` it
 holds the reader, and the second, which has closed the link by then, returns a `Timeout` that names
 the reader (not `is_link_shutdown_timeout`) when its own bound of twice `shutdown_timeout` runs
-out. Dropping the held first close takes the reader down mid-call, so `on_terminated` does not
+out. A first close that finishes within its bound is no hindrance: the second then finds nothing
+left to wait for, and both are `Ok`. The timeout is not limited to a first close that is parked and
+forgotten. A later close whose own bound runs out in the window after the first one's expiry, about
+a scheduler turn, in which the first still holds the reader while it takes it down, sees it too,
+where it used to see `Ok`; for now a host tells it from the link's timeout only by its `operation`
+text, "JSON-RPC reader shutdown". The first close, polled again after the second gave up, still
+completes with `Ok`; dropping it takes the reader down mid-call, so `on_terminated` does not
 return. The same holds for a caller that wraps `close` in a timeout shorter than twice
 `shutdown_timeout` on a connection that ended under this side: such a caller can cut
 `on_terminated` and should wrap `close` in nothing shorter than that bound if it relies on the
