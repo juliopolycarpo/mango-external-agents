@@ -22,6 +22,8 @@ use std::task::{Context, Poll};
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard, mpsc, oneshot};
 use tokio::time::Instant;
 
+use super::OutboundBound;
+
 use super::{ClientState, MidSend, Registration};
 use crate::error::{Error, Result};
 use crate::link::LinkSender;
@@ -615,7 +617,7 @@ pub(super) fn admission(
     }
     if limits.max_outbound_queued_frames == 0 {
         return Err(Refusal::NoRoomAtAll {
-            subject: QUEUED_FRAMES,
+            subject: OutboundBound::QueuedFrames.subject(),
             limit: 0,
             received: 1,
         });
@@ -623,7 +625,7 @@ pub(super) fn admission(
     let frames = frames.saturating_add(1);
     if frames > limits.max_outbound_queued_frames {
         return Err(Refusal::QueueFull {
-            subject: QUEUED_FRAMES,
+            subject: OutboundBound::QueuedFrames.subject(),
             limit: limits.max_outbound_queued_frames,
             received: frames,
         });
@@ -631,15 +633,13 @@ pub(super) fn admission(
     let held_bytes = held_bytes.saturating_add(bytes);
     if held_bytes > limits.max_outbound_queued_bytes {
         return Err(Refusal::QueueFull {
-            subject: "bytes of outgoing JSON-RPC frames awaiting their write",
+            subject: OutboundBound::QueuedBytes.subject(),
             limit: limits.max_outbound_queued_bytes,
             received: held_bytes,
         });
     }
     Ok(())
 }
-
-const QUEUED_FRAMES: &str = "outgoing JSON-RPC frames awaiting their write";
 
 const QUEUED: u8 = 0;
 const WRITING: u8 = 1;

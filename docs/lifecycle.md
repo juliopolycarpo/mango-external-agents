@@ -152,7 +152,11 @@ a failed link. A frame queued with `submit_*` is refused alone in the same way w
 than the queue could hold even when empty, which is every such frame under a queue bound of zero.
 Passing the bounds on queued frames or queued bytes with what the queue already holds, which
 counts the frame being written, means the peer stopped reading: the connection ends with `PeerTermination::OutboundBackpressure` and the call
-receives the same `LimitExceeded`. A queued request's `Reply` resolves to a `CallFailure` that
+receives the same `LimitExceeded`. Which of the three bounds was passed is read by type, not from
+the error's text: `OutboundBound::exceeded_by(&error)` for the refusal a caller receives and
+`PeerTermination::outbound_bound()` for the end the handler is told of, each `None` for anything
+else; `is_link_shutdown_timeout(&error)` says whether a `Timeout` is `Client::close` giving up.
+A queued request's `Reply` resolves to a `CallFailure` that
 tells the peer's own error from an ended connection (`Client::ended` gives the same
 `ConnectionEnd`), a deadline, an unwritten frame and a stopped handler by type. `Client::close`
 writes the notifications queued before it and refuses the requests still queued: a host that needs a last

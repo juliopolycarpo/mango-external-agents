@@ -181,13 +181,147 @@ pub enum PeerTermination {
     /// that has stopped reading.
     #[non_exhaustive]
     OutboundBackpressure {
-        /// What was counted, unit included, as in [`Error::LimitExceeded`].
+        /// What was counted, unit included, as in [`Error::LimitExceeded`]. It is text for a
+        /// person; [`PeerTermination::outbound_bound`] says which bound it names.
         subject: &'static str,
         /// The bound that was passed.
         limit: usize,
         /// What the queue would have held with the frame that did not fit.
         received: usize,
     },
+}
+
+/// Which of the bounds on what this side holds for the peer was passed.
+///
+/// Each is set on [`WireOptions`]. A frame larger than one frame may be is refused where it
+/// is submitted and the connection goes on; a queue that is full ends the connection as
+/// [`PeerTermination::OutboundBackpressure`]. Both are told as an [`Error::LimitExceeded`]
+/// whose `subject` is text; this says which bound that text names, so that nothing has to
+/// read it. More bounds may be added, so a `match` on this needs a wildcard arm.
+///
+/// ```
+/// use mango_external_agents::jsonrpc::OutboundBound;
+/// use mango_external_agents::Error;
+///
+/// fn too_large_to_send(error: &Error) -> bool {
+///     OutboundBound::exceeded_by(error) == Some(OutboundBound::FrameBytes)
+/// }
+/// assert!(!too_large_to_send(&Error::Closed { subject: "link" }));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum OutboundBound {
+    /// The bytes of one frame:
+    /// [`with_max_outbound_frame_bytes`](WireOptions::with_max_outbound_frame_bytes), or the
+    /// queue's byte bound where that is the smaller. Passing it refuses the frame and leaves
+    /// the connection as it was.
+    FrameBytes,
+    /// The bytes of the frames that wait to be written:
+    /// [`with_max_outbound_queued_bytes`](WireOptions::with_max_outbound_queued_bytes).
+    /// Passing it ends the connection.
+    QueuedBytes,
+    /// How many frames wait to be written:
+    /// [`with_max_outbound_queued_frames`](WireOptions::with_max_outbound_queued_frames).
+    /// Passing it ends the connection.
+    QueuedFrames,
+}
+
+impl OutboundBound {
+    /// Every bound, for the one place that reads a subject back.
+    const ALL: [Self; 3] = [Self::FrameBytes, Self::QueuedBytes, Self::QueuedFrames];
+
+    /// The bound `error` says was passed, or `None` when it is not this client's refusal for
+    /// one of them: another error, or a [`LimitExceeded`](Error::LimitExceeded) that counts
+    /// something else, such as the requests awaiting an answer.
+    ///
+    /// It reads through a [`Dispatch`] annotation, so the error can be given as it was
+    /// returned.
+    ///
+    /// ```no_run
+    /// # fn example(client: &mango_external_agents::jsonrpc::Client) {
+    /// use mango_external_agents::jsonrpc::{OutboundBound, RequestOptions};
+    ///
+    /// let submitted = client.submit_request("session/prompt", "a long prompt", RequestOptions::new());
+    /// if let Err(error) = submitted {
+    ///     match OutboundBound::exceeded_by(&error) {
+    ///         Some(OutboundBound::FrameBytes) => eprintln!("the prompt is too large to send"),
+    ///         Some(_) => eprintln!("the peer has stopped reading"),
+    ///         None => eprintln!("{error}"),
+    ///     }
+    /// }
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn exceeded_by(error: &Error) -> Option<Self> {
+        match error.cause() {
+            Error::LimitExceeded { subject, .. } => Self::from_subject(subject),
+            _ => None,
+        }
+    }
+
+    /// What the bound counts, unit included, as [`Error::LimitExceeded`] and
+    /// [`PeerTermination::OutboundBackpressure`] name it. Every site that names a bound takes
+    /// the text from here.
+    pub(crate) const fn subject(self) -> &'static str {
+        match self {
+            Self::FrameBytes => "bytes of one outgoing JSON-RPC frame",
+            Self::QueuedBytes => "bytes of outgoing JSON-RPC frames awaiting their write",
+            Self::QueuedFrames => "outgoing JSON-RPC frames awaiting their write",
+        }
+    }
+
+    /// The bound a subject names, or `None` for a subject that is not one of these.
+    fn from_subject(subject: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|bound| bound.subject() == subject)
+    }
+}
+
+/// What a [`Client::close`] that ran out of its grace names as the call that stalled.
+const LINK_SHUTDOWN: &str = "JSON-RPC link shutdown";
+
+/// Whether `error` is a [`Client::close`] that gave up: closing the link, behind whatever
+/// was still queued for it, did not finish within
+/// [`ClientOptions::shutdown_timeout`]. The link may still be open and the peer still
+/// running, which a host that owns the process has to deal with.
+///
+/// It is `false` for every other timeout, a request left unanswered and a frame left
+/// unwritten among them. It reads through a [`Dispatch`] annotation.
+///
+/// ```no_run
+/// # async fn example(client: &mango_external_agents::jsonrpc::Client) {
+/// use mango_external_agents::jsonrpc::is_link_shutdown_timeout;
+///
+/// if let Err(error) = client.close().await {
+///     if is_link_shutdown_timeout(&error) {
+///         eprintln!("the link did not close in time; ending the process");
+///     }
+/// }
+/// # }
+/// ```
+#[must_use]
+pub fn is_link_shutdown_timeout(error: &Error) -> bool {
+    matches!(error.cause(), Error::Timeout { operation, .. } if operation == LINK_SHUTDOWN)
+}
+
+impl PeerTermination {
+    /// Which outbound bound ended the connection, when it ended as
+    /// [`OutboundBackpressure`](Self::OutboundBackpressure), and `None` for every other
+    /// reason.
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::PeerTermination;
+    ///
+    /// assert_eq!(PeerTermination::Exited.outbound_bound(), None);
+    /// ```
+    #[must_use]
+    pub fn outbound_bound(&self) -> Option<OutboundBound> {
+        match self {
+            Self::OutboundBackpressure { subject, .. } => OutboundBound::from_subject(subject),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Debug for PeerTermination {
@@ -2894,7 +3028,7 @@ impl Client {
         })
         .await
         .map_err(|_| Error::Timeout {
-            operation: String::from("JSON-RPC link shutdown"),
+            operation: String::from(LINK_SHUTDOWN),
             after: self.state.options.shutdown_timeout,
         });
         giving_up.reached_the_link = closed.is_ok();
@@ -3434,7 +3568,7 @@ impl ClientState {
     fn refused(&self, refusal: outbox::Refusal) -> Error {
         match refusal {
             outbox::Refusal::FrameTooLarge { limit, received } => Error::LimitExceeded {
-                subject: FRAME_BYTES,
+                subject: OutboundBound::FrameBytes.subject(),
                 limit,
                 received,
             }
@@ -4697,17 +4831,8 @@ async fn write_reply(state: &Arc<ClientState>, raw_id: Value, outcome: ServerReq
 
 /// Whether `error` is this client's own refusal of one frame for its size.
 fn oversized_frame(error: &Error) -> bool {
-    matches!(
-        error.cause(),
-        Error::LimitExceeded {
-            subject: FRAME_BYTES,
-            ..
-        }
-    )
+    OutboundBound::exceeded_by(error) == Some(OutboundBound::FrameBytes)
 }
-
-/// What the per-frame outbound bound counts, as [`Error::LimitExceeded`] names it.
-const FRAME_BYTES: &str = "bytes of one outgoing JSON-RPC frame";
 
 #[cfg(test)]
 mod tests {
@@ -4715,6 +4840,7 @@ mod tests {
     mod handoff_queue_tests;
     mod invalid_request_tests;
     mod ordered_response_tests;
+    mod outbound_bound_tests;
     mod outbox_tests;
     mod request_lifecycle_tests;
     mod responder_tests;
