@@ -92,6 +92,11 @@ pub async fn open(
 }
 
 /// Writes one message per line.
+///
+/// A send fails with exactly the error the child's [`ByteSink`] returned for the write, so the
+/// contract of `LinkSender::send` is the sink's own: an [`Error::Link`] when bytes may have
+/// been accepted, and any other error only when none were. Nothing here turns one into the
+/// other.
 struct LineSink {
     stdin: Box<dyn ByteSink>,
 }

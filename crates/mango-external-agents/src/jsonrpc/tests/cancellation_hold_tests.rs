@@ -2118,3 +2118,103 @@ async fn a_calls_end_racing_a_hold_dropped_on_another_thread_counts_it_off_once(
         "expected every hold counted off exactly once over 500 calls: 0 | received {left}"
     );
 }
+
+/// A downstream test decides the end through `decide_cancellation` while the handler is parked
+/// before its hold: the hold it then asks for is refused, and the stretch behind it is never
+/// begun. The order a harness asks in, hold first and claim second, is what this proves.
+#[tokio::test]
+async fn deciding_the_end_through_the_seam_refuses_the_next_hold() {
+    let link = ScriptedLink::new();
+    let (handler, client) = connect(
+        &link,
+        Script {
+            park_before_hold: true,
+            ..HOLDING
+        },
+    );
+    link.push_line(UPDATE);
+    until("the handler to be inside its call", || {
+        handler.progress().0 == 1
+    })
+    .await;
+
+    let held = client.decide_cancellation();
+    handler.before_hold.add_permits(1);
+    until("the handler to ask for its hold", || {
+        HoldingHandler::count(&handler.asked_for_hold) == 1
+    })
+    .await;
+    // Asking and being refused are one step of the handler's task, so it is refused by now.
+    let observed = (held, handler.progress(), client.is_closed());
+    assert_eq!(
+        observed,
+        (false, (1, 0, 0), false),
+        "expected nothing held, the hold never granted, the stretch never begun and the connection still up: (false, (1, 0, 0), false) | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// The same decision, while a stretch is held, says that an end would wait for it, and the
+/// stretch runs whole.
+#[tokio::test(start_paused = true)]
+async fn deciding_the_end_through_the_seam_says_when_a_stretch_is_held() {
+    let link = ScriptedLink::new();
+    let (handler, client) = connect(&link, HOLDING);
+    inside_the_stretch(&link, &handler).await;
+
+    let held = client.decide_cancellation();
+    handler.inside.add_permits(1);
+    until("the stretch to be committed", || handler.progress().2 == 1).await;
+    let observed = (held, handler.progress());
+    assert_eq!(
+        observed,
+        (true, (1, 1, 1)),
+        "expected a stretch held when the end was decided, and committed whole: (true, (1, 1, 1)) | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// A close made from inside the handler's own call is cut short by its own abort of that call,
+/// before it reaches the link. A second close, from outside, finishes it.
+#[tokio::test(start_paused = true)]
+async fn a_close_made_from_inside_a_call_is_finished_by_a_second_from_outside() {
+    let link = ScriptedLink::new();
+    let (handler, client) = connect(
+        &link,
+        Script {
+            close_inside: true,
+            ..HOLDING
+        },
+    );
+    inside_the_stretch(&link, &handler).await;
+    handler.inside.add_permits(1);
+    eventually(
+        "the handler's task to stop",
+        client.state.worker_stopped.cancelled(),
+    )
+    .await;
+    let open = client
+        .state
+        .sender
+        .lock()
+        .await
+        .send(String::from("probe"))
+        .await
+        .is_ok();
+
+    let second = client.close().await;
+    let closed = client
+        .state
+        .sender
+        .lock()
+        .await
+        .send(String::from("probe"))
+        .await
+        .is_err();
+    let observed = (open, second.is_ok(), closed, handler.terminations().len());
+    assert_eq!(
+        observed,
+        (true, true, true, 0),
+        "expected the link open after the close cut short, then a second close to finish it and the handler told nothing: (true, true, true, 0) | received {observed:?}"
+    );
+}

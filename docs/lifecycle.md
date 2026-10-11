@@ -158,7 +158,9 @@ the error's text: `OutboundBound::exceeded_by(&error)` for the refusal a caller 
 else; `is_link_shutdown_timeout(&error)` says whether a `Timeout` is `Client::close` giving up.
 A queued request's `Reply` resolves to a `CallFailure` that
 tells the peer's own error from an ended connection (`Client::ended` gives the same
-`ConnectionEnd`), a deadline, an unwritten frame and a stopped handler by type. `Client::close`
+`ConnectionEnd`), a deadline, an unwritten frame and a stopped handler by type, and
+`CallFailure::peer_error_was_unreadable` tells an `error` member that could not be read as an
+error object, which fails the call with a stand-in `-32603`, from a peer's own `-32603`. `Client::close`
 writes the notifications queued before it and refuses the requests still queued: a host that needs a last
 request answered waits for its reply first. A close that times out or is dropped before it
 reaches the link leaves the link unusable, so nothing queued is written afterwards. A `Reply` that
@@ -182,8 +184,8 @@ one that read the connection as open an instant before it ended reaches the link
 (a closed link refuses the write, and the call returns that refusal).
 
 Two ends of a connection stop the handler's task without draining its queue: the peer passing an
-inbound budget, and `Client::close`. A call to `PeerHandler::on_notification` that is in progress
-then is cancelled at the await it had reached. A call that must finish a stretch it has begun asks
+inbound budget, and `Client::close`. A call to `PeerHandler::on_notification`, or to
+`PeerHandler::on_request_handoff`, that is in progress then is cancelled at the await it had reached. A call that must finish a stretch it has begun asks
 for `Client::hold_cancellation()` before the stretch and drops the hold after it. While a hold is
 out, such an end waits for it, for up to `shutdown_timeout`, and cancels only then; a hold asked
 for after the cancellation was decided is never granted, so the stretch runs whole or not at all.
@@ -195,7 +197,13 @@ A close overlaps that wait with the one for the answers it owes the peer, so its
 way, for up to one `shutdown_timeout` more. A hold belongs to its call: one kept, moved or
 forgotten stops counting when the call is over.
 
-`on_terminated` is made once, after the handler's task has stopped. A `Client::close` that arrives
+`on_terminated` is made once, after the handler's task has stopped, and not at all for an end a
+close put on record first: when the peer's exit, a failed link or a budget passed on either side
+is found with a close already on record, `Client::ended` reports `Closed` and the handler is told
+nothing. A close given up after it recorded its end (its future dropped, a timeout of the caller's
+own, or made from inside the handler's own call, which it cuts short) still owns the end: the
+handler is told nothing, the reader fails no pending call and the link stays open, and calling
+`close` again, or dropping the client, finishes the teardown. A `Client::close` that arrives
 while a connection is ending under this side waits for that call to return, within the bound of a
 close, where it used to take the reader down under it. Dropping the `Client` cannot wait: the
 call in progress is cancelled whatever it holds, and `on_terminated` may not be made at all.
@@ -257,16 +265,25 @@ written: one that was queued and then could not be, because the link refused it 
 ran out in the queue, ends the connection whether or not anyone awaits its write, and so does a
 question nothing can be said for: one no reply to fits a frame, or one let go on a queue bounded
 at nothing. Answers are queued without waiting, so the outbound bounds are
-what limits them when a peer asks faster than it reads: the option does not set them, so set them beside it. A write that
-fails in the moment a close is on record is the close's, and the handler is told of no
-termination for it. A question still queued when the
+what limits them when a peer asks faster than it reads: the option does not set them, so set them beside it. An end that
+finds a close already on record is the close's, whatever its cause (a write or a read that fails,
+the peer's exit, a budget passed on either side), and the handler is told of no termination for
+it. A question still queued when the
 connection ends is not handed over. Once the connection has ended a
 responder still out answers nothing and says nothing: a handler that parks questions settles them
 before it closes. The hand-off call is cancelled at an end like a notification call, and
-`hold_cancellation` holds nothing there. A request with `after_earlier_notifications` made from
+`hold_cancellation` holds there as it does in one. A request with `after_earlier_notifications` made from
 inside it is refused before it is written, as it is inside a notification. Without the option none of this applies: a question is
 answered by `on_request` on a task of its own, and its answer is written when that task has the
-link.
+link. An end raises the shutdown flag, and from then on that call is dropped at the await it is
+parked at, never run to its end, and the peer is refused with `-32000` over a link that still
+takes the write: awaited for up to `shutdown_timeout`, before the link is closed, and before
+`on_terminated` for an end that is not a close. A close and an inbound overflow raise the flag at
+once; the peer's exit, a failed link and an outbound overflow first give the notifications
+already read up to `shutdown_timeout` to reach the handler, and a call that returns in that time
+answers the peer itself. A link whose write failed, that this side's outbound budget made
+unusable, or that the peer's exit has closed to writes, takes no refusal. Dropping the `Client` aborts the call without waiting for it; a refusal
+another thread had begun to write may still go out.
 
 ACP sets those bounds from `Limits`: queued JSON-RPC messages by the larger of
 `turn_channel_capacity` and `max_pending_requests` (1,024 by default, batch members that are

@@ -435,6 +435,32 @@ pub trait PeerHandler: Send + Sync {
     /// that one is never asked here and need not write this at all. The default refuses
     /// with `-32601`, "Method not found", which is what a peer is owed by a handler that
     /// answers no questions.
+    ///
+    /// # When the connection ends
+    ///
+    /// Without that option, at most [`ClientOptions::max_in_flight_requests`] calls are out at
+    /// once, each on a task of its own. An end of the connection raises the shutdown flag, and
+    /// from then on the call is dropped at the await it is parked at: it is not run to its end
+    /// or waited for, and [`Client::hold_cancellation`] holds nothing in one. The peer is
+    /// refused with `-32000`, a message that the connection was closed, over the link, so long
+    /// as the link takes the write. The ends differ in when the flag rises, and in the link:
+    ///
+    /// - [`Client::close`] and the peer passing an inbound budget raise it at once.
+    /// - The peer's exit, a failed link and this side passing its outbound budget first let the
+    ///   notifications already read reach the handler, for up to
+    ///   [`ClientOptions::shutdown_timeout`], and raise it then. A call that returns before
+    ///   that answers the peer with what it returned.
+    /// - Once it is raised, the refusal is waited for, for up to `shutdown_timeout`, before the
+    ///   link is closed and, for an end that is not a close, before
+    ///   [`on_terminated`](Self::on_terminated) is made. A task still writing when that runs
+    ///   out is cut.
+    /// - A link whose write failed, one the peer's exit has closed to writes, and one the
+    ///   outbound budget has made unusable take no refusal, and none is written. A link whose
+    ///   read failed is still written to, and takes it. One whose writer is held behind a
+    ///   write the peer never reads outlasts the grace, and the task is cut.
+    /// - Dropping the [`Client`] aborts the calls without waiting for them, and writes no
+    ///   refusal of its own. One that another thread had already begun to write may still go
+    ///   out.
     async fn on_request(
         &self,
         _method: String,
@@ -460,9 +486,12 @@ pub trait PeerHandler: Send + Sync {
     /// is kept, not awaited here.
     ///
     /// Like a notification call, this one is cancelled at an await when the connection ends
-    /// without draining. [`Client::hold_cancellation`] has nothing to hold here, and a
-    /// [`Client::close`] awaited from inside the call ends the call at that await, as it
-    /// does inside a notification.
+    /// without draining, unless it holds that off: [`Client::hold_cancellation`] holds here as
+    /// it does in a notification call, and the same ends wait for the hold. A
+    /// [`Client::close`] awaited from inside the call cannot wait for it, and ends the call at
+    /// that await, as it does inside a notification. A [`Responder`] dropped with a call that
+    /// was cut says nothing to the peer, since the connection has ended by then; one kept
+    /// answers nothing once it has.
     ///
     /// The default asks [`on_request`](Self::on_request) and answers with what it returns,
     /// one question at a time. That suits an `on_request` that returns promptly. It is not
@@ -531,6 +560,13 @@ pub trait PeerHandler: Send + Sync {
     ///
     /// A handler can release state that only a complete vendor turn would otherwise clear. This
     /// callback is never made for [`Client::close`], whose caller already owns that shutdown.
+    /// Nor is it made for a peer's exit, a failed link or a budget passed that a close
+    /// overtook: the end on record first owns the connection's end, and [`Client::ended`]
+    /// reports it as the close. A close given up after it recorded its end (its future dropped,
+    /// a timeout of the caller's own, or made from inside the handler's own call, which the
+    /// close cuts short) still owns the end, whatever the reader had read: this is not made, the
+    /// reader fails no pending call, and the link stays open until a second [`Client::close`],
+    /// or dropping the client, finishes the teardown.
     ///
     /// Made once, after the handler's task has stopped. A [`Client::close`] that arrives while
     /// the connection is ending this way waits for this call to return, within the time a close
@@ -1018,15 +1054,8 @@ impl RequestOptions {
 }
 
 tokio::task_local! {
-    /// The client whose `on_request_handoff` the current task is inside, as its state's
-    /// address. Apart from the notification call's: a hand-off is awaited by the same task,
-    /// so an ordered answer asked for from inside it would wait for it too, but it is not a
-    /// call a [`CancellationHold`] can be taken in.
-    static HANDING_OFF_FOR: usize;
-}
-
-tokio::task_local! {
-    /// The client whose `on_notification` the current task is inside, as its state's address.
+    /// The client whose `on_notification` or `on_request_handoff` the current task is inside,
+    /// as its state's address: the two calls the handler's task awaits.
     ///
     /// Scoped around that one call, so it says nothing once the handler returned or panicked,
     /// and nothing on any other task. A recorded task id would do neither: it outlives a worker
@@ -1034,7 +1063,7 @@ tokio::task_local! {
     static HANDLING_NOTIFICATION_FOR: NotificationCall;
 }
 
-/// One call to `on_notification`, as the task making it knows it.
+/// One call to `on_notification` or `on_request_handoff`, as the task making it knows it.
 struct NotificationCall {
     /// The client's state, by address.
     client: usize,
@@ -1156,7 +1185,10 @@ pub struct Client {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConnectionEnd {
-    /// This side ended it: [`Client::close`] was called, or the client was dropped.
+    /// This side ended it: [`Client::close`] was called, or the client was dropped. It is also
+    /// what a connection reports when the peer exited, the link failed or a budget was passed in
+    /// the moment the close was put on record: the end on record first is the one reported, and
+    /// the handler is told of no termination for it.
     Closed,
     /// It ended under this side, for the reason the handler's
     /// [`on_terminated`](PeerHandler::on_terminated) is given: the peer exited, the link failed,
@@ -1714,10 +1746,22 @@ struct ClientState {
     /// test can have the writer's work done exactly there.
     #[cfg(test)]
     after_batch_member_answered: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
-    /// Runs once when the reader lets a write failure go because a close is on record, so a
-    /// test can tell that from the reader never having heard of the failure.
+    /// Runs once when the reader lets a failure that would end the connection go because a
+    /// close is on record, so a test can tell that from the reader never having heard of it.
     #[cfg(test)]
     after_write_failure_ignored: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once on the reader as soon as it is woken to end the connection, before it has
+    /// looked at why, so a test can have a close and a failure land exactly there.
+    #[cfg(test)]
+    after_reader_woken_to_end: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once on the reader before it puts the peer's exit, or an inbound budget the peer
+    /// passed, on record, so a test can have a close put its own end on record exactly there.
+    #[cfg(test)]
+    before_peer_end_recorded: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once in [`link_failed`] before the failure is put on record, so a test can have a
+    /// close put its own end on record exactly there.
+    #[cfg(test)]
+    before_link_failure_recorded: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     /// The calls whose claim the reader took, for a test that has to know which side won.
     #[cfg(test)]
     claimed_by_reader: StdMutex<Vec<String>>,
@@ -1834,13 +1878,23 @@ impl Drop for WorkerStopped {
     }
 }
 
-/// Keeps a notification call from being cancelled part-way through what it must finish.
+/// Keeps a notification call, or a hand-off, from being cancelled part-way through what it must
+/// finish.
 ///
 /// Returned by [`Client::hold_cancellation`], and released when dropped.
+///
+/// ```no_run
+/// # async fn commit() {}
+/// # async fn on_notification(client: &mango_external_agents::jsonrpc::Client) {
+/// let hold = client.hold_cancellation().await;
+/// commit().await; // an end of the connection waits for this, up to `shutdown_timeout`
+/// drop(hold); // released: the call may be cancelled again
+/// # }
+/// ```
 #[must_use = "the call may be cancelled again as soon as this is dropped"]
 pub struct CancellationHold {
     /// The holds of the call this was granted to. `None` for a hold asked for outside a
-    /// notification call, which holds nothing.
+    /// notification call or a hand-off, which holds nothing.
     call: Option<Arc<CallHolds>>,
 }
 
@@ -1855,8 +1909,9 @@ impl std::fmt::Debug for CancellationHold {
 
 impl CancellationHold {
     /// Whether this hold keeps anything from being cancelled. `false` for one asked for
-    /// outside a call to [`PeerHandler::on_notification`] on the client it was asked of, and
-    /// for one whose call is over.
+    /// outside a call to [`PeerHandler::on_notification`] or
+    /// [`PeerHandler::on_request_handoff`] on the client it was asked of, and for one whose
+    /// call is over.
     ///
     /// ```no_run
     /// # async fn example(client: &mango_external_agents::jsonrpc::Client) {
@@ -2498,6 +2553,12 @@ impl Client {
             #[cfg(test)]
             after_write_failure_ignored: StdMutex::new(None),
             #[cfg(test)]
+            after_reader_woken_to_end: StdMutex::new(None),
+            #[cfg(test)]
+            before_peer_end_recorded: StdMutex::new(None),
+            #[cfg(test)]
+            before_link_failure_recorded: StdMutex::new(None),
+            #[cfg(test)]
             claimed_by_reader: StdMutex::new(Vec::new()),
             peer_bytes,
             notification_capacity,
@@ -2853,12 +2914,13 @@ impl Client {
         Ok(Written::new(ticket, self.state.options.peer_name.clone()))
     }
 
-    /// Keeps the notification call this is made from from being cancelled until the returned
-    /// hold is dropped, for a handler that must finish what it has begun.
+    /// Keeps the notification call or the hand-off this is made from from being cancelled
+    /// until the returned hold is dropped, for a handler that must finish what it has begun.
     ///
     /// Two ends of a connection stop the handler's task without draining its queue: the peer
     /// passing an inbound budget, and [`Client::close`]. The call to
-    /// [`PeerHandler::on_notification`] in progress is then cancelled at whichever await it had
+    /// [`PeerHandler::on_notification`], or to [`PeerHandler::on_request_handoff`] on a client
+    /// that hands questions over, in progress is then cancelled at whichever await it had
     /// reached. That is right for a call parked on a host that stopped reading, and wrong for
     /// one that has claimed something it releases a few awaits further down. Such a call asks
     /// for a hold around exactly that stretch:
@@ -2894,9 +2956,12 @@ impl Client {
     ///
     /// What a hold does not do:
     ///
-    /// - It holds nothing outside a notification call on this client's handler task
-    ///   ([`CancellationHold::is_holding`] says so): not in
-    ///   [`on_request`](PeerHandler::on_request), not on a task the handler spawned.
+    /// - It holds nothing outside a call the client's handler task awaits, which is a
+    ///   notification call or an [`on_request_handoff`](PeerHandler::on_request_handoff) call,
+    ///   and the [`on_request`](PeerHandler::on_request) the default hand-off asks inside it
+    ///   ([`CancellationHold::is_holding`] says so). Not in `on_request` on a client that does
+    ///   not hand questions off, which is answered on a task of its own, and not on a task
+    ///   the handler spawned.
     /// - Dropping the [`Client`] cannot wait and cancels the call whatever it holds.
     /// - A [`Client::close`] awaited from inside the same call cannot wait for that call and
     ///   cancels it. One made on another task that the call then awaits is waited out for the
@@ -2945,6 +3010,36 @@ impl Client {
         }
     }
 
+    /// Decides, for a test, that the handler's task is to be cancelled, as [`Client::close`]
+    /// and the peer passing an inbound budget decide it first, and does nothing else.
+    ///
+    /// Only under the `testing` feature. A harness that takes a [`hold`](Self::hold_cancellation)
+    /// around a stretch can test the order it asks in, which no other way reaches: a hold asked
+    /// for after the cancellation was decided never returns, the call parking where it asked,
+    /// so the stretch behind it is never begun. Decide the end while the handler is parked
+    /// before its hold, let it go on, and see what it did and did not get to.
+    ///
+    /// The connection is not ended and nothing is cancelled here, but the worker has been told
+    /// to begin no more work: it stops at the next item it takes from its queue, and a frame
+    /// the peer sends after that ends the connection as inbound backpressure. A call that
+    /// asks for a hold parks at the ask and never returns. So decide it when the test is about
+    /// to be over, and close the client to clean up, which cancels the parked call. Returns
+    /// whether a hold is out that an end would wait for: `false` when nothing is held, and
+    /// when the caller is the call that holds it.
+    ///
+    /// ```no_run
+    /// # async fn example(client: &mango_external_agents::jsonrpc::Client) {
+    /// // Before the handler's call asks for its hold: that request will never return.
+    /// let held = client.decide_cancellation();
+    /// assert!(!held, "no stretch is being held yet");
+    /// client.close().await.expect("expected a clean close");
+    /// # }
+    /// ```
+    #[cfg(any(test, feature = "testing"))]
+    pub fn decide_cancellation(&self) -> bool {
+        self.state.cancellation_held()
+    }
+
     /// Stops the pump, fails every call still waiting, and closes this side of the link.
     ///
     /// The process or socket underneath is the caller's to reap: this client did not open it.
@@ -2957,7 +3052,7 @@ impl Client {
     /// and the link closed. Both waits are over at once on a link that takes its writes. The
     /// handler's tasks are cancelled, not waited out, which takes no time unless a handler is
     /// blocking its thread without yielding; nothing here can bound that. Two things are waited
-    /// for inside the same bound: a notification call that asked for a
+    /// for inside the same bound: a notification call or a hand-off that asked for a
     /// [`hold`](Self::hold_cancellation), during the first wait, and, on a connection that had
     /// already ended under this side, the handler's
     /// [`on_terminated`](PeerHandler::on_terminated), with whatever is left of the bound. A caller that wants
@@ -2984,6 +3079,11 @@ impl Client {
     /// afterwards. That is so when the close runs out of `shutdown_timeout` behind a write the
     /// peer never reads, and when the future returned here is dropped before it finishes,
     /// unless another call to `close` is still in progress, which then answers for the link.
+    ///
+    /// A close given up still owns the end it recorded. The handler is told of no end the
+    /// reader had read, the reader fails no pending call, and the child's input stays open.
+    /// Calling `close` again finishes the teardown from where the first one stopped: it fails
+    /// the calls still pending, stops the handler's task and closes the link.
     ///
     /// # Errors
     ///
@@ -3020,8 +3120,8 @@ impl Client {
         // shutdown flag has already reached them, so this is the moment they need to write the
         // refusal, and it happens before the link is closed under them.
         //
-        // A notification call that holds its cancellation off is waited for at the same time:
-        // the two waits overlap, so the close takes no longer for it.
+        // A notification call or a hand-off that holds its cancellation off is waited for at the
+        // same time: the two waits overlap, so the close takes no longer for it.
         if self.state.cancellation_held() {
             tokio::join!(self.state.wait_for_holds(), self.state.drain_in_flight());
             self.state.stop_notifications().await;
@@ -3092,7 +3192,7 @@ impl Client {
     /// holding a failure can ask this for the cause. That is a moment before
     /// [`is_closed`](Self::is_closed) turns true. It is the reason the handler's
     /// [`on_terminated`](PeerHandler::on_terminated) is given when the end came from under this
-    /// side.
+    /// side, and [`ConnectionEnd::Closed`] when a close was on record first.
     ///
     /// ```no_run
     /// # fn example(client: &mango_external_agents::jsonrpc::Client) {
@@ -3630,23 +3730,32 @@ impl ClientState {
     /// call is failed with, the typed reason the handler is told, and a link no later frame may
     /// use. The pump does the ending, as for any failed write.
     fn outbound_overflow(&self, subject: &'static str, limit: usize, received: usize) -> Error {
-        self.link_poisoned.store(true, Ordering::Release);
         let termination = PeerTermination::OutboundBackpressure {
             subject,
             limit,
             received,
         };
-        self.ended_with(
-            ConnectionEnd::Peer(termination.clone()),
-            JsonRpcError {
-                code: -32000,
-                message: format!(
-                    "the {} outbound queue reached its limit",
-                    self.options.peer_name
-                ),
-                data: None,
-            },
-        );
+        // Recorded and, unless a close is on record ahead of it, made unusable under one lock,
+        // so whoever sees the record finds the link unusable with it. A close that recorded
+        // first owns the queue: what was queued before it is still written before the link goes,
+        // and the overflow only refuses this frame.
+        {
+            let mut ended = self.ended.lock().unwrap_or_else(PoisonError::into_inner);
+            let failure = ended.get_or_insert(Failed {
+                body: JsonRpcError {
+                    code: -32000,
+                    message: format!(
+                        "the {} outbound queue reached its limit",
+                        self.options.peer_name
+                    ),
+                    data: None,
+                },
+                cause: FailedCause::Ended(ConnectionEnd::Peer(termination.clone())),
+            });
+            if !matches!(failure.cause, FailedCause::Ended(ConnectionEnd::Closed)) {
+                self.link_poisoned.store(true, Ordering::Release);
+            }
+        }
         if !self.closed.load(Ordering::Acquire) {
             self.outbound_overflow
                 .lock()
@@ -3864,12 +3973,10 @@ impl ClientState {
     /// a call that task is awaiting: a notification, or a question being handed over.
     fn on_own_worker(&self) -> bool {
         self.handling_own_notification()
-            || HANDING_OFF_FOR
-                .try_with(|client| *client == self.address())
-                .unwrap_or(false)
     }
 
-    /// Whether the caller is inside this client's `on_notification`, on the task that awaits it.
+    /// Whether the caller is inside a call this client's worker task awaits and scopes as a
+    /// notification call: its `on_notification`, or an `on_request_handoff`.
     fn handling_own_notification(&self) -> bool {
         HANDLING_NOTIFICATION_FOR
             .try_with(|call| call.client == self.address())
@@ -4274,15 +4381,8 @@ async fn pump(
             // A transport failure, refused reply or abandoned send can leave the read side open.
             // End the connection here, on the one task that owns termination.
             () = state.write_failed.notified() => {
-                // A close already on record owns this end. A write that failed in the moment
-                // between that record and the closed flag going up was let through by the
-                // flag; it is not a failure to tell the handler of, under a client whose
-                // host is closing it and says so through `Client::ended`.
-                if matches!(state.ended(), Some(ConnectionEnd::Closed)) {
-                    #[cfg(test)]
-                    ClientState::run_hook(&state.after_write_failure_ignored);
-                    break;
-                }
+                #[cfg(test)]
+                ClientState::run_hook(&state.after_reader_woken_to_end);
                 let overflow = state
                     .outbound_overflow
                     .lock()
@@ -4311,10 +4411,15 @@ async fn pump(
         match message {
             Ok(Some(message)) => {
                 if let Err(termination) = dispatch(&state, &notifications, message).await {
+                    #[cfg(test)]
+                    ClientState::run_hook(&state.before_peer_end_recorded);
                     let failure = state.ended_with(
                         ConnectionEnd::Peer(termination.clone()),
                         state.overflow_failure(),
                     );
+                    if owned_by_a_close(&state, &failure) {
+                        break;
+                    }
                     let termination = failure.termination(termination);
                     state.mark_closed();
                     state.fail_pending(failure).await;
@@ -4341,6 +4446,8 @@ async fn pump(
                 }
             }
             Ok(None) => {
+                #[cfg(test)]
+                ClientState::run_hook(&state.before_peer_end_recorded);
                 let failure = state.ended_with(
                     ConnectionEnd::Peer(PeerTermination::Exited),
                     JsonRpcError {
@@ -4350,11 +4457,7 @@ async fn pump(
                     },
                 );
                 let termination = failure.termination(PeerTermination::Exited);
-                state.mark_closed();
-                fail_pending_around_drain(&state, notifications, failure).await;
-                state.shutdown.cancel();
-                state.drain_in_flight().await;
-                handler.on_terminated(termination).await;
+                connection_failed(&state, &handler, notifications, termination, failure).await;
                 break;
             }
             Err(error) => {
@@ -4373,6 +4476,8 @@ async fn link_failed(
     notifications: mpsc::Sender<QueuedWork>,
     cause: String,
 ) {
+    #[cfg(test)]
+    ClientState::run_hook(&state.before_link_failure_recorded);
     let termination = PeerTermination::LinkFailed(cause.clone());
     let failure = state.ended_with(
         ConnectionEnd::Peer(termination.clone()),
@@ -4386,6 +4491,28 @@ async fn link_failed(
     connection_failed(state, handler, notifications, termination, failure).await;
 }
 
+/// Whether a close put its own end on record ahead of the one the reader was about to record,
+/// which then is the close's and is not told to the handler.
+///
+/// Decided on the record `ended_with` handed back, not on a look taken before it: a close
+/// that records between the reader's look and its record is found all the same. It holds for
+/// every end the reader records, whatever the cause: a link's write or read failing, this side
+/// passing its outbound budget, the peer passing an inbound budget, the peer's exit (which a
+/// poll of the reader already under way across the close can still read: a fresh poll finds the
+/// shutdown flag first). The close fails the calls and stops the handler's task itself, and
+/// the handler is not told of an end its host caused, under a client whose host says so
+/// through `Client::ended`. A close given up after it recorded its end keeps that ownership.
+fn owned_by_a_close(state: &ClientState, failure: &Failed) -> bool {
+    if !matches!(failure.cause, FailedCause::Ended(ConnectionEnd::Closed)) {
+        return false;
+    }
+    #[cfg(test)]
+    ClientState::run_hook(&state.after_write_failure_ignored);
+    #[cfg(not(test))]
+    let _ = state;
+    true
+}
+
 /// Ends a connection that can no longer be written to, telling the handler why.
 async fn connection_failed(
     state: &Arc<ClientState>,
@@ -4394,6 +4521,9 @@ async fn connection_failed(
     termination: PeerTermination,
     failure: Failed,
 ) {
+    if owned_by_a_close(state, &failure) {
+        return;
+    }
     state.mark_closed();
     fail_pending_around_drain(state, notifications, failure).await;
     state.shutdown.cancel();
@@ -4778,9 +4908,13 @@ async fn hand_off(
         return;
     };
     let responder = Responder::new(state, raw_id, Some(slot), bytes);
-    HANDING_OFF_FOR
+    // A call the worker awaits as it awaits a notification, so it is scoped as one: an ordered
+    // answer asked for from inside it would wait for the call it is made from, and a hold can
+    // be taken in it, which the end that cancels it waits for as it does for a notification
+    // call's.
+    HANDLING_NOTIFICATION_FOR
         .scope(
-            state.address(),
+            NotificationCall::of(state.address()),
             handler.on_request_handoff(method, params, responder),
         )
         .await;
@@ -4849,9 +4983,12 @@ fn oversized_frame(error: &Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod abandoned_close_tests;
     mod cancellation_hold_tests;
+    mod handoff_hold_tests;
     mod handoff_queue_tests;
     mod invalid_request_tests;
+    mod on_request_end_tests;
     mod ordered_response_tests;
     mod outbound_bound_tests;
     mod outbox_tests;
