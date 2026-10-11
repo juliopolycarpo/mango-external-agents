@@ -114,10 +114,14 @@ let host = HostContext::builder()
    `host.limits()`, and a host constructing `TokioLauncher` hands it the same ones with
    `TokioLauncher::with_limits`, so one setting governs a bound wherever it is enforced.
    Teardown is bounded by these limits, not by a fixed constant: before wrapping your own timeout
-   around `close` or `cancel`, read the worst cases in the Deadlines tables of
-   [harness-acp.md](harness-acp.md#deadlines) and [harness-claude.md](harness-claude.md#deadlines),
-   and in the stop-a-turn deadlines of
-   [harness-codex.md](harness-codex.md#sessions-turns-and-steering).
+   around `close` or `cancel`, ask the harness crate for the worst cases instead of copying a
+   formula. `mango_agent_acp::deadlines::Deadlines`, `mango_agent_claude::deadlines::Deadlines` and
+   `mango_agent_codex::deadlines::Deadlines` each build from the host's `Limits` with
+   `Deadlines::from_limits(&limits)`. `close_worst_case()` is how long any `close` can take,
+   measured from the call, and the other methods are the rows of the Deadlines tables of
+   [harness-acp.md](harness-acp.md#deadlines), [harness-claude.md](harness-claude.md#deadlines) and
+   the stop-a-turn deadlines of [harness-codex.md](harness-codex.md#sessions-turns-and-steering).
+   Add a margin of your own; these are the harness's bounds, not a promise about a typical stop.
 
 For ACP, one outgoing frame may be `Limits::turn_buffer_bytes` by default, and the writer queue
 holds twice that, counting the frame being written, so a full-size prompt can still be followed by
