@@ -113,6 +113,34 @@ struct NativeBinding {
     abandoned: Option<agent_client_protocol_schema::v1::SessionId>,
 }
 
+/// Gives a finished turn's slot back, on a connection that may already have ended.
+///
+/// A turn that ended with an answer did not wait for any teardown, so the connection can have
+/// ended behind it (the agent answered and exited) with the lifecycle watcher not yet run.
+/// Released then, the slot could be taken by a `start_turn` that would run on a dead
+/// connection and report its end, where the session should refuse it as closed. Admission is
+/// closed first in that case, which is what the watcher is about to do.
+///
+/// ```ignore
+/// release_turn(&state, &connection, &handle);
+/// ```
+pub(crate) fn release_turn(
+    state: &SessionState,
+    connection: &ConnectionHandle,
+    handle: &TurnHandle,
+) {
+    if connection.ended().is_cancelled() {
+        state.close_turn_admission();
+    }
+    state.release_turn_matching(handle);
+}
+
+/// How many tool-call ids are kept from one terminal for [`SessionState::is_late_for_a_closed_call`].
+///
+/// A turn that ends with more calls than this still running keeps the first ones only; the
+/// rest are treated as any other frame.
+const CLOSED_CALLS_KEPT: usize = 256;
+
 /// The option id a withdrawal reports, for a decision nobody chose.
 ///
 /// Not one of the request's own options, and deliberately so: naming one would tell an audit trail
@@ -320,6 +348,9 @@ pub(crate) struct SessionState {
     cancel_reason: Mutex<Option<CancelReason>>,
     /// Touched only by the notification handler, which the peer runs one call at a time.
     reducer: Mutex<Reducer>,
+    /// The tool calls the last terminal of this session closed while the agent still had them
+    /// running, by the reducer's key. See [`SessionState::is_late_for_a_closed_call`].
+    closed_calls: Mutex<std::collections::BTreeSet<String>>,
     /// Questions the agent is waiting on, keyed by [`SessionState::mint_approval_id`]'s id.
     ///
     /// Not the JSON-RPC id `session/request_permission` arrived on: that id is the peer's to choose
@@ -381,6 +412,7 @@ impl SessionState {
             generations: AtomicU64::new(0),
             cancel_reason: Mutex::new(None),
             reducer: Mutex::new(Reducer::new()),
+            closed_calls: Mutex::new(std::collections::BTreeSet::new()),
             pending: Mutex::new(HashMap::new()),
             next_approval: AtomicU64::new(0),
             activity: tokio::sync::watch::channel(0).0,
@@ -744,12 +776,70 @@ impl SessionState {
             let reason = self.lock_cancel_reason().take();
             let pending = self.take_pending();
             let closing = std::mem::take(&mut *self.lock_reducer());
+            self.remember_closed_calls(&closing);
             (turn, reason, pending, closing)
         };
         for pending in pending {
             pending.withdraw();
         }
         Some((turn, reason, closing))
+    }
+
+    /// Keeps the ids of the calls `closing` still holds open, in place of the ones kept at the
+    /// terminal before.
+    ///
+    /// Replaced at every terminal, so the set is only ever the last turn's leftovers, and at
+    /// most [`CLOSED_CALLS_KEPT`] of them.
+    fn remember_closed_calls(&self, closing: &Reducer) {
+        *self.lock_closed_calls() = closing
+            .open_call_ids()
+            .take(CLOSED_CALLS_KEPT)
+            .map(String::from)
+            .collect();
+    }
+
+    /// Whether `update` is a late frame for a call the previous turn's terminal closed.
+    ///
+    /// ACP updates carry no turn id, so a frame cannot in general be given to the turn it was
+    /// meant for. One case is certain: the agent left a call running when its turn ended, this
+    /// side closed that call with the turn's terminal, and a `tool_call_update` for the same
+    /// id arrives after the next turn began. Reduced there, it would open the call again on a
+    /// turn that never ran it. Such a frame is dropped, with nothing said: it is the tail of a
+    /// turn the host already saw end, not a fault of the turn now running, and a notice on
+    /// that turn would point at the wrong one.
+    ///
+    /// A `tool_call` that starts a call under a remembered id is the agent using the id anew,
+    /// so the id is forgotten and the frame is the running turn's. Anything else, a text chunk
+    /// or a call the previous turn never saw, cannot be told apart and is reduced as it comes.
+    ///
+    /// ```ignore
+    /// if state.is_late_for_a_closed_call(&notification.update) { return; }
+    /// ```
+    fn is_late_for_a_closed_call(&self, update: &SessionUpdate) -> bool {
+        match update {
+            SessionUpdate::ToolCallUpdate(late) => self.closed_call(&late.tool_call_id),
+            SessionUpdate::ToolCall(started) => {
+                self.lock_closed_calls()
+                    .remove(&crate::reducer::call_key(&started.tool_call_id));
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the previous turn's terminal closed the call the agent names `id`.
+    ///
+    /// For example, a `session/request_permission` about such a call is the previous turn's
+    /// question arriving late, and is withdrawn instead of shown on the turn now running.
+    fn closed_call(&self, id: &agent_client_protocol_schema::v1::ToolCallId) -> bool {
+        self.lock_closed_calls()
+            .contains(&crate::reducer::call_key(id))
+    }
+
+    fn lock_closed_calls(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeSet<String>> {
+        self.closed_calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Releases an already-terminal generation after its stream outcome is committed.
@@ -1194,6 +1284,10 @@ async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotif
     // Capture the current owner before anything is reduced. Facts may arrive between turns; their
     // publication must not attach turn events to a newly admitted generation.
     let turn = state.turn();
+    // The tail of a turn that has already ended is neither this turn's event nor its progress.
+    if turn.is_some() && state.is_late_for_a_closed_call(&notification.update) {
+        return;
+    }
     if is_progress(&notification.update) {
         state.touch();
     }
@@ -1328,6 +1422,11 @@ async fn on_request_permission(
     if !state.serves(&request.session_id) {
         // Another session's question. Refused rather than shown: this host's answer would grant
         // work in a conversation it never opened.
+        return reply.respond(permission::cancelled());
+    }
+    if state.closed_call(&request.tool_call.tool_call_id) {
+        // About a call the previous turn's terminal closed: that turn's question, arriving
+        // after it ended. Withdrawn, as it would have been had it arrived a moment earlier.
         return reply.respond(permission::cancelled());
     }
     let id = state.mint_approval_id();

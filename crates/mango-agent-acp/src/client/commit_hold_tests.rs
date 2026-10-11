@@ -574,3 +574,45 @@ async fn unreadable_updates_are_announced_once_and_are_not_progress() {
         "expected (frames counted as progress, notices shown, the turn's outcome): {expected:?} | received: {received:?}"
     );
 }
+
+impl RunningTurn {
+    /// A sink for one more turn on this session.
+    fn next_sink(&self, turn_id: &str) -> EventSink {
+        EventSink::new(
+            SessionId::new("session-1"),
+            TurnId::new(turn_id),
+            AttemptId::default(),
+            Arc::clone(self.host.clock()),
+            16,
+        )
+        .0
+    }
+}
+
+/// A turn that ended with an answer gives its slot back without waiting for any teardown. On
+/// a connection that is still up the next turn is admitted; on one that ended behind the
+/// answer, admission is closed before the slot is free, so the next turn is refused as closed
+/// whether or not the lifecycle watcher has run yet.
+#[tokio::test]
+async fn a_slot_released_on_an_ended_connection_admits_no_further_turn() {
+    let live = RunningTurn::start().await;
+    super::release_turn(&live.state, &live.connection, &live.turn);
+    let admitted = live.state.begin_turn(live.next_sink("turn-2"), None);
+
+    let ended = RunningTurn::start().await;
+    ended.agent.announce(flood());
+    ended.connection.ended().cancelled().await;
+    super::release_turn(&ended.state, &ended.connection, &ended.turn);
+    let refused = ended.state.begin_turn(ended.next_sink("turn-2"), None);
+
+    let received = (
+        admitted.is_ok(),
+        matches!(&refused, Err(mango_external_agents::Error::Closed { .. })),
+    );
+    assert_eq!(
+        received,
+        (true, true),
+        "expected (next turn admitted on a live connection, refused as closed on an ended one): (true, true) | received: {received:?} from {:?}",
+        refused.map(|_| "an installed turn")
+    );
+}

@@ -243,13 +243,39 @@ ends with one `EventKind::Error` coded `acp-request-failed`, with `request_id` `
 the agent's code as `vendor_code` and its message. The session stays usable, as it does after a
 `refusal` or `max_tokens` stop: the agent answered, so the connection is as healthy as after
 any answer. The failed turn's parked questions are withdrawn with ACP's `cancelled` outcome, the
-calls it left running are closed as failed, and the next `start_turn` begins clean. A host
-`cancel` that the agent answers with such an error still ends the turn as `Cancelled`.
+calls it left running are closed as failed, and the next turn begins clean. A host `cancel`
+that the agent answers with such an error still ends the turn as `Cancelled`.
+
+The library does not judge the agent's code. A host that treats a particular failure as fatal
+for the conversation calls `close` itself; nothing ends the session on its behalf. That
+includes an agent saying its session is gone, for which ACP has no code this client could
+rely on, and `-32000` (`AuthRequired`) on a prompt: a turn's terminal carries the agent's code
+as `vendor_code` and has no typed form for it, so the profile's login hint that
+`open_session` returns in `Error::AuthRequired` is not on the stream. The library never
+attempts a login either way.
+
+As after any turn, the terminal is published a moment before the turn's slot is released, so a
+host that starts the next turn the instant it reads the terminal can be answered `Error::Busy`
+and should start again.
 
 A result this client could not read is different. The turn reports it the same way, with
 `-32603` as the code, but the connection is torn down before the event is written: the agent
 believes the turn ended some way this side cannot tell, so what it holds the session to be is
 unknown. A prompt with no answer at all, because the link closed, ends the session too.
+
+Two limits:
+
+- An answer whose `error` member is not an error object (`null`, a string, an object with a
+  code that is not a number) is read by the connection as the agent's internal error,
+  `-32603`, and this harness cannot tell it from one the agent really sent. The turn fails as
+  the agent's refusal and the session is kept, where it should end as for an unreadable result.
+- ACP updates carry no turn id, so a frame the agent sends late, for a turn that has ended,
+  cannot in general be kept off the next turn. One case is handled: a `tool_call_update`, or a
+  `session/request_permission`, for a call the previous turn's terminal closed while the agent
+  still had it running is the previous turn's. The update is dropped without a word, since it
+  is the tail of a turn the host already saw end and a notice would point at the turn now
+  running; the question is answered `cancelled`. At most 256 such call ids are remembered, from
+  the last terminal only. Any other late frame, a text chunk say, is the running turn's.
 
 A turn ends as `Cancelled` in two cases. The agent answered its prompt with
 `stop_reason: cancelled`, which is believed and reported as `Requested` when no reason was

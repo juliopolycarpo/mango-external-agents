@@ -3,7 +3,9 @@
 A session admits one native turn at a time. A concurrent start returns `Error::Busy` with
 `Dispatch::NotSubmitted`; it never replaces, queues or steers the current turn. A stopping attempt
 continues to own admission until native work can no longer conflict and its terminal is committed.
-The host does not have to drain the old transcript before starting another turn.
+The host does not have to drain the old transcript before starting another turn. In the ACP
+harness the slot is released a moment after the terminal is published, so a start made the
+instant the terminal is read can still be answered `Error::Busy`, and is simply made again.
 
 Every callback belongs to an attempt. The harness compares that owner before publishing session
 state, resolving interactions or clearing admission. Reusing a host turn ID does not give an older

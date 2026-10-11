@@ -603,41 +603,71 @@ fn permission_ask(id: u32) -> String {
     .to_string()
 }
 
+/// A running call left open under `id`.
+fn running_call(id: &str) -> String {
+    update_line(serde_json::json!({
+        "sessionUpdate": "tool_call", "toolCallId": id,
+        "title": "Run tests", "kind": "execute", "status": "in_progress",
+    }))
+}
+
+/// A text chunk and the `end_turn` answer to the prompt `frame`.
+fn says_and_ends(frame: &serde_json::Value, text: &str) -> Vec<String> {
+    vec![
+        update_line(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": text }
+        })),
+        reply(
+            &frame["id"],
+            serde_json::json!({ "stopReason": "end_turn" }),
+        ),
+    ]
+}
+
+/// Each tool call the events close, as `<id> <status>`.
+fn closed_calls(events: &[EventKind]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|kind| match kind {
+            EventKind::ActivityCompleted { call_id, result } => {
+                Some(format!("{call_id} {:?}", result.status))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// An agent that refuses a prompt with an error of its own has answered: the connection is as
 /// healthy as after any answer, so the session stays usable, as it does after a `refusal` or a
-/// `max_tokens` stop. The failed turn leaves nothing behind for the next one: the question it
-/// left parked is withdrawn, the call it left running is closed with the failed turn, and the
-/// second turn on the same session starts clean and completes.
+/// `max_tokens` stop. The failed turn leaves nothing behind for the next one: the question the
+/// host was shown is resolved as withdrawn and answered `cancelled` on the wire, the call left
+/// running is closed as failed with the turn, and the second turn on the same session starts
+/// clean and completes.
+///
+/// The agent fails its first prompt when it is asked for a listing, so the test decides when:
+/// after the host has been shown the question.
 #[tokio::test]
 async fn a_session_takes_another_turn_after_an_agents_error_on_the_prompt() {
-    let prompts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let seen = Arc::clone(&prompts);
-    let peer = ScriptedPeer::new(move |frame| match frame["method"].as_str() {
-        Some("session/prompt") => {
-            match seen.fetch_add(1, std::sync::atomic::Ordering::AcqRel) {
-                // The first prompt: a call left running, a question left open, then the error.
-                0 => vec![
-                    update_line(serde_json::json!({
-                        "sessionUpdate": "tool_call", "toolCallId": "call_1",
-                        "title": "Run tests", "kind": "execute", "status": "in_progress",
-                    })),
-                    permission_ask(9_001),
-                    prompt_refusal(&frame["id"]),
-                ],
-                _ => vec![
-                    update_line(serde_json::json!({
-                        "sessionUpdate": "agent_message_chunk",
-                        "content": { "type": "text", "text": "second" }
-                    })),
-                    reply(
-                        &frame["id"],
-                        serde_json::json!({ "stopReason": "end_turn" }),
-                    ),
-                ],
+    let held = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let first = Arc::clone(&held);
+    let peer = ScriptedPeer::new(move |frame| {
+        let mut first = first.lock().expect("expected the prompt slot");
+        match frame["method"].as_str() {
+            Some("session/prompt") if frame["params"]["prompt"][0]["text"] == "try" => {
+                *first = frame.get("id").cloned();
+                vec![running_call("call_1"), permission_ask(9_001)]
             }
+            Some("session/prompt") => says_and_ends(frame, "second"),
+            Some("session/list") => {
+                let mut lines = vec![reply(&frame["id"], serde_json::json!({ "sessions": [] }))];
+                lines.extend(first.take().iter().map(prompt_refusal));
+                lines
+            }
+            _ => Vec::new(),
         }
-        _ => Vec::new(),
-    });
+    })
+    .with_session_capabilities(serde_json::json!({ "list": {} }));
     let launcher = FakeLauncher::new();
     launcher.push(peer.process());
     let session = AcpHarness::new(profile())
@@ -652,25 +682,33 @@ async fn a_session_takes_another_turn_after_an_agents_error_on_the_prompt() {
         .start_turn(TurnRequest::new("turn-1", "try"))
         .await
         .expect("expected the first turn");
-    let events = drain(&mut first).await;
-    let closed: Vec<String> = events
-        .iter()
-        .filter_map(|kind| match kind {
-            EventKind::ActivityCompleted { call_id, result } => {
-                Some(format!("{call_id} {:?}", result.status))
-            }
-            _ => None,
-        })
-        .collect();
-    let labels = event_labels(&events);
-    let received = (closed, labels.last().map(String::as_str));
+    read_until(&mut first, "the question shown to the host", |kind| {
+        matches!(kind, EventKind::ApprovalRequested { .. })
+    })
+    .await;
+    session
+        .list_sessions(Default::default())
+        .await
+        .expect("expected the listing that makes the agent fail its prompt");
+
+    let rest = drain(&mut first).await;
+    let labels = event_labels(&rest);
+    let received = (
+        closed_calls(&rest),
+        labels
+            .iter()
+            .filter(|label| *label == "ApprovalResolved")
+            .count(),
+        labels.last().map(String::as_str),
+    );
     let expected = (
         vec![String::from("call_1 Failed")],
+        1,
         Some("Error(acp-request-failed)"),
     );
     assert_eq!(
         received, expected,
-        "expected (calls closed, terminal) of the refused turn: {expected:?} | received: {received:?} in {labels:?}"
+        "expected (calls closed, questions resolved for the host, terminal) of the refused turn: {expected:?} | received: {received:?} in {labels:?}"
     );
     eventually("the parked question withdrawn", &launcher, || {
         wire_labels(&launcher)
@@ -704,54 +742,76 @@ async fn a_session_takes_another_turn_after_an_agents_error_on_the_prompt() {
     );
 }
 
-/// An agent that refuses a prompt and then floods the connection has still refused the prompt.
-/// The turn reports the refusal it was given, with the agent's code, and not the budget the
-/// agent went on to pass: that ends the connection, and the session with it, on its own.
+/// Frames an agent sends for a turn that has already ended do not land on the next one. The
+/// first turn fails with a call still running, which its terminal closes. When the agent then
+/// reports on that call during the second turn, and asks a question about it, neither is the
+/// second turn's: the update is dropped, where reducing it would open the call again, and the
+/// question is answered `cancelled` and never shown. The second turn carries only its own
+/// events.
 #[tokio::test]
-async fn an_agents_error_followed_by_a_flood_is_still_reported_as_the_error() {
+async fn late_frames_for_a_call_the_failed_turn_closed_do_not_reach_the_next_turn() {
     let peer = ScriptedPeer::new(|frame| match frame["method"].as_str() {
+        Some("session/prompt") if frame["params"]["prompt"][0]["text"] == "try" => {
+            vec![running_call("call_1"), prompt_refusal(&frame["id"])]
+        }
         Some("session/prompt") => {
-            let heartbeat = serde_json::json!({ "jsonrpc": "2.0", "method": "$/vendor/heartbeat" });
-            vec![
-                prompt_refusal(&frame["id"]),
-                serde_json::Value::Array(vec![heartbeat; 1_100]).to_string(),
-            ]
+            let mut lines = vec![
+                update_line(serde_json::json!({
+                    "sessionUpdate": "tool_call_update", "toolCallId": "call_1",
+                    "status": "completed",
+                })),
+                permission_ask(9_002),
+            ];
+            lines.extend(says_and_ends(frame, "second"));
+            lines
         }
         _ => Vec::new(),
     });
-    let (session, launcher) = open_under(peer.process(), Limits::default()).await;
-    let mut lifecycle = session.subscribe();
-    let mut turn = session
+    let launcher = FakeLauncher::new();
+    launcher.push(peer.process());
+    let session = AcpHarness::new(profile())
+        .open_session(
+            &host(&launcher),
+            OpenSession::new("chat-1").with_configuration(permissive()),
+        )
+        .await
+        .expect("expected a session");
+
+    let mut first = session
         .start_turn(TurnRequest::new("turn-1", "try"))
         .await
-        .expect("expected a turn");
+        .expect("expected the first turn");
+    let events = drain(&mut first).await;
+    let received = closed_calls(&events);
+    assert_eq!(
+        received,
+        ["call_1 Failed"],
+        "expected the failed turn to close its call: [\"call_1 Failed\"] | received: {received:?}"
+    );
 
+    let mut second = start_when_free(session.as_ref(), "turn-2", "again").await;
     assert_events(
-        "the refused turn",
-        &drain(&mut turn).await,
-        &["TurnStarted", "Error(acp-request-failed)"],
+        "the second turn",
+        &drain(&mut second).await,
+        &["TurnStarted", "TextDelta(second)", "Completed"],
     );
-    assert_status(
-        "after the flood",
-        status_once_settled(&mut lifecycle).await,
-        SessionStatus::Closed,
-    );
-    assert_no_live_children("after the flood", &launcher);
+    eventually("the late question withdrawn", &launcher, || {
+        wire_labels(&launcher)
+            .iter()
+            .any(|label| label == "outcome cancelled for 9002")
+            .then_some(())
+    })
+    .await;
 }
 
-/// A cancel that races the agent's own error is still the host's cancel: the turn ends as
-/// `Cancelled` with the reason the host gave, the agent having answered, and the session takes
-/// the next turn.
-#[tokio::test]
-async fn a_cancel_answered_with_the_agents_error_ends_as_cancelled_and_keeps_the_session() {
+/// A peer that holds the prompt whose text is `wait` and fails it when it is told to cancel.
+/// Every other prompt ends at once.
+fn refusing_when_cancelled() -> ScriptedPeer {
     let prompt = Arc::new(Mutex::new(None::<serde_json::Value>));
-    let held = Arc::clone(&prompt);
-    let peer = ScriptedPeer::new(move |frame| {
-        let mut held = held.lock().expect("expected the prompt slot");
+    ScriptedPeer::new(move |frame| {
+        let mut held = prompt.lock().expect("expected the prompt slot");
         match frame["method"].as_str() {
-            Some("session/prompt")
-                if held.is_none() && frame["params"]["prompt"][0]["text"] == "wait" =>
-            {
+            Some("session/prompt") if frame["params"]["prompt"][0]["text"] == "wait" => {
                 *held = frame.get("id").cloned();
                 Vec::new()
             }
@@ -761,12 +821,19 @@ async fn a_cancel_answered_with_the_agents_error_ends_as_cancelled_and_keeps_the
                     serde_json::json!({ "stopReason": "end_turn" }),
                 )]
             }
-            // The agent answers the cancel by failing the prompt it was holding.
             Some("session/cancel") => held.take().iter().map(prompt_refusal).collect(),
             _ => Vec::new(),
         }
-    });
-    let (session, _launcher) = open_under(peer.process(), Limits::default()).await;
+    })
+}
+
+/// A cancel that races the agent's own error is still the host's cancel: the turn ends as
+/// `Cancelled` with the reason the host gave, the agent having answered, and the session takes
+/// the next turn.
+#[tokio::test]
+async fn a_cancel_answered_with_the_agents_error_ends_as_cancelled_and_keeps_the_session() {
+    let (session, _launcher) =
+        open_under(refusing_when_cancelled().process(), Limits::default()).await;
 
     let mut first = session
         .start_turn(TurnRequest::new("turn-1", "wait"))
@@ -793,6 +860,165 @@ async fn a_cancel_answered_with_the_agents_error_ends_as_cancelled_and_keeps_the
         &drain(&mut second).await,
         &["TurnStarted", "Completed"],
     );
+}
+
+/// The idle deadline cancels a silent turn the way a host does. An agent that answers that
+/// cancel with an error of its own has answered: the turn ends as the timeout it was, nothing
+/// is reaped, and the session takes the next turn.
+#[tokio::test(start_paused = true)]
+async fn an_idle_cancel_answered_with_the_agents_error_ends_as_the_timeout_and_keeps_the_session() {
+    let (session, launcher) = open_under(
+        refusing_when_cancelled().process(),
+        Limits {
+            idle_timeout: Duration::from_secs(5),
+            ..Limits::default()
+        },
+    )
+    .await;
+
+    let mut first = session
+        .start_turn(TurnRequest::new("turn-1", "wait"))
+        .await
+        .expect("expected the first turn");
+    assert_events(
+        "the silent turn",
+        &drain(&mut first).await,
+        &["TurnStarted", "Cancelled(Timeout)", "Completed"],
+    );
+    assert_status(
+        "after the idle deadline",
+        session.snapshot().status,
+        SessionStatus::Ready,
+    );
+    assert_eq!(
+        launcher.live_children(),
+        1,
+        "expected the agent still running after the idle deadline | received: {} children",
+        launcher.live_children()
+    );
+
+    let mut second = start_when_free(session.as_ref(), "turn-2", "again").await;
+    assert_events(
+        "the turn after the idle deadline",
+        &drain(&mut second).await,
+        &["TurnStarted", "Completed"],
+    );
+}
+
+/// A session kept after an agent's error ends like any other when the agent then exits with no
+/// turn running: the lifecycle reaches `Closed` within the time the deadlines table gives an
+/// agent exit, the child is reaped, and the next turn is refused as closed.
+#[tokio::test(start_paused = true)]
+async fn an_agent_that_exits_while_idle_after_its_error_closes_the_session() {
+    let gone = CancelToken::new();
+    let peer = ScriptedPeer::new(|frame| match frame["method"].as_str() {
+        Some("session/prompt") => vec![prompt_refusal(&frame["id"])],
+        _ => Vec::new(),
+    });
+    let launcher = FakeLauncher::new();
+    launcher.push(
+        FakeProcess::responding(move |line| peer.answer(line))
+            .ending_stdout_when(gone.clone())
+            .with_stderr(STDERR),
+    );
+    let limits = Limits::default();
+    let session = AcpHarness::new(profile())
+        .open_session(&host_with(&launcher, limits), OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut lifecycle = session.subscribe();
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "try"))
+        .await
+        .expect("expected a turn");
+    assert_events(
+        "the refused turn",
+        &drain(&mut turn).await,
+        &["TurnStarted", "Error(acp-request-failed)"],
+    );
+    assert_status(
+        "after the agent's error",
+        session.snapshot().status,
+        SessionStatus::Ready,
+    );
+
+    let begun = tokio::time::Instant::now();
+    gone.cancel();
+    assert_status(
+        "after the agent exited",
+        status_once_settled(&mut lifecycle).await,
+        SessionStatus::Closed,
+    );
+    // An agent exit, to `Closed`: two shutdown timeouts, the teardown and one more.
+    let bound = 5 * limits.shutdown_timeout + 2 * limits.kill_grace;
+    let waited = begun.elapsed();
+    assert!(
+        waited <= bound,
+        "expected the session closed within {bound:?} of the exit | received: {waited:?}"
+    );
+    assert_no_live_children("after the agent exited", &launcher);
+    let next = refusal(
+        session
+            .start_turn(TurnRequest::new("turn-2", "again"))
+            .await,
+    );
+    assert!(
+        matches!(next.cause(), Error::Closed { subject: "session" }),
+        "expected the next turn: Closed {{ subject: \"session\" }} | received: {next:?}"
+    );
+}
+
+/// What happens today when the `error` member of the answer to a prompt is not an error
+/// object: the connection reads it as the agent's internal error (`-32603`), which this
+/// harness cannot tell from one the agent really sent, so the turn fails as the agent's
+/// refusal and the session is kept.
+///
+/// A known limit, pinned so it changes on purpose: such an answer is not one this side
+/// understood, and the session should end as it does for a result that cannot be read. That
+/// needs the connection to say the body was malformed.
+#[tokio::test]
+async fn a_malformed_error_body_on_the_prompt_is_read_as_the_agents_internal_error_and_keeps_the_session()
+ {
+    let bodies = [
+        serde_json::Value::Null,
+        serde_json::json!("boom"),
+        serde_json::json!({ "code": "x" }),
+    ];
+    for body in bodies {
+        let malformed = body.clone();
+        let peer = ScriptedPeer::new(move |frame| match frame["method"].as_str() {
+            Some("session/prompt") => vec![
+                serde_json::json!({ "jsonrpc": "2.0", "id": frame["id"], "error": malformed })
+                    .to_string(),
+            ],
+            _ => Vec::new(),
+        });
+        let (session, launcher) = open_under(peer.process(), Limits::default()).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "try"))
+            .await
+            .expect("expected a turn");
+
+        let events = drain(&mut turn).await;
+        assert_events(
+            &format!("the turn answered with error {body}"),
+            &events,
+            &["TurnStarted", "Error(acp-request-failed)"],
+        );
+        let Some(EventKind::Error { error }) = events.last() else {
+            unreachable!("the events above end in an error");
+        };
+        let received = (
+            error.vendor_code.as_deref(),
+            session.snapshot().status,
+            launcher.live_children(),
+        );
+        let expected = (Some("-32603"), SessionStatus::Ready, 1);
+        assert_eq!(
+            received, expected,
+            "expected (code, session status, children) after error {body}: {expected:?} | received: {received:?}"
+        );
+    }
 }
 
 /// A result this client cannot read is not the agent's refusal: the agent believes it answered

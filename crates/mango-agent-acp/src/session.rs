@@ -1293,12 +1293,7 @@ impl Session for AcpSession {
             // agent's own refusal of the prompt. It is ended when there was no answer, and when
             // the answer could not be read, because what the agent then holds the session to be
             // is unknown.
-            let answered = match &outcome {
-                Some(Ok(_)) => true,
-                Some(Err(failure)) => failure.leaves_the_connection_usable(),
-                None => false,
-            };
-            let cleanup_error = if answered {
+            let cleanup_error = if understood(&outcome) {
                 None
             } else {
                 connection.begin_shutdown(CancelReason::Shutdown);
@@ -1326,39 +1321,30 @@ impl Session for AcpSession {
                 .take();
             // Decided before anything is emitted, so the calls the agent left running close with a
             // status that agrees with the terminal that follows them.
-            let (ending, release) = if let Some(error) = cleanup_error {
-                // The process may still be live. Keep this generation installed so admission
-                // remains closed until a later session close can retry teardown.
-                (
-                    Some(Ending::Fail(link_failure(format!(
-                        "ACP process cleanup failed: {error}"
-                    )))),
-                    false,
-                )
-            } else if let Some(overflow) = match answered {
-                // An answer this side understood is reported as itself, whatever the agent
-                // did to the connection after giving it.
-                true => None,
-                false => connection.overflow(),
-            } {
-                (Some(Ending::Fail(overflow_failure(overflow))), true)
-            } else {
-                let recorded = TurnRecord {
-                    cancel_reason,
-                    cancel_failure,
-                    already_terminal: turn.sink.is_terminal(),
-                    timed_out: connection.timed_out().map(String::from),
-                };
-                let agent = profile.id.to_string();
-                let ending = prompt_ending(outcome, recorded, &agent, control.as_ref());
-                (ending, true)
+            let recorded = TurnRecord {
+                cancel_reason,
+                cancel_failure,
+                already_terminal: turn.sink.is_terminal(),
+                timed_out: connection.timed_out().map(String::from),
             };
+            let connection_state = ConnectionRecord {
+                cleanup_error: cleanup_error.map(|error| error.to_string()),
+                overflow: connection.overflow(),
+            };
+            let agent = profile.id.to_string();
+            let (ending, release) = turn_ending(
+                outcome,
+                recorded,
+                connection_state,
+                &agent,
+                control.as_ref(),
+            );
             let _ = turn.approvals.flush(&turn.sink).await;
             if let Some(ending) = ending {
                 ending.emit(&turn.sink, closing).await;
             }
             if release {
-                state.release_turn_matching(&handle);
+                client::release_turn(&state, &connection, &handle);
             }
         });
 
@@ -1536,6 +1522,61 @@ impl Ending {
             Self::Fail(error) => sink.fail(error).await,
         };
     }
+}
+
+/// Whether a prompt wait ended with an answer this side understood.
+///
+/// A result, or the agent's own refusal of the prompt. The connection is kept after either. It
+/// is ended when there was no answer, and when the answer could not be read, because what the
+/// agent then holds the session to be is unknown. For example, `understood(&None)` is `false`.
+fn understood(outcome: &Option<std::result::Result<PromptResponse, PromptFailure>>) -> bool {
+    match outcome {
+        Some(Ok(_)) => true,
+        Some(Err(failure)) => failure.leaves_the_connection_usable(),
+        None => false,
+    }
+}
+
+/// What the connection had to say by the time a turn's ending is decided.
+struct ConnectionRecord {
+    /// Why the teardown this turn asked for did not finish, when it did not.
+    cleanup_error: Option<String>,
+    /// The queue budget that ended the connection, when one did.
+    overflow: Option<crate::transport::Overflow>,
+}
+
+/// Decides how a turn ends and whether its slot is given back, from how the prompt wait ended,
+/// what the session recorded and what the connection had to say.
+///
+/// In this order:
+///
+/// - a teardown that did not finish fails the turn naming it and keeps the slot: the process
+///   may still be live, so admission stays closed until a later `close` can retry;
+/// - an answer this side [`understood`] is reported as itself by [`prompt_ending`], whatever
+///   the agent did to the connection after giving it;
+/// - with no such answer, a queue budget that ended the connection is why the turn ended;
+/// - otherwise [`prompt_ending`] decides.
+///
+/// ```ignore
+/// let (ending, release) = turn_ending(outcome, recorded, connection, "opencode", control);
+/// ```
+fn turn_ending(
+    outcome: Option<std::result::Result<PromptResponse, PromptFailure>>,
+    recorded: TurnRecord,
+    connection: ConnectionRecord,
+    agent: &str,
+    control: &dyn ProcessControl,
+) -> (Option<Ending>, bool) {
+    if let Some(error) = connection.cleanup_error {
+        let failure = link_failure(format!("ACP process cleanup failed: {error}"));
+        return (Some(Ending::Fail(failure)), false);
+    }
+    if !understood(&outcome)
+        && let Some(overflow) = connection.overflow
+    {
+        return (Some(Ending::Fail(overflow_failure(overflow))), true);
+    }
+    (prompt_ending(outcome, recorded, agent, control), true)
 }
 
 /// What a session recorded about a turn by the time its prompt wait ended.
@@ -1875,6 +1916,127 @@ mod tests {
             cancel_failure: None,
             already_terminal: false,
             timed_out: None,
+        }
+    }
+
+    /// The connection with nothing to report.
+    fn healthy() -> super::ConnectionRecord {
+        super::ConnectionRecord {
+            cleanup_error: None,
+            overflow: None,
+        }
+    }
+
+    /// A connection that a queue budget ended.
+    fn overflowed() -> super::ConnectionRecord {
+        super::ConnectionRecord {
+            cleanup_error: None,
+            overflow: Some(crate::transport::Overflow::incoming_messages(8, 50)),
+        }
+    }
+
+    fn refused() -> Waited {
+        Some(Err(PromptFailure::Agent(
+            agent_client_protocol_schema::v1::Error::new(-31_000, "model busy"),
+        )))
+    }
+
+    fn unreadable() -> Waited {
+        Some(Err(PromptFailure::Unreadable(
+            agent_client_protocol_schema::v1::Error::internal_error(),
+        )))
+    }
+
+    #[test]
+    fn only_a_result_or_the_agents_refusal_is_an_answer_this_side_understood() {
+        let cases: [(&str, Waited, bool); 5] = [
+            (
+                "a result",
+                Some(Ok(PromptResponse::new(StopReason::EndTurn))),
+                true,
+            ),
+            ("the agent's refusal", refused(), true),
+            ("an unreadable result", unreadable(), false),
+            ("a closed link", Some(Err(PromptFailure::LinkClosed)), false),
+            ("no answer", None, false),
+        ];
+        for (what, outcome, expected) in cases {
+            let received = super::understood(&outcome);
+            assert_eq!(
+                received, expected,
+                "expected {what} understood: {expected} | received: {received}"
+            );
+        }
+    }
+
+    /// Every row of the decision: what the turn reports and whether its slot is given back.
+    #[test]
+    fn a_turns_ending_is_decided_from_the_answer_and_then_from_the_connection() {
+        let cleanup_failed = || super::ConnectionRecord {
+            cleanup_error: Some(String::from("kill refused")),
+            overflow: Some(crate::transport::Overflow::incoming_messages(8, 50)),
+        };
+        let overflow = "Fail(acp-transport-overflow, \"expected at most 8 JSON-RPC messages queued from the ACP agent, received 50\")";
+        let cases: [(&str, Waited, super::ConnectionRecord, &str, bool); 7] = [
+            (
+                "a refusal on a healthy connection",
+                refused(),
+                healthy(),
+                "Fail(acp-request-failed, \"model busy\")",
+                true,
+            ),
+            (
+                "a refusal the agent followed with a flood",
+                refused(),
+                overflowed(),
+                "Fail(acp-request-failed, \"model busy\")",
+                true,
+            ),
+            (
+                "a result the agent followed with a flood",
+                Some(Ok(PromptResponse::new(StopReason::EndTurn))),
+                overflowed(),
+                "Some(Complete)",
+                true,
+            ),
+            (
+                "an unreadable result under an overflow",
+                unreadable(),
+                overflowed(),
+                overflow,
+                true,
+            ),
+            (
+                "a closed link under an overflow",
+                Some(Err(PromptFailure::LinkClosed)),
+                overflowed(),
+                overflow,
+                true,
+            ),
+            (
+                "no answer under an overflow",
+                None,
+                overflowed(),
+                overflow,
+                true,
+            ),
+            (
+                "a teardown that did not finish",
+                None,
+                cleanup_failed(),
+                "Fail(acp-link-closed, \"ACP process cleanup failed: kill refused\")",
+                false,
+            ),
+        ];
+        for (what, outcome, connection, expected, release) in cases {
+            let (ending, released) =
+                super::turn_ending(outcome, untouched(), connection, "fake", &DeadAgent);
+            let received = (shown(ending.as_ref()), released);
+            assert_eq!(
+                received,
+                (String::from(expected), release),
+                "expected (ending, slot released) for {what}: ({expected}, {release}) | received: {received:?}"
+            );
         }
     }
 
