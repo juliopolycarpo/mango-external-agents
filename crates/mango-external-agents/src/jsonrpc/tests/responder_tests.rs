@@ -3,7 +3,7 @@
 
 use super::outbox_tests::{limits, options, ordered_options, sent, until, within};
 use super::*;
-use crate::jsonrpc::{ConnectionEnd, Responder, WireOptions, Written};
+use crate::jsonrpc::{ConnectionEnd, OutboundBound, Responder, WireOptions, Written};
 
 /// What the fake does with a question, by the method the peer names.
 const PARK: &str = "park";
@@ -25,6 +25,8 @@ struct ParkingHandler {
     gate: tokio::sync::Semaphore,
     /// What `answer` said to the answer that was too large.
     too_large: std::sync::Mutex<Vec<(bool, String)>>,
+    /// The outbound bound that answer's error names, if it names one.
+    too_large_bound: std::sync::Mutex<Vec<Option<OutboundBound>>>,
     terminations: std::sync::Mutex<Vec<PeerTermination>>,
     /// The client this handles for, for the question that asks the peer something back.
     client: std::sync::OnceLock<std::sync::Weak<Client>>,
@@ -41,6 +43,7 @@ impl ParkingHandler {
             parked: std::sync::Mutex::new(Vec::new()),
             gate: tokio::sync::Semaphore::new(0),
             too_large: std::sync::Mutex::new(Vec::new()),
+            too_large_bound: std::sync::Mutex::new(Vec::new()),
             terminations: std::sync::Mutex::new(Vec::new()),
         })
     }
@@ -125,6 +128,10 @@ impl PeerHandler for ParkingHandler {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push((unanswered.is_too_large(), unanswered.error().to_string()));
+                self.too_large_bound
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(OutboundBound::exceeded_by(unanswered.error()));
                 let (responder, _error) = unanswered.into_parts();
                 let _ = responder.answer(ServerRequestOutcome::Answer(json!("small")));
             }
@@ -555,6 +562,36 @@ async fn an_answer_too_large_hands_the_responder_back_for_a_smaller_one() {
     assert_eq!(
         observed, expected,
         "expected the large answer refused for its size alone and the small one written: {expected:?} | received {observed:?} ({refusals:?})"
+    );
+    connected
+        .client
+        .close()
+        .await
+        .expect("expected a clean close");
+}
+
+/// The error of an answer that is too large names the bound on one frame's bytes by type, as
+/// the error of a frame refused where it is submitted does, and so when it is the queue's byte
+/// bound that the answer passes, with the bound on one frame left unset.
+#[tokio::test]
+async fn an_answer_too_large_names_the_frame_bound() {
+    let connected = connect(
+        options(),
+        limits(usize::MAX, 200, usize::MAX).with_request_handoff(),
+    );
+    connected.link.push_line(question(5, LARGE));
+
+    sent(&connected.link, 1).await;
+    let bounds = connected
+        .handler
+        .too_large_bound
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(
+        bounds,
+        vec![Some(OutboundBound::FrameBytes)],
+        "expected the answer's error to name the bound on one frame's bytes: [Some(FrameBytes)] | received {bounds:?}"
     );
     connected
         .client
@@ -1221,6 +1258,52 @@ async fn a_responder_dropped_with_no_way_to_say_so_ends_the_connection() {
         );
         let _ = connected.client.close().await;
     }
+}
+
+/// Under a queue bound of nothing no answer can be queued, and the error of the answer names the
+/// bound on queued frames. That does not end anything by itself, but the responder cannot say
+/// anything for its question either, so the connection ends as a failed link when it is dropped.
+#[tokio::test]
+async fn an_answer_under_a_queue_bound_of_nothing_names_the_bound_and_the_connection_ends() {
+    let connected = connect(
+        options(),
+        limits(usize::MAX, usize::MAX, 0).with_request_handoff(),
+    );
+    connected.link.push_line(question(5, LARGE));
+
+    let termination = termination_of(&connected.handler).await;
+    let refused = connected
+        .handler
+        .too_large
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(|(too_large, _)| *too_large)
+        .collect::<Vec<_>>();
+    let bounds = connected
+        .handler
+        .too_large_bound
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let observed = (
+        bounds,
+        refused,
+        matches!(&termination, PeerTermination::LinkFailed(cause)
+            if cause.contains("outgoing JSON-RPC frames awaiting their write")),
+        connected.link.sent().len(),
+    );
+    let expected = (
+        vec![Some(OutboundBound::QueuedFrames)],
+        vec![false],
+        true,
+        0,
+    );
+    assert_eq!(
+        observed, expected,
+        "expected the bound on queued frames named for an answer that was not too large, and the connection ended as a failed link naming it with nothing written: {expected:?} | received {observed:?} ({termination:?})"
+    );
+    let _ = connected.client.close().await;
 }
 
 /// Ordered calls given up, more of them than the reserve for ordered responses holds, on one
