@@ -239,6 +239,14 @@ impl WireOptions {
     ///   [`PeerHandler::on_request_past_cap`](super::PeerHandler::on_request_past_cap), which
     ///   answers it on the spot.
     ///
+    /// Set the outbound queue's bounds along with this. An answer given on the spot, and the
+    /// answer to a question past the cap, is queued without waiting for the peer to read
+    /// anything. With no bound on the queue, a peer that asks without reading is limited only
+    /// by the write at the head of the queue running out its
+    /// [`ClientOptions::request_timeout`](super::ClientOptions::request_timeout), and the
+    /// queue grows until then. The bounds are what ends such a connection sooner; this
+    /// option does not set them.
+    ///
     /// # Example
     ///
     /// ```

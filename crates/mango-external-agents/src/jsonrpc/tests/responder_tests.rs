@@ -3,7 +3,7 @@
 
 use super::outbox_tests::{limits, options, ordered_options, sent, until, within};
 use super::*;
-use crate::jsonrpc::{Responder, WireOptions, Written};
+use crate::jsonrpc::{ConnectionEnd, Responder, WireOptions, Written};
 
 /// What the fake does with a question, by the method the peer names.
 const PARK: &str = "park";
@@ -11,6 +11,8 @@ const WAIT_THEN_PARK: &str = "wait-then-park";
 const LARGE: &str = "large";
 const LET_GO: &str = "let-go";
 const ASK_BACK: &str = "ask-back";
+const ASK_PLAIN: &str = "ask-plain";
+const CLOSE_INSIDE: &str = "close-inside";
 
 /// A handler that takes questions with their responders. It keeps the ones named `park`,
 /// waits at a gate before keeping `wait-then-park`, answers `large` with more than fits and
@@ -127,6 +129,26 @@ impl PeerHandler for ParkingHandler {
                 let _ = responder.answer(ServerRequestOutcome::Answer(json!("small")));
             }
             LET_GO => drop(responder),
+            ASK_PLAIN => {
+                let client = self
+                    .client
+                    .get()
+                    .and_then(std::sync::Weak::upgrade)
+                    .expect("expected the client still there");
+                let got = client.request::<_, Value>("back", json!({})).await;
+                let _ = responder.answer(ServerRequestOutcome::Answer(json!({ "got": got.ok() })));
+            }
+            CLOSE_INSIDE => {
+                let client = self
+                    .client
+                    .get()
+                    .and_then(std::sync::Weak::upgrade)
+                    .expect("expected the client still there");
+                self.record(String::from("closing"));
+                let _ = client.close().await;
+                self.record(String::from("close returned"));
+                drop(responder);
+            }
             ASK_BACK => {
                 let client = self
                     .client
@@ -1255,4 +1277,512 @@ async fn a_handler_that_answers_nothing_refuses_every_question_as_not_found() {
         );
         client.close().await.expect("expected a clean close");
     }
+}
+
+/// Takes every question handed over and keeps it, and answers the ones past the cap itself,
+/// noting which was which by the number the peer gave it.
+struct RacingHandler {
+    parked: std::sync::Mutex<Vec<Responder>>,
+    handed: std::sync::Mutex<Vec<u64>>,
+    past_cap: std::sync::Mutex<Vec<u64>>,
+}
+
+impl RacingHandler {
+    fn seen(&self, id: u64) -> bool {
+        let handed = self
+            .handed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&id);
+        handed
+            || self
+                .past_cap
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&id)
+    }
+
+    fn take(&self) -> Option<Responder> {
+        self.parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop()
+    }
+}
+
+#[async_trait::async_trait]
+impl PeerHandler for RacingHandler {
+    async fn on_notification(&self, _method: String, _params: Value) {}
+
+    async fn on_request_handoff(&self, _method: String, _params: Value, responder: Responder) {
+        let id = responder.id().as_json().as_u64().unwrap_or(u64::MAX);
+        self.handed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(id);
+        self.parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(responder);
+    }
+
+    fn on_request_past_cap(
+        &self,
+        _method: &str,
+        _params: &Value,
+        id: &RequestId,
+    ) -> Option<ServerRequestOutcome> {
+        self.past_cap
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(id.as_json().as_u64().unwrap_or(u64::MAX));
+        Some(ServerRequestOutcome::Answer(json!("past the cap")))
+    }
+}
+
+/// Answers the question when the peer gave it an even number, and lets it go otherwise.
+fn settle(responder: Responder) {
+    if responder.id().as_json().as_u64().unwrap_or(0) % 2 == 0 {
+        let _ = responder.answer(ServerRequestOutcome::Answer(json!("answered")));
+    }
+}
+
+/// One place for a question in flight, and a second thread that answers or drops the question
+/// holding it while the worker looks for a place for the next one. Round after round, with a
+/// quarter of the rounds given to each order and a quarter left to race. Every question gets
+/// exactly one reply, of the kind that fits what became of it; the place is never given back
+/// twice or kept; and nothing the questions held is left behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_place_freed_from_another_thread_is_given_back_once_whatever_the_worker_is_doing() {
+    const ROUNDS: u64 = 240;
+    let link = ScriptedLink::new();
+    let handler = Arc::new(RacingHandler {
+        parked: std::sync::Mutex::new(Vec::new()),
+        handed: std::sync::Mutex::new(Vec::new()),
+        past_cap: std::sync::Mutex::new(Vec::new()),
+    });
+    let client = Client::connect_with(
+        link.clone().into_link(),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        options().with_max_in_flight_requests(1),
+        handoff(),
+    );
+    let bytes = client.state.peer_bytes.available_permits();
+    for id in 0..ROUNDS {
+        let ask = || link.push_line(question(id, "ask"));
+        let outstanding = handler.take();
+        match id % 4 {
+            // The place is free before the question is asked: it is handed over.
+            0 | 2 => {
+                if let Some(responder) = outstanding {
+                    within(
+                        "the settling thread",
+                        tokio::task::spawn_blocking(|| settle(responder)),
+                    )
+                    .await
+                    .expect("expected the settling thread to finish");
+                }
+                ask();
+                until("the question to be seen", || handler.seen(id)).await;
+            }
+            // The place is still taken when the question is asked: it is past the cap.
+            1 => {
+                ask();
+                until("the question to be seen", || handler.seen(id)).await;
+                if let Some(responder) = outstanding {
+                    settle(responder);
+                }
+            }
+            // Both at once.
+            _ => {
+                let settling =
+                    outstanding.map(|responder| tokio::task::spawn_blocking(|| settle(responder)));
+                ask();
+                until("the question to be seen", || handler.seen(id)).await;
+                if let Some(settling) = settling {
+                    within("the settling thread", settling)
+                        .await
+                        .expect("expected the settling thread to finish");
+                }
+            }
+        }
+    }
+    if let Some(responder) = handler.take() {
+        settle(responder);
+    }
+    sent(
+        &link,
+        usize::try_from(ROUNDS).expect("expected the rounds to fit"),
+    )
+    .await;
+    until("what the questions held to be given back", || {
+        client.state.peer_bytes.available_permits() == bytes && client.state.outbox.held() == (0, 0)
+    })
+    .await;
+
+    let handed = handler
+        .handed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let past_cap = handler
+        .past_cap
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let written: Vec<Value> = link
+        .sent()
+        .iter()
+        .map(|frame| serde_json::from_str(frame).expect("expected a JSON frame"))
+        .collect();
+    for id in 0..ROUNDS {
+        let replies: Vec<&Value> = written.iter().filter(|frame| frame["id"] == id).collect();
+        let was = (handed.contains(&id), past_cap.contains(&id));
+        let expected = match (was, id % 2) {
+            ((true, false), 0) => json!({ "jsonrpc": "2.0", "id": id, "result": "answered" }),
+            ((true, false), _) => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32603, "message": "the request was let go without an answer" },
+            }),
+            _ => json!({ "jsonrpc": "2.0", "id": id, "result": "past the cap" }),
+        };
+        assert!(
+            (was.0 != was.1) && replies == [&expected],
+            "expected question {id} either handed over or past the cap, and its one reply to match: (one of the two, [{expected}]) | received (handed {}, past the cap {}, {replies:?})",
+            was.0,
+            was.1
+        );
+    }
+    let quarter = usize::try_from(ROUNDS / 4).expect("expected the rounds to fit");
+    let observed = (
+        client.state.handoff_slots.available_permits(),
+        handed.len() >= 2 * quarter,
+        past_cap.len() >= quarter - 1,
+        client.state.outbox.aside(),
+    );
+    assert_eq!(
+        observed,
+        (1, true, true, 0),
+        "expected the one place back exactly once, and both ends to have occurred: (1, true, true, 0) | received {observed:?} ({} handed over, {} past the cap)",
+        handed.len(),
+        past_cap.len()
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// An answer given in the moment a close has sealed the queue and not yet raised its flag is
+/// refused as closed and comes back with its responder. It is not taken for written, nothing
+/// is written for it, and the responder dropped afterwards adds nothing.
+#[tokio::test]
+async fn an_answer_given_as_the_connection_closes_is_refused_and_not_lost_in_silence() {
+    let connected = connect(options(), handoff());
+    connected.link.push_line(question(1, PARK));
+    until("the question to be parked", || {
+        connected.handler.parked() == 1
+    })
+    .await;
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    {
+        let responder = connected.handler.take();
+        let seen = Arc::clone(&seen);
+        let client = Arc::clone(&connected.client);
+        *connected
+            .client
+            .state
+            .after_seal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+            let answered = responder.answer(ServerRequestOutcome::Answer(json!("too late")));
+            let outcome = match &answered {
+                Ok(_) => String::from("queued"),
+                Err(unanswered) => format!(
+                    "refused: closed {}, too large {}",
+                    matches!(unanswered.error(), Error::Closed { .. }),
+                    unanswered.is_too_large()
+                ),
+            };
+            *seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((client.is_closed(), outcome));
+        }));
+    }
+    connected
+        .client
+        .close()
+        .await
+        .expect("expected a clean close");
+
+    let seen = seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let observed = (
+        seen,
+        connected.link.sent().len(),
+        connected.client.state.outbox.held(),
+        connected.client.state.outbox.aside(),
+    );
+    let expected = (
+        Some((false, String::from("refused: closed true, too large false"))),
+        0,
+        (0, 0),
+        0,
+    );
+    assert_eq!(
+        observed, expected,
+        "expected the answer in the window refused as closed, with the flag still down, and nothing written or queued: {expected:?} | received {observed:?}"
+    );
+}
+
+/// An answer that waits in the queue until its deadline has run out was never written, and
+/// nobody has to be awaiting its write for that to matter: the connection ends.
+#[tokio::test(start_paused = true)]
+async fn an_answer_whose_deadline_runs_out_in_the_queue_ends_the_connection() {
+    let connected = connect(
+        options().with_request_timeout(Duration::from_millis(50)),
+        handoff(),
+    );
+    connected.link.push_line(question(1, PARK));
+    until("the question to be parked", || {
+        connected.handler.parked() == 1
+    })
+    .await;
+    // The link is busy with nothing that has a deadline of its own: the test holds it.
+    let link_taken = connected.client.state.sender.lock().await;
+    drop(
+        connected
+            .handler
+            .take()
+            .answer(ServerRequestOutcome::Answer(json!("stale")))
+            .expect("expected the answer queued"),
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(link_taken);
+
+    let termination = termination_of(&connected.handler).await;
+    let observed = (&termination, connected.link.sent().len());
+    assert!(
+        matches!(&observed, (PeerTermination::LinkFailed(_), 0)),
+        "expected the answer that outlived its deadline to end the connection unwritten: (LinkFailed, 0) | received {observed:?}"
+    );
+    let _ = connected.client.close().await;
+}
+
+/// A close awaited from inside a hand-off ends the call at that await, as it does inside a
+/// notification: the close does not wait for the call it was made from. The responder goes
+/// with the call and says nothing.
+#[tokio::test]
+async fn a_close_awaited_inside_a_hand_off_ends_the_call_there() {
+    let connected = connect(options().with_max_in_flight_requests(1), handoff());
+    connected.link.push_line(question(1, CLOSE_INSIDE));
+
+    until("the call to be over and its place back", || {
+        connected.client.is_closed() && slots(&connected.client) == 1
+    })
+    .await;
+    let observed = (
+        connected.handler.calls(),
+        connected.link.sent().len(),
+        connected.client.ended(),
+    );
+    let expected = (
+        vec![
+            String::from("handoff:close-inside"),
+            String::from("closing"),
+        ],
+        0,
+        Some(ConnectionEnd::Closed),
+    );
+    assert_eq!(
+        observed, expected,
+        "expected the call cut at its close, nothing written, and the close on record: {expected:?} | received {observed:?}"
+    );
+    let _ = connected.client.close().await;
+}
+
+/// A request whose answer the reader delivers itself can be awaited inside a hand-off: nothing
+/// it waits for is behind the call.
+#[tokio::test]
+async fn a_request_delivered_by_the_reader_can_be_awaited_inside_a_hand_off() {
+    let connected = connect(options(), handoff());
+    connected.link.push_line(question(5, ASK_PLAIN));
+    sent(&connected.link, 1).await;
+    connected
+        .link
+        .push_line(r#"{"jsonrpc":"2.0","id":"1","result":"pong"}"#);
+
+    sent(&connected.link, 2).await;
+    let written = connected.link.sent();
+    let observed = (wire(&connected.link), written.last().cloned());
+    let expected = (
+        vec![String::from("back"), String::from("result:5")],
+        Some(json!({ "jsonrpc": "2.0", "id": 5, "result": { "got": "pong" } }).to_string()),
+    );
+    assert_eq!(
+        observed, expected,
+        "expected the request made inside the hand-off answered, and the question answered with it: {expected:?} | received {observed:?}"
+    );
+    connected
+        .client
+        .close()
+        .await
+        .expect("expected a clean close");
+}
+
+/// Questions read while a hand-off is in progress wait in the queue the notifications wait
+/// in, and count against the same budget. A peer that asks past it ends the connection as it
+/// would with notifications, and none of the questions behind the call is handed over.
+#[tokio::test]
+async fn a_flood_of_questions_behind_a_hand_off_ends_the_connection_at_the_budget() {
+    let connected = connect(options().with_max_pending_notifications(4), handoff());
+    connected.link.push_line(question(0, WAIT_THEN_PARK));
+    until("the hand-off to begin", || {
+        connected.handler.calls() == ["handoff:wait-then-park"]
+    })
+    .await;
+    for id in 1..=5 {
+        connected.link.push_line(question(id, "unknown"));
+    }
+
+    let termination = termination_of(&connected.handler).await;
+    let observed = (
+        &termination,
+        connected.handler.calls(),
+        connected.link.sent().len(),
+    );
+    assert!(
+        matches!(
+            &observed,
+            (
+                PeerTermination::NotificationBackpressure {
+                    limit: 4,
+                    received: 5,
+                    ..
+                },
+                calls,
+                0
+            ) if calls == &["handoff:wait-then-park"]
+        ),
+        "expected the fifth question behind the call to pass a budget of four, with none of them handed over or answered: (NotificationBackpressure {{ limit: 4, received: 5 }}, [handoff:wait-then-park], 0) | received {observed:?}"
+    );
+    let _ = connected.client.close().await;
+}
+
+/// Two questions the peer gave the same id are two questions: each has its own responder and
+/// its own place, and each answer goes out under the id it came with.
+#[tokio::test]
+async fn questions_with_the_same_id_are_answered_each_on_its_own() {
+    let connected = connect(options().with_max_in_flight_requests(2), handoff());
+    connected.link.push_line(question(7, PARK));
+    connected.link.push_line(question(7, PARK));
+    until("both questions to be parked", || {
+        connected.handler.parked() == 2
+    })
+    .await;
+    let taken = slots(&connected.client);
+    for answer in ["first", "second"] {
+        let written = connected
+            .handler
+            .take()
+            .answer(ServerRequestOutcome::Answer(json!(answer)))
+            .expect("expected the answer queued");
+        within("the answer written", written)
+            .await
+            .expect("expected the answer written");
+    }
+
+    let observed = (taken, connected.link.sent(), slots(&connected.client));
+    let expected = (
+        0,
+        vec![
+            json!({ "jsonrpc": "2.0", "id": 7, "result": "first" }).to_string(),
+            json!({ "jsonrpc": "2.0", "id": 7, "result": "second" }).to_string(),
+        ],
+        2,
+    );
+    assert_eq!(
+        observed, expected,
+        "expected a place for each question, one answer each in the order given, and both places back: {expected:?} | received {observed:?}"
+    );
+    connected
+        .client
+        .close()
+        .await
+        .expect("expected a clean close");
+}
+
+/// A handler that says, through a channel a thread can wait on, that it was told of an end.
+struct ToldHandler {
+    told: std::sync::Mutex<std::sync::mpsc::Sender<&'static str>>,
+}
+
+#[async_trait::async_trait]
+impl PeerHandler for ToldHandler {
+    async fn on_notification(&self, _method: String, _params: Value) {}
+
+    async fn on_terminated(&self, _termination: PeerTermination) {
+        let _ = self
+            .told
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .send("told of a termination");
+    }
+}
+
+/// A write that fails in the moment a close is on record and its flag is not yet up reaches
+/// the reader as a write failure. The close owns that end: the reader lets the failure go,
+/// the handler is told of no termination, and the client reports the close it was given.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_failure_that_lands_on_a_close_is_not_reported_as_a_termination() {
+    let link = ScriptedLink::new();
+    let (tell, told) = std::sync::mpsc::channel();
+    let handler = Arc::new(ToldHandler {
+        told: std::sync::Mutex::new(tell.clone()),
+    });
+    let client = Client::connect(
+        link.into_link(),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        options(),
+    );
+    *client
+        .state
+        .after_write_failure_ignored
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+        let _ = tell.send("let go by the reader");
+    }));
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    {
+        let state = Arc::clone(&client.state);
+        let seen = Arc::clone(&seen);
+        *client
+            .state
+            .after_seal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+            // What a writer that read the flag a moment ago does next.
+            state.signal_write_failure(&state.write_timeout());
+            // Held here, the flag still down, until the reader has dealt with it one way or
+            // the other.
+            let dealt_with = told.recv_timeout(Duration::from_secs(5)).ok();
+            *seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = dealt_with;
+        }));
+    }
+    client.close().await.expect("expected a clean close");
+
+    let observed = (
+        *seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        client.ended(),
+    );
+    assert_eq!(
+        observed,
+        (Some("let go by the reader"), Some(ConnectionEnd::Closed)),
+        "expected the reader to let the failure go under the close on record: (Some(\"let go by the reader\"), Some(Closed)) | received {observed:?}"
+    );
 }

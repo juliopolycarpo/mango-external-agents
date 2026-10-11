@@ -327,6 +327,10 @@ pub trait PeerHandler: Send + Sync {
     ///
     /// A question still queued when the connection ends is not handed over.
     ///
+    /// On a client made without the option this is never called. A handler that overrides
+    /// only this one, on such a client, answers every question through the default
+    /// [`on_request`](Self::on_request), which is `-32601`.
+    ///
     /// ```no_run
     /// # use mango_external_agents::jsonrpc::{JsonRpcError, Responder, ServerRequestOutcome};
     /// # use serde_json::Value;
@@ -1395,6 +1399,10 @@ struct ClientState {
     /// response on, so a test can have the caller give the call up exactly there.
     #[cfg(test)]
     after_response_claimed: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once when the reader lets a write failure go because a close is on record, so a
+    /// test can tell that from the reader never having heard of the failure.
+    #[cfg(test)]
+    after_write_failure_ignored: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     /// The calls whose claim the reader took, for a test that has to know which side won.
     #[cfg(test)]
     claimed_by_reader: StdMutex<Vec<String>>,
@@ -1586,6 +1594,11 @@ impl Drop for CancellationHold {
 /// [`Reply`]: a host that drops its [`Client`] and waits for the child to see end-of-input
 /// lets its responders go first.
 ///
+/// A responder that is never dropped, by `mem::forget` or a reference cycle, says nothing to
+/// the peer and keeps what it holds for as long as the connection's state lives: one of the
+/// places for questions in flight, the question's share of the byte budget, and that state
+/// itself. As many of those as there are places, and every later question is past the cap.
+///
 /// ```no_run
 /// # use mango_external_agents::jsonrpc::{Responder, ServerRequestOutcome};
 /// # async fn decided() -> serde_json::Value { serde_json::Value::Null }
@@ -1772,6 +1785,23 @@ pub struct Unanswered {
     parts: Box<(Responder, Error)>,
 }
 
+impl std::fmt::Display for Unanswered {
+    /// The reason, as [`Unanswered::error`] words it.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the answer to a peer's question was not queued: {}",
+            self.parts.1
+        )
+    }
+}
+
+impl std::error::Error for Unanswered {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.parts.1)
+    }
+}
+
 impl Unanswered {
     /// Why the answer was not queued.
     ///
@@ -1787,6 +1817,13 @@ impl Unanswered {
 
     /// Whether the only thing wrong was the size of the answer: the connection is as it was,
     /// and the question can still be answered with something smaller.
+    ///
+    /// The size an answer may have is the smaller of
+    /// [`WireOptions::with_max_outbound_frame_bytes`] and
+    /// [`WireOptions::with_max_outbound_queued_bytes`]. Where that leaves no room for any
+    /// reply at all, a queue bounded at no bytes or a question whose id fills a frame, this
+    /// is still true and no smaller answer exists: the smaller answer is refused in the same
+    /// way, and the connection ends when the responder is dropped.
     ///
     /// ```no_run
     /// # fn example(unanswered: &mango_external_agents::jsonrpc::Unanswered) {
@@ -2136,6 +2173,8 @@ impl Client {
             after_response_matched: StdMutex::new(None),
             #[cfg(test)]
             after_response_claimed: StdMutex::new(None),
+            #[cfg(test)]
+            after_write_failure_ignored: StdMutex::new(None),
             #[cfg(test)]
             claimed_by_reader: StdMutex::new(Vec::new()),
             peer_bytes,
@@ -3879,6 +3918,15 @@ async fn pump(
             // A transport failure, refused reply or abandoned send can leave the read side open.
             // End the connection here, on the one task that owns termination.
             () = state.write_failed.notified() => {
+                // A close already on record owns this end. A write that failed in the moment
+                // between that record and the closed flag going up was let through by the
+                // flag; it is not a failure to tell the handler of, under a client whose
+                // host is closing it and says so through `Client::ended`.
+                if matches!(state.ended(), Some(ConnectionEnd::Closed)) {
+                    #[cfg(test)]
+                    ClientState::run_hook(&state.after_write_failure_ignored);
+                    break;
+                }
                 let overflow = state
                     .outbound_overflow
                     .lock()
@@ -4173,7 +4221,7 @@ async fn dispatch_frame(
 /// What an ordered request made from inside its own client's `on_notification` is refused with.
 fn reentrant_ordered_request() -> Error {
     Error::HostConfiguration {
-        expected: "an ordered JSON-RPC request made outside this client's notification handler",
+        expected: "an ordered JSON-RPC request made outside this client's on_notification and on_request_handoff",
         received: String::from(
             "one made inside on_notification or on_request_handoff, whose return its answer would wait for",
         ),
