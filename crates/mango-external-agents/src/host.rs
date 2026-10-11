@@ -214,16 +214,18 @@ pub struct Limits {
     ///
     /// A Codex session can therefore stay busy for up to one request wait on a pending start, one
     /// interrupt request, this deadline, and then the shutdown stages. At the defaults that is
-    /// about five and a half minutes. An interrupt that fails skips this deadline, but can wait
+    /// about 5.6 minutes. An interrupt that fails skips this deadline, but can wait
     /// one more [`Self::request_timeout`] behind a steer in flight and one
-    /// [`Self::shutdown_timeout`] for a closing connection, about six and a half minutes. A
+    /// [`Self::shutdown_timeout`] for a closing connection, about 6.7 minutes. A
     /// start whose answer was lost and that is named only later pays a second interrupt and
     /// settle round on top of either. `docs/harness-codex.md` has the table.
     ///
     /// A `cancel` call waits only when the turn is already named: then it covers the interrupt,
     /// this deadline and any shutdown. Before that it returns as soon as the stop is recorded.
-    /// `close` skips the protocol stop and stays within [`Self::kill_grace`] and
-    /// [`Self::shutdown_timeout`].
+    /// `close` skips the protocol stop and this deadline. In the Codex harness it goes straight
+    /// to the teardown. Each stage of that teardown is bounded by [`Self::kill_grace`] or
+    /// [`Self::shutdown_timeout`], and together they add up to the teardown row of the same
+    /// table: 36 seconds at the defaults.
     ///
     /// For example, a host whose tools can take minutes to abort raises this without lengthening
     /// every protocol request: `Limits { cancel_settle_timeout: Duration::from_secs(300),
