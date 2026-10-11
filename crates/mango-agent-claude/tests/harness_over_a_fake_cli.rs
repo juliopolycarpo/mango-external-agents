@@ -5761,6 +5761,79 @@ mod deadlines {
         );
     }
 
+    /// A pipe ends when its last writer closes it, so a helper that inherited stdout holds the
+    /// read open after the Claude process itself is gone. The turn used to sit there until the
+    /// idle timer, ten minutes at the least; it ends one kill grace after the exit.
+    #[tokio::test(start_paused = true)]
+    async fn a_child_that_exits_while_a_helper_holds_its_stdout_ends_the_turn_one_kill_grace_later()
+    {
+        let limits = Limits::default();
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(stalled()));
+        let session = open_under(&launcher, limits).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        let began = tokio::time::Instant::now();
+        launcher.exit_turn_holding_its_output(1);
+        let events = terminal_of(&mut turn).await;
+        assert_eq!(
+            began.elapsed(),
+            limits.kill_grace,
+            "expected the terminal one kill_grace ({:?}) after the child exited | received {:?}",
+            limits.kill_grace,
+            began.elapsed()
+        );
+        assert_no_result(&events, "exit code 1");
+
+        tokio::time::timeout(NEVER, launcher.turn_reaped())
+            .await
+            .expect("expected the helper to be stopped | received one still holding stdout after an hour");
+        assert_eq!(
+            launcher.kill_requests(),
+            1,
+            "expected one stop request for the tree the child left behind | received {}",
+            launcher.kill_requests()
+        );
+    }
+
+    /// The grace is counted from the exit, not from the last line: a helper that keeps printing
+    /// into the pipe it inherited does not buy the turn more time with each line.
+    #[tokio::test(start_paused = true)]
+    async fn a_helper_that_keeps_writing_after_the_exit_does_not_extend_the_grace() {
+        let limits = Limits::default();
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(stalled()));
+        let session = open_under(&launcher, limits).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        let began = tokio::time::Instant::now();
+        launcher.exit_turn_holding_its_output(1);
+        // The helper's own behaviour: a line every 300 ms, for as long as its pipe is open.
+        let helper = tokio::spawn({
+            let launcher = Arc::clone(&launcher);
+            async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    launcher.write_to_held_output("dev server: still listening");
+                }
+            }
+        });
+        let events = terminal_of(&mut turn).await;
+        helper.abort();
+        assert_eq!(
+            began.elapsed(),
+            limits.kill_grace,
+            "expected the terminal one kill_grace ({:?}) after the exit, whatever the helper wrote | received {:?}",
+            limits.kill_grace,
+            began.elapsed()
+        );
+        assert_no_result(&events, "exit code 1");
+    }
+
     /// The exit does not cut off what the child already wrote: a `result` printed before it left
     /// still completes the turn, with no wait at all.
     #[tokio::test(start_paused = true)]

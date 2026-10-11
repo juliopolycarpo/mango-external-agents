@@ -1446,6 +1446,103 @@ async fn finish_prompt_io(
     settle_owner(shared, end);
 }
 
+/// The child's own exit, watched while its stdout is read.
+///
+/// A pipe ends when its last writer closes it, not when the process this harness spawned exits.
+/// A helper that inherited stdout, such as a background Bash task the run left behind, holds the
+/// read open after Claude itself is gone, and a pump that only read would sit there until the
+/// idle timer. [`ProcessControl::wait`](mango_external_agents::ProcessControl::wait) reports the
+/// exit without consuming the child, so the pump watches it beside the read.
+///
+/// The exit does not end the read. Whatever the child wrote before it left is still in the pipe,
+/// and that can be the `result` that completes the turn, so reading goes on for one more
+/// `grace`, counted from the exit, and stops there whether or not the pipe has closed.
+struct ExitWatch {
+    /// `None` once the exit was seen, or once the host's control failed to report one.
+    exited: Option<ChildExit>,
+    grace: Duration,
+    /// Where reading stops. Set when the exit is seen.
+    drain_until: Option<tokio::time::Instant>,
+}
+
+type ChildExit = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<mango_external_agents::ExitStatus>> + Send>,
+>;
+
+impl ExitWatch {
+    fn new(control: &Arc<dyn mango_external_agents::ProcessControl>, grace: Duration) -> Self {
+        let control = Arc::clone(control);
+        Self {
+            exited: Some(Box::pin(async move { control.wait().await })),
+            grace,
+            drain_until: None,
+        }
+    }
+
+    /// Resolves once, when the child's exit is first seen, and never again.
+    ///
+    /// The wait itself lives in `self`, so dropping this future loses nothing. A control that
+    /// fails to report an exit leaves the read to the idle timer, as it was before this existed.
+    async fn seen(&mut self) {
+        let Some(exited) = self.exited.as_mut() else {
+            return std::future::pending().await;
+        };
+        let status = exited.await;
+        self.exited = None;
+        if status.is_ok() {
+            self.drain_until = Some(tokio::time::Instant::now() + self.grace);
+        }
+    }
+}
+
+/// What one read of the child's stdout came to.
+enum Read {
+    Line(String),
+    /// The pipe closed, or the child exited and its grace to be read ran out.
+    Ended,
+    Failed(Error),
+    /// Nothing arrived for the whole idle timeout from a child that has not exited.
+    Idle,
+}
+
+/// Reads the next line, under the idle timeout and under the grace an observed exit starts.
+///
+/// One `recv` is polled to completion however many times the loop turns, so the exit arriving
+/// mid-read never abandons a read that may already hold part of a line. The order is the bound:
+/// the exit and its deadline are looked at before the pipe, so a helper that keeps writing after
+/// the child left cannot hold the turn open past that deadline. A line that is ready when the
+/// idle timer fires still wins, as it always did.
+async fn next_line(
+    receiver: &mut dyn mango_external_agents::LinkReceiver,
+    exit: &mut ExitWatch,
+    idle_timeout: Duration,
+) -> Read {
+    let received = receiver.recv();
+    tokio::pin!(received);
+    let idle = tokio::time::sleep(idle_timeout);
+    tokio::pin!(idle);
+    loop {
+        let drain_until = exit.drain_until;
+        let drained = async {
+            match drain_until {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            () = exit.seen() => {}
+            () = drained => return Read::Ended,
+            received = &mut received => return match received {
+                Ok(Some(line)) => Read::Line(line),
+                Ok(None) => Read::Ended,
+                Err(error) => Read::Failed(error),
+            },
+            () = &mut idle => return Read::Idle,
+        }
+    }
+}
+
 /// One turn, from the prompt to the terminal event.
 ///
 /// The only thing in this harness that emits.
@@ -1536,8 +1633,9 @@ async fn pump(
     }
 
     let mut failure = None;
+    let mut exit = ExitWatch::new(&control, exit_grace);
     loop {
-        let line = tokio::select! {
+        let read = tokio::select! {
             () = sink.closed() => {
                 stop_pump(&shared, &end, CancelReason::Requested, true).await;
                 settle_owner(&shared, &end);
@@ -1548,16 +1646,16 @@ async fn pump(
                 break;
             }
             () = stop.cancelled() => break,
-            received = tokio::time::timeout(idle_timeout, receiver.recv()) => received,
+            read = next_line(receiver.as_mut(), &mut exit, idle_timeout) => read,
         };
-        let line = match line {
-            Ok(Ok(Some(line))) => line,
-            Ok(Ok(None)) => break,
-            Ok(Err(error)) => {
+        let line = match read {
+            Read::Line(line) => line,
+            Read::Ended => break,
+            Read::Failed(error) => {
                 failure = Some(error);
                 break;
             }
-            Err(_elapsed) => {
+            Read::Idle => {
                 failure = Some(Error::Timeout {
                     operation: String::from("a stream-json record"),
                     after: idle_timeout,

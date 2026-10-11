@@ -446,6 +446,17 @@ impl FakeClaudeCli {
         child.changed.notify_waiters();
     }
 
+    /// Writes one line to the newest turn child's stdout from whatever still holds it open,
+    /// which after [`exit_turn_holding_its_output`](Self::exit_turn_holding_its_output) is the
+    /// helper the child left behind.
+    pub fn write_to_held_output(&self, line: impl Into<String>) {
+        let Some(child) = self.newest_turn(Child::output_is_open) else {
+            return;
+        };
+        lock(&child.pending).push_back(line.into());
+        child.changed.notify_waiters();
+    }
+
     fn run_for(&self, argv: &[String]) -> (Run, Vec<u8>) {
         if argv.iter().any(|argument| argument == "--version") {
             return (Run::replaying(&lock(&self.version)), Vec::new());
