@@ -5991,6 +5991,139 @@ mod deadlines {
         );
     }
 
+    /// The pump's watch is a `wait` on the host's control, and a host control may serialise its
+    /// calls. A watch still held when the pump starts a stop would keep the kill waiting on it
+    /// for the whole shutdown stage, so the watch is let go before every stop the pump starts.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_stream_stops_a_child_whose_control_serialises_wait_and_kill() {
+        let inner = Arc::new(FakeClaudeCli::new().with_turn(stalled()));
+        let session = open_serialised(&inner).await;
+        let turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        reading(&inner).await;
+        let began = tokio::time::Instant::now();
+        drop(turn);
+        tokio::time::timeout(NEVER, inner.turn_reaped())
+            .await
+            .expect("expected the kill to reach the child once the stream was dropped | received a child still running after an hour");
+        assert_eq!(
+            began.elapsed(),
+            Duration::ZERO,
+            "expected the stop to wait on nothing | received {:?}",
+            began.elapsed()
+        );
+    }
+
+    /// The same, for the host's own shutdown token.
+    #[tokio::test(start_paused = true)]
+    async fn a_host_shutdown_stops_a_child_whose_control_serialises_wait_and_kill() {
+        let inner = Arc::new(FakeClaudeCli::new().with_turn(stalled()));
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(SerialisedLauncher {
+            inner: Arc::clone(&inner),
+        });
+        let host = host_under(launcher, Limits::default());
+        let session = ClaudeHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session");
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        reading(&inner).await;
+        let began = tokio::time::Instant::now();
+        host.cancel().cancel();
+        let events = terminal_of(&mut turn).await;
+        assert!(
+            events.contains(&EventKind::Cancelled {
+                reason: CancelReason::Shutdown
+            }),
+            "expected the turn to end cancelled by the shutdown | received {events:?}"
+        );
+        assert_eq!(
+            (began.elapsed(), inner.all_children_ended()),
+            (Duration::ZERO, true),
+            "expected the child stopped with no wait | received (elapsed, all ended) = ({:?}, {})",
+            began.elapsed(),
+            inner.all_children_ended()
+        );
+    }
+
+    /// Returns once the pump has written the prompt, which it does in the same poll that takes
+    /// it into the read. No clock is involved, so this is a bounded number of passes.
+    async fn reading(launcher: &FakeClaudeCli) {
+        for _ in 0..64 {
+            if !launcher.written().is_empty() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("expected the pump to write the prompt and start reading | received no prompt");
+    }
+
+    async fn open_serialised(inner: &Arc<FakeClaudeCli>) -> Box<dyn Session> {
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(SerialisedLauncher {
+            inner: Arc::clone(inner),
+        });
+        ClaudeHarness::new()
+            .open_session(
+                &host_under(launcher, Limits::default()),
+                OpenSession::new("chat-1"),
+            )
+            .await
+            .expect("expected a session")
+    }
+
+    /// A launcher whose turn controls take one lock for `wait` and for `kill`.
+    struct SerialisedLauncher {
+        inner: Arc<FakeClaudeCli>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessLauncher for SerialisedLauncher {
+        async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
+            let is_turn = spec.argv.iter().any(|argument| argument == "--print");
+            let mut child = self.inner.spawn(spec).await?;
+            if is_turn {
+                child.control = Arc::new(SerialisedControl {
+                    inner: child.control,
+                    calls: tokio::sync::Mutex::new(()),
+                });
+            }
+            Ok(child)
+        }
+    }
+
+    struct SerialisedControl {
+        inner: Arc<dyn ProcessControl>,
+        calls: tokio::sync::Mutex<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessControl for SerialisedControl {
+        fn pid(&self) -> Option<u32> {
+            self.inner.pid()
+        }
+
+        fn stderr_tail(&self) -> String {
+            self.inner.stderr_tail()
+        }
+
+        async fn wait(&self) -> Result<mango_external_agents::ExitStatus> {
+            let _call = self.calls.lock().await;
+            self.inner.wait().await
+        }
+
+        async fn kill(&self, reason: CancelReason) -> Result<()> {
+            let _call = self.calls.lock().await;
+            self.inner.kill(reason).await
+        }
+    }
+
     /// A launcher whose turn controls fail every `wait`.
     struct UnwaitableLauncher {
         inner: Arc<FakeClaudeCli>,

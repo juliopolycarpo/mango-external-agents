@@ -1485,6 +1485,15 @@ impl ExitWatch {
         }
     }
 
+    /// Lets go of the wait on the host's control, before the pump starts or joins a stop.
+    ///
+    /// A stop waits on the same control and asks it to kill. A host control may serialise its
+    /// calls, and a wait this watch still held would then keep that kill out for a whole shutdown
+    /// stage. A deadline an exit already set stays in force.
+    fn release(&mut self) {
+        self.exited = None;
+    }
+
     /// Resolves once, when the child's exit is first seen, and never again.
     ///
     /// The wait itself lives in `self`, so dropping this future loses nothing. A control that
@@ -1644,11 +1653,13 @@ async fn pump(
     loop {
         let read = tokio::select! {
             () = sink.closed() => {
+                exit.release();
                 stop_pump(&shared, &end, CancelReason::Requested, true).await;
                 settle_owner(&shared, &end);
                 return;
             }
             () = cancel_token.cancelled() => {
+                exit.release();
                 stop_pump(&shared, &end, CancelReason::Shutdown, false).await;
                 break;
             }
@@ -1703,6 +1714,7 @@ async fn pump(
         if native_finished {
             // Publish native completion before the bounded event send so cancellation joins
             // teardown without discarding the confirmed resumable continuation.
+            exit.release();
             let _ = start_terminal_teardown(&shared, &end, &control, true);
         }
         let mut room_for_closes = true;
@@ -1717,6 +1729,7 @@ async fn pump(
                 // The host dropped the stream. There is nobody to tell, and a turn nobody is
                 // reading is a turn to stop feeding.
                 Err(Error::Closed { .. }) => {
+                    exit.release();
                     stop_pump(&shared, &end, CancelReason::Requested, true).await;
                     settle_owner(&shared, &end);
                     return;
@@ -1725,6 +1738,7 @@ async fn pump(
                 // No later vendor frame may follow that terminal, and a process whose output the
                 // stream rejected must not keep working for an absent consumer.
                 Err(_) if sink.is_terminal() => {
+                    exit.release();
                     stop_pump(&shared, &end, CancelReason::Requested, true).await;
                     settle_owner(&shared, &end);
                     return;
@@ -1738,8 +1752,8 @@ async fn pump(
     }
 
     // The watch holds a wait on the host's control. The stop below waits on the same control, so
-    // the first is let go before the second begins.
-    drop(exit);
+    // the first is let go before the second begins, here as before every stop inside the loop.
+    exit.release();
 
     // An EOF, idle timeout, or broken link can end before any conversation record arrives. It is
     // still a failed strict verification: cleanup only tells us that the child stopped, never
