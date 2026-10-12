@@ -241,6 +241,105 @@ fn a_close_lost_inside_the_removal_after_the_child_was_reaped_demands_no_cleanup
     launcher.end_turns_for_host_cleanup();
 }
 
+/// A session with no active turn has no child, so a close whose worker never ran because the
+/// opening runtime is gone has nothing left to stop: the outcome is lost, the session is `Closed`.
+#[test]
+fn a_close_that_never_ran_over_a_session_without_a_turn_settles_closed() {
+    let runtime = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("expected a runtime")
+    };
+    let opening = runtime();
+    let launcher = Arc::new(FakeClaudeCli::new());
+    let session =
+        opening.block_on(async { session_over(Arc::new(ControlTap::new(Arc::clone(&launcher)))) });
+    opening.shutdown_background();
+
+    let later = runtime().block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            session.close(mango_external_agents::CloseReason::Requested),
+        )
+        .await
+    });
+
+    let outcome = later.unwrap_or_else(|_| {
+        panic!("expected the close to return within 1s | received: still waiting after 1s")
+    });
+    let error = outcome.expect_err("expected the lost outcome to be reported");
+    assert!(
+        matches!(&error, Error::Link { peer, .. } if peer == "tokio runtime"),
+        "expected a bare Link naming the runtime | received {error:?}"
+    );
+    assert_eq!(
+        session.snapshot().status,
+        mango_external_agents::SessionStatus::Closed,
+        "expected session status: Closed | received: {:?}",
+        session.snapshot().status
+    );
+}
+
+/// The same close gives up the MCP artifact it was to remove: no child is left to read the file.
+#[test]
+fn a_close_that_never_ran_over_a_session_without_a_turn_removes_its_artifact() {
+    let runtime = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("expected a runtime")
+    };
+    let opening = runtime();
+    let scratch = std::env::temp_dir().join(format!("mea-unrun-close-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&scratch).expect("expected a scratch root");
+    let launcher = Arc::new(FakeClaudeCli::new());
+    let session = opening.block_on(async {
+        let file = crate::mcp::ConfigFile::write(
+            &[mango_external_agents::McpServer {
+                name: String::from("docs"),
+                transport: mango_external_agents::McpTransport::Stdio {
+                    command: String::from("docs-mcp"),
+                    args: Vec::new(),
+                    env: std::collections::BTreeMap::new(),
+                },
+            }],
+            &scratch,
+        )
+        .await
+        .expect("expected a written artifact")
+        .expect("expected servers to produce one");
+        session_with(Arc::new(ControlTap::new(Arc::clone(&launcher))), Some(file))
+    });
+    let artifacts = || {
+        std::fs::read_dir(&scratch)
+            .expect("expected a readable scratch root")
+            .count()
+    };
+    assert_eq!(artifacts(), 1, "expected one artifact before the close");
+    opening.shutdown_background();
+
+    let left = runtime().block_on(async {
+        let _ = session
+            .close(mango_external_agents::CloseReason::Requested)
+            .await;
+        // The guard hands the removal to the blocking pool and cannot wait for it.
+        for _ in 0..200 {
+            if artifacts() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        artifacts()
+    });
+
+    assert_eq!(
+        left, 0,
+        "expected artifacts left in the scratch root: 0 | received: {left}"
+    );
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 /// A turn worker lost after its stop task proved the child gone, and before it published, owes no
 /// cleanup either; the instant between the two cannot be hit from outside, so the guard is dropped
 /// directly with the flag the stop task sets.
