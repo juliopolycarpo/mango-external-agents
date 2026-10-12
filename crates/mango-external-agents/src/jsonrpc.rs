@@ -545,8 +545,10 @@ fn json_value_type(value: &Value) -> &'static str {
 /// close ends within its bound, twice `shutdown_timeout`, plus at most 50 ms for each abort it
 /// has to wait to land, the link is closed, and the call stays on its blocked thread until it
 /// returns, when nothing is reported and nothing panics. The client stays closed,
-/// [`Client::ended`] keeps the end it recorded, `on_terminated` is not made, and a later close or
-/// a drop has nothing left to wait for or to stop.
+/// [`Client::ended`] keeps the end it recorded, no end is told to the handler through a further
+/// call (`on_terminated`, where it is the call that blocks, was made once), and a later close or
+/// a drop does not wait for the call again: a later close that returns `Ok` says nothing of
+/// whether the call has returned.
 ///
 /// - [`on_notification`](Self::on_notification) and
 ///   [`on_request_handoff`](Self::on_request_handoff), on a connection that has not ended: these
@@ -556,7 +558,9 @@ fn json_value_type(value: &Value) -> &'static str {
 ///   shutdown" ([`is_handler_shutdown_timeout`]), or the link's own error if closing the link
 ///   failed.
 /// - [`on_terminated`](Self::on_terminated), and a call of either kind above on a connection that
-///   ended under this side: the reader is the one waiting, for the call or for the task. The
+///   ended under this side once the reader has taken the handler's task to drain it (a close that
+///   gets to the task first, as when a caller recorded the end before the reader woke to it, is
+///   in the case above): the reader is the one waiting, for the call or for the task. The
 ///   close waits for the reader within its bound, then takes it down, gives the abort 50 ms to
 ///   land when its bound is already spent, and returns [`Error::Timeout`] for the operation
 ///   "JSON-RPC reader shutdown" ([`is_reader_shutdown_timeout`]) when the reader is inside a call
@@ -3228,8 +3232,10 @@ impl Client {
     /// given what is left of the first grace and the reader what is left of the whole bound, and
     /// each, when its time is spent, 50 ms more for the abort to land. A close thus ends within
     /// twice `shutdown_timeout`, plus at most 100 ms, and only a handler that blocks its thread
-    /// can use that, whatever else a handler does. [`PeerHandler`] says what each call leaves
-    /// behind. The exceptions are not handlers: a link whose own `send` or `close` blocks its
+    /// can use that, whatever else a handler does. A call that blocks its thread for longer than
+    /// the first grace and then returns is treated as one that never does: the close returns the
+    /// handler's timeout, with the link closed, where it used to wait the call out. [`PeerHandler`]
+    /// says what each call leaves behind. The exceptions are not handlers: a link whose own `send` or `close` blocks its
     /// thread, and a runtime whose every worker thread is blocked, which cannot run the timers
     /// that bound the close. Two things are waited
     /// for inside the same bound: a notification call or a hand-off that asked for a
@@ -3384,8 +3390,13 @@ impl Client {
             tokio::join!(self.state.wait_for_holds(), self.state.drain_in_flight());
             self.state.stop_notifications_until(owed_by).await
         } else {
-            let stopped = self.state.stop_notifications_until(owed_by).await;
-            self.state.drain_in_flight().await;
+            // Together, so that the two share the first grace: one after the other, a handler
+            // that blocks and an answer that cannot be written would take a grace each, and the
+            // link's would come on top. The task is aborted first, as `join!` polls in order.
+            let (stopped, ()) = tokio::join!(
+                self.state.stop_notifications_until(owed_by),
+                self.state.drain_in_flight()
+            );
             stopped
         };
         // What a close that left the handler's task running answers with once the rest is done.

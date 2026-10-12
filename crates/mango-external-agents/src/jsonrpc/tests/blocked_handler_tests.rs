@@ -328,6 +328,9 @@ enum BlockedCall {
     Notification,
     RequestHandoff,
     Request,
+    /// A notification and a question at once, so that a close has a task that cannot be stopped
+    /// and an answer that cannot be written.
+    NotificationAndRequest,
 }
 
 /// A handler that blocks its thread, with no await, in the one call it is told to, and answers
@@ -352,7 +355,17 @@ impl ThreadBlockedCall {
     }
 
     fn block_if(&self, call: BlockedCall) {
-        if std::mem::discriminant(&self.blocked) != std::mem::discriminant(&call) {
+        let blocks = matches!(
+            (self.blocked, call),
+            (BlockedCall::Notification, BlockedCall::Notification)
+                | (BlockedCall::RequestHandoff, BlockedCall::RequestHandoff)
+                | (BlockedCall::Request, BlockedCall::Request)
+                | (
+                    BlockedCall::NotificationAndRequest,
+                    BlockedCall::Notification | BlockedCall::Request
+                )
+        );
+        if !blocks {
             return;
         }
         self.entered.fetch_add(1, Ordering::AcqRel);
@@ -418,6 +431,9 @@ async fn close_behind_a_handler_blocked_in(blocked: BlockedCall, peer_exits: boo
             // Every question goes to the handler's task on a client made with the option.
             BlockedCall::RequestHandoff => WireOptions::new().with_request_handoff(),
             BlockedCall::Notification | BlockedCall::Request => WireOptions::new(),
+            BlockedCall::NotificationAndRequest => {
+                unreachable!("a test of its own drives both")
+            }
         },
     );
     let frame = match blocked {
@@ -425,6 +441,7 @@ async fn close_behind_a_handler_blocked_in(blocked: BlockedCall, peer_exits: boo
         BlockedCall::RequestHandoff | BlockedCall::Request => {
             r#"{"jsonrpc":"2.0","id":7,"method":"ask","params":{}}"#
         }
+        BlockedCall::NotificationAndRequest => unreachable!("a test of its own drives both"),
     };
     link.push_line(frame);
     until("the handler to block inside the call", || {
@@ -590,4 +607,56 @@ async fn a_close_returns_within_its_bound_when_on_notification_blocks_after_the_
     let ended = Some(ConnectionEnd::Peer(PeerTermination::Exited));
     behind.assert_closed_with_the_call_still_blocked(ended.clone());
     behind.assert_quiet_when_the_call_returns_late(ended).await;
+}
+
+/// A handler task that cannot be stopped and an answer that cannot be written take the same
+/// first grace, not one each: the close waits for the two together, and the link's grace is then
+/// all it has left to spend. One after the other they would take twice `shutdown_timeout` before
+/// the link was reached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blocked_task_and_a_blocked_answer_share_the_first_grace() {
+    let gate = ThreadGate::arc();
+    let _release = ReleaseOnDrop(Arc::clone(&gate));
+    let handler = ThreadBlockedCall::arc(BlockedCall::NotificationAndRequest, &gate);
+    let link = ScriptedLink::new();
+    let mut slow = options();
+    slow.shutdown_timeout = Duration::from_millis(400);
+    let grace = slow.shutdown_timeout;
+    let client = Client::connect(
+        link.clone().into_link(),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        slow,
+    );
+    // The question first, and the notification once its answer is blocked: the answer is spawned
+    // by the handler's task, into the slot of the worker thread that the notification then blocks,
+    // where no other worker steals it from.
+    link.push_line(r#"{"jsonrpc":"2.0","id":7,"method":"ask","params":{}}"#);
+    until("the answer to block", || {
+        handler.entered.load(Ordering::Acquire) == 1
+    })
+    .await;
+    link.push_line(r#"{"jsonrpc":"2.0","method":"note","params":{}}"#);
+    until("both calls to block", || {
+        handler.entered.load(Ordering::Acquire) == 2
+    })
+    .await;
+
+    let began = Instant::now();
+    let closed = tokio::time::timeout(grace * 2 + LOAD_MARGIN, client.close()).await;
+    let waited = began.elapsed();
+    let Ok(closed) = closed else {
+        panic!(
+            "expected close to return within {:?} | received: still waiting after {waited:?}",
+            grace * 2
+        );
+    };
+    assert!(
+        matches!(&closed, Err(error) if is_handler_shutdown_timeout(error)),
+        "expected the handler's timeout | received {closed:?} after {waited:?}"
+    );
+    assert!(
+        waited >= grace && waited < grace + grace / 2,
+        "expected the task and the answer to share one grace, {grace:?} to {:?} | received {waited:?}",
+        grace + grace / 2
+    );
 }
