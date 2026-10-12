@@ -917,6 +917,93 @@ mod kept_outcome {
     }
 }
 
+/// A `cancel` over a launch that is still inside the host's launcher has no child to stop and
+/// returns at once, however many stops already recorded their reason: nothing here bounds that
+/// launcher, so a call that waited on it would wait on the host.
+mod pending_launch_cancel {
+    use super::*;
+
+    /// A session whose first turn is stuck in the launcher, and the start that is in it.
+    async fn launching() -> (Held, support::SpawnGate, tokio::task::JoinHandle<()>) {
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(stalled()));
+        let gate = launcher.gate_turn_spawns();
+        let held = open_over(launcher, ControlTap::new).await;
+        let starting = tokio::spawn({
+            let session = Arc::clone(&held.session);
+            async move {
+                let _ = session.start_turn(TurnRequest::new("turn-1", "hold")).await;
+            }
+        });
+        gate.wait_for_spawn().await;
+        (held, gate, starting)
+    }
+
+    /// The call returns `Ok` within the shutdown bound, or the test says how long it waited.
+    async fn returns_at_once(
+        label: &str,
+        held: &Held,
+        call: impl std::future::Future<Output = Result<(), Error>>,
+    ) {
+        let began = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(held.limits.shutdown_timeout, call).await;
+        assert!(
+            matches!(outcome, Ok(Ok(()))),
+            "expected {label} to return Ok within {:?} | received: {} after {:?}",
+            held.limits.shutdown_timeout,
+            match &outcome {
+                Ok(result) => format!("{result:?}"),
+                Err(_) => String::from("still waiting"),
+            },
+            began.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_cancel_returns_at_once() {
+        let (held, gate, starting) = launching().await;
+        returns_at_once(
+            "the first cancel",
+            &held,
+            held.session.cancel(CancelReason::Requested),
+        )
+        .await;
+
+        returns_at_once(
+            "the second cancel",
+            &held,
+            held.session.cancel(CancelReason::Requested),
+        )
+        .await;
+
+        gate.release();
+        let _ = starting.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_after_a_close_that_gave_up_returns_at_once() {
+        let (held, gate, starting) = launching().await;
+        let closed = tokio::time::timeout(NEVER, held.session.close(CloseReason::Requested))
+            .await
+            .expect(
+                "expected the close to stop waiting for the launch | received none within an hour",
+            );
+        assert!(
+            closed.is_err(),
+            "expected the close to give up on the pending launch | received {closed:?}"
+        );
+
+        returns_at_once(
+            "a cancel after the close gave up",
+            &held,
+            held.session.cancel(CancelReason::Requested),
+        )
+        .await;
+
+        gate.release();
+        let _ = starting.await;
+    }
+}
+
 /// The pump's own stops: the stream ending, the child exiting, the idle timer, the host's token.
 mod pump {
     use super::*;

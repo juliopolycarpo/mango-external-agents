@@ -359,8 +359,27 @@ impl ClaudeSession {
     /// `Session` method that held this lock across an await would deadlock the moment the turn
     /// channel filled, which is exactly when a host is least able to do anything about it.
     async fn stop_active_turn(&self, reason: CancelReason) -> Result<()> {
-        let claim = claim_stop(&mut self.shared.lock(), None, reason);
-        await_stop_claim(&self.shared, claim, reason, false).await
+        let (claim, launching) = {
+            let mut state = self.shared.lock();
+            let claim = claim_stop(&mut state, None, reason);
+            let launching = state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.control.is_none());
+            (claim, launching)
+        };
+        match claim {
+            // The launch is still inside the host's launcher, and an earlier stop recorded its
+            // reason and installed the teardown the owning `start_turn` will run. There is no
+            // child to stop here, so this call returns at once, as the first cancel did, instead
+            // of waiting for a launcher nothing here bounds. A teardown whose worker has started
+            // is waited for: its stop is bounded stage by stage.
+            StopClaim::Existing(Some(teardown)) if launching => teardown
+                .wait_past_launch(Duration::ZERO)
+                .await
+                .unwrap_or(Ok(())),
+            claim => await_stop_claim(&self.shared, claim, reason, false).await,
+        }
     }
 }
 
