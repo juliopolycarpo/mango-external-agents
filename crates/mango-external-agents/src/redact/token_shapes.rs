@@ -249,15 +249,17 @@ fn a_web_token_is_three_parts_and_the_first_two_are_json() {
 }
 
 #[test]
-fn a_private_key_block_is_redacted_to_its_end_marker_or_to_the_end_of_the_text() {
+fn a_private_key_block_is_redacted_to_its_end_marker() {
     let (begin, end) = (
         concat!("-----BEGIN PRIV", "ATE KEY-----"),
         concat!("-----END PRIV", "ATE KEY-----"),
     );
     let closed = format!("before\n{begin}\nbGluZTEK\nbGluZTIK\n{end}\nafter");
     assert_eq!(shown(&closed), "before\n[REDACTED]\nafter");
-    let open = format!("before\n{begin}\nbGluZTEK\nbGluZTIK\nafter");
-    assert_eq!(shown(&open), "before\n[REDACTED]");
+    // Without an end marker the header and the lines of base64 under it go, and the text after.
+    let line = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj";
+    let open = format!("before\n{begin}\n{line}\n{line}\nQUJDRA==\nafter: ok");
+    assert_eq!(shown(&open), "before\n[REDACTED]\nafter: ok");
     for label in [
         concat!("RSA PRIV", "ATE KEY"),
         concat!("EC PRIV", "ATE KEY"),
@@ -448,5 +450,53 @@ fn private_key_blocks_that_adjoin_are_redacted_in_one_pass() {
     assert_eq!(
         once, "[REDACTED][REDACTED] after",
         "expected two adjoining blocks redacted in one pass | input {text:?} received: {once:?}"
+    );
+}
+
+/// A sentence that mentions a header is not a key: with no end marker in reach only the marker
+/// goes, and the base64 lines directly under it, so the rest of the message is kept.
+#[test]
+fn a_header_quoted_in_prose_takes_only_itself() {
+    let begin = concat!("-----BEGIN OPENSSH PRIV", "ATE KEY-----");
+    let text = format!(
+        "ssh: handshake failed: expected {begin} header, got garbage; see docs. next: retry later. final line"
+    );
+    assert_eq!(
+        shown(&text),
+        "ssh: handshake failed: expected [REDACTED] header, got garbage; see docs. next: retry later. final line",
+        "expected only the marker redacted | input {text:?}"
+    );
+}
+
+/// A key cut before its end marker (a message bound, a truncated log) loses its header and the
+/// lines of base64 under it, in real line breaks and in the escaped form a JSON string carries.
+#[test]
+fn a_key_without_an_end_marker_loses_its_header_and_its_base64_lines() {
+    let begin = concat!("-----BEGIN PRIV", "ATE KEY-----");
+    let line = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj";
+    let real = format!("{begin}\n{line}\r\n{line}\n{line}\nAbCd+/==\nnext line: ok\nword");
+    assert_eq!(shown(&real), "[REDACTED]\nnext line: ok\nword");
+    let escaped = format!("{{\"error\":\"{begin}\\n{line}\\n{line}\\nAbCd+/==\\nnext\"}}");
+    assert_eq!(shown(&escaped), "{\"error\":\"[REDACTED]\\nnext\"}");
+    // A short word under the header is a word, and a marker with nothing under it is only itself.
+    assert_eq!(shown(&format!("{begin}\nafter")), "[REDACTED]\nafter");
+    // Base64 in the middle of a sentence is not under the header.
+    let sentence = format!("{begin} and then {line} here");
+    assert_eq!(shown(&sentence), format!("[REDACTED] and then {line} here"));
+}
+
+/// An end marker farther away than a key can be belongs to something else.
+#[test]
+fn an_end_marker_past_the_window_does_not_close_the_block() {
+    let begin = concat!("-----BEGIN PRIV", "ATE KEY-----");
+    let far = format!(
+        "{begin} oops{}-----END PRIVATE KEY-----",
+        " filler".repeat(4000)
+    );
+    let received = crate::redact::message_text(&far);
+    assert!(
+        received.starts_with("[REDACTED] oops filler") && received.contains("-----END PRIV"),
+        "expected only the header redacted when the end marker is 28 KiB away | received: {:?}",
+        received.get(..60)
     );
 }

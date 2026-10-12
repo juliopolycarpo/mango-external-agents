@@ -72,6 +72,7 @@ fn redact_blocks(text: &str) -> Option<String> {
     let mut out: Option<String> = None;
     let mut copied = 0;
     let mut from = 0;
+    let mut ends = Ends::default();
     while let Some(offset) = text[from..].find(BEGIN) {
         count_steps(offset + 1);
         let start = from + offset;
@@ -81,7 +82,7 @@ fn redact_blocks(text: &str) -> Option<String> {
         if start < copied || !(adjoins || starts_a_run(bytes, start)) {
             continue;
         }
-        let Some(end) = private_key_block(text, start) else {
+        let Some(end) = private_key_block(text, start, &mut ends) else {
             continue;
         };
         let out = out.get_or_insert_with(|| String::with_capacity(text.len()));
@@ -309,9 +310,52 @@ fn web_token(bytes: &[u8], run: &[u8], run_end: usize) -> Option<usize> {
 /// The longest label inside `-----BEGIN ...-----`: `ENCRYPTED PRIVATE KEY` is 21.
 const MAX_LABEL: usize = 40;
 
-/// A private-key block: `-----BEGIN ... PRIVATE KEY-----` to the line that ends it, or to the end
-/// of the text when it never ends. A certificate and a public key are not secrets and are left.
-fn private_key_block(text: &str, start: usize) -> Option<usize> {
+/// The farthest an end marker can be from its begin marker and still close the block: the longest
+/// private key in use, a 16384-bit RSA key, is 12 KiB of PEM, and a 4096-bit one is 3.3 KiB.
+const MAX_BLOCK_BYTES: usize = 16 * 1024;
+
+/// The most lines of base64 under a header that has no end marker in reach.
+const MAX_BODY_LINES: usize = 128;
+
+/// The shortest line of base64 that is a line of a key: PEM lines are 64 characters, 76 in older
+/// writers; a shorter one is only the last line of a body that has longer ones above it.
+const MIN_BODY_LINE: usize = 16;
+
+/// Where the next end marker is, kept between blocks so that no text is searched twice: a search
+/// that finds nothing means there is none past that place.
+#[derive(Default)]
+struct Ends {
+    found: Option<usize>,
+    none_from: Option<usize>,
+}
+
+impl Ends {
+    /// The first `-----END ` at or after `from`.
+    fn after(&mut self, text: &str, from: usize) -> Option<usize> {
+        if self.none_from.is_some_and(|none| from >= none) {
+            return None;
+        }
+        if let Some(at) = self.found.filter(|at| *at >= from) {
+            return Some(at);
+        }
+        let rest = &text[from..];
+        let Some(offset) = rest.find("-----END ") else {
+            count_steps(rest.len());
+            (self.found, self.none_from) = (None, Some(from));
+            return None;
+        };
+        count_steps(offset);
+        self.found = Some(from + offset);
+        self.found
+    }
+}
+
+/// A private-key block: `-----BEGIN ... PRIVATE KEY-----` to the line that ends it. A certificate
+/// and a public key are not secrets and are left.
+///
+/// A header with no end marker within [`MAX_BLOCK_BYTES`] is a key that was cut, or a sentence
+/// that mentions one: the marker goes, and the lines of base64 directly under it, and nothing else.
+fn private_key_block(text: &str, start: usize, ends: &mut Ends) -> Option<usize> {
     let bytes = text.as_bytes();
     let label_start = start + b"-----BEGIN ".len();
     if !bytes[start..].starts_with(b"-----BEGIN ") {
@@ -322,16 +366,57 @@ fn private_key_block(text: &str, start: usize) -> Option<usize> {
     if !label.ends_with(b"PRIVATE KEY") && !label.ends_with(b"PRIVATE KEY BLOCK") {
         return None;
     }
-    // The block goes on to the next end marker. One read of what follows: the matches that come
-    // after an end marker start there, and one that finds none takes the rest of the text.
-    let rest = &text[after_begin..];
-    let Some(offset) = rest.find("-----END ") else {
-        count_steps(rest.len());
-        return Some(text.len());
+    let Some(at) = ends
+        .after(text, after_begin)
+        .filter(|at| at - after_begin <= MAX_BLOCK_BYTES)
+    else {
+        return Some(body_lines(bytes, after_begin));
     };
-    count_steps(offset);
-    let marker = after_begin + offset + b"-----END ".len();
+    let marker = at + b"-----END ".len();
     Some(closing_dashes(bytes, marker, false).unwrap_or(marker))
+}
+
+/// Where the lines of base64 that start at `from`, right under a header, end. A line break is a
+/// real one or the two characters a JSON string writes it as. Lines of [`MIN_BODY_LINE`]
+/// characters or more are the body, up to [`MAX_BODY_LINES`]; one shorter line after them is the
+/// last. The first line may follow the header without a break.
+fn body_lines(bytes: &[u8], from: usize) -> usize {
+    let (mut end, mut long) = (from, 0);
+    for line in 0..MAX_BODY_LINES {
+        let start = match line_break(bytes, end) {
+            Some(after) => after,
+            None if line == 0 => end,
+            None => break,
+        };
+        let run_end = take_while(bytes, start, is_base64);
+        count_steps(run_end - start + 1);
+        let length = run_end - start;
+        if length >= MIN_BODY_LINE {
+            (end, long) = (run_end, long + 1);
+            continue;
+        }
+        if long > 0 && length >= 4 {
+            end = run_end;
+        }
+        break;
+    }
+    end
+}
+
+fn is_base64(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() | matches!(byte, b'+' | b'/' | b'=')
+}
+
+/// The place after the line break at `at`: `\n`, `\r\n` or `\r`, or the same written as the
+/// escapes `\\n` and `\\r\\n`.
+fn line_break(bytes: &[u8], at: usize) -> Option<usize> {
+    let rest = bytes.get(at..)?;
+    for pattern in [&b"\r\n"[..], b"\n", b"\r", b"\\r\\n", b"\\n"] {
+        if rest.starts_with(pattern) {
+            return Some(at + pattern.len());
+        }
+    }
+    None
 }
 
 /// The place after the `-----` that closes a label starting at `from`, when 1 to [`MAX_LABEL`]

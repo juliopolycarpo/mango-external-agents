@@ -31,7 +31,7 @@ const AWAITING_STEPS_PER_BYTE: usize = 40;
 /// Doubling the text may add a little more than double the work: block searches round up to a
 /// whole block, each shape has a constant tail, and a read bounded by a count of lines or items
 /// (a container, a sequence) costs less than a byte for each byte until its bound is reached.
-const DOUBLING_SLACK: usize = 2048;
+const DOUBLING_SLACK: usize = 4096;
 
 /// One shape of text that has cost a rule more than its length, and the length it is built to.
 struct Shape {
@@ -599,6 +599,42 @@ const TOKEN_SHAPES: &[Shape] = &[
         build: |len| repeated(concat!("-----BEGIN PRIV", "ATE KEY-----\n"), "", len),
     },
     Shape {
+        what: "private-key begin markers, each with a long line of base64 under it and no end marker",
+        build: |len| {
+            repeated(
+                &format!(
+                    concat!("-----BEGIN PRIV", "ATE KEY-----\n{}\n"),
+                    "Ab+/".repeat(16)
+                ),
+                "",
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "a begin marker and more lines of base64 than the body bound takes, repeated",
+        build: |len| {
+            let unit = format!(
+                concat!("-----BEGIN PRIV", "ATE KEY-----\n{}"),
+                format!("{}\n", "Ab+/".repeat(16)).repeat(140)
+            );
+            exactly(unit.repeat(len / unit.len() + 1), len)
+        },
+    },
+    Shape {
+        what: "private-key begin markers escaped as a JSON string writes them, no end marker",
+        build: |len| {
+            repeated(
+                &format!(
+                    concat!("-----BEGIN PRIV", "ATE KEY-----\\n{}\\n"),
+                    "Ab+/".repeat(16)
+                ),
+                "",
+                len,
+            )
+        },
+    },
+    Shape {
         what: "certificate begin markers, which are not secrets",
         build: |len| repeated("-----BEGIN CERTIFICATE-----\n", "", len),
     },
@@ -800,5 +836,31 @@ fn a_normalized_extension_value_is_still_bounded_after_redaction() {
     assert_eq!(
         kept, 128,
         "expected 128 code points of redacted text kept | received {normalized:?}"
+    );
+}
+
+/// The end marker of a block that is past the window is searched for once, not once for each
+/// begin marker, so a text of many such blocks costs a constant number of steps for each byte.
+#[test]
+fn begin_markers_whose_end_marker_is_past_the_window_cost_a_constant_for_each_byte() {
+    let unit = format!(
+        concat!(
+            "-----BEGIN PRIV",
+            "ATE KEY-----{}-----BEGIN PRIV",
+            "ATE KEY-----{}-----END PRIV",
+            "ATE KEY-----\n"
+        ),
+        " x".repeat(8200),
+        " x".repeat(100)
+    );
+    let mut per_byte = Vec::new();
+    for copies in [1, 4, 16] {
+        let text = unit.repeat(copies);
+        per_byte.push(message_steps(&text) as f64 / text.len() as f64);
+    }
+    let (first, last) = (per_byte[0], per_byte[2]);
+    assert!(
+        last <= first * 1.5 + 1.0 && last <= 24.0,
+        "expected steps for each byte to stay flat from 1 to 16 copies | received: {per_byte:?}"
     );
 }
