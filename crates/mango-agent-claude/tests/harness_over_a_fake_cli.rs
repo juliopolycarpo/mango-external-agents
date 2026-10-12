@@ -4099,13 +4099,18 @@ mod mcp_passthrough {
             path.display()
         );
 
-        let again = session
-            .close(CloseReason::Requested)
-            .await
-            .expect_err("expected a second close to replay the first close's outcome");
+        // The late child is proven gone and the artifact removed, so nothing is left for the
+        // session to wait on: the close that gave up is answered by a close that finds it done.
+        let again = session.close(CloseReason::Requested).await;
         assert!(
-            matches!(again.cause(), Error::Timeout { .. }),
-            "expected the stored Error::Timeout | received {again:?}"
+            matches!(again, Ok(())),
+            "expected a second close, after the late child was reaped, to return Ok | received {again:?}"
+        );
+        assert_eq!(
+            session.snapshot().status,
+            SessionStatus::Closed,
+            "expected a session whose late child was reaped to be Closed | received {:?}",
+            session.snapshot().status
         );
     }
 

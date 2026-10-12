@@ -1417,7 +1417,9 @@ impl mango_external_agents::Session for ClaudeSession {
         };
         let (close, active, taken, mcp_config) = match claim {
             CloseClaim::Existing(Some(teardown)) => {
-                return self.prefer_late_stop_failure(teardown.wait().await).await;
+                return self
+                    .prefer_late_stop_failure(&teardown, teardown.wait().await)
+                    .await;
             }
             CloseClaim::Existing(None) => return Ok(()),
             CloseClaim::New {
@@ -1449,14 +1451,18 @@ impl mango_external_agents::Session for ClaudeSession {
 }
 
 impl ClaudeSession {
-    /// A later `close`'s answer when the first gave up on a launch that has since returned a child.
+    /// A later `close`'s answer when the first gave up on a launch that has since ended.
     ///
-    /// That first close kept an `Error::Timeout` with no control, because no child existed. The
-    /// `start_turn` that owns the launch has since stopped the child it got, and if that stop
-    /// failed, the control to reconcile it with belongs in the answer of the call a host that only
-    /// closes would make next. A stop still running is waited for, bounded stage by stage; a stop
-    /// that succeeded, or one nobody started, leaves the kept answer as it was.
-    async fn prefer_late_stop_failure(&self, kept: Result<()>) -> Result<()> {
+    /// That first close kept an `Error::Timeout` with no control, because no child existed yet.
+    /// The `start_turn` that owns the launch has since stopped the child it got, or the launch
+    /// failed, and that is what the call a host that only closes makes next has to report:
+    ///
+    /// - a stop that failed returns its `Error::CleanupRequired`, with the control to reconcile;
+    ///   one still running is waited for, bounded stage by stage;
+    /// - a stop that succeeded, or a launch that never produced a child, leaves nothing to stop:
+    ///   the session reaches `Closed` and this close, and every later one, returns `Ok`;
+    /// - a launch still in the launcher repeats the timeout.
+    async fn prefer_late_stop_failure(&self, close: &Teardown, kept: Result<()>) -> Result<()> {
         let pending_launch = matches!(
             &kept,
             Err(Error::Timeout { operation, .. }) if operation == PENDING_LAUNCH_OPERATION
@@ -1464,19 +1470,31 @@ impl ClaudeSession {
         if !pending_launch {
             return kept;
         }
-        let late = self
-            .shared
-            .lock()
-            .active
-            .as_ref()
-            .and_then(|active| active.teardown.clone());
-        let Some(late) = late else {
-            return kept;
+        let (launch_over, late) = {
+            let state = self.shared.lock();
+            let late = state
+                .active
+                .as_ref()
+                .and_then(|active| active.teardown.clone());
+            (state.active.is_none(), late)
         };
-        match late.wait_past_launch(Duration::ZERO).await {
+        let outcome = match late {
+            Some(late) => late.wait_past_launch(Duration::ZERO).await,
+            None => None,
+        };
+        match outcome {
             Some(Err(error)) if error.cleanup_control().is_some() => Err(error),
+            Some(Ok(())) => self.settle_closed(close),
+            None if launch_over => self.settle_closed(close),
             _ => kept,
         }
+    }
+
+    /// Records that the one child this session ever had is gone, after a close that gave up.
+    fn settle_closed(&self, close: &Teardown) -> Result<()> {
+        self.shared.core_state.set_status(SessionStatus::Closed);
+        close.finish(Ok(()));
+        Ok(())
     }
 }
 

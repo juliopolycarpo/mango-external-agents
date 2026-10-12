@@ -681,9 +681,10 @@ mod close {
         gate.release();
     }
 
-    /// The late child was stopped, so there is no failure to reconcile: the kept timeout stands.
+    /// The late child was stopped, so nothing is left to reconcile: the session reaches `Closed`,
+    /// and this close and every later one return `Ok` rather than the launch timeout for good.
     #[tokio::test(start_paused = true)]
-    async fn a_close_after_the_late_child_was_stopped_repeats_the_timeout() {
+    async fn a_close_after_the_late_child_was_stopped_reaches_closed_and_returns_ok() {
         let launcher = Arc::new(FakeClaudeCli::new().with_turn(stalled()));
         let gate = launcher.gate_turn_spawns();
         let held = open_over(launcher, ControlTap::new).await;
@@ -703,18 +704,21 @@ mod close {
 
         let again = tokio::time::timeout(NEVER, held.session.close(CloseReason::Requested))
             .await
-            .expect("expected the second close to return | received none within an hour")
-            .expect_err("expected the second close to repeat the timeout");
-
-        assert_timeout(
-            "the close after the late child was stopped",
-            &again,
-            "a pending Claude launch",
-            held.limits.shutdown_timeout,
-        );
+            .expect("expected the second close to return | received none within an hour");
         assert!(
-            again.cleanup_control().is_none(),
-            "expected no control for a child that was stopped | received {again:?}"
+            matches!(again, Ok(())),
+            "expected a close after the late child was stopped to return Ok | received {again:?}"
+        );
+        let status = held.session.snapshot().status;
+        assert_eq!(
+            status,
+            SessionStatus::Closed,
+            "expected a session whose only child was stopped to be Closed | received {status:?}"
+        );
+        let third = held.session.close(CloseReason::Requested).await;
+        assert!(
+            matches!(third, Ok(())),
+            "expected every later close to return Ok | received {third:?}"
         );
     }
 
