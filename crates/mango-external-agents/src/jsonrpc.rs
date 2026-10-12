@@ -3245,9 +3245,13 @@ impl Client {
     /// twice `shutdown_timeout`, plus at most 100 ms, and only a handler that blocks its thread
     /// can use that, whatever else a handler does. A call that blocks its thread for longer than
     /// the first grace and then returns is treated as one that never does: the close returns the
-    /// handler's timeout, with the link closed, where it used to wait the call out. A task that
-    /// ended in the meantime, even late, does not fail the close: it is looked at again as the
-    /// close ends. [`PeerHandler`] says what each call leaves behind. The exceptions are not
+    /// handler's timeout, with the link closed, where it used to wait the call out. The handler's
+    /// task is looked at again as the close ends, so one that ended in the meantime, even late,
+    /// does not fail the close. The reader has no later moment to be looked at: it is the last
+    /// thing a close waits for. So on a connection that had already ended, when the handler's
+    /// `on_terminated` used the whole bound, a reader that is not blocked but takes longer than
+    /// those 50 ms to stop still gives the reader's timeout, with the link closed.
+    /// [`PeerHandler`] says what each call leaves behind. The exceptions are not
     /// handlers: a link whose own `send` or `close` blocks its thread, and a runtime whose every
     /// worker thread is blocked, which cannot run the timers that bound the close. Two things
     /// are waited for inside the same bound: a notification call or a hand-off that asked for a
