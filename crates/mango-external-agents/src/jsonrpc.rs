@@ -3380,12 +3380,11 @@ impl Client {
         // or, when that is spent, for the allowance an abort needs to land: a call that blocks its
         // thread never reaches the await where it would, and the link must still be closed
         // after it, in the second grace.
-        let stopping_until = owed_by.max(deadline_after(ABORT_SETTLE));
         let handler_stopped = if self.state.cancellation_held() {
             tokio::join!(self.state.wait_for_holds(), self.state.drain_in_flight());
-            self.state.stop_notifications_until(stopping_until).await
+            self.state.stop_notifications_until(owed_by).await
         } else {
-            let stopped = self.state.stop_notifications_until(stopping_until).await;
+            let stopped = self.state.stop_notifications_until(owed_by).await;
             self.state.drain_in_flight().await;
             stopped
         };
@@ -3741,14 +3740,15 @@ impl ClientState {
             .abort_all();
     }
 
-    /// Takes the handler's task down for a close, and says whether it had stopped by `until`.
+    /// Takes the handler's task down for a close, and says whether it had stopped by `owed_by`,
+    /// or, when that is past, within the allowance for an abort to land, counted from now.
     ///
     /// An abort lands at the task's next await, so a task that stops does so at once; one that
     /// has not by then is inside a call that blocks its thread, and waiting longer cannot tell it
     /// from one that never returns. The task is then left to stop whenever that call does.
     /// `true` also when there is nothing to wait for: the reader or another close has the task's
     /// handle, and answers for it.
-    async fn stop_notifications_until(&self, until: tokio::time::Instant) -> bool {
+    async fn stop_notifications_until(&self, owed_by: tokio::time::Instant) -> bool {
         self.abort_worker();
         let handle = self
             .notifications
@@ -3759,6 +3759,7 @@ impl ClientState {
             return true;
         };
         handle.abort();
+        let until = owed_by.max(deadline_after(ABORT_SETTLE));
         tokio::time::timeout_at(until, &mut handle).await.is_ok()
     }
 
