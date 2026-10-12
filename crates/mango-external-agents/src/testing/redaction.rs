@@ -192,6 +192,16 @@ pub const LEAKS: &[Leak] = &[
         &["login failed password=\"", "for ann"],
     ),
     leak(
+        "login failed password=\"pw-25\".Zq-25x for ann",
+        "Zq-25x",
+        &["login failed password=\"", "for ann"],
+    ),
+    leak(
+        "bad config password=\"pw-26\"b}c-26x\" for ann",
+        "c-26x",
+        &["bad config password=\"", "for ann"],
+    ),
+    leak(
         "run cmd &password=pw-24x&ss-24y after",
         "ss-24y",
         &["run cmd &password=", "after"],
@@ -236,6 +246,8 @@ pub const BENIGN: &[&str] = &[
     "env OLDPWD=/home/u PWD=/home/u/project",
     "clone failed for ssh://jenkins-deploy-agent-01@build.example.com/repo.git",
     r#"{"access_token":"[REDACTED]","token_type":"Bearer","expires_in":3600}"#,
+    "x-functions-keyboard: layout-us",
+    "subscription-keyword: alerts",
     "tokenizer: gpt-4o-mini",
     "secretary: bob",
     "tokenization: bpe",

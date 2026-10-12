@@ -194,6 +194,10 @@ const KEY_HEADER_PREFIXES: [&str; 2] = ["x-functions-", "subscription-"];
 /// The end of the `key` at `at` when a header name above leads up to it.
 fn match_header_key(bytes: &[u8], at: usize) -> Option<usize> {
     let end = match_word(bytes, at, b"key")?;
+    // The name ends there: `x-functions-keyboard` is not the header.
+    if bytes.get(end).copied().is_some_and(is_name_byte) {
+        return None;
+    }
     let before = &bytes[..at];
     KEY_HEADER_PREFIXES
         .iter()
@@ -204,60 +208,70 @@ fn match_header_key(bytes: &[u8], at: usize) -> Option<usize> {
         .then_some(end)
 }
 
-/// How far back a `?` is looked for before a `&` is taken for the join of two parameters. A query
-/// can carry a redirect URI, a state value or a JWT ahead of the key, so the reach is a URL's
-/// usual limit; text with no `?` in reach pays at most this much for each `&name=` start, which
-/// is a constant a byte (`work.rs` pins it).
-pub(super) const QUERY_LOOKBACK: usize = 2048;
+/// What the rewrite pass has read of the run of non-blank text it is in: whether a `?` stands in it
+/// before the place read up to. A `&` joins two parameters of a query only after a `?` in the
+/// same run (`cmd &password=pa&ss` is a shell's ampersand, and its value runs to the next blank).
+///
+/// The pass asks at starts that only move forward, so the text is read once, from where the last
+/// answer stood to where the next is asked, and a `?` at any distance in the run counts. A caller
+/// that asks from an earlier place starts over from the beginning.
+#[derive(Default)]
+pub(super) struct QueryRun {
+    /// The text before this place has been read.
+    read_to: usize,
+    /// Whether the last `?` or blank read was a `?`.
+    question_mark: bool,
+}
 
-/// Whether the parameter that starts at `at` is in a query string: right after a `?`, or after a
-/// `&` with a `?` earlier in the same run of non-blank bytes. `cmd &password=pa&ss` is a shell's
-/// ampersand, not a query's, and its value runs to the next blank.
-fn in_a_query(bytes: &[u8], at: usize) -> bool {
-    match at.checked_sub(1).and_then(|before| bytes.get(before)) {
-        Some(b'?') => true,
-        Some(b'&') => {
-            let window = &bytes[at.saturating_sub(QUERY_LOOKBACK)..at];
-            // A step is a block of 32 bytes, and the blank check reads at most as many again.
-            count_steps(2 * window.len().div_ceil(32));
-            // The nearest `?`, then whether a blank stands between it and the parameter.
-            last_question_mark(window).is_some_and(|mark| !holds_a_blank(&window[mark..]))
+impl QueryRun {
+    /// Whether the parameter whose name starts at `start`, asked about from `at` (`start` or a
+    /// later place in the same name), is in a query string: right after a `?`, or after a `&`
+    /// with a `?` earlier in the same run of non-blank bytes.
+    pub(super) fn is_query_parameter(&mut self, bytes: &[u8], start: usize, at: usize) -> bool {
+        match start.checked_sub(1).and_then(|before| bytes.get(before)) {
+            Some(b'?') => true,
+            Some(b'&') => self.has_a_question_mark_before(bytes, at),
+            _ => false,
         }
-        _ => false,
+    }
+
+    fn has_a_question_mark_before(&mut self, bytes: &[u8], at: usize) -> bool {
+        if at < self.read_to {
+            *self = Self::default();
+        }
+        let unread = &bytes[self.read_to..at];
+        count_steps(unread.len());
+        if let Some(last) = last_question_mark_or_blank(unread) {
+            self.question_mark = last == b'?';
+        }
+        self.read_to = at;
+        self.question_mark
     }
 }
 
-/// The place of the last `?` in `window`, read a block at a time so that a look back over text with
-/// none costs a vector compare for each block and not a branch for each byte.
-pub(super) fn last_question_mark(window: &[u8]) -> Option<usize> {
-    const BLOCK: usize = 32;
-    let mut end = window.len();
-    for block in window.rchunks(BLOCK) {
-        let start = end - block.len();
-        if block.iter().fold(false, |any, byte| any | (*byte == b'?')) {
+/// The last `?` or blank in `window`, whichever it is, read a block at a time so that text with
+/// neither costs a vector compare for each block and not a branch for each byte.
+pub(super) fn last_question_mark_or_blank(window: &[u8]) -> Option<u8> {
+    for block in window.rchunks(32) {
+        let holds = block.iter().fold(false, |any, byte| {
+            any | (*byte == b'?') | is_space_byte(*byte)
+        });
+        if holds {
             return block
                 .iter()
-                .rposition(|byte| *byte == b'?')
-                .map(|at| start + at);
+                .rev()
+                .find(|byte| (**byte == b'?') | is_space_byte(**byte))
+                .copied();
         }
-        end = start;
     }
     None
 }
 
-/// Whether `window` holds a blank, with the same block-at-a-time read as [`last_question_mark`].
-pub(super) fn holds_a_blank(window: &[u8]) -> bool {
-    window.chunks(32).any(|block| {
-        block
-            .iter()
-            .fold(false, |any, byte| any | is_space_byte(*byte))
-    })
-}
-
 /// A query parameter that is a credential's only when it is the whole name (`key`, `auth`,
-/// `sig`), or when it ends in `signature` or `sig` (`X-Amz-Signature`).
+/// `sig`), or when it ends in `signature` or `sig` (`X-Amz-Signature`). Whether the parameter is in
+/// a query is the caller's to ask ([`QueryRun`]).
 fn match_query_name(bytes: &[u8], at: usize) -> Option<Keyword> {
-    if !starts_a_parameter(bytes, at) || !in_a_query(bytes, at) {
+    if !starts_a_parameter(bytes, at) {
         return None;
     }
     let end = take_while(bytes, at, |byte| {
@@ -604,9 +618,18 @@ fn read_header(bytes: &[u8], at: usize, separator: u8) -> Option<Outcome> {
     // An unknown scheme takes the rest of its line. When the header's name was quoted the line is a
     // JSON text, and a quote or a bracket ends it too.
     let json = after_quote != after_keyword;
+    // After an equals sign `authorization` is a variable (`authorization=true mode=strict`), and a
+    // scheme this does not know is one token of the line's several; after a colon it is a header
+    // line, and the rest of it is the credential.
+    let one_token = separator == b'=';
     let unknown_end = || {
         let end = take_while(bytes, scheme_start, |byte| {
-            !matches!(byte, b'\n' | b'\r') && !(json && matches!(byte, b'"' | b'\'' | b'}' | b']'))
+            let in_line = if one_token {
+                is_value_byte(byte)
+            } else {
+                !matches!(byte, b'\n' | b'\r')
+            };
+            in_line && !(json && matches!(byte, b'"' | b'\'' | b'}' | b']'))
         });
         trim_end(bytes, scheme_start, end)
     };
@@ -744,7 +767,7 @@ pub(super) fn header_colon(bytes: &[u8], from: usize) -> Option<Anchor> {
 /// so a keep for it (`session_token_cookie: ;a=b`, a name that holds both a token and a cookie)
 /// also skips the later ones. Such names are not ones a vendor writes.
 #[inline]
-pub(super) fn assignment_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
+pub(super) fn assignment_rule(bytes: &[u8], at: usize, query: &mut QueryRun) -> Option<Outcome> {
     // Every byte of a name is a start now, since a keyword may end a name or follow a capital.
     // Most are not the first letter of anything, and are turned away on that alone.
     if !(starts_a_keyword(bytes, at) || starts_a_parameter(bytes, at)) {
@@ -760,7 +783,9 @@ pub(super) fn assignment_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
     }
     let keyword = match_keyword(bytes, at)
         .filter(|keyword| keyword_may_start(bytes, at, keyword.end))
-        .or_else(|| match_query_name(bytes, at))?;
+        .or_else(|| {
+            match_query_name(bytes, at).filter(|_| query.is_query_parameter(bytes, at, at))
+        })?;
     if !keyword.whole && is_a_plain_word(bytes, at, keyword.end) {
         return None;
     }
@@ -775,26 +800,37 @@ pub(super) fn assignment_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
     // `cookies: 3 stored` is a count; only a header named `cookie` has a line of values. And a name
     // that ends in `cookie` is a cookie header whatever opens it (`session_token_cookie`), so its
     // line is redacted from whichever of its starts is asked first.
+    let after_name = skip_quote(bytes, name_end);
+    // `{"token": 12345}`: a bare value in JSON ends where its object does.
+    let quoted_name = after_name != name_end;
+    // A cookie header's line is its value; a quoted member named for a cookie
+    // (`{"accept_cookie": true, "path": "/"}`) has the value of any other member.
     let kind = match keyword.kind {
+        _ if quoted_name => Kind::Token,
         Kind::Line if name_end != keyword.end => Kind::Token,
         Kind::Line => Kind::Line,
         _ if ends_in_cookie(bytes, keyword.end, name_end) => Kind::Line,
         kind => kind,
     };
     let keyword = Keyword { kind, ..keyword };
-    let after_name = skip_quote(bytes, name_end);
-    // `{"token": 12345}`: a bare value in JSON ends where its object does.
-    let quoted_name = after_name != name_end;
     let separator = skip_spaces(bytes, after_name);
     let colon = bytes.get(separator) == Some(&b':');
     let after_separator =
         match_byte(bytes, separator, b'=').or_else(|| match_byte(bytes, separator, b':'))?;
     let value_start = skip_spaces(bytes, after_separator);
+    let mut context = Context {
+        query,
+        start: run_start(bytes, at, is_name_byte),
+        at,
+        colon,
+        quoted_name,
+        in_query: None,
+    };
     if let Some(opened) = open_quote(bytes, value_start) {
-        return quoted_value(bytes, &keyword, at, opened, after_separator);
+        return quoted_value(bytes, &keyword, at, opened, after_separator, &mut context);
     }
     // A `&` ends a value only in a query string, and a query string separates with `=`.
-    let in_query = !colon && in_a_query(bytes, run_start(bytes, at, is_name_byte));
+    let in_query = context.in_query(bytes);
     let vetoed = || another_keyword_nearby(bytes, at, &keyword);
     let ends_value = |byte: u8| {
         !is_value_byte(byte)
@@ -996,6 +1032,31 @@ fn close_quote(bytes: &[u8], opened: &Opened) -> usize {
     bytes.len()
 }
 
+/// What the assignment rule knows about the name it is reading, for the value rules that need it.
+struct Context<'a> {
+    query: &'a mut QueryRun,
+    /// Where the name starts, and the place the rule was asked about.
+    start: usize,
+    at: usize,
+    colon: bool,
+    /// Whether the name was in quotes, which makes the text a JSON member.
+    quoted_name: bool,
+    in_query: Option<bool>,
+}
+
+impl Context<'_> {
+    /// Whether the name is a query parameter. A `&` ends a value only there, and a query string
+    /// separates with `=`. Asked once.
+    fn in_query(&mut self, bytes: &[u8]) -> bool {
+        if let Some(known) = self.in_query {
+            return known;
+        }
+        let known = !self.colon && self.query.is_query_parameter(bytes, self.start, self.at);
+        self.in_query = Some(known);
+        known
+    }
+}
+
 /// A value inside quotes runs to the closing quote whatever it holds, spaces and punctuation
 /// included, and the quotes and the separator stand as they were.
 fn quoted_value(
@@ -1004,11 +1065,12 @@ fn quoted_value(
     at: usize,
     opened: Opened,
     after_separator: usize,
+    context: &mut Context,
 ) -> Option<Outcome> {
     let end = close_quote(bytes, &opened);
     // Text glued to the closing quote (`"pa"ss"word"`) is more of the value, not the end of it:
     // the value is redacted through the glued tail, and no keep below applies.
-    if let Some(tail_end) = glued_tail(bytes, &opened, end) {
+    if let Some(tail_end) = glued_tail(bytes, &opened, end, context) {
         // The closing quote goes back after the marker, so that the text still reads as a quoted
         // value and a second pass over it leaves it as it is.
         let tail = match (opened.quote, opened.escaped) {
@@ -1053,10 +1115,15 @@ fn quoted_value(
 }
 
 /// Where the value ends when text is glued to the quote that closes it: the closing quote at `end`
-/// (a backslash and a quote when the value was written escaped), then a byte that goes on with the
-/// value instead of ending it. A comma, a space, a closing bracket or a `)`, `.`, `&` or `>` ends
-/// a value; a letter, a digit, another quote or an operator does not.
-fn glued_tail(bytes: &[u8], opened: &Opened, end: usize) -> Option<usize> {
+/// (a backslash and a quote when the value was written escaped), then text that goes on with the
+/// value instead of ending it.
+///
+/// After a JSON member's name (a quoted name) a letter, a digit, another quote or an operator
+/// glues, and a `}` or `]` ends the value. After a bare name the value is the run to the next
+/// blank, comma or semicolon, as it always was, so it is glued when a word follows even behind
+/// marks (`"x".C`, `"x")C`, `"a"b}c"`) and the brackets belong to it; marks alone (`"x").`) end
+/// it. In a query a `&` or `#` ends the value in both.
+fn glued_tail(bytes: &[u8], opened: &Opened, end: usize, context: &mut Context) -> Option<usize> {
     if !bytes
         .get(end)
         .is_some_and(|byte| *byte == opened.quote || *byte == b'\\')
@@ -1064,33 +1131,69 @@ fn glued_tail(bytes: &[u8], opened: &Opened, end: usize) -> Option<usize> {
         return None;
     }
     let after = end + if opened.escaped { 2 } else { 1 };
-    let glued = bytes.get(after).is_some_and(|byte| {
-        byte.is_ascii_alphanumeric()
-            || is_quote(*byte)
-            || matches!(
-                byte,
-                b'_' | b'-'
-                    | b'+'
-                    | b'/'
-                    | b'='
-                    | b'@'
-                    | b'!'
-                    | b'#'
-                    | b'$'
-                    | b'%'
-                    | b'^'
-                    | b'*'
-                    | b'~'
-                    | b'|'
-                    | b'?'
-                    | b'\\'
-            )
-    });
-    glued.then(|| {
-        take_while(bytes, after, |byte| {
-            is_value_byte(byte) && !matches!(byte, b'}' | b']')
-        })
-    })
+    let first = *bytes.get(after)?;
+    let glued = is_word_or_quote(first)
+        || is_glue_operator(first)
+        || (!context.quoted_name && marks_then_a_word(bytes, after, context));
+    if !glued {
+        return None;
+    }
+    let mut run_end = after;
+    while let Some(&byte) = bytes.get(run_end) {
+        let ends = !is_value_byte(byte)
+            || (context.quoted_name && matches!(byte, b'}' | b']'))
+            || (matches!(byte, b'&' | b'#') && context.in_query(bytes));
+        if ends {
+            break;
+        }
+        count_steps(1);
+        run_end += 1;
+    }
+    Some(run_end)
+}
+
+/// Whether a byte is part of a word or a quote, which marks before it do not end a value for.
+fn is_word_or_quote(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte >= 0x80 || is_quote(byte)
+}
+
+/// An operator a value may go on with, glued to a closing quote.
+fn is_glue_operator(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'_' | b'-'
+            | b'+'
+            | b'/'
+            | b'='
+            | b'@'
+            | b'!'
+            | b'#'
+            | b'$'
+            | b'%'
+            | b'^'
+            | b'*'
+            | b'~'
+            | b'|'
+            | b'?'
+            | b'\\'
+    )
+}
+
+/// Whether the marks that begin at `from` are followed by a word before a blank, a comma or a
+/// semicolon: `.C`, `)C`, `}c"`. A `&` or `#` in a query ends it.
+fn marks_then_a_word(bytes: &[u8], from: usize, context: &mut Context) -> bool {
+    let mut at = from;
+    while let Some(&byte) = bytes.get(at) {
+        if !is_value_byte(byte) || (matches!(byte, b'&' | b'#') && context.in_query(bytes)) {
+            return false;
+        }
+        if is_word_or_quote(byte) {
+            return true;
+        }
+        count_steps(1);
+        at += 1;
+    }
+    false
 }
 
 /// The end of the line from `start`, without the spaces that trail it.

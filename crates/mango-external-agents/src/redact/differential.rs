@@ -26,7 +26,7 @@
 //! `testing::redaction`, not to 0.4.1, which is frozen and never edited.
 
 use super::reference::{self, Rewrite, remove_boundaries, strip_every_character};
-use super::rules::{assignment_rule, bearer_rule, url_password_rule};
+use super::rules::{QueryRun, assignment_rule, bearer_rule, url_password_rule};
 use super::strip::strip_control_characters;
 use super::{
     REDACTED, as_text, ends_awaiting_value, redact_assignments, redact_bearer,
@@ -36,8 +36,8 @@ use super::{
 /// A rule under test, described the way the replaced scan wants it: where the match ends and the
 /// text that stands in its place.
 fn described(
-    rule: impl Fn(&[u8], usize) -> Option<super::Outcome>,
-) -> impl Fn(&[u8], usize) -> Option<Described> {
+    mut rule: impl FnMut(&[u8], usize) -> Option<super::Outcome>,
+) -> impl FnMut(&[u8], usize) -> Option<Described> {
     move |bytes, at| {
         Some(match rule(bytes, at)? {
             super::Outcome::Keep { end } => Described::Keep { end },
@@ -50,6 +50,13 @@ fn described(
             }
         })
     }
+}
+
+/// The assignment rule, described, with the state of the text it reads kept from one place to the
+/// next as the pass keeps it.
+fn described_assignments() -> impl FnMut(&[u8], usize) -> Option<Described> {
+    let mut query = QueryRun::default();
+    described(move |bytes, at| assignment_rule(bytes, at, &mut query))
 }
 
 /// A rule's answer in the replaced scan's terms.
@@ -284,7 +291,10 @@ fn agreement_with_0_4_1(raw: &str) -> Result<Agreement, String> {
 /// `rewrite` as it was first written: `rule` tried at every byte, the text pushed a character at
 /// a time. A rule decides for itself where a match may start, and a match it leaves alone is
 /// stepped over.
-fn rewrite_every_word(raw: &str, rule: impl Fn(&[u8], usize) -> Option<Described>) -> String {
+fn rewrite_every_word(
+    raw: &str,
+    mut rule: impl FnMut(&[u8], usize) -> Option<Described>,
+) -> String {
     let bytes = raw.as_bytes();
     let mut out = String::with_capacity(raw.len());
     let mut at = 0;
@@ -367,7 +377,7 @@ fn assert_matches_the_replaced_scan(raw: &str) {
         plain
     };
     let bearer = rewrite_every_word(&plain, described(bearer_rule));
-    let assignments = rewrite_every_word(&bearer, described(assignment_rule));
+    let assignments = rewrite_every_word(&bearer, described_assignments());
     let urls = rewrite_every_word(&assignments, described(url_password_rule));
     for input in [raw, plain.as_str()] {
         expect(
@@ -382,7 +392,7 @@ fn assert_matches_the_replaced_scan(raw: &str) {
             "the assignment rule",
             input,
             redact_assignments,
-            rewrite_every_word(input, described(assignment_rule)),
+            rewrite_every_word(input, described_assignments()),
         );
     }
     for input in [raw, assignments.as_str()] {

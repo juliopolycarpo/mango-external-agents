@@ -602,11 +602,11 @@ fn a_credential_word_beside_the_matched_one_vetoes_a_keep() {
 }
 
 /// The `?` that makes a `&` a query's join can be far behind it: a redirect URI, a state value or
-/// a JWT in the query ahead of the key is hundreds of bytes. `key`, `auth` and `sig` are
+/// a JWT in the query ahead of the key is hundreds of bytes, and there is no limit to how far. `key`, `auth` and `sig` are
 /// credentials only as query parameters, so one lost here is a credential in the clear.
 #[test]
 fn a_query_credential_is_found_however_long_the_query_before_it_is() {
-    for filler in [80, 700, 1500] {
+    for filler in [80, 700, 1500, 5000, 100_000] {
         let state = "s".repeat(filler);
         let text = format!("GET /v1?state={state}&key=AIzaSyA1&page=2");
         let expected = format!("GET /v1?state={state}&key=[REDACTED]&page=2");
@@ -620,31 +620,138 @@ fn a_query_credential_is_found_however_long_the_query_before_it_is() {
 }
 
 #[test]
-fn the_block_reads_find_the_last_question_mark_and_any_blank_at_every_offset() {
-    use super::rules::{holds_a_blank, last_question_mark};
+fn the_last_question_mark_or_blank_is_found_at_every_offset_around_a_block() {
+    use super::rules::last_question_mark_or_blank;
     for len in [0, 1, 31, 32, 33, 64, 65, 100] {
-        for mark in 0..len {
+        assert_eq!(last_question_mark_or_blank(&vec![b'a'; len]), None);
+        for at in 0..len {
             let mut text = vec![b'a'; len];
-            text[mark] = b'?';
+            text[at] = b'?';
             assert_eq!(
-                last_question_mark(&text),
-                Some(mark),
-                "expected the only `?` of {len} bytes at {mark} to be found | received a different place"
+                last_question_mark_or_blank(&text),
+                Some(b'?'),
+                "expected a `?` at {at} of {len} bytes to be found | received a different byte"
             );
-            text[len - 1] = b'?';
+            text[at] = b'\t';
             assert_eq!(
-                last_question_mark(&text),
-                Some(len - 1),
-                "expected the last of two `?` in {len} bytes to be found | received a different place"
+                last_question_mark_or_blank(&text),
+                Some(b'\t'),
+                "expected a tab at {at} of {len} bytes to be found | received a different byte"
             );
-            let mut blank = vec![b'a'; len];
-            blank[mark] = b'\t';
-            assert!(
-                holds_a_blank(&blank),
-                "expected a tab at {mark} of {len} bytes to be found | received: no blank"
-            );
+            // The later of the two is the answer.
+            let mut both = vec![b'a'; len];
+            both[at] = b'?';
+            if at + 1 < len {
+                both[len - 1] = b' ';
+                assert_eq!(
+                    last_question_mark_or_blank(&both),
+                    Some(b' '),
+                    "expected a blank after a `?` in {len} bytes to win | received the `?`"
+                );
+            }
         }
-        assert_eq!(last_question_mark(&vec![b'a'; len]), None);
-        assert!(!holds_a_blank(&vec![b'a'; len]));
     }
+}
+
+/// The run is read forward once; each answer is what a look back over the whole run gives.
+#[test]
+fn a_run_of_text_answers_for_every_ampersand_as_a_look_back_would() {
+    use super::rules::QueryRun;
+    let text = "a&k=1 ?x=1&k=2&k=3 b&k=4 ?&k=5 c\n&k=6&?&k=7";
+    let bytes = text.as_bytes();
+    let mut run = QueryRun::default();
+    for at in 1..bytes.len() {
+        if bytes[at - 1] != b'&' {
+            continue;
+        }
+        let run_start = text[..at]
+            .rfind(|c: char| c.is_ascii_whitespace())
+            .map_or(0, |blank| blank + 1);
+        let expected = text[run_start..at].contains('?');
+        let received = run.is_query_parameter(bytes, at, at);
+        assert_eq!(
+            received, expected,
+            "expected the parameter at {at} of {text:?} to be in a query: {expected} | received: \
+             {received}"
+        );
+    }
+}
+
+/// After an equals sign `authorization` is a variable (`authorization=true mode=strict`), not a
+/// header line, so a scheme this does not know takes one token and not the rest of the line. A
+/// header written with a colon keeps the line: `Authorization: sk-live-1 was rejected` leaves no
+/// key behind.
+#[test]
+fn an_unknown_scheme_after_an_equals_sign_takes_one_token() {
+    assert_shown(&[
+        (
+            "authorization=true mode=strict path=/repo",
+            "authorization=[REDACTED] mode=strict path=/repo",
+        ),
+        (
+            "Authorization=sk-live-1 was rejected",
+            "Authorization=[REDACTED] was rejected",
+        ),
+        (
+            "Authorization=Bearer x1 mode=strict",
+            "Authorization=Bearer [REDACTED] mode=strict",
+        ),
+        (
+            "Authorization=Basic dTpw mode=strict",
+            "Authorization=Basic [REDACTED] mode=strict",
+        ),
+        (
+            "Authorization=Digest user=u, response=r mode=strict",
+            "Authorization=Digest [REDACTED]",
+        ),
+        (
+            "Authorization: sk-live-1 was rejected",
+            "Authorization: [REDACTED]",
+        ),
+        (
+            r#"{"authorization": "sk-live-1 was", "path": "/repo"}"#,
+            r#"{"authorization": "[REDACTED]", "path": "/repo"}"#,
+        ),
+    ]);
+}
+
+/// A cookie header is a line of values. A member of a JSON text whose name ends in `cookie` is a
+/// member like any other: its value ends where the member does.
+#[test]
+fn a_quoted_cookie_member_is_a_member_and_a_cookie_header_is_a_line() {
+    assert_shown(&[
+        (
+            r#"{"accept_cookie": true, "path": "/repo"}"#,
+            r#"{"accept_cookie": [REDACTED], "path": "/repo"}"#,
+        ),
+        (
+            r#"{"cookie": "a=1; b=2", "path": "/repo"}"#,
+            r#"{"cookie": "[REDACTED]", "path": "/repo"}"#,
+        ),
+        (
+            r#"{"set-cookie": "sid=1", "path": "/repo"}"#,
+            r#"{"set-cookie": "[REDACTED]", "path": "/repo"}"#,
+        ),
+        ("Cookie: a=1; b=2 path=/x", "Cookie: [REDACTED]"),
+        ("Set-Cookie: sid=1; Path=/", "Set-Cookie: [REDACTED]"),
+        (
+            "x-session-cookie: sid=1; Path=/",
+            "x-session-cookie: [REDACTED]",
+        ),
+    ]);
+}
+
+/// A vendor's header name is matched only when the name ends at its key.
+#[test]
+fn a_header_name_that_only_starts_like_a_vendors_key_header_is_not_one() {
+    assert_shown(&[
+        ("x-functions-keyboard: abc", "x-functions-keyboard: abc"),
+        ("subscription-keyword: abc", "subscription-keyword: abc"),
+        ("x-functions-keys: abc", "x-functions-keys: abc"),
+        ("x-functions-key: abc", "x-functions-key=[REDACTED]"),
+        (
+            "Ocp-Apim-Subscription-Key: abc",
+            "Ocp-Apim-Subscription-Key=[REDACTED]",
+        ),
+    ]);
 }

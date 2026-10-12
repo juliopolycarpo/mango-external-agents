@@ -234,7 +234,10 @@ fn redact_bearer(raw: &str) -> String {
 
 /// `api_key=`, `secret:`, `"token": "..."`, … and whatever value follows.
 fn redact_assignments(raw: &str) -> String {
-    rewrite(raw, rules::assignment_separator, rules::assignment_rule)
+    let mut query = rules::QueryRun::default();
+    rewrite(raw, rules::assignment_separator, |bytes, at| {
+        rules::assignment_rule(bytes, at, &mut query)
+    })
 }
 
 /// The password half of `scheme://user:password@host`.
@@ -275,7 +278,7 @@ enum Outcome {
 fn rewrite(
     raw: &str,
     locate: impl Fn(&[u8], usize) -> Option<Anchor>,
-    rule: impl Fn(&[u8], usize) -> Option<Outcome>,
+    mut rule: impl FnMut(&[u8], usize) -> Option<Outcome>,
 ) -> String {
     let bytes = raw.as_bytes();
     let mut out = String::with_capacity(raw.len());
