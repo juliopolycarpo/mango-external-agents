@@ -113,12 +113,21 @@ pub fn parse(output: &str) -> Option<String> {
 mod tests {
     use super::{Comparison, compare, parse};
 
+    /// The text as a discovery shows it: `Discovery::normalized` reads it with `redact::bounded`.
+    fn shown(text: &str) -> String {
+        mango_external_agents::redact::bounded(
+            text,
+            mango_external_agents::normalize::TextLimit::AccountLabel,
+        )
+        .text
+    }
+
     /// The probe parses the raw line and stores the token, so a banner the redactor rewrites
     /// (`token: 1.2.3` reads as an assignment) keeps a version that survives redaction.
     #[test]
     fn a_banner_the_redactor_rewrites_still_yields_a_version_that_survives_redaction() {
         let banner = "tool token: 1.2.3";
-        let redacted = mango_external_agents::redact::stderr_text(banner);
+        let redacted = shown(banner);
         assert_eq!(
             parse(&redacted),
             None,
@@ -126,7 +135,7 @@ mod tests {
         );
         let version = parse(banner).expect("expected a version off the raw banner");
         assert_eq!(
-            mango_external_agents::redact::stderr_text(&version),
+            shown(&version),
             version,
             "expected the version token to survive redaction | received a different text"
         );

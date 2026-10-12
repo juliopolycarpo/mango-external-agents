@@ -159,13 +159,22 @@ mod tests {
         );
     }
 
+    /// The text as a discovery shows it: `Discovery::normalized` reads it with `redact::bounded`.
+    fn shown(text: &str) -> String {
+        mango_external_agents::redact::bounded(
+            text,
+            mango_external_agents::normalize::TextLimit::AccountLabel,
+        )
+        .text
+    }
+
     /// The gate reads the version off the raw line, and the host is shown the token alone. A banner
     /// the redactor rewrites (`token: 0.153.4` reads as an assignment) keeps its version, and the
     /// token survives the redaction a discovery goes through.
     #[test]
     fn a_banner_the_redactor_rewrites_still_yields_a_version_that_survives_redaction() {
         let banner = "tool token: 0.153.4\n";
-        let redacted = mango_external_agents::redact::stderr_text(banner);
+        let redacted = shown(banner);
         assert_eq!(
             parse_version(&redacted),
             None,
@@ -173,7 +182,7 @@ mod tests {
         );
         let version = parse_version(banner).expect("expected a version off the raw banner");
         assert_eq!(
-            mango_external_agents::redact::stderr_text(&version),
+            shown(&version),
             version,
             "expected the version token to survive redaction | received a different text"
         );

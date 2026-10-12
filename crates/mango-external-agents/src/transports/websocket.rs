@@ -124,7 +124,7 @@ fn ws_reason(error: &WsError) -> String {
 /// A URL configured as `wss://svc:s3cr3t@agent.internal/ws` otherwise carries its password into
 /// the `Display` of each link failure, and the password is the half nobody needs to diagnose one.
 fn peer_label(url: &str) -> String {
-    redact::stderr_text(url)
+    redact::message_text(url)
 }
 
 struct SocketSender {
@@ -242,13 +242,27 @@ fn is_disconnect(error: &WsError) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{dial, from_socket};
+    use super::{dial, from_socket, peer_label};
     use crate::process::LineLimits;
     use crate::transport::WsSpec;
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
     use tokio_tungstenite::tungstenite::Message;
+
+    /// A webhook-style URL carries its token as a path segment, with no name beside it.
+    #[test]
+    fn a_bare_token_in_the_url_path_is_not_repeated_in_the_peer_label() {
+        let token = format!(
+            "{}0123456789abcdefghijklmnopqrstuvwxyz",
+            concat!("gh", "p_")
+        );
+        let label = peer_label(&format!("wss://agent.internal/hooks/{token}/ws"));
+        assert_eq!(
+            label, "wss://agent.internal/hooks/[REDACTED]/ws",
+            "expected the path token out of the peer label | received: {label:?}"
+        );
+    }
 
     /// Accepts one connection, echoes every text frame back with a prefix, then closes.
     async fn echo_server() -> String {

@@ -1,5 +1,6 @@
 //! Stable, credential-free diagnostic output for every registered harness.
 
+use mango_external_agents::normalize::TextLimit;
 use mango_external_agents::{AuthState, Discovery, GateVerdict};
 use serde_json::{Value, json};
 
@@ -10,11 +11,17 @@ pub(crate) fn json(reports: &[DiscoveryReport]) -> Value {
     Value::Array(reports.iter().map(row).collect())
 }
 
+/// A probe failure as it is printed: the CLI's own message, read for names and for the well-known
+/// token prefixes, and bounded.
+fn shown_error(error: &str) -> String {
+    mango_external_agents::redact::bounded(error, TextLimit::ErrorMessage).text
+}
+
 fn row(report: &DiscoveryReport) -> Value {
     let discovery = match &report.result {
         Ok(discovery) => discovery,
         Err(error) => {
-            return json!({"harness": report.kind.to_string(), "installed": null, "version": null, "gate": "unknown", "auth": "unknown", "error": mango_external_agents::redact::stderr_text(error)});
+            return json!({"harness": report.kind.to_string(), "installed": null, "version": null, "gate": "unknown", "auth": "unknown", "error": shown_error(error)});
         }
     };
     let (auth, login_hint) = account(discovery);
@@ -70,7 +77,7 @@ pub(crate) fn text(report: &DiscoveryReport) -> String {
             return format!(
                 "{}: installed=null version=unknown gate=unknown auth=unknown; {}",
                 report.kind,
-                mango_external_agents::redact::stderr_text(error)
+                shown_error(error)
             );
         }
     };
@@ -92,6 +99,25 @@ pub(crate) fn text(report: &DiscoveryReport) -> String {
 mod tests {
     use super::*;
     use mango_external_agents::HarnessId;
+
+    /// A probe failure is the CLI's own message, not a stderr line: a bare token in it is read for
+    /// the well-known prefixes as well.
+    #[test]
+    fn a_bare_token_in_a_probe_failure_is_redacted_in_text_and_json() {
+        let token = format!(
+            "{}0123456789abcdefghijklmnopqrstuvwxyz",
+            concat!("gh", "p_")
+        );
+        let report = DiscoveryReport {
+            kind: HarnessId::codex(),
+            result: Err(format!("probe failed for {token}")),
+        };
+        let (shown, as_json) = (text(&report), row(&report).to_string());
+        assert!(
+            !shown.contains(&token) && !as_json.contains(&token),
+            "expected the token out of both outputs | received: {shown:?} and {as_json:?}"
+        );
+    }
 
     #[test]
     fn logged_out_reports_the_vendors_login_command() {
