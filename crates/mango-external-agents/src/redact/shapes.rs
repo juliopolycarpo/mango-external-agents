@@ -410,3 +410,76 @@ fn ordinary_text_that_looks_like_a_name_is_kept() {
         (r#"{"token_type":"abc"}"#, r#"{"token_type":"[REDACTED]"}"#),
     ]);
 }
+
+#[test]
+fn only_the_shells_own_names_for_the_working_directory_keep_a_path() {
+    assert_shown(&[
+        ("PWD=/home/u/project", "PWD=/home/u/project"),
+        ("OLDPWD=/home/u", "OLDPWD=/home/u"),
+        ("MYSQL_PWD=/Zk3x9aQ+hunter2", "MYSQL_PWD=[REDACTED]"),
+        ("export MYSQL_PWD=/x9y8z7", "export MYSQL_PWD=[REDACTED]"),
+        ("DB_PWD=/s3cret/pass", "DB_PWD=[REDACTED]"),
+        ("pwd: /secret", "pwd=[REDACTED]"),
+        ("pwd_secret=/shh", "pwd_secret=[REDACTED]"),
+        ("token_typesigtoken=basic", "token_typesigtoken=[REDACTED]"),
+    ]);
+}
+
+#[test]
+fn an_unknown_scheme_keeps_its_quoted_parameters_in_the_redaction() {
+    assert_shown(&[
+        (
+            "Authorization: MyScheme user=\"alice\", sig=\"deadbeef\"",
+            "Authorization: [REDACTED]",
+        ),
+        (
+            "Authorization: Foo abc, def=\"x\"",
+            "Authorization: [REDACTED]",
+        ),
+        ("Authorization: +Zx9/abc==", "Authorization: [REDACTED]"),
+        ("Authorization: /9j/4AAQ", "Authorization: [REDACTED]"),
+        ("Authorization: Bearer+abc", "Authorization: [REDACTED]"),
+        (
+            r#"{"Authorization": "+Zx9/abc==", "Accept": "a"}"#,
+            r#"{"Authorization": "[REDACTED]", "Accept": "a"}"#,
+        ),
+        // The text around a value is not one.
+        ("Authorization:\\nBearer x", "Authorization:\\nBearer x"),
+        ("Authorization:", "Authorization:"),
+    ]);
+}
+
+#[test]
+fn a_password_or_a_token_array_is_redacted_whole_and_not_at_its_first_comma() {
+    assert_shown(&[
+        (
+            r#"{"password":["hunter2","swordfish"]}"#,
+            r#"{"password":[REDACTED]}"#,
+        ),
+        (r#"{"pwd": ["one", "two"]}"#, r#"{"pwd": [REDACTED]}"#),
+        (
+            r#"{"passphrase": {"a":"hunter2","b":"swordfish"}}"#,
+            r#"{"passphrase": [REDACTED]}"#,
+        ),
+        // JSON inside a string: the escaped quotes open and close strings too.
+        (
+            r#"error: {\"tokens\":[\"a\"],\"detail\":\"rate limited\"} then retry"#,
+            r#"error: {\"tokens\":[REDACTED],\"detail\":\"rate limited\"} then retry"#,
+        ),
+    ]);
+}
+
+#[test]
+fn a_password_phrase_that_goes_on_after_its_status_is_a_value() {
+    assert_shown(&[
+        ("password: invalid \"hunter2\"", "password=[REDACTED]"),
+        ("password: not set (was hunter2)", "password=[REDACTED]"),
+        (
+            "password: required, try again",
+            "password: required, try again",
+        ),
+        ("password: required.", "password: required."),
+        // A token is one word, as it always was.
+        ("token: expired (ghp_abc)", "token: expired (ghp_abc)"),
+    ]);
+}

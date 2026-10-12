@@ -428,35 +428,59 @@ pub(super) fn bearer_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
     let after_scheme = take_while(bytes, scheme_start, |byte| {
         byte.is_ascii_alphanumeric() | (byte == b'-') | (byte == b'_') | (byte == b'.')
     });
-    if after_scheme == scheme_start {
-        return None;
-    }
     let scheme = &bytes[scheme_start..after_scheme];
     // A boundary marker stands where a byte was removed between the scheme and its token.
     let token_start = take_while(bytes, after_scheme, |byte| {
         is_space_byte(byte) || byte == strip::BOUNDARY_BYTE
     });
+    let gap = token_start > after_scheme;
+    // An unknown scheme takes the rest of its line. When the header's name was quoted the line is a
+    // JSON text, and a quote or a bracket ends it too.
+    let json = after_quote != after_keyword;
+    let unknown_end = || {
+        let end = take_while(bytes, scheme_start, |byte| {
+            !matches!(byte, b'\n' | b'\r') && !(json && matches!(byte, b'"' | b'\'' | b'}' | b']'))
+        });
+        trim_end(bytes, scheme_start, end)
+    };
     let (end, takes_a_token) = if quoted {
         let opened = opened_before(bytes, scheme_start)?;
         let end = close_quote(bytes, &opened);
         if status_phrase_end(bytes, scheme_start).is_some_and(|status| status == end) {
             return Some(Outcome::Keep { end });
         }
-        (end, token_start < end && is_known_scheme(scheme))
-    } else if is_single_token_scheme(scheme) {
-        (take_while(bytes, token_start, is_value_byte), true)
-    } else if is_multi_part_scheme(scheme) {
-        (line_end(bytes, token_start), true)
+        (end, gap && token_start < end && is_known_scheme(scheme))
+    } else if scheme.is_empty() {
+        // A bare credential that opens with another byte (`+Zx9/abc==`), but not an escape's
+        // backslash or a quote or bracket: those are the text around a value, not a value.
+        let opens = bytes.get(scheme_start).copied();
+        if !opens.is_some_and(|byte| {
+            is_value_byte(byte) && !matches!(byte, b'\\' | b'"' | b'\'' | b'[' | b']' | b'{' | b'}')
+        }) {
+            return None;
+        }
+        (unknown_end(), false)
+    } else if is_known_scheme(scheme) {
+        if !gap {
+            // Nothing follows the scheme, or a byte is glued to it (`Bearer+abc`): the second is
+            // a credential, as an unknown scheme is.
+            if !bytes
+                .get(after_scheme)
+                .is_some_and(|byte| is_value_byte(*byte))
+            {
+                return None;
+            }
+            (unknown_end(), false)
+        } else if is_single_token_scheme(scheme) {
+            (take_while(bytes, token_start, is_value_byte), true)
+        } else {
+            (line_end(bytes, token_start), true)
+        }
     } else {
-        // A quote or a bracket ends it too: the line may be a JSON text on one line.
-        let end = take_while(bytes, scheme_start, |byte| {
-            !matches!(byte, b'\n' | b'\r' | b'"' | b'\'' | b'}' | b']')
-        });
-        (trim_end(bytes, scheme_start, end), false)
+        (unknown_end(), false)
     };
     // A scheme with nothing after it carries no credential.
-    if end <= scheme_start || (takes_a_token && (token_start == after_scheme || end <= token_start))
-    {
+    if end <= scheme_start || (takes_a_token && end <= token_start) {
         return None;
     }
     let (kept_end, joiner) = if takes_a_token {
@@ -545,6 +569,10 @@ pub(super) fn header_colon(bytes: &[u8], from: usize) -> Option<Anchor> {
 /// about the value alone (an empty one, a status, a count) answers [`Outcome::Keep`] past the
 /// separator, and the other starts of the name are not asked. The bounded reads come first: the
 /// value may be a megabyte of text and a status is a few words.
+///
+/// A name that holds more than one keyword is answered for by the leftmost that may start there,
+/// so a keep for it (`session_token_cookie: ;a=b`, a name that holds both a token and a cookie)
+/// also skips the later ones. Such names are not ones a vendor writes.
 #[inline]
 pub(super) fn assignment_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
     // Every byte of a name is a start now, since a keyword may end a name or follow a capital.
@@ -589,7 +617,10 @@ pub(super) fn assignment_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
             || (in_query && matches!(byte, b'&' | b'#'))
             || (quoted_name && matches!(byte, b'}' | b']'))
     };
-    if let Some(end) = status_phrase_end(bytes, value_start) {
+    let phrase = keyword.kind == Kind::Phrase && colon && !in_query;
+    if let Some(end) = status_phrase_end(bytes, value_start)
+        && (!phrase || phrase_closes(bytes, end))
+    {
         return Some(Outcome::Keep { end });
     }
     let digits_end = take_while(bytes, value_start, is_number_byte);
@@ -605,16 +636,14 @@ pub(super) fn assignment_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
     {
         return Some(Outcome::Keep { end: value_start });
     }
-    let value_end = match (keyword.kind, colon && !in_query) {
+    let value_end = match (keyword.kind, bytes.get(value_start)) {
         (Kind::Line, _) => line_end(bytes, value_start),
-        (Kind::Phrase, true) => phrase_end(bytes, value_start),
-        _ => match bytes.get(value_start) {
-            // The brackets close the value, and whatever is glued after them goes with it.
-            Some(b'[' | b'{') => take_while(bytes, closing_bracket(bytes, value_start), |byte| {
-                !ends_value(byte)
-            }),
-            _ => take_while(bytes, value_start, |byte| !ends_value(byte)),
-        },
+        // The brackets close the value, and whatever is glued after them goes with it.
+        (_, Some(b'[' | b'{')) => take_while(bytes, closing_bracket(bytes, value_start), |byte| {
+            !ends_value(byte)
+        }),
+        (Kind::Phrase, _) if phrase => phrase_end(bytes, value_start),
+        _ => take_while(bytes, value_start, |byte| !ends_value(byte)),
     };
     if value_end == value_start {
         return Some(Outcome::Keep {
@@ -635,16 +664,33 @@ pub(super) fn assignment_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
     }))
 }
 
+/// Whether nothing is left of a phrase after the status that ends at `end`: the text ends, or a
+/// line break, comma or semicolon comes next, after its marks and blanks. `password: not set (was
+/// hunter2)` has more phrase after its status, and that is the password.
+fn phrase_closes(bytes: &[u8], end: usize) -> bool {
+    let marks = take_while(bytes, end, |byte| {
+        matches!(byte, b'.' | b')' | b']' | b'}' | b'"' | b'\'')
+    });
+    let next = take_while(bytes, marks, is_blank_byte);
+    bytes
+        .get(next)
+        .is_none_or(|byte| matches!(byte, b'\n' | b'\r' | b',' | b';'))
+}
+
 /// A digit or one of the marks a number is written with.
 fn is_number_byte(byte: u8) -> bool {
     byte.is_ascii_digit() | (byte == b',') | (byte == b'_')
 }
 
-/// `pwd` is also the shell's name for the working directory: `PWD=/home/u/project`.
+/// `PWD` and `OLDPWD` are the shell's names for the working directory: `PWD=/home/u/project`. Any
+/// other name that ends in `pwd` (`MYSQL_PWD`) is a password.
 fn is_a_path_for_pwd(bytes: &[u8], at: usize, keyword: &Keyword, value_start: usize) -> bool {
-    keyword.end - at == 3
-        && bytes[at..keyword.end].eq_ignore_ascii_case(b"pwd")
-        && bytes.get(value_start) == Some(&b'/')
+    if keyword.end - at != 3 || bytes.get(value_start) != Some(&b'/') {
+        return false;
+    }
+    let name_start = run_start(bytes, at, is_name_byte);
+    let name_end = take_while(bytes, keyword.end, is_name_byte);
+    matches!(&bytes[name_start..name_end], b"PWD" | b"OLDPWD")
 }
 
 /// `"token_type": "Bearer"` names a scheme and not a credential.
@@ -660,6 +706,9 @@ fn is_a_token_type(bytes: &[u8], keyword: &Keyword, value_start: usize) -> bool 
     if kind.len() < 4 || !kind[..4].eq_ignore_ascii_case(b"type") {
         return false;
     }
+    if kind.get(4).is_some_and(|byte| is_name_byte(*byte)) {
+        return false;
+    }
     let value_end = take_while(bytes, value_start, |byte| byte.is_ascii_alphabetic());
     let value = &bytes[value_start..value_end];
     ["bearer", "basic", "mac"]
@@ -669,20 +718,33 @@ fn is_a_token_type(bytes: &[u8], keyword: &Keyword, value_start: usize) -> bool 
 }
 
 /// Where the bracket that opens at `start` closes, counting the brackets and the strings inside:
-/// a JSON array or object that is one credential's value. An unclosed one ends with its line.
+/// a JSON array or object that is one credential's value. A string opens with a quote, or with a
+/// backslash and a quote when the JSON is itself inside a string (`{\\"a\\":1}`). An unclosed one
+/// ends with its line.
 fn closing_bracket(bytes: &[u8], start: usize) -> usize {
     let mut depth = 0usize;
-    let mut quote = None;
+    // The quote that opened the string we are in, and whether it was written with a backslash.
+    let mut string: Option<(u8, bool)> = None;
     let mut at = start;
-    while let Some(byte) = bytes.get(at) {
+    while let Some(&byte) = bytes.get(at) {
         count_steps(1);
         at += 1;
-        match (quote, *byte) {
-            (_, b'\n' | b'\r') => return at - 1,
-            (Some(_), b'\\') => at += 1,
-            (Some(open), byte) if byte == open => quote = None,
+        if matches!(byte, b'\n' | b'\r') {
+            return at - 1;
+        }
+        match (string, byte) {
+            (Some((quote, true)), b'\\') if bytes.get(at) == Some(&quote) => {
+                string = None;
+                at += 1;
+            }
+            (Some((_, false)), b'\\') if !matches!(bytes.get(at), Some(b'\n' | b'\r')) => at += 1,
+            (Some((quote, false)), byte) if byte == quote => string = None,
             (Some(_), _) => {}
-            (None, b'"' | b'\'') => quote = Some(*byte),
+            (None, b'\\') if bytes.get(at).is_some_and(|byte| is_quote(*byte)) => {
+                string = Some((bytes[at], true));
+                at += 1;
+            }
+            (None, b'"' | b'\'') => string = Some((byte, false)),
             (None, b'[' | b'{') => depth += 1,
             (None, b']' | b'}') => {
                 depth = depth.saturating_sub(1);

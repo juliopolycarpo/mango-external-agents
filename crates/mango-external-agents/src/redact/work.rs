@@ -231,6 +231,30 @@ const SHAPES: &[Shape] = &[
         build: |len| repeated("token=[\"", "{[", len),
     },
     Shape {
+        what: "a known scheme glued to a colon, repeated on one line",
+        build: |len| repeated("Authorization:Bearer:", "", len),
+    },
+    Shape {
+        what: "a multi-part scheme glued to a comma, repeated on one line",
+        build: |len| repeated("Authorization:Digest,", "", len),
+    },
+    Shape {
+        what: "a known scheme glued to an equals sign, repeated",
+        build: |len| repeated("Authorization:Basic=", "", len),
+    },
+    Shape {
+        what: "an authorization header opening a quote that never closes, repeated",
+        build: |len| repeated("Authorization:'x", "", len),
+    },
+    Shape {
+        what: "an array that never closes under a password, repeated",
+        build: |len| repeated("password:[\"", "", len),
+    },
+    Shape {
+        what: "an escaped string that never closes inside an array, repeated",
+        build: |len| repeated("token=[\\\"a", "", len),
+    },
+    Shape {
         what: "token-length userinfo with no password, repeated",
         build: |len| repeated("a://aaaaaaaaaaaaaaaaaaa1@", "", len),
     },
