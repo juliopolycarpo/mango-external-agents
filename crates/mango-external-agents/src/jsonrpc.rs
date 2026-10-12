@@ -3245,9 +3245,17 @@ impl Client {
     /// is the first close's expiry plus about a scheduler turn, in which it still holds the
     /// reader while it takes it down, and a second close whose own bound runs out in that window
     /// returns the timeout where it used to return `Ok`. The first close, polled again after the
-    /// second gave up, still completes with `Ok`. For now a host tells this timeout from the
-    /// link's only by its `operation` text, "JSON-RPC reader shutdown";
-    /// [`is_link_shutdown_timeout`] is `false` for it.
+    /// second gave up, still completes with `Ok`. A host tells this timeout from the link's by
+    /// type: [`is_reader_shutdown_timeout`] is `true` for it and [`is_link_shutdown_timeout`] is
+    /// `false`.
+    ///
+    /// # A close that is kept
+    ///
+    /// A close future borrows the client it was called on, or owns a share of it, so a client
+    /// cannot be dropped under a close that is kept: the reader lives no longer than the future,
+    /// and dropping the future takes the reader down. Drop a kept close before the client it
+    /// belongs to. A future that is leaked, with [`std::mem::forget`], holds the lock on the
+    /// reader's handle for good; dropping the client stops the reader without that lock.
     ///
     /// # Wrapping a close
     ///
@@ -3262,14 +3270,15 @@ impl Client {
     ///
     /// [`Error::Link`] when closing the link itself failed, [`Error::Timeout`] when the link
     /// could not be reached within `shutdown_timeout` (that one is
-    /// [`is_link_shutdown_timeout`]), and [`Error::Timeout`] naming the reader when another
-    /// close that holds it was still waiting for the handler to be told after this one's bound
-    /// of twice `shutdown_timeout` had run out. The link is closed by then. Nothing in the
-    /// second case waits for good, whether or not the other close is ever polled again. The same
-    /// [`Error::Timeout`] is what a close returns when it took the reader down and the reader did
-    /// not stop, because a handler blocks its thread; see [`PeerHandler`]. That close ends at
-    /// its bound, twice `shutdown_timeout` and, when it had to take the reader down after the
-    /// bound was spent, a few milliseconds more for the abort to land.
+    /// [`is_link_shutdown_timeout`]), and [`Error::Timeout`] naming the reader
+    /// ([`is_reader_shutdown_timeout`]) when the reader had not let go once this close's bound of
+    /// twice `shutdown_timeout` had run out: because another close that holds it was still
+    /// waiting for the handler to be told, or because the reader was taken down and a handler
+    /// that blocks its thread (see [`PeerHandler`]) kept it from stopping. The link is closed by
+    /// then. Nothing in either case waits for good, whether or not the other close is ever
+    /// polled again. A close that took the reader down after its bound was spent ends a few
+    /// milliseconds later than that, for the abort to land. The [module documentation](self) says
+    /// what the two timeouts mean.
     pub async fn close(&self) -> Result<()> {
         // Stored before the drain rather than inside it, and that order is the contract `call`
         // reads: a caller that finds the map open has, by that fact, arrived before this store,

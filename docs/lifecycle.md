@@ -157,9 +157,11 @@ instead: the call alone receives the `LimitExceeded`, the link is not made unusa
 is told nothing, and what was queued before the close is still written before the link goes. Which of the three bounds was passed is read by type, not from
 the error's text: `OutboundBound::exceeded_by(&error)` for the refusal a caller receives and
 `PeerTermination::outbound_bound()` for the end the handler is told of, each `None` for anything
-else; `is_link_shutdown_timeout(&error)` says whether a `Timeout` is `Client::close` giving up on
-the link, which may be still open. A `Timeout` that names the reader is a later close giving up
-behind another close's wait for `on_terminated`: the link is already closed, and `false` here.
+else. Which wait of a `Client::close` ran out is read by type too, from the `Timeout` it returns:
+`is_link_shutdown_timeout(&error)` is `true` for a close giving up on the link, which may be still
+open, and `is_reader_shutdown_timeout(&error)` for a close that gave up on the reader, with the link
+already closed. The `jsonrpc` module documentation says what each means; the paragraphs on a second
+close and on a handler that blocks its thread, below, say when the second one comes.
 A queued request's `Reply` resolves to a `CallFailure` that
 tells the peer's own error from an ended connection (`Client::ended` gives the same
 `ConnectionEnd`), a deadline, an unwritten frame and a stopped handler by type, and
@@ -225,15 +227,32 @@ own bound all the same. If the first is parked inside the closing of the link it
 and the second returns the link's `Timeout` after `shutdown_timeout` without having closed it;
 dropping the first lets a later close finish. If it is parked in its wait for `on_terminated` it
 holds the reader, and the second, which has closed the link by then, returns a `Timeout` that names
-the reader (not `is_link_shutdown_timeout`) when its own bound of twice `shutdown_timeout` runs
-out. A first close that finishes within its bound is no hindrance: the second then finds nothing
+the reader (`is_reader_shutdown_timeout`, not `is_link_shutdown_timeout`) when its own bound of
+twice `shutdown_timeout` runs out. A first close that finishes within its bound is no hindrance: the second then finds nothing
 left to wait for, and both are `Ok`. The timeout is not limited to a first close that is parked and
 forgotten. A later close whose own bound runs out in the window after the first one's expiry, about
 a scheduler turn, in which the first still holds the reader while it takes it down, sees it too,
-where it used to see `Ok`; for now a host tells it from the link's timeout only by its `operation`
-text, "JSON-RPC reader shutdown". The first close, polled again after the second gave up, still
-completes with `Ok`; dropping it takes the reader down mid-call, so `on_terminated` does not
-return. The same holds for a caller that wraps `close` in a timeout shorter than twice
+where it used to see `Ok`. The first close, polled again after the second gave up, still completes
+with `Ok`; dropping it takes the reader down mid-call, so `on_terminated` does not return.
+
+A close future that is kept holds a borrow of the client it was called on, or a share of it when it
+owns one, so a client is not dropped under it: the reader lives no longer than the future, and
+dropping the future takes the reader down. A host that wants a kept close gone drops the future,
+and then the client. A future that is leaked instead (`std::mem::forget`) holds the lock on the
+reader's handle for good, and dropping the client stops the reader without that lock.
+
+A handler that blocks its thread, with `std::thread::sleep` or a blocking lock, inside
+`on_terminated` cannot be stopped by the abort that a close gives up on, since an abort lands at an
+await. The close no longer waits for it without a bound: after the reader's wait runs out it takes
+the reader down, allows the abort a few milliseconds to land (50 ms, and no more than
+`shutdown_timeout`) when its bound is already spent, and returns the reader's `Timeout`, or the
+link's own error if closing the link failed. The close thus ends within twice `shutdown_timeout`,
+plus that allowance in this case. The reader's task stays on the blocked thread until the call
+returns and then ends without a further call: the client stays closed, `Client::ended` keeps the
+end it recorded, `on_terminated` is not made again, and a later close or a drop has nothing left to
+wait for or stop. A handler must not block its thread; this only keeps the close from waiting for
+it. A handler blocked in `on_notification` or `on_request_handoff` is not covered: the close waits
+for that task, after aborting it, for as long as it blocks. The same holds for a caller that wraps `close` in a timeout shorter than twice
 `shutdown_timeout` on a connection that ended under this side: such a caller can cut
 `on_terminated` and should wrap `close` in nothing shorter than that bound if it relies on the
 call finishing.
