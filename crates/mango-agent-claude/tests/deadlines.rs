@@ -179,6 +179,66 @@ async fn a_host_shutdown_writes_the_terminal_after_the_whole_stop() {
     );
 }
 
+/// A close that gave up on a pending launch is followed by a close while the late child's stop is
+/// still running: it waits out the whole stop and returns the failure as `CleanupRequired`.
+#[tokio::test(start_paused = true)]
+async fn a_later_close_waits_out_the_late_childs_whole_stop() {
+    let limits = limits();
+    let deadlines = Deadlines::from_limits(&limits);
+    // Takes the interrupt and the kill inside their bounds, and exits for neither: the reap runs out.
+    let launcher = Arc::new(
+        FakeClaudeCli::new()
+            .with_turn(stalled())
+            .with_slow_stop(SlowStop {
+                interrupt: Some(limits.kill_grace - MILLISECOND),
+                kill: limits.shutdown_timeout - MILLISECOND,
+                kill_ends_child: false,
+            }),
+    );
+    let gate = launcher.gate_turn_spawns();
+    let session = open_under(&launcher, limits).await;
+    let _starting = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            session
+                .start_turn(TurnRequest::new("turn-1", "hold"))
+                .await
+                .map(drop)
+        }
+    });
+    gate.wait_for_spawn().await;
+    let first = session
+        .close(mango_external_agents::CloseReason::Requested)
+        .await;
+    assert!(
+        matches!(&first, Err(error) if error.cleanup_control().is_none()),
+        "expected the first close to give up on the launch without a control | received {first:?}"
+    );
+    gate.release();
+    // The start runs and begins its stop; the clock does not move while tasks are ready.
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+
+    let began = Instant::now();
+    let later = session
+        .close(mango_external_agents::CloseReason::Requested)
+        .await;
+    let elapsed = began.elapsed();
+
+    assert!(
+        matches!(&later, Err(error) if error.cleanup_control().is_some()),
+        "expected the later close to return the late child's CleanupRequired | received {later:?}"
+    );
+    assert_window(
+        "the later close (close_after_pending_launch)",
+        elapsed,
+        deadlines.close_after_pending_launch(),
+        FULL_STOP_EARLY,
+    );
+    launcher.end_turns_for_host_cleanup();
+}
+
 /// A session dropped with a child installed reaps it by the end of the stop.
 #[tokio::test(start_paused = true)]
 async fn a_dropped_session_reaps_its_child_after_the_whole_stop() {
@@ -312,7 +372,8 @@ async fn a_stream_that_ended_under_a_live_child_reaps_it_after_a_grace_and_a_who
     drop(session);
 }
 
-/// A stop that cannot succeed still ends at the same bound, with the stop's own error.
+/// A stop that cannot succeed still ends at the same bound, with `Error::CleanupRequired` around
+/// the stop's own error.
 #[tokio::test(start_paused = true)]
 async fn a_stop_the_child_ignores_fails_at_the_process_stop_bound() {
     let limits = limits();
@@ -334,6 +395,10 @@ async fn a_stop_the_child_ignores_fails_at_the_process_stop_bound() {
         .await
         .expect("expected the cancel to return | received none within an hour")
         .expect_err("expected a stop the child ignored to fail");
+    assert!(
+        matches!(&error, Error::CleanupRequired { .. }),
+        "expected the stop failure as Error::CleanupRequired | received {error:?}"
+    );
     assert!(
         matches!(error.cause(), Error::Timeout { operation, .. } if operation == "process reaping"),
         "expected Error::Timeout naming process reaping | received {error:?}"
