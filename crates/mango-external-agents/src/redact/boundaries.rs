@@ -208,7 +208,7 @@ fn a_url_whose_user_is_a_credential_name_reaches_its_final_shape_in_one_pass() {
 /// which is the only text the assignment rule reads once more. An ordinary user is not charged.
 #[test]
 fn the_url_rule_flags_only_a_password_under_a_credential_name() {
-    use super::redact_url_passwords;
+    use super::floor::redact_url_passwords;
     for (raw, flagged) in [
         ("x://token:;hunter2@host", true),
         ("x://PASSWORD:,@h", true),
@@ -232,7 +232,7 @@ fn the_url_rule_flags_only_a_password_under_a_credential_name() {
 /// outside it.
 #[test]
 fn a_keyword_is_found_inside_the_range_and_not_outside_it() {
-    use super::rules::holds_a_keyword;
+    use super::floor::holds_a_keyword;
     let text = b"https://user:hunter2@host/?token=x";
     for (from, to, expected) in [
         (0, 13, false),

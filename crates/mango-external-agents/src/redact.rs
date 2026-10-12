@@ -37,6 +37,12 @@
 //! The keyword list is the one the structured walk uses, so `pwd=x` as text and `"pwd":"x"` as
 //! data agree.
 //!
+//! The rules above are the release before this one's, and `redact::floor` keeps them as they
+//! were. [`stderr_text`] is exactly that. The paths that carry a vendor's messages ([`bounded`],
+//! [`structured`]) read the same text with the newer reads too (escape depth, containers across
+//! lines, sequences, block scalars, well-known tokens, JSON inside strings), each reader saying
+//! which spans it hides, and hide the union (`redact::union`): never less than the release before.
+//!
 //! Every pass is linear in the text. A rule is asked at each place a match can start, and the
 //! places that share an end share everything after their start, so what depends on the end is
 //! decided once, by the function that finds the anchor (see `scan::Candidates`), and not by
@@ -46,6 +52,8 @@
 mod boundaries;
 #[cfg(test)]
 mod differential;
+mod embedded;
+mod floor;
 #[cfg(test)]
 mod reference;
 mod rules;
@@ -59,6 +67,7 @@ mod structured;
 #[cfg(test)]
 mod token_shapes;
 mod tokens;
+mod union;
 #[cfg(test)]
 mod work;
 
@@ -66,7 +75,6 @@ use std::borrow::Cow;
 
 use scan::{Anchor, Candidates, count_steps};
 pub(crate) use strip::{MAX_ESCAPE_BYTES, holds_string_terminator};
-use strip::{remove_boundaries, strip_control_characters};
 pub use structured::structured;
 
 /// Redacts a stderr tail and strips terminal-unsafe control characters.
@@ -80,39 +88,21 @@ pub use structured::structured;
 /// assert_eq!(tail, "Authorization: Bearer [REDACTED] API_KEY=[REDACTED]");
 /// ```
 pub fn stderr_text(raw: &str) -> String {
-    read(raw, false)
-}
-
-/// What a vendor's message is shown as: [`stderr_text`], and the well-known tokens with no name
-/// beside them (`ghp_...`, `AKIA...`, a web token, a private-key block) taken out as well.
-///
-/// The extra pass reads the whole text a byte at a time, which a stderr tail, read line after line,
-/// does not pay for (`docs/benchmarks.md`); a message is short and rare.
-pub(crate) fn message_text(raw: &str) -> String {
-    read(raw, true)
-}
-
-/// [`stderr_text`], with the token pass when `tokens` is set.
-fn read(raw: &str, tokens: bool) -> String {
     // Stripped first rather than last. A CLI that colours its output writes `Authorization:` and
     // ` Bearer sk-live-x` either side of an escape sequence, and a rule that reads the two as
     // neighbours never sees the token at all if the sequence is still sitting between them.
     let (plain, marked) = strip::strip_marking(raw);
-    let (mut redacted, reread) = rules_round(&plain, tokens);
+    let (mut redacted, reread) = floor::rules_round(&plain);
     // A marker the stripper left parts a name from the word before it for the rules, and is gone
     // from what they return, so a second call over that would read the same text differently.
     // Reading it again here, until it stops changing, makes the answer one a second call leaves
     // alone. Text with no removed byte, nearly all of it, pays for one round.
     //
-    // A private-key block does the same: the rules read the mark it left as the end of a header,
-    // and the name they made of it and the text glued on is a different name once it is a
-    // `[REDACTED]`.
-    //
     // A URL password redacted under a credential's name does the same: the `user:[REDACTED]@` it
     // leaves is read as an assignment, and what that takes can make another URL of what is left.
     if marked || reread {
-        for _ in 0..EXTRA_ROUNDS {
-            let (next, _) = rules_round(&redacted, tokens);
+        for _ in 0..floor::EXTRA_ROUNDS {
+            let (next, _) = floor::rules_round(&redacted);
             if next == redacted {
                 break;
             }
@@ -122,45 +112,40 @@ fn read(raw: &str, tokens: bool) -> String {
     redacted
 }
 
-/// The most times text that carried a marker is read again.
-const EXTRA_ROUNDS: usize = 3;
-
-/// The three rules over text the stripper has handled, and the markers taken out after. When asked,
-/// the private-key blocks go first (a name that redacts the first line of a block would leave the
-/// rest of it behind) and the other well-known tokens go last: a name that opens like a prefix
-/// (`sk-live-api-key: x`) must reach the rules whole, and the `[REDACTED]` a token leaves must not
-/// stand where a rule is reading a value. It answers whether a block was replaced or a URL password
-/// under a credential's name was, since the text then wants another round (see [`read`]).
-fn rules_round(plain: &str, tokens: bool) -> (String, bool) {
-    let blocks = tokens
-        .then(|| tokens::redact(plain, tokens::Pass::Blocks))
-        .flatten();
-    let bearer = redact_bearer(blocks.as_deref().unwrap_or(plain));
-    let assignments = redact_assignments(&bearer);
-    let (urls, named) = redact_url_passwords(&assignments);
-    // A URL password the last rule redacted leaves `user:[REDACTED]@`, which reads as an assignment
-    // when the user is a credential's name (`token:;x@` gives `token:[REDACTED]@`). Reading it once
-    // more gives the text a second call would, so a call leaves its own output alone. Only text
-    // with such a URL pays for it: a URL with an ordinary user does not.
-    let settled = if named {
-        redact_assignments(&urls)
-    } else {
-        urls
-    };
-    let named_last = tokens
-        .then(|| tokens::redact(&settled, tokens::Pass::Prefixes))
-        .flatten();
-    let text = remove_boundaries(named_last.unwrap_or(settled));
-    if blocks.is_some() {
-        return (tokens::settle_marks(&text), true);
-    }
-    (text, named)
+/// What a vendor's message is shown as: everything [`stderr_text`] hides, and the well-known tokens
+/// with no name beside them (`ghp_...`, `AKIA...`, a web token, a private-key block), the reads
+/// that cross lines (containers, sequences, block scalars) and the deeper levels of escaping
+/// hidden as well.
+///
+/// The text is read by each of them over the same text and the answer hides what any of them hides
+/// (`redact::union`), so the answer hides at least what `stderr_text` hides, whatever the newer
+/// reads make of the same place. It is then read again, until a reading changes nothing: the text
+/// a call returns is one a second call leaves alone. A stderr tail, read line after line, does not
+/// pay for the extra reads (`docs/benchmarks.md`); a message is short and rare.
+pub(crate) fn message_text(raw: &str) -> String {
+    read_until_stable(raw, &union::Plain)
 }
 
-/// [`stderr_text`] without the rounds that follow a marker: what one reading of the rules gives.
-#[cfg(test)]
-fn single_round(raw: &str) -> String {
-    rules_round(&strip_control_characters(raw), false).0
+/// The most readings of one text before it is given up on and hidden whole. No input the searches
+/// generate comes near it; it is the bound that makes "a second call changes nothing" hold by
+/// construction.
+const MAX_READINGS: usize = 8;
+
+/// `raw` read by every reader and `layer` until a reading changes nothing.
+///
+/// Each reading only replaces text that is in front of it: nothing a reading hid comes back in the
+/// next, so a text that stops changing is a text that every reader leaves alone, and a text that
+/// never stops is hidden whole.
+fn read_until_stable(raw: &str, layer: &dyn union::Layer) -> String {
+    let mut text = Cow::Borrowed(raw);
+    for _ in 0..MAX_READINGS {
+        let next = union::read_once(&text, layer);
+        if next == text {
+            return text.into_owned();
+        }
+        text = Cow::Owned(next);
+    }
+    layer.whole(raw)
 }
 
 /// Redacts `raw` and then bounds it to `limit`: the order every vendor-written diagnostic needs.
@@ -184,16 +169,6 @@ pub fn bounded(raw: &str, limit: crate::normalize::TextLimit) -> crate::normaliz
     crate::normalize::bound_text(&message_text(raw), limit)
 }
 
-/// Whether a keyword or `Authorization` starts anywhere in `text`: without one, nothing in it can
-/// be a credential's name, and a probe would only read it for nothing.
-pub(super) fn names_a_credential(text: &str) -> bool {
-    (0..text.len()).any(|at| {
-        count_steps(1);
-        rules::names_a_keyword(text.as_bytes(), at)
-            || match_word(text.as_bytes(), at, rules::AUTHORIZATION).is_some()
-    })
-}
-
 /// Whether `dropped`, the text a cut removed from the end of what came before, stops where a
 /// rule here is still waiting for a credential's value.
 ///
@@ -203,33 +178,10 @@ pub(super) fn names_a_credential(text: &str) -> bool {
 /// appends each shape a continuation can take and asks the rules whether the appended value was
 /// redacted, so the answer follows the rules and not a second list of names and separators.
 /// It errs toward `true`: a trailing `password` counts as awaiting even when nothing follows.
+///
+/// It answers for the rules of [`stderr_text`], which is what reads a tail.
 pub(crate) fn ends_awaiting_value(dropped: &str) -> bool {
-    // Each probe finishes one waiting state: a name that wants its separator, a separator that
-    // wants its value, `Authorization` that wants `:`, `Authorization:` that wants a scheme and a
-    // scheme that wants its token. `Z` is the value; it survives only when nothing claimed it.
-    // The fifth continues the line, as a cut inside a quoted JSON string does. The last closes a
-    // container that a credential's name opened (a bracket closes either kind): `Z]` survives
-    // only when no such container was open, since a bracket nothing opened stays text.
-    const PROBES: [(&str, &str); 6] = [
-        ("\n=Z", "Z"),
-        ("\n:bearer Z", "Z"),
-        ("\nbearer Z", "Z"),
-        ("\nZ", "Z"),
-        (" Z", "Z"),
-        ("\nZ]", "Z]"),
-    ];
-    // Only the two rules that read across a line break: a URL password cannot span one.
-    let plain = strip_control_characters(dropped);
-    // Nothing is awaited without a keyword in the text, and most tails have none.
-    if !names_a_credential(&plain) {
-        return false;
-    }
-    PROBES.iter().any(|(probe, survives)| {
-        // The text is copied once with its probe, then redacted by the rules, which count their own.
-        count_steps(plain.len());
-        let probed = redact_assignments(&redact_bearer(&format!("{plain}{probe}")));
-        !probed.ends_with(survives)
-    })
+    floor::ends_awaiting_value(dropped)
 }
 
 /// A safe executable summary from a host-owned path.
@@ -289,34 +241,47 @@ fn is_known_program(name: &str) -> bool {
     KNOWN_PROGRAMS.contains(&bare)
 }
 
-/// `authorization : <scheme> <token>`, however it was spaced, cased and quoted.
-///
-/// Any scheme counts, `bearer` and `basic` among them: it is the same header carrying the same
-/// credential, and a base64 user:password is no less a secret for being the older spelling.
-fn redact_bearer(raw: &str) -> String {
-    rewrite(raw, rules::header_colon, rules::bearer_rule)
-}
-
-/// `api_key=`, `secret:`, `"token": "..."`, … and whatever value follows.
-fn redact_assignments(raw: &str) -> String {
+/// The spans the reads added since the release before this one hide in `plain`: a name and a value
+/// at any depth of escaping, a value that is a container, a sequence or a block scalar across
+/// lines. The rules of the release before are in [`floor`]; this is read beside them.
+fn read_hides(plain: &str) -> Vec<union::Hide> {
     let mut query = rules::QueryRun::default();
-    rewrite(raw, rules::assignment_separator, |bytes, at| {
+    let headers = scan_hides(plain, rules::header_colon, rules::bearer_rule);
+    let assignments = scan_hides(plain, rules::assignment_separator, |bytes, at| {
         rules::assignment_rule(bytes, at, &mut query)
-    })
+    });
+    union::union(vec![headers, assignments])
 }
 
-/// The password half of `scheme://user:password@host`, and whether a password was redacted from a
-/// URL whose scheme or user holds a keyword: the text then reads as an assignment.
-fn redact_url_passwords(raw: &str) -> (String, bool) {
-    let mut named = false;
-    let text = rewrite(raw, rules::scheme_separator, |bytes, at| {
-        let outcome = rules::url_password_rule(bytes, at);
-        if let Some(Outcome::Redact(found)) = &outcome {
-            named = named || rules::holds_a_keyword(bytes, at, found.kept_end);
-        }
-        outcome
-    });
-    (text, named)
+/// The spans one rule hides in `text`, trying it where its locator says it can match.
+fn scan_hides(
+    text: &str,
+    locate: impl Fn(&[u8], usize) -> Option<Anchor>,
+    mut rule: impl FnMut(&[u8], usize) -> Option<Outcome>,
+) -> Vec<union::Hide> {
+    let bytes = text.as_bytes();
+    let mut hides = Vec::new();
+    let mut candidates = Candidates::new(locate);
+    let mut from = 0;
+    while let Some(at) = candidates.next_from(bytes, from) {
+        from = at + 1;
+        let found = match rule(bytes, at) {
+            None => continue,
+            Some(Outcome::Keep { end }) => {
+                from = end;
+                continue;
+            }
+            Some(Outcome::Redact(found)) => found,
+        };
+        hides.push(union::Hide::written(
+            found.kept_end,
+            found.end,
+            found.joiner,
+            found.tail,
+        ));
+        from = found.end;
+    }
+    hides
 }
 
 /// What one rule matched: where the match ends, and what stands in its place.
@@ -339,46 +304,6 @@ enum Outcome {
     /// steps over it to `end` and leaves it, so the value is read once however many starts the
     /// name had.
     Keep { end: usize },
-}
-
-/// Scans left to right, letting `rule` claim a span starting at a word boundary.
-///
-/// The result is what trying `rule` at every word boundary in turn gives, the leftmost match
-/// first and the next one looked for where it ends. `locate` is how the scan gets there without
-/// trying every word: it finds the punctuation the rule cannot match without and the starts that
-/// reach it (see [`Candidates`]), and the text between two matches is copied whole. Every rule
-/// starts at an ASCII letter and ends at an ASCII byte or the end of the text, so both ends of a
-/// copied span are character boundaries.
-fn rewrite(
-    raw: &str,
-    locate: impl Fn(&[u8], usize) -> Option<Anchor>,
-    mut rule: impl FnMut(&[u8], usize) -> Option<Outcome>,
-) -> String {
-    let bytes = raw.as_bytes();
-    let mut out = String::with_capacity(raw.len());
-    let mut candidates = Candidates::new(locate);
-    let mut copied = 0;
-    let mut from = 0;
-    while let Some(at) = candidates.next_from(bytes, from) {
-        from = at + 1;
-        let found = match rule(bytes, at) {
-            None => continue,
-            Some(Outcome::Keep { end }) => {
-                from = end;
-                continue;
-            }
-            Some(Outcome::Redact(found)) => found,
-        };
-        out.push_str(&span(raw, copied, at));
-        out.push_str(&as_text(bytes, at, found.kept_end));
-        out.push_str(found.joiner);
-        out.push_str(REDACTED);
-        out.push_str(found.tail);
-        copied = found.end;
-        from = found.end;
-    }
-    out.push_str(&span(raw, copied, raw.len()));
-    out
 }
 
 fn match_word(bytes: &[u8], at: usize, word: &[u8]) -> Option<usize> {
@@ -447,30 +372,6 @@ fn is_value_byte(byte: u8) -> bool {
     !is_space_byte(byte) && !matches!(byte, b',' | b';')
 }
 
-/// `raw[from..to]`, borrowed, for a span whose ends are character boundaries.
-///
-/// Every rule starts at an ASCII letter and ends at an ASCII byte or the end of the text, so the
-/// spans [`rewrite`] copies always are. Should one ever not be, the text is repaired the way
-/// [`as_text`] repairs it rather than panicking in a diagnostic path. The boundary check is the
-/// one slicing makes, so the common case costs the same.
-///
-/// # Example
-///
-/// ```ignore
-/// assert_eq!(span("caf\u{e9}", 0, 3), "caf");
-/// ```
-fn span(raw: &str, from: usize, to: usize) -> Cow<'_, str> {
-    match raw.get(from..to) {
-        Some(text) => Cow::Borrowed(text),
-        None => as_text(raw.as_bytes(), from, to),
-    }
-}
-
-/// `bytes[from..to]` as text, borrowed unless it is not valid UTF-8.
-fn as_text(bytes: &[u8], from: usize, to: usize) -> Cow<'_, str> {
-    String::from_utf8_lossy(bytes.get(from..to).unwrap_or_default())
-}
-
 /// Every code point a diagnostic must not carry across a boundary, tab and newline excepted.
 ///
 /// One list rather than a second opinion: the ranges are the ones
@@ -485,11 +386,10 @@ fn is_unsafe_to_render(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::rules::{has_value, url_password};
-    use super::{
-        Anchor, Outcome, Rewrite, ends_awaiting_value, is_stripped_byte, program_name, rewrite,
-        span, stderr_text,
-    };
+    use super::floor::rules::{has_value, url_password};
+    use super::floor::{Outcome, Rewrite, rewrite, span};
+    use super::scan::Anchor;
+    use super::{ends_awaiting_value, is_stripped_byte, program_name, stderr_text};
 
     /// The fixture a vendor child writes in the port's own process test.
     const FIXTURE: &str =
@@ -774,11 +674,6 @@ mod tests {
             "noise {\"Authorization\": \"Bearer",
             "noise accessToken",
             "noise Cookie:",
-            // A container a credential's name opened and nothing has closed.
-            "noise {\"tokens\": [",
-            "noise {\"password\": [\n  \"hunter2\",",
-            "noise \"credentials\": {\"user\": \"u\",\n",
-            "noise tokens: [\n  sk-aaa,",
         ] {
             assert!(
                 ends_awaiting_value(dropped),
@@ -796,10 +691,6 @@ mod tests {
             "Authorization: Bearer sk-live-42",
             "retry at https://user:url-secret@agent.internal",
             "an ordinary line ending in a colon:",
-            // A container that closed, and one a name that is no credential's opened.
-            "noise {\"tokens\": [\"a\"],",
-            "noise {\"password\": [\n  \"hunter2\"\n],\n",
-            "noise {\"items\": [\n  \"a\",",
         ] {
             assert!(
                 !ends_awaiting_value(dropped),

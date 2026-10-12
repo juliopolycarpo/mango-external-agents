@@ -10,7 +10,7 @@
 
 use serde_json::{Map, Value};
 
-use super::message_text;
+use super::embedded::Embedded;
 
 /// What replaces a credential.
 const REDACTED: &str = "[REDACTED]";
@@ -37,13 +37,6 @@ pub(super) const CREDENTIAL_WORDS: [&str; 11] = [
 /// Names that are a credential's only when they are the whole name: too short or too ordinary to
 /// be one inside another word (`passenger`, `author`, `monkey`).
 pub(super) const CREDENTIAL_NAMES: [&str; 3] = ["pass", "auth", "sig"];
-
-/// The longest string read as JSON: a larger one is a log, not a field, and the parse is the only
-/// work here that is not a pass over the text. 256 KiB is a few thousand headers or variables.
-const MAX_EMBEDDED_BYTES: usize = 256 * 1024;
-
-/// How many strings deep a JSON text is read, one inside the next.
-const MAX_EMBEDDED_DEPTH: usize = 4;
 
 /// How many digits make a number under a name that counts tokens a secret and not a count. The
 /// largest count is a 32-bit counter's 4,294,967,295, ten digits, and no window or budget comes
@@ -114,7 +107,7 @@ pub(super) fn names_a_count(name: &str) -> bool {
 }
 
 /// Whether `text` is only digits, with the separators numbers are written with.
-fn only_digits(text: &str) -> bool {
+pub(super) fn only_digits(text: &str) -> bool {
     !text.is_empty()
         && text
             .bytes()
@@ -169,12 +162,25 @@ fn only_digits(text: &str) -> bool {
 /// ```
 #[must_use]
 pub fn structured(value: &Value) -> Value {
-    walk(value, Under::Nothing, 0)
+    walk(value, Under::Nothing, 0, leaf)
 }
+
+/// [`structured`] with the rules of the release before this one reading every string that is not
+/// under a credential's name: the floor the walk is held to in `redact::search`.
+#[cfg(test)]
+pub(super) fn structured_by_the_floor(value: &Value) -> Value {
+    walk(value, Under::Nothing, 0, |text, _| {
+        super::floor::stderr_text(text)
+    })
+}
+
+/// How a string that is not under a credential's name is read, given how many JSON strings deep it
+/// stands.
+type Leaf = fn(&str, usize) -> String;
 
 /// What the walk is below.
 #[derive(Clone, Copy)]
-enum Under {
+pub(super) enum Under {
     /// Nothing that names a credential.
     Nothing,
     /// A member whose name is a credential's. The flag is whether the name counts something, so
@@ -183,7 +189,7 @@ enum Under {
 }
 
 impl Under {
-    fn credential(name: &str) -> Option<Self> {
+    pub(super) fn credential(name: &str) -> Option<Self> {
         names_a_credential(name).then(|| Self::Credential {
             counts: names_a_count(name),
         })
@@ -192,28 +198,26 @@ impl Under {
 
 /// The walk below `value`, which is `embedded` strings deep inside JSON texts that were themselves
 /// a string of the value.
-fn walk(value: &Value, under: Under, embedded: usize) -> Value {
+fn walk(value: &Value, under: Under, embedded: usize, leaf: Leaf) -> Value {
     match (value, under) {
         // A container under a credential name is one marker, so that redacting never makes the
         // value larger: a megabyte of `1,` under `"token"` would otherwise come back as six.
-        // Except under a name that counts tokens, where a container of counts is counts
-        // (`"output_tokens_details": {"reasoning_tokens": 12}`).
-        (Value::Object(_) | Value::Array(_), Under::Credential { counts: true })
-            if holds_only_counts(value) =>
+        (Value::Object(_), Under::Credential { .. }) => Value::String(String::from(REDACTED)),
+        (Value::Array(items), Under::Credential { counts: true })
+            if items.iter().all(is_a_count) =>
         {
             value.clone()
         }
-        (Value::Object(_), Under::Credential { .. }) => Value::String(String::from(REDACTED)),
         (Value::Array(_), Under::Credential { .. }) => Value::String(String::from(REDACTED)),
-        _ => walk_leaf_or_free(value, under, embedded),
+        _ => walk_leaf_or_free(value, under, embedded, leaf),
     }
 }
 
-fn walk_leaf_or_free(value: &Value, under: Under, embedded: usize) -> Value {
+fn walk_leaf_or_free(value: &Value, under: Under, embedded: usize, leaf: Leaf) -> Value {
     match value {
-        Value::Object(members) => Value::Object(object(members, embedded)),
-        Value::Array(items) => Value::Array(array(items, under, embedded)),
-        Value::String(text) => Value::String(string(text, under, embedded)),
+        Value::Object(members) => Value::Object(object(members, embedded, leaf)),
+        Value::Array(items) => Value::Array(array(items, under, embedded, leaf)),
+        Value::String(text) => Value::String(string(text, under, embedded, leaf)),
         Value::Number(_) => match under {
             Under::Credential { counts: false } => Value::String(String::from(REDACTED)),
             Under::Credential { counts: true } if !is_a_count(value) => {
@@ -225,18 +229,6 @@ fn walk_leaf_or_free(value: &Value, under: Under, embedded: usize) -> Value {
     }
 }
 
-/// Whether `value` is a number with few enough digits to be a count, or an array or an object
-/// that holds nothing but those, under keys that are no credential's name or count something.
-fn holds_only_counts(value: &Value) -> bool {
-    match value {
-        Value::Object(members) => members
-            .iter()
-            .all(|(key, member)| key_is_no_secret(key) && holds_only_counts(member)),
-        Value::Array(items) => items.iter().all(holds_only_counts),
-        other => is_a_count(other),
-    }
-}
-
 /// Whether `value` is a number with few enough digits to be a count.
 fn is_a_count(value: &Value) -> bool {
     value
@@ -244,334 +236,23 @@ fn is_a_count(value: &Value) -> bool {
         .is_some_and(|number| digits_make_a_count(&number.to_string()))
 }
 
-fn string(text: &str, under: Under, embedded: usize) -> String {
+fn string(text: &str, under: Under, embedded: usize, leaf: Leaf) -> String {
     match under {
         Under::Credential { counts: true } if only_digits(text) && digits_make_a_count(text) => {
             text.to_owned()
         }
         Under::Credential { .. } => String::from(REDACTED),
-        Under::Nothing => text_or_structure(text, embedded),
+        Under::Nothing => leaf(text, embedded),
     }
 }
 
-/// A string that is not under a credential's name: read as the text it is, and, when it is a JSON
-/// object or array, as the structure it holds.
+/// A string that is not under a credential's name: read as the text it is by every reader, and,
+/// when it is a JSON object or array, as the structure it holds.
 ///
-/// A vendor that serialises a request into a field sends JSON as a string, and the structure in it
-/// (a `{"name": ..., "value": ...}` pair, an `["Authorization", ...]` entry) is a credential the
-/// text rules cannot see. Only a text that parses as a container is walked, so `"123"`, `"null"`
-/// and a prose sentence stay what they are.
-///
-/// The walk finds the spans of the values to replace and the text is written again with those spans
-/// and no others changed (see [`rewrite_embedded`]): a number, a key's order, a duplicate key or the
-/// way a string is escaped in what is not a credential comes back byte for byte. Every other string
-/// comes back as the text rules left it. The text is read to [`MAX_EMBEDDED_BYTES`] and
-/// [`MAX_EMBEDDED_DEPTH`] strings deep; past either it is the text rules' alone, which read a quoted
-/// pair at any escaping level.
-fn text_or_structure(text: &str, embedded: usize) -> String {
-    let redacted = message_text(text);
-    let Some(rewritten) = rewrite_embedded(text, embedded) else {
-        return redacted;
-    };
-    // The text rules read the written form too, as they read the text: a pair the walk does not
-    // know is theirs, and the walk never leaves more than they would have.
-    message_text(&rewritten)
-}
-
-/// `text` written again with every value the walk redacts replaced, when `text` is a JSON object or
-/// array within the bounds and the walk redacts something in it.
-///
-/// ```text
-/// {"name": "API_KEY", "value": "sk-live-1", "n": 100000000000000000000000000001}
-/// {"name": "API_KEY", "value": "[REDACTED]", "n": 100000000000000000000000000001}
-/// ```
-fn rewrite_embedded(text: &str, embedded: usize) -> Option<String> {
-    if embedded >= MAX_EMBEDDED_DEPTH || text.len() > MAX_EMBEDDED_BYTES {
-        return None;
-    }
-    let trimmed = text.trim();
-    let wrapped = (trimmed.starts_with('{') && trimmed.ends_with('}'))
-        || (trimmed.starts_with('[') && trimmed.ends_with(']'));
-    // The parse accepts what is JSON, so that the scan below can rely on it.
-    if !wrapped || serde_json::from_str::<serde::de::IgnoredAny>(trimmed).is_err() {
-        return None;
-    }
-    let tree = spans::parse(trimmed)?;
-    let mut edits = Vec::new();
-    redact_span(&tree, Under::Nothing, embedded, trimmed, &mut edits);
-    if edits.is_empty() {
-        return None;
-    }
-    let start = text.len() - text.trim_start().len();
-    let mut out = String::with_capacity(text.len());
-    let mut copied = 0;
-    out.push_str(&text[..start]);
-    for (range, replacement) in edits {
-        out.push_str(&trimmed[copied..range.start]);
-        out.push_str(&replacement);
-        copied = range.end;
-    }
-    out.push_str(&trimmed[copied..]);
-    out.push_str(&text[start + trimmed.len()..]);
-    Some(out)
-}
-
-/// The marker as a JSON string.
-const REDACTED_JSON: &str = "\"[REDACTED]\"";
-
-/// [`walk`] over a text and its spans: pushes, in text order, the span of each value that is a
-/// credential and the string it becomes.
-fn redact_span(
-    node: &spans::Spanned,
-    under: Under,
-    embedded: usize,
-    text: &str,
-    edits: &mut Vec<(std::ops::Range<usize>, String)>,
-) {
-    use spans::Node;
-    let replace = |edits: &mut Vec<_>| {
-        edits.push((node.span.clone(), String::from(REDACTED_JSON)));
-    };
-    match (&node.node, under) {
-        // A container under a credential name is one marker, as in `walk`.
-        (Node::Object(_) | Node::Array(_), Under::Credential { counts: true })
-            if holds_only_counts_span(node, text) => {}
-        (Node::Object(_), Under::Credential { .. }) => replace(edits),
-        (Node::Array(_), Under::Credential { .. }) => replace(edits),
-        (Node::Object(members), _) => {
-            let names = |keys: &[&str]| {
-                members
-                    .iter()
-                    .find(|member| keys.iter().any(|key| member.key.eq_ignore_ascii_case(key)))
-            };
-            // `{"name": "Authorization", "value": "Bearer ..."}`: the value is the credential.
-            let pair_value = names(&["name", "key", "header", "field"])
-                .and_then(|member| match &member.value.node {
-                    Node::String(name) => Under::credential(name),
-                    _ => None,
-                })
-                .and_then(|_| names(&["value", "val"]))
-                .map(|member| member.key.as_str());
-            for member in members {
-                let below = if pair_value == Some(member.key.as_str()) {
-                    Under::Credential { counts: false }
-                } else {
-                    Under::credential(&member.key).unwrap_or(Under::Nothing)
-                };
-                redact_span(&member.value, below, embedded, text, edits);
-            }
-        }
-        (Node::Array(items), under) => {
-            // `["Authorization", "Bearer ..."]`: the second entry is the credential.
-            let pair = matches!(items.as_slice(),
-                [first, second]
-                    if matches!(&first.node, Node::String(name) if Under::credential(name).is_some())
-                        && matches!(second.node, Node::String(_)))
-                && matches!(under, Under::Nothing);
-            for (index, item) in items.iter().enumerate() {
-                let below = if pair && index == 1 {
-                    Under::Credential { counts: false }
-                } else {
-                    under
-                };
-                redact_span(item, below, embedded, text, edits);
-            }
-        }
-        (Node::String(decoded), Under::Credential { counts }) => {
-            let kept = counts && only_digits(decoded) && digits_make_a_count(decoded);
-            if !kept {
-                replace(edits);
-            }
-        }
-        (Node::String(decoded), Under::Nothing) => {
-            // The string as it is written is read first, escapes and all, as the text rules read
-            // the whole text; what it holds once decoded (a real line break where `\n` stood) is
-            // read after, so that the second reading adds to the first and never replaces it.
-            let content = &text[node.span.start + 1..node.span.end - 1];
-            let raw = message_text(content);
-            let base = if raw == content {
-                None
-            } else {
-                serde_json::from_str::<String>(&format!("\"{raw}\"")).ok()
-            };
-            let base = base.as_deref().unwrap_or(decoded);
-            let shown = text_or_structure(base, embedded + 1);
-            if shown != *decoded {
-                let written =
-                    serde_json::to_string(&shown).unwrap_or_else(|_| String::from(REDACTED_JSON));
-                edits.push((node.span.clone(), written));
-            }
-        }
-        (Node::Number, Under::Credential { counts: false }) => replace(edits),
-        (Node::Number, Under::Credential { counts: true }) => {
-            if !is_a_count_span(node, text) {
-                replace(edits);
-            }
-        }
-        (Node::Number | Node::Other, _) => {}
-    }
-}
-
-/// Whether a member's key leaves its value a count: no credential's name, or one that counts.
-fn key_is_no_secret(key: &str) -> bool {
-    !matches!(
-        Under::credential(key),
-        Some(Under::Credential { counts: false })
-    )
-}
-
-/// [`holds_only_counts`] over a text and its spans.
-fn holds_only_counts_span(node: &spans::Spanned, text: &str) -> bool {
-    match &node.node {
-        spans::Node::Object(members) => members.iter().all(|member| {
-            key_is_no_secret(&member.key) && holds_only_counts_span(&member.value, text)
-        }),
-        spans::Node::Array(items) => items.iter().all(|item| holds_only_counts_span(item, text)),
-        _ => is_a_count_span(node, text),
-    }
-}
-
-/// Whether the node is a number written with few enough digits to be a count.
-fn is_a_count_span(node: &spans::Spanned, text: &str) -> bool {
-    matches!(node.node, spans::Node::Number) && digits_make_a_count(&text[node.span.clone()])
-}
-
-/// A scan of text that is JSON already: the spans of its values, and the strings it holds decoded.
-mod spans {
-    use std::ops::Range;
-
-    /// A value and where it is written.
-    pub(super) struct Spanned {
-        pub(super) span: Range<usize>,
-        pub(super) node: Node,
-    }
-
-    pub(super) enum Node {
-        Object(Vec<Member>),
-        Array(Vec<Spanned>),
-        /// A string, decoded.
-        String(String),
-        Number,
-        /// `true`, `false` and `null`.
-        Other,
-    }
-
-    pub(super) struct Member {
-        pub(super) key: String,
-        pub(super) value: Spanned,
-    }
-
-    /// The value `text` holds, or `None` when it is not the JSON it was taken for.
-    pub(super) fn parse(text: &str) -> Option<Spanned> {
-        let mut scan = Scan {
-            text,
-            bytes: text.as_bytes(),
-            at: 0,
-        };
-        let value = scan.value()?;
-        scan.blanks();
-        (scan.at == text.len()).then_some(value)
-    }
-
-    struct Scan<'a> {
-        text: &'a str,
-        bytes: &'a [u8],
-        at: usize,
-    }
-
-    impl Scan<'_> {
-        fn blanks(&mut self) {
-            while self
-                .bytes
-                .get(self.at)
-                .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
-            {
-                self.at += 1;
-            }
-        }
-
-        fn value(&mut self) -> Option<Spanned> {
-            self.blanks();
-            let start = self.at;
-            let node = match *self.bytes.get(start)? {
-                b'{' => self.object()?,
-                b'[' => self.array()?,
-                b'"' => Node::String(self.string()?),
-                b'-' | b'0'..=b'9' => {
-                    while self.bytes.get(self.at).is_some_and(|byte| {
-                        matches!(byte, b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
-                    }) {
-                        self.at += 1;
-                    }
-                    Node::Number
-                }
-                _ => {
-                    while self.bytes.get(self.at).is_some_and(u8::is_ascii_alphabetic) {
-                        self.at += 1;
-                    }
-                    Node::Other
-                }
-            };
-            Some(Spanned {
-                span: start..self.at,
-                node,
-            })
-        }
-
-        fn string(&mut self) -> Option<String> {
-            let start = self.at;
-            self.at += 1;
-            while let Some(&byte) = self.bytes.get(self.at) {
-                self.at += 1;
-                match byte {
-                    b'\\' => self.at += 1,
-                    b'"' => return serde_json::from_str(&self.text[start..self.at]).ok(),
-                    _ => {}
-                }
-            }
-            None
-        }
-
-        fn object(&mut self) -> Option<Node> {
-            self.at += 1;
-            let mut members = Vec::new();
-            loop {
-                self.blanks();
-                match self.bytes.get(self.at)? {
-                    b'}' => {
-                        self.at += 1;
-                        return Some(Node::Object(members));
-                    }
-                    b',' => self.at += 1,
-                    b'"' => {
-                        let key = self.string()?;
-                        self.blanks();
-                        (self.bytes.get(self.at) == Some(&b':')).then_some(())?;
-                        self.at += 1;
-                        let value = self.value()?;
-                        members.push(Member { key, value });
-                    }
-                    _ => return None,
-                }
-            }
-        }
-
-        fn array(&mut self) -> Option<Node> {
-            self.at += 1;
-            let mut items = Vec::new();
-            loop {
-                self.blanks();
-                match self.bytes.get(self.at)? {
-                    b']' => {
-                        self.at += 1;
-                        return Some(Node::Array(items));
-                    }
-                    b',' => self.at += 1,
-                    _ => items.push(self.value()?),
-                }
-            }
-        }
-    }
+/// The text rules read it as it is written (that is the floor: what the release before hid, this
+/// hides), and the structure only adds to that: see [`embedded`](super::embedded).
+fn leaf(text: &str, embedded: usize) -> String {
+    super::read_until_stable(text, &Embedded { depth: embedded })
 }
 
 /// The member of `members` whose key, in any case, is one of `names`.
@@ -581,7 +262,7 @@ fn member<'a>(members: &'a Map<String, Value>, names: &[&str]) -> Option<(&'a St
         .find(|(key, _)| names.iter().any(|name| key.eq_ignore_ascii_case(name)))
 }
 
-fn object(members: &Map<String, Value>, embedded: usize) -> Map<String, Value> {
+fn object(members: &Map<String, Value>, embedded: usize, leaf: Leaf) -> Map<String, Value> {
     // `{"name": "Authorization", "value": "Bearer ..."}`: the value is the credential.
     let pair_value = member(members, &["name", "key", "header", "field"])
         .and_then(|(_, name)| name.as_str())
@@ -596,12 +277,12 @@ fn object(members: &Map<String, Value>, embedded: usize) -> Map<String, Value> {
             } else {
                 Under::credential(key).unwrap_or(Under::Nothing)
             };
-            (key.clone(), walk(member, below, embedded))
+            (key.clone(), walk(member, below, embedded, leaf))
         })
         .collect()
 }
 
-fn array(items: &[Value], under: Under, embedded: usize) -> Vec<Value> {
+fn array(items: &[Value], under: Under, embedded: usize, leaf: Leaf) -> Vec<Value> {
     // `["Authorization", "Bearer ..."]`: the second entry is the credential.
     let pair = matches!(items, [Value::String(name), Value::String(_)] if Under::credential(name).is_some())
         && matches!(under, Under::Nothing);
@@ -609,8 +290,8 @@ fn array(items: &[Value], under: Under, embedded: usize) -> Vec<Value> {
         .iter()
         .enumerate()
         .map(|(index, item)| match (pair, index) {
-            (true, 1) => walk(item, Under::Credential { counts: false }, embedded),
-            _ => walk(item, under, embedded),
+            (true, 1) => walk(item, Under::Credential { counts: false }, embedded, leaf),
+            _ => walk(item, under, embedded, leaf),
         })
         .collect()
 }
@@ -769,28 +450,23 @@ mod tests {
 
     /// A count has at most ten digits; twelve or more under a name that counts tokens is a secret
     /// that is made of digits, as the text rules read it.
-    /// A container of counts under a name that counts tokens is counts: Claude's usage objects carry
-    /// `output_tokens_details` and `cache_creation` that way, and a host that reads its usage back
-    /// needs them.
+    /// An object under a name that counts tokens is one marker, as it is in the release before this
+    /// one, however small its numbers are: Claude's `output_tokens_details` is hidden with it, and
+    /// showing it is a decision of its own. A list of counts is kept.
     #[test]
-    fn a_container_of_counts_under_a_count_name_keeps_its_counts() {
+    fn an_object_under_a_count_name_is_redacted_whole_and_a_list_of_counts_is_kept() {
         let usage = json!({
-            "output_tokens_details": { "reasoning_tokens": 12, "nested": { "audio_tokens": 3 } },
+            "output_tokens_details": { "reasoning_tokens": 12 },
             "input_tokens": [1, 2, 3],
             "max_tokens": { "limit": 100_000_000_000_000_i64 },
-            "total_tokens": { "note": "sk-live-1" },
             "api_key": { "n": 1 },
         });
         let shown = structured(&usage);
-        assert_eq!(
-            shown["output_tokens_details"], usage["output_tokens_details"],
-            "expected an object of counts under a count name kept | received: {shown}"
-        );
         assert_eq!(shown["input_tokens"], usage["input_tokens"]);
-        for name in ["max_tokens", "total_tokens", "api_key"] {
+        for name in ["output_tokens_details", "max_tokens", "api_key"] {
             assert_eq!(
                 shown[name], "[REDACTED]",
-                "expected {name} redacted whole, since it holds more than counts | received: {shown}"
+                "expected {name} redacted whole | received: {shown}"
             );
         }
     }
@@ -1035,14 +711,15 @@ mod tests {
         let pair = r#"{"name":"X_API_KEY","value":"sk-live-4"},"#;
         let within = format!(
             "[{}{{}}]",
-            pair.repeat(super::MAX_EMBEDDED_BYTES / pair.len() - 1)
+            pair.repeat(crate::redact::embedded::MAX_BYTES / pair.len() - 1)
         );
         let over = format!(
             "[{}{{}}]",
-            pair.repeat(super::MAX_EMBEDDED_BYTES / pair.len() + 1)
+            pair.repeat(crate::redact::embedded::MAX_BYTES / pair.len() + 1)
         );
         assert!(
-            within.len() <= super::MAX_EMBEDDED_BYTES && over.len() > super::MAX_EMBEDDED_BYTES
+            within.len() <= crate::redact::embedded::MAX_BYTES
+                && over.len() > crate::redact::embedded::MAX_BYTES
         );
         let read = structured(&json!({ "a": within }));
         assert!(

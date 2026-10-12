@@ -218,17 +218,6 @@ pub const LEAKS: &[Leak] = &[
         "ss-24y",
         &["run cmd &password=", "after"],
     ),
-    // A number of twelve digits or more under a name that counts tokens is not a count.
-    leak(
-        "quota check: tokens: 123456789012 exceeded",
-        "123456789012",
-        &["quota check: tokens", "exceeded"],
-    ),
-    leak(
-        r#"usage {"total_tokens":"123456789012","retry_after":30}"#,
-        "123456789012",
-        &["usage", r#""retry_after":30"#],
-    ),
     leak(
         r#"call failed {"error":"bad","env":[{"name":"HOME","value":"/h"}],"token":"tk-15"}"#,
         "tk-15",
@@ -287,13 +276,26 @@ pub const BENIGN: &[&str] = &[
     "quota check: tokens: 4294967295 allowed, max_tokens=4,294,967,295",
 ];
 
-/// Credentials with no name beside them, in the messages a vendor prints them in.
+/// Credentials that only the entry points for a vendor's messages hide: ones with no name beside
+/// them, in the messages a vendor prints them in, and a number of twelve digits or more under a
+/// name that counts tokens.
 ///
 /// Redacted by [`redact::bounded`](crate::redact::bounded) and
 /// [`redact::structured`](crate::redact::structured); see the module documentation for why
 /// [`redact::stderr_text`](crate::redact::stderr_text) is not asked. The `secret` of each row is the
 /// whole token, prefix included.
 pub const BARE_TOKENS: &[Leak] = &[
+    // A number of twelve digits or more under a name that counts tokens is not a count.
+    leak(
+        "quota check: tokens: 123456789012 exceeded",
+        "123456789012",
+        &["quota check: tokens", "exceeded"],
+    ),
+    leak(
+        r#"usage {"total_tokens":"123456789012","retry_after":30}"#,
+        "123456789012",
+        &["usage", r#""retry_after":30"#],
+    ),
     leak(
         concat!(
             "token: expired (gh",
@@ -412,6 +414,28 @@ pub const BARE_TOKENS: &[Leak] = &[
             "k-proj-0123456789abcdefghijklmnopqrstuvwxyz-ABCDEF_ghij"
         ),
         &["openai rejected ", " today"],
+    ),
+    leak(
+        concat!(
+            "openai svcacct key rejected s",
+            "k-svcacct-0123456789abcdefghijklmnopqrstuvwxyz-ABCDEF_ghij today"
+        ),
+        concat!(
+            "s",
+            "k-svcacct-0123456789abcdefghijklmnopqrstuvwxyz-ABCDEF_ghij"
+        ),
+        &["openai svcacct key rejected ", " today"],
+    ),
+    leak(
+        concat!(
+            "openai admin key rejected s",
+            "k-admin-0123456789abcdefghijklmnopqrstuvwxyz-ABCDEF_ghij today"
+        ),
+        concat!(
+            "s",
+            "k-admin-0123456789abcdefghijklmnopqrstuvwxyz-ABCDEF_ghij"
+        ),
+        &["openai admin key rejected ", " today"],
     ),
     leak(
         concat!(
@@ -609,6 +633,7 @@ pub const BENIGN_NEAR_TOKENS: &[&str] = &[
     "AIzaSyShort is too short and ya29.x too",
     "ya29.is-a-prefix-of-google-tokens-in-docs and ya29.abcdefghijklmnopqrstuvwxyzabcdef too",
     "sk-proj-roadmap-for-2026-quarter-4 and sk-ant-colony-optimization-v2 are page names",
+    "sk-svcacct-roadmap-for-2026-quarter-4 and sk-admin-console-layout-v2 are page names",
     "serving sk-live-streaming-server-1 on port 8080",
     "the publishable key pk_live_0123456789abcdefghijklmn is on every page",
     "short hf_abc and npm_abc and shpat_abc and dop_v1_abc",

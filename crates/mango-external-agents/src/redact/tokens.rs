@@ -25,7 +25,8 @@
 //! messages, do (see `docs/benchmarks.md`).
 
 use super::scan::count_steps;
-use super::{REDACTED, take_while};
+use super::take_while;
+use super::union::{Hide, union};
 
 /// The characters a token is made of, at most: letters, digits, `_` and `-`.
 fn is_run_byte(byte: u8) -> bool {
@@ -37,58 +38,27 @@ fn is_escape_letter(byte: u8) -> bool {
     matches!(byte, b'n' | b'r' | b't' | b'b' | b'f')
 }
 
-/// Which tokens a pass reads: the private-key blocks, which have to go before the name rules (a
-/// name that redacts the block's first line would leave the rest of it), or every other prefix,
-/// which has to go after them (a name that opens like a prefix is a name).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Pass {
-    Blocks,
-    Prefixes,
-}
-
-/// `text` with every well-known token of `pass` replaced, or `None` when it holds none.
+/// The spans of `text` that hold a well-known token: the private-key blocks, then every other
+/// prefix. Both are read over the text as it stands, beside the name rules and not before or
+/// after them, so a name that opens like a prefix (`sk-live-api-key: x`) reaches the rules whole
+/// and a block does not hide the name glued to its end from them; the union takes both.
 ///
 /// # Example
 ///
 /// ```ignore
-/// let found = redact("see ghp_0123456789abcdefghijklmnopqrstuv now", Pass::Prefixes);
-/// assert_eq!(found.as_deref(), Some("see [REDACTED] now"));
+/// let found = hides("see ghp_0123456789abcdefghijklmnopqrstuv now");
+/// assert_eq!(found, [Hide::marker(4, 40)]);
 /// ```
-pub(super) fn redact(text: &str, pass: Pass) -> Option<String> {
-    match pass {
-        Pass::Blocks => redact_blocks(text),
-        Pass::Prefixes => redact_prefixes(text),
-    }
-}
-
-/// What stands for a redacted private-key block while the name rules read the text.
-///
-/// It is read the way the rules read the marker it replaces, `-----BEGIN PRIVATE KEY-----`: a word
-/// that a value in front of it may take, then a space, then a name with its dashes glued on
-/// (`PRIVATE KEY-----`). A name glued to the end of it (`-----END PRIVATE KEY-----abc: x`), a
-/// separator right after it or one on the next line is an assignment to the rules, and the block
-/// must not change that by being gone. The marker itself (`[REDACTED]`) would read as a closed
-/// container to a rule that is reading a value (`password: [REDACTED] more`).
-const BLOCK_MARK: &str = "\u{e000} \u{e001}PRIVATE_KEY-----";
-
-/// What is left of [`BLOCK_MARK`] when a value in front of it took its first word. It is a
-/// redaction of its own and not nothing: what was glued to the key stays a word apart from the
-/// value, as the space in the key's header kept it.
-const BLOCK_TAIL: &str = " \u{e001}PRIVATE_KEY-----";
-
-/// What the redacted text is left with once the rules are done: a mark that is whole is a
-/// `[REDACTED]`, and what a value in front of one left of it is a `[REDACTED]` of its own.
-pub(super) fn settle_marks(text: &str) -> String {
-    text.replace(BLOCK_MARK, REDACTED)
-        .replace(BLOCK_TAIL, concat!(" ", "[REDACTED]"))
+pub(super) fn hides(text: &str) -> Vec<Hide> {
+    union(vec![block_hides(text), prefix_hides(text)])
 }
 
 /// The private-key blocks of `text`, found by a search for the begin marker and not a read of
-/// every run, each replaced by [`BLOCK_MARK`].
-fn redact_blocks(text: &str) -> Option<String> {
+/// every run.
+fn block_hides(text: &str) -> Vec<Hide> {
     const BEGIN: &str = "-----BEGIN ";
     let bytes = text.as_bytes();
-    let mut out: Option<String> = None;
+    let mut found = Vec::new();
     let mut copied = 0;
     let mut from = 0;
     let mut ends = Ends::default();
@@ -104,16 +74,11 @@ fn redact_blocks(text: &str) -> Option<String> {
         let Some(end) = private_key_block(text, start, &mut ends) else {
             continue;
         };
-        let out = out.get_or_insert_with(|| String::with_capacity(text.len()));
-        out.push_str(&text[copied..start]);
-        out.push_str(BLOCK_MARK);
+        found.push(Hide::marker(start, end));
         copied = end;
         from = end;
     }
-    out.map(|mut out| {
-        out.push_str(&text[copied..]);
-        out
-    })
+    found
 }
 
 /// Whether a token may start at `at`: no name character in front, or the letter of a JSON line
@@ -125,10 +90,9 @@ fn starts_a_run(bytes: &[u8], at: usize) -> bool {
     !is_run_byte(before) || (is_escape_letter(before) && at >= 2 && bytes[at - 2] == b'\\')
 }
 
-fn redact_prefixes(text: &str) -> Option<String> {
+fn prefix_hides(text: &str) -> Vec<Hide> {
     let bytes = text.as_bytes();
-    let mut out: Option<String> = None;
-    let mut copied = 0;
+    let mut found = Vec::new();
     let mut at = 0;
     while at < bytes.len() {
         count_steps(1);
@@ -138,41 +102,21 @@ fn redact_prefixes(text: &str) -> Option<String> {
         }
         let run_end = take_while(bytes, at, is_run_byte);
         let escaped = at > 0 && bytes[at - 1] == b'\\' && is_escape_letter(bytes[at]);
-        // A token glued to a mark starts a word as it would after the header the mark stands for.
-        let first = at + glued_to_a_mark(bytes, at, run_end);
-        let found = token_at(text, first, run_end)
-            .map(|end| (first, end))
+        let hit = token_at(text, at, run_end)
+            .map(|end| (at, end))
             .or_else(|| {
                 escaped
                     .then(|| token_at(text, at + 1, run_end).map(|end| (at + 1, end)))
                     .flatten()
             });
-        let Some((start, end)) = found else {
+        let Some((start, end)) = hit else {
             at = run_end;
             continue;
         };
-        let out = out.get_or_insert_with(|| String::with_capacity(text.len()));
-        out.push_str(&text[copied..start]);
-        out.push_str(REDACTED);
-        copied = end;
+        found.push(Hide::marker(start, end));
         at = end;
     }
-    out.map(|mut out| {
-        out.push_str(&text[copied..]);
-        out
-    })
-}
-
-/// How many bytes of the run at `at` are the name a mark ends in (`PRIVATE_KEY-----`), when it is
-/// one: a token behind it is the start of a word, since the header it stands for ended a word.
-fn glued_to_a_mark(bytes: &[u8], at: usize, run_end: usize) -> usize {
-    const NAME: &[u8] = b"PRIVATE_KEY-----";
-    let after_the_mark = at >= 3 && bytes[..at].ends_with("\u{e001}".as_bytes());
-    if after_the_mark && bytes[at..run_end].starts_with(NAME) {
-        NAME.len()
-    } else {
-        0
-    }
+    found
 }
 
 /// Where the token that starts at `start` ends, when one does. The run of name characters that
@@ -275,8 +219,8 @@ fn slack(run: &[u8]) -> bool {
 }
 
 /// `sk-ant-` and a type and two digits (`api03-`) and 80 or more base64url characters, as Anthropic's
-/// console issues them; `sk-proj-` and 40 or more base64url characters with both cases and three
-/// digits among them; `sk-live-` and 16 or more that look random; Stripe's `sk_live_` and `sk_test_`
+/// console issues them; `sk-proj-`, `sk-svcacct-` and `sk-admin-` (OpenAI's project, service-account and admin keys) and
+/// 40 or more base64url characters with both cases and three digits among them; `sk-live-` and 16 or more that look random; Stripe's `sk_live_` and `sk_test_`
 /// and 16 or more letters and digits (a `pk_` key is published and no secret); Shopify's `shpat_`
 /// family and 32 hex digits; and OpenAI's older `sk-` and 40 or more letters and digits with a
 /// digit and a letter among them.
@@ -284,7 +228,10 @@ fn s_token(run: &[u8]) -> bool {
     if let Some(body) = run.strip_prefix(b"sk-ant-") {
         return anthropic(body);
     }
-    if let Some(body) = run.strip_prefix(b"sk-proj-") {
+    if let Some(body) = [&b"sk-proj-"[..], b"sk-svcacct-", b"sk-admin-"]
+        .iter()
+        .find_map(|prefix| run.strip_prefix(*prefix))
+    {
         return body.len() >= 40
             && is_base64url(body)
             && body.iter().filter(|byte| byte.is_ascii_digit()).count() >= 3
@@ -450,9 +397,7 @@ impl Ends {
 /// and a public key are not secrets and are left.
 ///
 /// Only a private key's own end marker closes it: `-----END PASSWORD-----` is a label that names a
-/// credential, and the rules have to read it. Nor does a marker close a block whose inside leaves a
-/// name waiting for its value: that value would run on past the marker, and the rules, which run
-/// after this pass, would never see the name. A header with no end marker within
+/// credential, and the rules have to read it. A header with no end marker within
 /// [`MAX_BLOCK_BYTES`] is a key that was cut, or a sentence that mentions one: the marker goes, and
 /// the lines of base64 directly under it, and nothing else.
 fn private_key_block(text: &str, start: usize, ends: &mut Ends) -> Option<usize> {
@@ -465,40 +410,15 @@ fn private_key_block(text: &str, start: usize, ends: &mut Ends) -> Option<usize>
     if !is_private_key_label(&bytes[label_start..after_begin - 5]) {
         return None;
     }
-    // A name can be made of the header and what is glued to it (`PRIVATE KEY-----spo=`), and then
-    // the header belongs to the text a value is waited for in.
-    let from = if header_joins_the_text(bytes, after_begin) {
-        start
-    } else {
-        after_begin
-    };
     let closing = ends
         .after(text, after_begin)
         .filter(|at| at - after_begin <= MAX_BLOCK_BYTES)
-        .filter(|at| !waits_on_a_value(&text[from..*at]))
         .and_then(|at| {
             let label = at + b"-----END ".len();
             let close = closing_dashes(bytes, label, true)?;
             is_private_key_label(&bytes[label..close - 5]).then_some(close)
         });
-    Some(closing.unwrap_or_else(|| body_lines(text, after_begin, from)))
-}
-
-/// Whether the text after a header makes it part of a name: something is glued to the dashes, or
-/// a `:` or an `=` follows them, after blanks and breaks as the rules skip them.
-fn header_joins_the_text(bytes: &[u8], after: usize) -> bool {
-    let mut at = after;
-    while let Some(&byte) = bytes.get(at) {
-        count_steps(1);
-        if let Some(next) = line_break(bytes, at) {
-            at = next;
-        } else if byte.is_ascii_whitespace() {
-            at += 1;
-        } else {
-            return at == after || matches!(byte, b':' | b'=');
-        }
-    }
-    false
+    Some(closing.unwrap_or_else(|| body_lines(text, after_begin)))
 }
 
 /// Whether a label between `BEGIN ` or `END ` and the dashes is a private key's.
@@ -513,10 +433,8 @@ fn is_private_key_label(label: &[u8]) -> bool {
 ///
 /// A line counts only when it ends where a line ends: at a break, at the end of the text or at the
 /// quote of a JSON string. A run that stops at a `:` or a space is a word, or the name of a
-/// credential glued to base64, and the rules need to read it. For the same reason a line that a
-/// name is waiting on (`pwd=` and a value on the next line) is left: this pass runs before the
-/// rules, so whatever it takes they never see.
-fn body_lines(text: &str, from: usize, header: usize) -> usize {
+/// credential glued to base64, and the rules read it.
+fn body_lines(text: &str, from: usize) -> usize {
     let bytes = text.as_bytes();
     let (mut end, mut long) = (from, 0);
     for line in 0..MAX_BODY_LINES {
@@ -529,11 +447,7 @@ fn body_lines(text: &str, from: usize, header: usize) -> usize {
         count_steps(run_end - start + 1);
         let length = run_end - start;
         let accepted = length >= MIN_BODY_LINE || (long > 0 && length >= 4);
-        if !accepted
-            || !is_padded_base64(&bytes[start..run_end])
-            || !ends_a_line(bytes, run_end)
-            || waits_on_a_value(&text[if line == 0 { header } else { start }..run_end])
-        {
+        if !accepted || !is_padded_base64(&bytes[start..run_end]) || !ends_a_line(bytes, run_end) {
             break;
         }
         end = run_end;
@@ -569,12 +483,6 @@ fn ends_a_line(bytes: &[u8], at: usize) -> bool {
 fn is_padded_base64(run: &[u8]) -> bool {
     let padding = run.iter().rev().take_while(|byte| **byte == b'=').count();
     padding <= 2 && !run[..run.len() - padding].contains(&b'=')
-}
-
-/// Whether a credential's name stands at the end of `line` with its value still to come.
-fn waits_on_a_value(line: &str) -> bool {
-    // The text is stripped already, and most lines of a key's body name nothing.
-    super::names_a_credential(line) && super::ends_awaiting_value(line)
 }
 
 fn is_base64(byte: u8) -> bool {

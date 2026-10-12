@@ -25,6 +25,11 @@ const SMALL: usize = 16 * 1024;
 /// steps a byte at this size.
 const STEPS_PER_BYTE: usize = 24;
 
+/// What a byte of a message may cost: the rules of the release before, the reads added since, the
+/// tokens, each over the whole text, and a second reading of a text the first one changed. 8 to 40
+/// on the shapes below; 96 leaves room as 24 does for [`stderr_text`], and hides no more.
+const MESSAGE_STEPS_PER_BYTE: usize = 96;
+
 /// [`ends_awaiting_value`] runs two rules over the text four times and sweeps it once more.
 const AWAITING_STEPS_PER_BYTE: usize = 40;
 
@@ -53,7 +58,9 @@ fn repeated(unit: &str, tail: &str, len: usize) -> String {
 /// its unit and would otherwise double to a little more or less than twice.
 fn exactly(mut text: String, len: usize) -> String {
     text.truncate(len);
-    format!("{text:<len$}")
+    let padding = len.saturating_sub(text.len());
+    text.push_str(&" ".repeat(padding));
+    text
 }
 
 const SHAPES: &[Shape] = &[
@@ -424,6 +431,22 @@ const SHAPES: &[Shape] = &[
         build: |len| repeated("tokens:\n  - a\n\n\n\n\n", "", len),
     },
     Shape {
+        what: "a block scalar under a name, repeated",
+        build: |len| repeated("password: |\n  abc def ghi jkl\n", "", len),
+    },
+    Shape {
+        what: "a block scalar that holds a name with its value on the next line, repeated",
+        build: |len| repeated("token: |\n  abc secret:\n  ghi\n", "", len),
+    },
+    Shape {
+        what: "a block scalar that holds a quoted name, repeated",
+        build: |len| repeated("token: |\n  abc \"token\":\n  ghi\n", "", len),
+    },
+    Shape {
+        what: "a block scalar as long as the text",
+        build: |len| exactly(format!("password: |\n{}", "  a\n".repeat(len / 4)), len),
+    },
+    Shape {
         what: "escaped JSON quotes, three deep, one after another",
         build: |len| repeated("\\\\\\\"api_key\\\\\\\":\\\\\\\"v\\\\\\\" ", "", len),
     },
@@ -435,7 +458,16 @@ fn redaction_steps(text: &str) -> usize {
     })
 }
 
-/// The entry point a vendor's messages take: the rules of `stderr_text` and the token pass.
+/// The walk over a string that holds JSON, the entry point a structured vendor message takes.
+fn embedded_steps(text: &str) -> usize {
+    steps::counted(|| {
+        let value = serde_json::Value::String(text.to_owned());
+        std::hint::black_box(crate::redact::structured(std::hint::black_box(&value)));
+    })
+}
+
+/// The entry point a vendor's messages take: the rules of `stderr_text`, the reads added since and
+/// the token pass.
 fn message_steps(text: &str) -> usize {
     steps::counted(|| {
         std::hint::black_box(message_text(std::hint::black_box(text)));
@@ -513,7 +545,106 @@ fn extension_normalization_work_is_proportional_to_the_value_for_every_shape() {
         "ExtensionValue::normalized",
         &[SHAPES],
         extension_steps,
-        STEPS_PER_BYTE,
+        MESSAGE_STEPS_PER_BYTE,
+    );
+}
+
+/// JSON texts inside a string: many members, many strings that hold a credential, nesting.
+const EMBEDDED_SHAPES: &[Shape] = &[
+    Shape {
+        what: "an object of many members, each a credential",
+        build: |len| {
+            exactly(
+                format!(
+                    "{{{}\"z\":1}}",
+                    "\"password\":\"x\",".repeat((len - 8) / 16)
+                ),
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "an array of many strings that each hold an assignment",
+        build: |len| {
+            exactly(
+                format!("[{}\"z\"]", "\"token=abc d\",".repeat((len - 8) / 14)),
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "an array of many strings that each hold a sequence item",
+        build: |len| {
+            exactly(
+                format!("[{}\"z\"]", "\"token=- a\\n- b\",".repeat((len - 8) / 18)),
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "an array of many strings that each cross a closing quote",
+        build: |len| {
+            exactly(
+                format!("[{}\"z\"]", "\"password: a\",".repeat((len - 8) / 16)),
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "an object of many keys that are tokens",
+        build: |len| {
+            exactly(
+                format!("{{{}\"z\":1}}", "\"ghp_a\":1,".repeat((len - 8) / 10)),
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "arrays nested to the depth the parser allows",
+        build: |len| {
+            exactly(
+                format!("{}\"token=a\"{}", "[".repeat(100), "]".repeat(100)),
+                len.min(300),
+            )
+        },
+    },
+    Shape {
+        what: "one string as long as the text that holds many escapes and assignments",
+        build: |len| {
+            exactly(
+                format!(
+                    "{{\"m\":\"{}\"}}",
+                    "token=a\\n b\\\"".repeat((len - 8) / 14)
+                ),
+                len,
+            )
+        },
+    },
+];
+
+/// A shape that is not JSON is read by the text rules alone and measures nothing here.
+#[test]
+fn every_embedded_shape_is_a_json_text_at_both_sizes() {
+    for shape in EMBEDDED_SHAPES {
+        for len in [SMALL, 2 * SMALL] {
+            let text = (shape.build)(len);
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&text).is_ok(),
+                "expected {} to be a JSON text at {len} bytes | received the start: {:?}",
+                shape.what,
+                text.chars().take(60).collect::<String>()
+            );
+        }
+    }
+}
+
+#[test]
+fn embedded_json_work_is_proportional_to_the_text_for_every_shape() {
+    assert_work_is_linear(
+        "redact::structured",
+        &[EMBEDDED_SHAPES],
+        embedded_steps,
+        MESSAGE_STEPS_PER_BYTE,
     );
 }
 
@@ -688,7 +819,7 @@ fn message_redaction_work_is_proportional_to_the_text_for_every_shape() {
         "redact::bounded",
         &[SHAPES, TOKEN_SHAPES],
         message_steps,
-        STEPS_PER_BYTE,
+        MESSAGE_STEPS_PER_BYTE,
     );
 }
 

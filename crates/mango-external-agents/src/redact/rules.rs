@@ -1,4 +1,11 @@
-//! The three credential rules: a header, a name with a value, and a URL's userinfo.
+//! The newer reads of two credential rules: a header, and a name with a value. (The URL's userinfo
+//! rule is not read twice; it is the release before's.)
+//!
+//! `stderr_text` does not run these: it runs the rules of the release before, kept as they were in
+//! `redact::floor`. These are read beside them by the entry points for a vendor's messages, over
+//! the same text, and what either hides is hidden (`redact::union`). That is why a rule here may
+//! read more (escape depth, containers and sequences across lines, block scalars, counts of twelve
+//! digits) and never has to account for what the release before did with the same place.
 //!
 //! Each is a rule (tried at a place a match can start) and a locator (finds the punctuation a
 //! rule cannot match without, and the starts that reach it; see [`Candidates`]). The scan in
@@ -10,8 +17,6 @@
 //! whatever it holds, and a few values are left alone because they say a credential is missing
 //! and not what it is (see [`status_phrase_end`]).
 
-use std::ops::Range;
-
 use super::scan::{Anchor, count_steps, first_match, run_start};
 use super::structured::{CREDENTIAL_NAMES, CREDENTIAL_WORDS, SECRET_DIGITS};
 use super::{
@@ -21,19 +26,6 @@ use super::{
 
 /// The header name the bearer rule starts at.
 pub(super) const AUTHORIZATION: &[u8] = b"authorization";
-
-/// What a URL's scheme is made of after its first letter, and the marker a removed byte left in
-/// it, which parts nothing: see [`is_name_byte`].
-pub(super) fn is_scheme_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric()
-        | (byte == b'+')
-        | (byte == b'.')
-        | (byte == b'-')
-        | (byte == strip::BOUNDARY_BYTE)
-}
-
-/// What ends a scheme and opens the authority of a URL.
-const SCHEME_SEPARATOR: &[u8] = b"://";
 
 /// The `\b` the rules open with: a match may not start inside a word.
 ///
@@ -352,13 +344,6 @@ pub(super) fn names_a_keyword(bytes: &[u8], at: usize) -> bool {
         return true;
     }
     starts_a_keyword(bytes, at) && match_keyword(bytes, at).is_some()
-}
-
-/// Whether a keyword starts anywhere in `bytes[from..to]`: the userinfo of a URL, say. The query
-/// name rules are left out, since the text is not a query, which makes this a good deal cheaper
-/// than asking [`names_a_keyword`] at every place.
-pub(super) fn holds_a_keyword(bytes: &[u8], from: usize, to: usize) -> bool {
-    (from..to).any(|at| starts_a_keyword(bytes, at) && match_keyword(bytes, at).is_some())
 }
 
 /// Whether the two bytes at `at` open some keyword, of `key` or of `signature`: `se`cret,
@@ -795,6 +780,8 @@ fn is_known_scheme(scheme: &[u8]) -> bool {
     is_single_token_scheme(scheme) || is_multi_part_scheme(scheme)
 }
 
+// ---- the assignment rule --------------------------------------------------------------------
+
 /// The next `:` and the one place [`bearer_rule`] can start to reach it.
 ///
 /// The rule wants `authorization`, an optional quote, any spaces, then the colon. (With an equals
@@ -817,8 +804,6 @@ pub(super) fn header_colon(bytes: &[u8], from: usize) -> Option<Anchor> {
     };
     Some(Anchor { at: colon, starts })
 }
-
-// ---- the assignment rule --------------------------------------------------------------------
 
 /// `api_key=`, `secret:`, `"token": `, … and whatever value follows.
 ///
@@ -976,20 +961,6 @@ fn read_assignment(bytes: &[u8], at: usize, query: &mut QueryRun) -> Option<Outc
         (Kind::Phrase, _) if phrase => phrase_end(bytes, value_start),
         _ => take_while(bytes, value_start, |byte| !ends_value(byte)),
     };
-    // A sequence item, a block scalar or a container, under a name that reads one word
-    // (`tokens: - abc password:`),
-    // stops short of a credential's name that ends it: the name's own value is the text after it,
-    // which the rule for that name reads. A name that reads a phrase or a line takes the names in
-    // it along, as it always has, and the text after the redaction is then the same word it was.
-    let past_a_word = keyword.kind == Kind::Token
-        && (list.is_some()
-            || block.is_some()
-            || matches!(bytes.get(value_start), Some(b'[' | b'{')));
-    let value_end = if past_a_word {
-        stop_at_pending_name(bytes, value_start, value_end)
-    } else {
-        value_end
-    };
     let value_end = {
         let mut end = value_end;
         loop {
@@ -1092,140 +1063,6 @@ fn next_line(bytes: &[u8], at: usize) -> usize {
         (Some(b'\r'), Some(b'\n')) => at + 2,
         _ => at + 1,
     }
-}
-
-/// A credential's name that ends a value and has its own value still to come.
-struct PendingName {
-    /// Where the name starts.
-    start: usize,
-    /// How its value is read.
-    kind: Kind,
-    /// Where its separator is.
-    separator: usize,
-}
-
-/// The credential's name that ends `bytes[from..to]` with its separator at the end of the text or
-/// right after it, past blanks: `abc password:` and `abc password` (`:` next).
-fn pending_name(bytes: &[u8], from: usize, to: usize) -> Option<PendingName> {
-    let mut end = to;
-    while end > from && matches!(bytes[end - 1], b' ' | b'\t' | b'\n' | b'\r') {
-        count_steps(1);
-        end -= 1;
-    }
-    if end <= from {
-        return None;
-    }
-    // The separator closes the value, or the value ends with the name and the separator follows.
-    let (separator, name_end) = if matches!(bytes[end - 1], b'=' | b':') {
-        let separator = end - 1;
-        (
-            separator,
-            before_quote(bytes, run_start(bytes, separator, is_space_byte)),
-        )
-    } else {
-        let blanks = take_while(bytes, to, is_blank_byte);
-        let after = skip_spaces(bytes, skip_quote(bytes, blanks));
-        if !matches!(bytes.get(after), Some(b'=' | b':')) {
-            return None;
-        }
-        (after, before_quote(bytes, end))
-    };
-    let (start, first) = name_run(bytes, name_end);
-    let keyword = named_credential(bytes, first, name_end)?;
-    let kind = if ends_in_cookie(bytes, first, name_end) {
-        Kind::Line
-    } else {
-        keyword.kind
-    };
-    Some(PendingName {
-        start,
-        kind,
-        separator,
-    })
-}
-
-/// The keyword that makes a name a credential's, when one starts in `bytes[first..name_end]`.
-fn named_credential(bytes: &[u8], first: usize, name_end: usize) -> Option<Keyword> {
-    (first..name_end).find_map(|place| {
-        if !starts_a_keyword(bytes, place) {
-            // The header's name is no keyword of the assignment rule, and its line is a line.
-            return (bytes[place] | 0x20 == b'a'
-                && starts_a_word(bytes, place)
-                && match_word(bytes, place, AUTHORIZATION) == Some(name_end))
-            .then_some(Keyword {
-                end: name_end,
-                kind: Kind::Line,
-                whole: true,
-                token: false,
-                key_shape: false,
-            });
-        }
-        match_keyword(bytes, place).filter(|keyword| {
-            keyword_may_start(bytes, place, keyword.end)
-                && (keyword.whole || !is_a_plain_word(bytes, place, keyword.end))
-        })
-    })
-}
-
-/// Where a value that runs from `from` to `to` ends when a credential's name ends it: `- abc
-/// password:` ends where `password` starts, since what the name takes is the text after it, and a
-/// value that took the name along would leave that text behind.
-///
-/// `to` when no such name ends it, and `from` when the value is nothing but the name. And `to`
-/// when the name would read the word after it as its value and that word is itself a name with
-/// its separator (`secret=\n\ncredential: x`): the value that took the first name along leaves the
-/// second to its own rule, and a bare value that took the second would leave `x`.
-fn stop_at_pending_name(bytes: &[u8], from: usize, to: usize) -> usize {
-    let Some(pending) = pending_name(bytes, from, to) else {
-        return to;
-    };
-    // A cookie's line takes whatever follows, names included. A password's phrase takes the rest
-    // of its line unless it opens with a quote, which is a value of its own. The others read one
-    // word, and would take a name for it.
-    let takes_the_line = match pending.kind {
-        Kind::Line => true,
-        Kind::Phrase if bytes[pending.separator] == b':' => {
-            // Whole line unless a comma or a semicolon ends the phrase early, or a quote opens a
-            // value of its own that the rules read as one.
-            let value = skip_spaces(bytes, pending.separator + 1);
-            phrase_end(bytes, value) == line_end(bytes, value)
-                && quote_at(bytes, value).is_none_or(|(_, slashes, _)| slashes > 1)
-        }
-        Kind::Phrase | Kind::Token => false,
-    };
-    if !takes_the_line && next_word_is_a_name(bytes, pending.separator + 1) {
-        return to;
-    }
-    let mut stop = pending.start;
-    // A name glued to the end of the value is a part of it: the text left behind would be read
-    // again as one word with the redaction, and the next pass would not be this one.
-    if stop > from && !is_blank_byte(bytes[stop - 1]) {
-        return to;
-    }
-    while stop > from && is_blank_byte(bytes[stop - 1]) {
-        stop -= 1;
-    }
-    // The value is the name and nothing else: the reading that took it along is the one that holds.
-    if stop <= from { to } else { stop }
-}
-
-/// Whether the word that follows `after`, past blanks and line breaks, is a credential's name
-/// with its separator: it ends in one, or a separator follows it.
-fn next_word_is_a_name(bytes: &[u8], after: usize) -> bool {
-    let word = skip_spaces(bytes, after);
-    let end = take_while(bytes, word, |byte| !is_space_byte(byte));
-    pending_name(bytes, word, end).is_some() || starts_a_named_pair(bytes, word)
-}
-
-/// Whether a credential's name and its separator stand at `at`, the name quoted or not.
-fn starts_a_named_pair(bytes: &[u8], at: usize) -> bool {
-    let inner = skip_quote(bytes, at);
-    let name_end = take_while(bytes, inner, is_name_byte);
-    if name_end == inner || named_credential(bytes, inner, name_end).is_none() {
-        return false;
-    }
-    let after = skip_spaces(bytes, skip_quote(bytes, name_end));
-    matches!(bytes.get(after), Some(b'=' | b':'))
 }
 
 /// The most items of a YAML sequence that a credential's name takes.
@@ -1751,91 +1588,3 @@ pub(super) fn has_value(bytes: &[u8], from: usize) -> bool {
 }
 
 // ---- the URL rule ---------------------------------------------------------------------------
-
-/// The password half of `scheme://user:password@host`, or the whole userinfo when it has no
-/// password but is itself a token (`https://ghp_0123456789abcdefghij@host`).
-#[inline]
-pub(super) fn url_password_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
-    if !starts_a_word(bytes, at) || !bytes.get(at)?.is_ascii_alphabetic() {
-        return None;
-    }
-    let scheme_end = take_while(bytes, at + 1, is_scheme_byte);
-    let after_scheme = match_word(bytes, scheme_end, SCHEME_SEPARATOR)?;
-    let password = url_password(bytes, after_scheme)?;
-    Some(Outcome::Redact(Rewrite {
-        end: password.end,
-        kept_end: password.start,
-        joiner: "",
-        tail: "",
-    }))
-}
-
-/// Where the password of the URL whose `://` ends at `after_scheme` starts and ends.
-///
-/// `None` unless the authority is `user:password@`, the user optional and the password not: a
-/// URL that has no password, or whose userinfo is never closed by an `@`, is left as it is. The
-/// exception is a userinfo with no colon that is itself a token, which is long, has a digit and is
-/// made of the characters a token is made of: `git@github.com` is a name, `ghp_0123...@host` is not.
-pub(super) fn url_password(bytes: &[u8], after_scheme: usize) -> Option<Range<usize>> {
-    let user_end = take_while(bytes, after_scheme, |byte| {
-        !matches!(
-            byte,
-            b' ' | b'\t' | b'\n' | b'\r' | b':' | b'/' | b'?' | b'#'
-        )
-    });
-    // The user half is optional: `redis://:hunter2@db/main` is what a URL looks like when
-    // only a password was configured.
-    let Some(password_start) = match_byte(bytes, user_end, b':') else {
-        return token_userinfo(bytes, after_scheme);
-    };
-    let password_end = take_while(bytes, password_start, |byte| {
-        !matches!(
-            byte,
-            b' ' | b'\t' | b'\n' | b'\r' | b'@' | b'/' | b'?' | b'#'
-        )
-    });
-    if password_end == password_start || bytes.get(password_end) != Some(&b'@') {
-        return None;
-    }
-    Some(password_start..password_end)
-}
-
-/// A userinfo with no colon, of 20 or more token characters with a digit among them, closed by `@`.
-fn token_userinfo(bytes: &[u8], start: usize) -> Option<Range<usize>> {
-    let end = take_while(bytes, start, |byte| {
-        byte.is_ascii_alphanumeric() | matches!(byte, b'_' | b'-' | b'.' | b'~' | b'%')
-    });
-    let user = &bytes[start..end];
-    // A name such as `jenkins-deploy-agent-01` is long and has a digit; a token also has a capital
-    // or an underscore, is long enough to be random, or opens like one.
-    let looks_random = user.iter().any(u8::is_ascii_uppercase)
-        || user.contains(&b'_')
-        || user.len() >= 32
-        || [&b"xox"[..], b"sk-", b"pat-"].iter().any(|prefix| {
-            user.len() >= prefix.len() && user[..prefix.len()].eq_ignore_ascii_case(prefix)
-        });
-    let token_like = user.len() >= 20 && user.iter().any(u8::is_ascii_digit) && looks_random;
-    (token_like && bytes.get(end) == Some(&b'@')).then_some(start..end)
-}
-
-/// The next `:` and the places [`url_password_rule`] can start to reach it.
-///
-/// The rule wants a letter, the rest of a scheme, then `://`, then a userinfo with a password in
-/// it. A colon that does not open `://`, or opens a URL with no password to redact, allows no
-/// start; one that does allows any start in the run of scheme bytes that ends at it.
-///
-/// Every start in that run reaches the same authority, so the answer is found here, once, and
-/// not by each start of a scheme like `a.a.a.…` reading the rest of the text again. The
-/// check stops at a `/`, and the next `://` has one right after its colon, so no byte is read
-/// for two separators.
-#[inline]
-pub(super) fn scheme_separator(bytes: &[u8], from: usize) -> Option<Anchor> {
-    let colon = first_match(bytes, from, |byte| byte == b':')?;
-    let starts = match match_word(bytes, colon, SCHEME_SEPARATOR) {
-        Some(after_scheme) if url_password(bytes, after_scheme).is_some() => {
-            run_start(bytes, colon, is_scheme_byte)..colon
-        }
-        _ => 0..0,
-    };
-    Some(Anchor { at: colon, starts })
-}

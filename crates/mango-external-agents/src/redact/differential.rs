@@ -25,23 +25,23 @@
 //! ones did; an input with one is held to the cases in `redact::shapes` and the corpus in
 //! `testing::redaction`, not to 0.4.1, which is frozen and never edited.
 
-use super::reference::{self, Rewrite, remove_boundaries, strip_every_character};
-use super::rules::{QueryRun, assignment_rule, bearer_rule, url_password_rule};
-use super::strip::strip_control_characters;
-use super::{
-    REDACTED, as_text, ends_awaiting_value, redact_assignments, redact_bearer,
-    redact_url_passwords, single_round, stderr_text,
+use super::floor::rules::{QueryRun, assignment_rule, bearer_rule, url_password_rule};
+use super::floor::{
+    as_text, redact_assignments, redact_bearer, redact_url_passwords, single_round,
 };
+use super::reference::{self, Rewrite, remove_boundaries, strip_every_character};
+use super::strip::strip_control_characters;
+use super::{REDACTED, ends_awaiting_value, stderr_text};
 
 /// A rule under test, described the way the replaced scan wants it: where the match ends and the
 /// text that stands in its place.
 fn described(
-    mut rule: impl FnMut(&[u8], usize) -> Option<super::Outcome>,
+    mut rule: impl FnMut(&[u8], usize) -> Option<super::floor::Outcome>,
 ) -> impl FnMut(&[u8], usize) -> Option<Described> {
     move |bytes, at| {
         Some(match rule(bytes, at)? {
-            super::Outcome::Keep { end } => Described::Keep { end },
-            super::Outcome::Redact(found) => {
+            super::floor::Outcome::Keep { end } => Described::Keep { end },
+            super::floor::Outcome::Redact(found) => {
                 let kept = as_text(bytes, at, found.kept_end);
                 Described::Redact(Rewrite {
                     end: found.end,
@@ -114,34 +114,20 @@ const KEYWORDS: &[&str] = &["secret", "token", "password", "passwd", "credential
 /// colon (its value may run on), an `Authorization` header with a scheme other than bearer and
 /// basic, and a userinfo long enough to be a token each qualify.
 fn carries_a_new_trigger(raw: &str) -> bool {
-    // Either stripper may leave what the other took: an escape introducer that ends in a name's
-    // first letter, for one. And the text as it came holds a trigger that both took out, when an
-    // escape sequence swallowed a `?` and left the `key` after it to this stripper, which keeps the
-    // first letter of a name an introducer would have taken (see `strip::pick`).
-    [
+    let (old, new) = (
         reference::strip_control_characters(raw),
         strip_control_characters(raw),
-        raw.to_owned(),
-    ]
-    .iter()
-    .any(|plain| triggers_in(plain))
-}
-
-/// Whether twelve digits or more, with `,` and `_` between them, are in `lower`: a number that is
-/// no longer a count under a name that counts tokens, which a rule added after 0.4.1 redacts.
-fn twelve_digits(lower: &str) -> bool {
-    let mut digits = 0;
-    for byte in lower.bytes() {
-        match byte {
-            b'0'..=b'9' => digits += 1,
-            b',' | b'_' => {}
-            _ => digits = 0,
-        }
-        if digits >= 12 {
-            return true;
-        }
+    );
+    // The stripper keeps the first letter of a name that an escape introducer would have taken
+    // (see `strip::pick`), whatever the name is: a letter one stripper keeps and the other takes
+    // is that rule at work, in a name this list of words cannot tell from its neighbours
+    // (`[&key` then `sk-svcacct-passwd=`).
+    if old.replace('\u{1}', "") != new.replace('\u{1}', "") {
+        return true;
     }
-    false
+    // Either stripper may leave what the other took: an escape introducer that ends in a name's
+    // first letter, for one.
+    [old, new].iter().any(|plain| triggers_in(plain))
 }
 
 /// Whether a status word stands after a `:` or an `=`, which is where a rule keeps it.
@@ -158,27 +144,6 @@ fn status_follows_a_separator(lower: &str) -> bool {
             && word.starts_with(['4', '5'])
             && word.chars().all(|c| c.is_ascii_digit());
         http || STATUS_WORDS.contains(&word.as_str())
-    })
-}
-
-/// Whether a sequence marker, a hyphen then a blank, stands right after a `:` or an `=`, where a
-/// rule added after 0.4.1 reads the item after it as the value.
-fn marker_follows_a_separator(lower: &str) -> bool {
-    lower.match_indices([':', '=']).any(|(at, _)| {
-        let rest =
-            lower[at + 1..].trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '\u{1}');
-        rest.strip_prefix('-')
-            .is_some_and(|after| after.starts_with(|c: char| c.is_ascii_whitespace()))
-    })
-}
-
-/// Whether `|` or `>` stands right after a `:` or an `=`, where a rule added after 0.4.1 reads the
-/// lines under it as the value of a YAML block scalar.
-fn block_scalar_follows_a_separator(lower: &str) -> bool {
-    lower.match_indices([':', '=']).any(|(at, _)| {
-        let rest =
-            lower[at + 1..].trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '\u{1}');
-        rest.starts_with(['|', '>'])
     })
 }
 
@@ -224,11 +189,8 @@ const STATUS_WORDS: &[&str] = &[
 fn triggers_in(plain: &str) -> bool {
     let lower = plain.to_ascii_lowercase();
     if lower.contains(['"', '\'', '\\', '?', '&', '[', '{'])
-        || twelve_digits(&lower)
         || NEW_WORDS.iter().any(|word| lower.contains(word))
         || status_follows_a_separator(&lower)
-        || marker_follows_a_separator(&lower)
-        || block_scalar_follows_a_separator(&lower)
     {
         return true;
     }
@@ -371,11 +333,6 @@ fn next_char_boundary(raw: &str, at: usize) -> usize {
     next.min(raw.len())
 }
 
-/// The URL password rule's text, without the flag it also returns.
-fn url_passwords_only(raw: &str) -> String {
-    redact_url_passwords(raw).0
-}
-
 /// Fails, naming `raw`, unless redacting what one pass returned changes nothing.
 ///
 /// A host that redacts again, as the harnesses do with a tail from a control that may not have
@@ -448,21 +405,15 @@ pub(super) fn assert_matches_the_replaced_scan(raw: &str) {
         expect(
             "the URL password rule",
             input,
-            url_passwords_only,
+            |raw| redact_url_passwords(raw).0,
             rewrite_every_word(input, described(url_password_rule)),
         );
     }
-    // A URL password the last rule redacted is read by the assignment rule once more.
-    let settled = if redact_url_passwords(&assignments).1 {
-        rewrite_every_word(&urls, described_assignments())
-    } else {
-        urls
-    };
     expect(
         "the whole redactor",
         raw,
         single_round,
-        remove_boundaries(settled),
+        remove_boundaries(urls),
     );
     if let Err(why) = agreement_with_0_4_1(raw) {
         panic!("{why}");
@@ -510,14 +461,7 @@ pub(super) const FRAGMENTS: &[&str] = &[
     "\"",
     "'",
     "\\\"",
-    "\\\\\"",
-    "\\\\\\\"",
-    "\\\\\\\\\\\\\\\"",
     "\\",
-    "- ",
-    "\n  - ",
-    "123456789012",
-    "1,234,567,890,123",
     "{",
     "}",
     "[",
@@ -625,20 +569,6 @@ pub(super) const SHAPES: &[&str] = &[
     r#"{"Authorization":"Bearer sk-live-1","Accept":"a"}"#,
     "{'Authorization': 'Bearer sk-live-1'}",
     r#"{\"api_key\":\"sk-live-1\",\"m\":1}"#,
-    r#"{\\\"api_key\\\":\\\"sk-live-1\\\",\\\"m\\\":1}"#,
-    r#"{\\\"tokens\\\":[\\\"a\\\"],\\\"retry_after\\\":30}"#,
-    r#"{\\\\\\\"password\\\\\\\":\\\\\\\"a b\\\\\\\",\\\\\\\"u\\\\\\\":1}"#,
-    r#"{\\\"Authorization\\\":\\\"Bearer sk-live-1\\\",\\\"Accept\\\":\\\"a\\\"}"#,
-    "{\"tokens\":\n[\n\"a\",\n\"b\"\n]}",
-    "{\n  \"password\": [\n    \"x\"\n  ],\n  \"user\": \"u\"\n}",
-    "{\"credentials\": {\n  \"k\": [1,\n 2]\n}, \"n\": 1}",
-    "{\"token\": [\n\"never closed\",",
-    "tokens: [\n  a,\n  b\n]\nnext: ok",
-    "api_key:\n  - sk-live-1\n  - sk-live-2\nnext",
-    "tokens:\n  - a\n  - b\n - c\nother:\n  - d",
-    "api_key: - sk-live-1\nnext",
-    "token:\n  - expired\nnext",
-    "tokens:\n  -\n  - a",
     r#"{"password":"a b; c","user":"u"}"#,
     r#"{"token": 12345}"#,
     r#"{"tokens": ["a", "b"]}"#,
@@ -733,6 +663,18 @@ fn empty_text_and_the_documented_fixture_match_the_replaced_scan() {
     ] {
         assert_matches_the_replaced_scan(raw);
     }
+}
+
+#[test]
+fn a_letter_the_stripper_keeps_of_a_hyphenated_name_is_a_rule_at_work_and_not_a_regression() {
+    // Found by the long search: `[&k` is an escape introducer 0.4.1 removes whole, and the
+    // stripper keeps the `k` when a name follows, however the name is spelled.
+    let raw = "A\u{1b}[31m\u{1b}[&key\rsk-svcacct-passwd=vxy\u{7f}";
+    assert!(
+        carries_a_new_trigger(raw),
+        "expected a new trigger for a kept escape letter before a name | input {raw:?}"
+    );
+    assert_matches_the_replaced_scan(raw);
 }
 
 #[test]

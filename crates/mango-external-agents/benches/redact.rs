@@ -7,10 +7,11 @@
 //! stop at without finding anything. Two more shapes are built to repeat a read for each word
 //! start, a credential name made of one keyword over and over and a URL scheme made of dotted
 //! letters, at 16 KiB, 120 KB and 1 MiB: their cost has to grow with the length, not with its
-//! square. Further shapes read what a later rule added: JSON inside a string at three levels of
-//! escaping, a container that spans lines, a YAML sequence and the unnamed-token pass that
-//! `redact::bounded` runs and `stderr_text` does not. The fixtures are synthetic; no vendor wrote
-//! them. Run with:
+//! square. `stderr_text` reads what the release before it read and nothing more, so a tail costs
+//! what it did. `redact::bounded` is the entry point for a vendor's messages and reads the rest:
+//! JSON inside a string at three levels of escaping, a container that spans lines, a YAML
+//! sequence and the unnamed-token pass. It is run over the same texts, beside `stderr_text`. The
+//! fixtures are synthetic; no vendor wrote them. Run with:
 //!
 //! ```sh
 //! cargo bench -p mango-external-agents --bench redact
@@ -182,15 +183,32 @@ fn assert_redacted(label: &str, raw: &str, redacted: &str) {
             "expected every credential in a {} byte tail redacted | received {redacted:?}",
             raw.len()
         ),
-        "escaped-json" | "pretty" | "bounded-tokens" => assert!(
-            redacted.contains("[REDACTED]")
-                && !redacted.contains("hunter2")
-                && !redacted.contains("0123456789"),
-            "expected every credential in a {} byte {label} tail redacted | received {redacted:?}",
-            raw.len()
-        ),
-        "bounded-plain" | "sequence" | "containers" | "slashes" | "prefixes" | "pem" | "web"
-        | "one-run" => assert!(
+        "bounded-secrets" | "bounded-escaped-json" | "bounded-pretty" | "bounded-tokens" => {
+            assert!(
+                redacted.contains("[REDACTED]")
+                    && !redacted.contains("hunter2")
+                    && !redacted.contains("0123456789"),
+                "expected every credential in a {} byte {label} tail redacted | received {redacted:?}",
+                raw.len()
+            )
+        }
+        "bounded-plain"
+        | "sequence"
+        | "containers"
+        | "slashes"
+        | "prefixes"
+        | "pem"
+        | "web"
+        | "one-run"
+        | "escaped-json"
+        | "pretty"
+        | "bounded-names"
+        | "bounded-schemes"
+        | "bounded-quoted-names"
+        | "bounded-quotes"
+        | "bounded-slashes"
+        | "bounded-containers"
+        | "bounded-sequence" => assert!(
             !redacted.is_empty(),
             "expected a {} byte {label} tail to come back",
             raw.len()
@@ -245,14 +263,18 @@ fn main() {
     token_shapes(&bench);
 }
 
-/// `redact::bounded`, which also reads the unnamed tokens: 16 KiB tails of plain lines and of lines
-/// that carry tokens, 320 KiB per sample, to be read beside `stderr_text` over the same lines.
+/// `redact::bounded`, which also reads the unnamed tokens and the reads added since the release
+/// before: 16 KiB tails of plain lines and of lines that carry tokens, credentials, JSON in strings
+/// and containers, 320 KiB per sample, to be read beside `stderr_text` over the same lines.
 fn messages(bench: &Bench) {
     let len = 16 * KIB;
     let per_byte = Unit::new(BYTES_PER_SAMPLE as u64, "byte");
     for (label, lines) in [
         ("bounded-plain", PLAIN_LINES),
         ("bounded-tokens", BARE_TOKEN_LINES),
+        ("bounded-secrets", SECRET_LINES),
+        ("bounded-escaped-json", ESCAPED_JSON_LINES),
+        ("bounded-pretty", PRETTY_LINES),
     ] {
         let raw = tail(lines, len);
         let first = bounded(&raw, TextLimit::ErrorMessage);
@@ -297,16 +319,31 @@ fn pathological(bench: &Bench) {
         ] {
             let name = format!("redact/stderr_text-{size_label}/{label}");
             // Checked only when the case runs: a filtered-out case must not pay for the call.
-            if !bench.selected(&name) {
-                continue;
+            if bench.selected(&name) {
+                assert_redacted(label, &raw, &stderr_text(&raw));
+                bench.run(
+                    &name,
+                    Unit::new(raw.len() as u64, "byte"),
+                    || (),
+                    |()| stderr_text(std::hint::black_box(&raw)).len(),
+                );
             }
-            assert_redacted(label, &raw, &stderr_text(&raw));
-            bench.run(
-                &name,
-                Unit::new(raw.len() as u64, "byte"),
-                || (),
-                |()| stderr_text(std::hint::black_box(&raw)).len(),
-            );
+            // The same text through the entry point that reads the rest.
+            let name = format!("redact/bounded-{size_label}/{label}");
+            if bench.selected(&name) {
+                let label = format!("bounded-{label}");
+                assert_redacted(&label, &raw, &bounded(&raw, TextLimit::ErrorMessage).text);
+                bench.run(
+                    &name,
+                    Unit::new(raw.len() as u64, "byte"),
+                    || (),
+                    |()| {
+                        bounded(std::hint::black_box(&raw), TextLimit::ErrorMessage)
+                            .text
+                            .len()
+                    },
+                );
+            }
         }
     }
 }

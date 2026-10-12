@@ -64,6 +64,8 @@ fn rows() -> Vec<Row> {
         row(concat!("s", "k-ant-api03-"), URL_SAFE, 80, AtLeast),
         row(concat!("s", "k-ant-admin01-"), URL_SAFE, 80, AtLeast),
         row(concat!("s", "k-proj-"), URL_SAFE, 40, AtLeast),
+        row(concat!("s", "k-svcacct-"), URL_SAFE, 40, AtLeast),
+        row(concat!("s", "k-admin-"), URL_SAFE, 40, AtLeast),
         row(concat!("s", "k-live-"), URL_SAFE, 16, AtLeast),
         row(concat!("s", "k-"), ALNUM, 40, AtLeast),
         row(concat!("s", "k_live_"), ALNUM, 16, AtLeast),
@@ -507,21 +509,32 @@ const KEY_LINE: &str = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTU
 #[test]
 fn a_name_under_an_unclosed_key_keeps_its_value_redacted() {
     let begin = concat!("-----BEGIN RSA PRIV", "ATE KEY-----");
-    for (what, after) in [
-        ("a name on its own line", "password: CNRY1\n"),
-        ("a name whose value is on the next line", "pwd=\nCNRY2"),
+    for (what, after, expected_after) in [
+        ("a name on its own line", "password: CNRY1\n", None),
+        // `pwd=` is a short last line of base64 with its padding, and the key takes it; the floor
+        // hides the value on the next line, and the two spans make one.
+        (
+            "a name whose value is on the next line",
+            "pwd=\nCNRY2",
+            Some(""),
+        ),
         (
             "a name glued to the base64 before it",
             "AAAAAAAAAAAAAsecret: CNRY4",
+            None,
         ),
         (
             "an end label that is not a key's",
             "-----END PASSWORD-----: CNRY5",
+            None,
         ),
     ] {
         let text = format!("{begin}\n{KEY_LINE}\n{after}");
         let received = shown(&text);
-        let expected = format!("[REDACTED]\n{}", stderr_text(after));
+        let read_alone = stderr_text(after);
+        let expected_after =
+            expected_after.map_or_else(|| format!("\n{read_alone}"), |after| after.to_owned());
+        let expected = format!("[REDACTED]{expected_after}");
         assert!(
             !received.contains("CNRY") && received == expected,
             "expected {what} read as a name after the key | input {text:?} received: {received:?}, expected: {expected:?}"
