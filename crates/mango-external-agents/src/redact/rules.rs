@@ -52,32 +52,78 @@ fn is_quote(byte: u8) -> bool {
     (byte == b'"') | (byte == b'\'')
 }
 
-/// Where a closing quote that ends at `end` begins, with the backslash that escapes it, or `end`
+/// The most backslashes read in front of a quote: a JSON text serialised into a string, that string
+/// into another, and so on, writes each quote with `2^n - 1` of them for the `n`th string. Five
+/// strings deep is 31. More is a run of backslashes and not a quote, and costs the same bounded read.
+const MAX_SLASHES: usize = 31;
+
+/// How many backslashes stand at `at`, counting no further than one past [`MAX_SLASHES`].
+fn slashes_from(bytes: &[u8], at: usize) -> usize {
+    let mut count = 0;
+    while count <= MAX_SLASHES && bytes.get(at + count) == Some(&b'\\') {
+        count_steps(1);
+        count += 1;
+    }
+    count
+}
+
+/// How many backslashes stand just before `end`, counting no further than one past [`MAX_SLASHES`].
+fn slashes_before(bytes: &[u8], end: usize) -> usize {
+    let mut count = 0;
+    while count <= MAX_SLASHES
+        && end
+            .checked_sub(count + 1)
+            .and_then(|before| bytes.get(before))
+            == Some(&b'\\')
+    {
+        count_steps(1);
+        count += 1;
+    }
+    count
+}
+
+/// Where a closing quote that ends at `end` begins, with the backslashes that escape it, or `end`
 /// when the byte before it is not a quote.
+///
+/// Inlined, with the backslash count behind a call: nearly every separator is turned away on the
+/// byte before it, and a locator that grows past what the compiler inlines costs the plain path.
+#[inline(always)]
 fn before_quote(bytes: &[u8], end: usize) -> usize {
     count_steps(1);
     match end.checked_sub(1) {
         Some(quote) if bytes.get(quote).is_some_and(|byte| is_quote(*byte)) => {
-            match quote.checked_sub(1) {
-                Some(slash) if bytes.get(slash) == Some(&b'\\') => slash,
-                _ => quote,
+            if quote > 0 && bytes[quote - 1] == b'\\' {
+                quote - escaping_slashes(bytes, quote)
+            } else {
+                quote
             }
         }
         _ => end,
     }
 }
 
-/// The byte after a quote at `at`, or `at` when there is none. A backslash may come first: the
-/// quotes of a JSON text inside a string are escaped.
-fn skip_quote(bytes: &[u8], at: usize) -> usize {
-    let quote = match bytes.get(at) {
-        Some(b'\\') => at + 1,
-        _ => at,
-    };
-    match bytes.get(quote) {
-        Some(byte) if is_quote(*byte) => quote + 1,
-        _ => at,
+/// The backslashes in front of the quote at `quote`, or none when there are more than
+/// [`MAX_SLASHES`].
+#[inline(never)]
+fn escaping_slashes(bytes: &[u8], quote: usize) -> usize {
+    match slashes_before(bytes, quote) {
+        slashes if slashes <= MAX_SLASHES => slashes,
+        _ => 0,
     }
+}
+
+/// The quote at `at`, with the backslashes in front of it: the quote, how many there are, and the
+/// byte after it. A JSON text inside a string has its quotes escaped, once for each string it is
+/// inside.
+fn quote_at(bytes: &[u8], at: usize) -> Option<(u8, usize, usize)> {
+    let slashes = slashes_from(bytes, at);
+    let quote = *bytes.get(at + slashes).filter(|byte| is_quote(**byte))?;
+    (slashes <= MAX_SLASHES).then_some((quote, slashes, at + slashes + 1))
+}
+
+/// The byte after a quote at `at`, or `at` when there is none.
+fn skip_quote(bytes: &[u8], at: usize) -> usize {
+    quote_at(bytes, at).map_or(at, |(_, _, after)| after)
 }
 
 // ---- keywords -------------------------------------------------------------------------------
@@ -689,10 +735,11 @@ fn read_header(bytes: &[u8], at: usize, separator: u8) -> Option<Outcome> {
 /// The quote that opens the value whose text starts at `inner`.
 fn opened_before(bytes: &[u8], inner: usize) -> Option<Opened> {
     let quote = *bytes.get(inner.checked_sub(1)?)?;
-    is_quote(quote).then_some(Opened {
+    let slashes = slashes_before(bytes, inner - 1);
+    (is_quote(quote) && slashes <= MAX_SLASHES).then_some(Opened {
         inner,
         quote,
-        escaped: inner >= 2 && bytes[inner - 2] == b'\\',
+        slashes,
     })
 }
 
@@ -766,13 +813,20 @@ pub(super) fn header_colon(bytes: &[u8], from: usize) -> Option<Anchor> {
 /// A name that holds more than one keyword is answered for by the leftmost that may start there,
 /// so a keep for it (`session_token_cookie: ;a=b`, a name that holds both a token and a cookie)
 /// also skips the later ones. Such names are not ones a vendor writes.
-#[inline]
+#[inline(always)]
 pub(super) fn assignment_rule(bytes: &[u8], at: usize, query: &mut QueryRun) -> Option<Outcome> {
     // Every byte of a name is a start now, since a keyword may end a name or follow a capital.
-    // Most are not the first letter of anything, and are turned away on that alone.
+    // Most are not the first letter of anything, and are turned away on that alone, before the
+    // frame the rest of the rule needs is set up.
     if !(starts_a_keyword(bytes, at) || starts_a_parameter(bytes, at)) {
         return None;
     }
+    read_assignment(bytes, at, query)
+}
+
+/// [`assignment_rule`] for a place that may open a name.
+#[inline(never)]
+fn read_assignment(bytes: &[u8], at: usize, query: &mut QueryRun) -> Option<Outcome> {
     // `Authorization=Bearer x`: the bearer rule's header, written with an equals sign.
     if bytes[at] | 0x20 == b'a'
         && let Some(after_name) = match_word(bytes, at, AUTHORIZATION)
@@ -956,13 +1010,14 @@ fn token_type_scheme(bytes: &[u8], keyword: &Keyword, value_start: usize) -> Opt
 }
 
 /// Where the bracket that opens at `start` closes, counting the brackets and the strings inside:
-/// a JSON array or object that is one credential's value. A string opens with a quote, or with a
-/// backslash and a quote when the JSON is itself inside a string (`{\\"a\\":1}`). An unclosed one
-/// ends with its line.
+/// a JSON array or object that is one credential's value. A string opens with a quote, or with
+/// backslashes and a quote when the JSON is itself inside a string (`{\\"a\\":1}`, and
+/// `{\\\\\\"a\\\\\\":1}` one string deeper), and a string opened with `n` backslashes ends at
+/// a quote with exactly `n`. An unclosed one ends with its line.
 fn closing_bracket(bytes: &[u8], start: usize) -> usize {
     let mut depth = 0usize;
-    // The quote that opened the string we are in, and whether it was written with a backslash.
-    let mut string: Option<(u8, bool)> = None;
+    // The quote that opened the string we are in, and the backslashes written in front of it.
+    let mut string: Option<(u8, usize)> = None;
     let mut at = start;
     while let Some(&byte) = bytes.get(at) {
         count_steps(1);
@@ -971,18 +1026,26 @@ fn closing_bracket(bytes: &[u8], start: usize) -> usize {
             return at - 1;
         }
         match (string, byte) {
-            (Some((quote, true)), b'\\') if bytes.get(at) == Some(&quote) => {
-                string = None;
-                at += 1;
+            (Some((_, 0)), b'\\') if !matches!(bytes.get(at), Some(b'\n' | b'\r')) => at += 1,
+            (Some((quote, 0)), byte) if byte == quote => string = None,
+            (Some((quote, slashes)), b'\\') => {
+                let run = 1 + take_while(bytes, at, |byte| byte == b'\\') - at;
+                at += run - 1;
+                if run == slashes && bytes.get(at) == Some(&quote) {
+                    string = None;
+                    at += 1;
+                }
             }
-            (Some((_, false)), b'\\') if !matches!(bytes.get(at), Some(b'\n' | b'\r')) => at += 1,
-            (Some((quote, false)), byte) if byte == quote => string = None,
             (Some(_), _) => {}
-            (None, b'\\') if bytes.get(at).is_some_and(|byte| is_quote(*byte)) => {
-                string = Some((bytes[at], true));
-                at += 1;
+            (None, b'\\') => {
+                let run = 1 + take_while(bytes, at, |byte| byte == b'\\') - at;
+                at += run - 1;
+                if run <= MAX_SLASHES && bytes.get(at).is_some_and(|byte| is_quote(*byte)) {
+                    string = Some((bytes[at], run));
+                    at += 1;
+                }
             }
-            (None, b'"' | b'\'') => string = Some((byte, false)),
+            (None, b'"' | b'\'') => string = Some((byte, 0)),
             (None, b'[' | b'{') => depth += 1,
             (None, b']' | b'}') => {
                 depth = depth.saturating_sub(1);
@@ -996,36 +1059,41 @@ fn closing_bracket(bytes: &[u8], start: usize) -> usize {
     bytes.len()
 }
 
-/// A quote that opens a value at `at`: where its text starts, the quote and whether it is escaped.
+/// A quote that opens a value at `at`: where its text starts, the quote and the backslashes that
+/// escape it (none for a plain string, one for JSON inside a string, `2^n - 1` for the `n`th).
 struct Opened {
     inner: usize,
     quote: u8,
-    escaped: bool,
+    slashes: usize,
 }
 
 fn open_quote(bytes: &[u8], at: usize) -> Option<Opened> {
-    let escaped = bytes.get(at) == Some(&b'\\');
-    let quote_at = if escaped { at + 1 } else { at };
-    let quote = *bytes.get(quote_at).filter(|byte| is_quote(**byte))?;
+    let (quote, slashes, inner) = quote_at(bytes, at)?;
     Some(Opened {
-        inner: quote_at + 1,
+        inner,
         quote,
-        escaped,
+        slashes,
     })
 }
 
 /// Where the text inside a quote ends: at its closing quote, or at the end of the line when it is
 /// never closed.
+///
+/// A plain string ends at its quote, and a backslash escapes the byte after it. One written with
+/// `n` backslashes in front of its quote ends at a quote with exactly `n`: more are the quotes of
+/// a JSON text inside it, written one level deeper. The count is kept as the text is read, so the
+/// work is the length of the string however long a run of backslashes is.
 fn close_quote(bytes: &[u8], opened: &Opened) -> usize {
     let mut at = opened.inner;
+    let mut run = 0;
     while let Some(byte) = bytes.get(at) {
         count_steps(1);
         match *byte {
             b'\n' | b'\r' => return at,
-            b'\\' if opened.escaped && bytes.get(at + 1) == Some(&opened.quote) => return at,
-            b'\\' if !opened.escaped => at += 1,
-            byte if byte == opened.quote && !opened.escaped => return at,
-            _ => {}
+            b'\\' if opened.slashes == 0 => at += 1,
+            b'\\' => run += 1,
+            byte if byte == opened.quote && run == opened.slashes => return at - run,
+            _ => run = 0,
         }
         at += 1;
     }
@@ -1073,12 +1141,7 @@ fn quoted_value(
     if let Some(tail_end) = glued_tail(bytes, &opened, end, context) {
         // The closing quote goes back after the marker, so that the text still reads as a quoted
         // value and a second pass over it leaves it as it is.
-        let tail = match (opened.quote, opened.escaped) {
-            (b'"', false) => "\"",
-            (b'"', true) => "\\\"",
-            (_, false) => "'",
-            (_, true) => "\\'",
-        };
+        let tail = closing_quote_text(&opened);
         return Some(Outcome::Redact(Rewrite {
             end: tail_end,
             kept_end: opened.inner,
@@ -1114,6 +1177,15 @@ fn quoted_value(
     }))
 }
 
+/// The backslashes and the quote that close `opened`, as text that outlives the match: a suffix of
+/// [`MAX_SLASHES`] backslashes and a quote.
+fn closing_quote_text(opened: &Opened) -> &'static str {
+    const DOUBLE: &str = "\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\"";
+    const SINGLE: &str = "\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\'";
+    let all = if opened.quote == b'"' { DOUBLE } else { SINGLE };
+    &all[MAX_SLASHES - opened.slashes.min(MAX_SLASHES)..]
+}
+
 /// Where the value ends when text is glued to the quote that closes it: the closing quote at `end`
 /// (a backslash and a quote when the value was written escaped), then text that goes on with the
 /// value instead of ending it.
@@ -1130,7 +1202,7 @@ fn glued_tail(bytes: &[u8], opened: &Opened, end: usize, context: &mut Context) 
     {
         return None;
     }
-    let after = end + if opened.escaped { 2 } else { 1 };
+    let after = end + opened.slashes + 1;
     let first = *bytes.get(after)?;
     let glued = is_word_or_quote(first)
         || is_glue_operator(first)

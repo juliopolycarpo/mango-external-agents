@@ -755,3 +755,108 @@ fn a_header_name_that_only_starts_like_a_vendors_key_header_is_not_one() {
         ),
     ]);
 }
+
+/// `text` as the content of a JSON string: the backslashes and the double quotes escaped.
+fn escaped(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// `text` escaped once for each string it is inside.
+fn escaped_levels(text: &str, levels: usize) -> String {
+    (0..levels).fold(text.to_owned(), |inner, _| escaped(&inner))
+}
+
+/// How many strings deep a JSON text is read: `{\\\"api_key\\\":...}` is two, five is the most.
+const MOST_LEVELS: usize = 5;
+
+/// A JSON text that was serialised into a string, and that string into another, has a quote
+/// written with a backslash for every level (`\"`, `\\\"`, `\\\\\\\"`). The credential is as much
+/// a credential at the fifth level as at the first, and the words around it stay readable.
+#[test]
+fn json_inside_json_strings_is_read_at_every_level_of_escaping() {
+    for (plain, redacted, own_levels) in [
+        (
+            r#"{"api_key":"sk-live-x1","model":"m"}"#,
+            r#"{"api_key":"[REDACTED]","model":"m"}"#,
+            0,
+        ),
+        // Already one string deep before it is escaped further.
+        (
+            r#"{"data":"{\"api_key\":\"sk-live-x2\"}","id":1}"#,
+            r#"{"data":"{\"api_key\":\"[REDACTED]\"}","id":1}"#,
+            1,
+        ),
+        (
+            r#"{"Authorization":"Bearer sk-live-x3","Accept":"a"}"#,
+            r#"{"Authorization":"Bearer [REDACTED]","Accept":"a"}"#,
+            0,
+        ),
+        (
+            r#"{"password":"two words, here","user":"ann"}"#,
+            r#"{"password":"[REDACTED]","user":"ann"}"#,
+            0,
+        ),
+        (
+            r#"{"token": 12345, "n": 1}"#,
+            r#"{"token": [REDACTED], "n": 1}"#,
+            0,
+        ),
+        (
+            r#"{"tokens":["sk-18a","sk-18b"],"retry_after":30}"#,
+            r#"{"tokens":[REDACTED],"retry_after":30}"#,
+            0,
+        ),
+        (
+            r#"{"headers":{"cookie":"sid=1; b=2"},"ok":true}"#,
+            r#"{"headers":{"cookie":"[REDACTED]"},"ok":true}"#,
+            0,
+        ),
+        (
+            r#"{"password":"pa"ss"word","user":"ann"}"#,
+            r#"{"password":"[REDACTED]","user":"ann"}"#,
+            0,
+        ),
+    ] {
+        for level in 0..=MOST_LEVELS - own_levels {
+            let (text, expected) = (
+                format!("upstream said {}", escaped_levels(plain, level)),
+                format!("upstream said {}", escaped_levels(redacted, level)),
+            );
+            let received = stderr_text(&text);
+            assert_eq!(
+                received, expected,
+                "expected the credential {level} strings deep redacted | input {text:?} received: {received:?}"
+            );
+        }
+    }
+}
+
+/// The reading stops at the bound and does not run on: text nested past it is a value of
+/// backslashes and quotes, as it was before the bound existed, and it costs a bounded read.
+#[test]
+fn escaping_deeper_than_the_bound_is_not_read_as_a_quote() {
+    let deeper = escaped_levels(r#"{"api_key":"sk-live-x4","m":1}"#, MOST_LEVELS + 1);
+    let received = stderr_text(&deeper);
+    assert!(
+        received.len() <= deeper.len() + "[REDACTED]".len(),
+        "expected the text no larger than the bound allows | received {} bytes from {}",
+        received.len(),
+        deeper.len()
+    );
+}
+
+/// A value in single quotes that were escaped, once or three times: the closing quote goes back
+/// the way it stood.
+#[test]
+fn escaped_single_quotes_close_a_value_with_the_backslashes_that_opened_it() {
+    assert_shown(&[
+        (
+            r"x=1 password=\'pa\'ss-word\' tail",
+            r"x=1 password=\'[REDACTED]\' tail",
+        ),
+        (
+            r"x=1 password=\\\'pa\\\'ss-word\\\' tail",
+            r"x=1 password=\\\'[REDACTED]\\\' tail",
+        ),
+    ]);
+}

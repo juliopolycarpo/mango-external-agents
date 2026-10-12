@@ -307,6 +307,48 @@ const SHAPES: &[Shape] = &[
         what: "token-length userinfo with no password, repeated",
         build: |len| repeated("a://aaaaaaaaaaaaaaaaaaa1@", "", len),
     },
+    Shape {
+        what: "a run of backslashes as long as the text, then a quoted name",
+        build: |len| format!("{}\"token\":x", "\\".repeat(len)),
+    },
+    Shape {
+        what: "a run of backslashes before every quote of a name, repeated",
+        build: |len| repeated(&format!("{}\"token_", "\\".repeat(31)), "\":", len),
+    },
+    Shape {
+        what: "a run of backslashes one past the bound before a quote, repeated",
+        build: |len| repeated(&format!("api_key={}\"a", "\\".repeat(32)), "", len),
+    },
+    Shape {
+        what: "a value opened with three backslashes that is never closed, repeated",
+        build: |len| repeated("api_key=\\\\\\\"a\\\"", "", len),
+    },
+    Shape {
+        what: "a value of backslashes and quotes of every count but its own",
+        build: |len| repeated("api_key=\\\\\\\"a\\\"b\\\\\\\\\\\"", "", len),
+    },
+    Shape {
+        what: "a bracket opening a string with 31 backslashes that never closes, repeated",
+        build: |len| {
+            repeated(
+                &format!("token=[{}\"a{}", "\\".repeat(31), " ".repeat(24)),
+                "",
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "a long run of backslashes inside an array under a credential",
+        build: |len| format!("token=[\\\"a{}\\\"]", "\\".repeat(len)),
+    },
+    Shape {
+        what: "a long run of backslashes inside an array outside any string",
+        build: |len| format!("token=[{}]", "\\".repeat(len)),
+    },
+    Shape {
+        what: "escaped JSON quotes, three deep, one after another",
+        build: |len| repeated("\\\\\\\"api_key\\\\\\\":\\\\\\\"v\\\\\\\" ", "", len),
+    },
 ];
 
 fn redaction_steps(text: &str) -> usize {

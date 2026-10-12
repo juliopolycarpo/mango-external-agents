@@ -115,10 +115,13 @@ const KEYWORDS: &[&str] = &["secret", "token", "password", "passwd", "credential
 /// basic, and a userinfo long enough to be a token each qualify.
 fn carries_a_new_trigger(raw: &str) -> bool {
     // Either stripper may leave what the other took: an escape introducer that ends in a name's
-    // first letter, for one.
+    // first letter, for one. And the text as it came holds a trigger that both took out, when an
+    // escape sequence swallowed a `?` and left the `key` after it to this stripper, which keeps the
+    // first letter of a name an introducer would have taken (see `strip::pick`).
     [
         reference::strip_control_characters(raw),
         strip_control_characters(raw),
+        raw.to_owned(),
     ]
     .iter()
     .any(|plain| triggers_in(plain))
@@ -455,6 +458,9 @@ const FRAGMENTS: &[&str] = &[
     "\"",
     "'",
     "\\\"",
+    "\\\\\"",
+    "\\\\\\\"",
+    "\\\\\\\\\\\\\\\"",
     "\\",
     "{",
     "}",
@@ -563,6 +569,10 @@ const SHAPES: &[&str] = &[
     r#"{"Authorization":"Bearer sk-live-1","Accept":"a"}"#,
     "{'Authorization': 'Bearer sk-live-1'}",
     r#"{\"api_key\":\"sk-live-1\",\"m\":1}"#,
+    r#"{\\\"api_key\\\":\\\"sk-live-1\\\",\\\"m\\\":1}"#,
+    r#"{\\\"tokens\\\":[\\\"a\\\"],\\\"retry_after\\\":30}"#,
+    r#"{\\\\\\\"password\\\\\\\":\\\\\\\"a b\\\\\\\",\\\\\\\"u\\\\\\\":1}"#,
+    r#"{\\\"Authorization\\\":\\\"Bearer sk-live-1\\\",\\\"Accept\\\":\\\"a\\\"}"#,
     r#"{"password":"a b; c","user":"u"}"#,
     r#"{"token": 12345}"#,
     r#"{"tokens": ["a", "b"]}"#,
