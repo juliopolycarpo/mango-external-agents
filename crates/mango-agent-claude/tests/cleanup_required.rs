@@ -1023,6 +1023,77 @@ mod pending_launch_cancel {
     }
 }
 
+/// A session is torn down on the runtime that opened it. If that runtime is gone, the worker is
+/// dropped unrun, and the caller on another runtime must still hear that the child was not stopped.
+mod opening_runtime_gone {
+    use super::*;
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("expected a runtime")
+    }
+
+    /// A session with a running turn, opened on a runtime that is then dropped.
+    fn orphaned() -> (Held, TurnStream) {
+        let opened = runtime();
+        let (held, turn) = opened.block_on(async {
+            let held = hold(FakeClaudeCli::new().with_turn(stalled())).await;
+            let turn = held.start().await;
+            (held, turn)
+        });
+        drop(opened);
+        (held, turn)
+    }
+
+    fn within_a_second<T>(label: &str, call: impl std::future::Future<Output = T>) -> T {
+        runtime()
+            .block_on(async { tokio::time::timeout(Duration::from_secs(1), call).await })
+            .unwrap_or_else(|_| {
+                panic!("expected {label} to return within 1s | received: still waiting after 1s")
+            })
+    }
+
+    #[test]
+    fn a_cancel_from_another_runtime_is_cleanup_required_rather_than_a_hang() {
+        let (held, _turn) = orphaned();
+
+        let outcome = within_a_second(
+            "a cancel after the opening runtime shut down",
+            held.session.cancel(CancelReason::Requested),
+        );
+
+        let error = outcome.expect_err("expected a stop that never ran to fail the cancel");
+        assert_cleanup_required("a cancel after the runtime shut down", &error, &held);
+        assert!(
+            matches!(error.cause(), Error::Link { peer, .. } if peer == "tokio runtime"),
+            "expected the cause to name the runtime that shut down | received {error:?}"
+        );
+        assert_eq!(
+            held.launcher.kill_requests(),
+            0,
+            "expected no kill request from a stop that never ran | received {}",
+            held.launcher.kill_requests()
+        );
+        held.reconcile();
+    }
+
+    #[test]
+    fn a_close_from_another_runtime_is_cleanup_required_rather_than_a_hang() {
+        let (held, _turn) = orphaned();
+
+        let outcome = within_a_second(
+            "a close after the opening runtime shut down",
+            held.session.close(CloseReason::Requested),
+        );
+
+        let error = outcome.expect_err("expected a stop that never ran to fail the close");
+        assert_cleanup_required("a close after the runtime shut down", &error, &held);
+        held.reconcile();
+    }
+}
+
 /// The pump's own stops: the stream ending, the child exiting, the idle timer, the host's token.
 mod pump {
     use super::*;

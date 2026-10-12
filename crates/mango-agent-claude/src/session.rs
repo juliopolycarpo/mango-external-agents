@@ -544,7 +544,9 @@ fn start_teardown(
     }
     let shared_for_worker = Arc::clone(shared);
     let teardown_for_worker = Arc::clone(teardown);
+    let lost = LostWorker::new(teardown, taken.control.clone());
     spawn_owned(shared, async move {
+        let _lost = lost;
         run_teardown(
             &shared_for_worker,
             &teardown_for_worker,
@@ -971,6 +973,50 @@ fn settle_owner_locked(state: &mut Mutable, end: &Arc<TurnEnd>) {
         })
     {
         state.active = None;
+    }
+}
+
+/// Publishes an outcome for a teardown whose worker was dropped before it finished.
+///
+/// A worker is spawned on the runtime that opened the session. A runtime that has shut down drops
+/// the task unrun, and a runtime shutting down drops it part way; either way nobody would ever
+/// publish the outcome, and every `cancel` and `close` waiting on it would wait for good. The
+/// guard rides inside the worker's future, so dropping the future publishes the failure. A stop
+/// that never ran leaves the child as it was, so it comes back as `CleanupRequired` with the
+/// host's control whenever the teardown had one.
+struct LostWorker {
+    teardown: Arc<Teardown>,
+    control: Option<Arc<dyn mango_external_agents::ProcessControl>>,
+}
+
+impl LostWorker {
+    fn new(
+        teardown: &Arc<Teardown>,
+        control: Option<Arc<dyn mango_external_agents::ProcessControl>>,
+    ) -> Self {
+        Self {
+            teardown: Arc::clone(teardown),
+            control,
+        }
+    }
+}
+
+impl Drop for LostWorker {
+    fn drop(&mut self) {
+        if self.teardown.outcome().is_some() {
+            return;
+        }
+        let lost = Error::Link {
+            peer: String::from("tokio runtime"),
+            message: String::from(
+                "expected the runtime that opened the session to run its teardown | received: it shut down first",
+            ),
+        };
+        let lost = match self.control.take() {
+            Some(control) => cleanup_required(control, lost),
+            None => lost,
+        };
+        self.teardown.finish(Err(lost));
     }
 }
 
@@ -1434,6 +1480,7 @@ impl mango_external_agents::Session for ClaudeSession {
             } => (close, active, taken, mcp_config),
         };
         self.shared.core_state.set_status(SessionStatus::Closing);
+        let child = taken.as_ref().and_then(|taken| taken.control.clone());
         if let (Some(active), Some(taken)) = (&active, taken)
             && taken.control.is_some()
         {
@@ -1447,7 +1494,9 @@ impl mango_external_agents::Session for ClaudeSession {
         }
         let shared = Arc::clone(&self.shared);
         let close_for_worker = Arc::clone(&close);
+        let lost = LostWorker::new(&close, child);
         spawn_owned(&self.shared, async move {
+            let _lost = lost;
             run_close_teardown(&shared, &close_for_worker, active, mcp_config).await;
         });
         close.wait().await
