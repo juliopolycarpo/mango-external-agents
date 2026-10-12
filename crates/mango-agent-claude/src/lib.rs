@@ -36,6 +36,12 @@ pub fn harness_id() -> mango_external_agents::HarnessId {
     mango_external_agents::HarnessId::claude()
 }
 
+/// The fake `claude` launcher the integration tests share, compiled once for the unit tests that
+/// need a launcher too.
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod test_support;
+
 #[cfg(test)]
 mod tests {
     use super::harness_id;

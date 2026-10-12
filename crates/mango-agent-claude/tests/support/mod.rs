@@ -21,8 +21,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use mango_external_agents::testing::FrozenClock;
 use mango_external_agents::{
-    ByteSink, ByteSource, CancelReason, EnvSource, ExitStatus, HostContext, InterruptOutcome,
-    LaunchSpec, Limits, ManagedProcess, ProcessControl, ProcessLauncher, Result, StderrTail,
+    ByteSink, ByteSource, CancelReason, EnvSource, Error, ExitStatus, HostContext,
+    InterruptOutcome, LaunchSpec, Limits, ManagedProcess, ProcessControl, ProcessLauncher, Result,
+    StderrTail,
 };
 use tokio::sync::Notify;
 
@@ -841,4 +842,187 @@ pub fn host_under(launcher: Arc<dyn ProcessLauncher>, limits: Limits) -> HostCon
         .limits(limits)
         .build()
         .expect("expected a host")
+}
+
+/// What the launcher says when it fails a launch over a child it could not end.
+pub const REFUSED_LAUNCH: &str = "the host's launcher could not end the child it failed to use";
+
+/// What the host's control says when it refuses the kill: the cause a host reads back.
+pub const REFUSED_KILL: &str = "the host's process control refused the kill";
+
+/// A launcher that remembers the control it hands the harness for each turn child, so a test can
+/// tell the host's own control from any other.
+///
+/// Wraps a [`FakeClaudeCli`] and passes every spawn through. With [`refusing_kill`]
+/// (Self::refusing_kill) the control it hands out answers a kill with an error of the host's own,
+/// instead of the stalling the fake's `SlowStop` models.
+pub struct ControlTap {
+    inner: Arc<FakeClaudeCli>,
+    kill: KillMode,
+    refused: Arc<std::sync::atomic::AtomicUsize>,
+    controls: Mutex<Vec<Arc<dyn ProcessControl>>>,
+    foreign: Mutex<Option<Arc<dyn ProcessControl>>>,
+    fails_launch: bool,
+}
+
+impl ControlTap {
+    /// Passes every spawn through to `inner` and records each turn child's control.
+    pub fn new(inner: Arc<FakeClaudeCli>) -> Self {
+        Self {
+            inner,
+            kill: KillMode::Passed,
+            refused: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            controls: Mutex::new(Vec::new()),
+            foreign: Mutex::new(None),
+            fails_launch: false,
+        }
+    }
+
+    /// The same, with a launcher that creates the turn child and then fails the launch with a
+    /// `CleanupRequired` carrying that child's control, as `stdio::open` does when it cannot end
+    /// a child it could not use.
+    pub fn failing_launch_over_a_child(inner: Arc<FakeClaudeCli>) -> Self {
+        Self {
+            fails_launch: true,
+            ..Self::new(inner)
+        }
+    }
+
+    /// The same, with a control whose kill fails with [`REFUSED_KILL`].
+    pub fn refusing_kill(inner: Arc<FakeClaudeCli>) -> Self {
+        Self {
+            kill: KillMode::Refused,
+            ..Self::new(inner)
+        }
+    }
+
+    /// The same, with a control whose kill panics, as a faulty host control can.
+    pub fn panicking_kill(inner: Arc<FakeClaudeCli>) -> Self {
+        Self {
+            kill: KillMode::Panics,
+            ..Self::new(inner)
+        }
+    }
+
+    /// The same, with a control whose kill fails with a `CleanupRequired` of its own, naming
+    /// another control than the one the launcher handed out ([`foreign_control`](Self::foreign_control)).
+    pub fn answering_with_its_own_cleanup(inner: Arc<FakeClaudeCli>) -> Self {
+        Self {
+            kill: KillMode::OwnCleanup,
+            ..Self::new(inner)
+        }
+    }
+
+    /// The control named inside the `CleanupRequired` that [`answering_with_its_own_cleanup`]
+    /// (Self::answering_with_its_own_cleanup) returns, once a turn child was launched.
+    pub fn foreign_control(&self) -> Option<Arc<dyn ProcessControl>> {
+        lock(&self.foreign).as_ref().map(Arc::clone)
+    }
+
+    /// How many kills the refusing control was asked for.
+    pub fn refused_kills(&self) -> usize {
+        self.refused.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The control of the newest turn child, exactly as the harness was handed it.
+    pub fn newest_turn_control(&self) -> Option<Arc<dyn ProcessControl>> {
+        lock(&self.controls).last().map(Arc::clone)
+    }
+}
+
+#[async_trait::async_trait]
+impl ProcessLauncher for ControlTap {
+    async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
+        let is_turn = !is_probe(&spec.argv);
+        let mut child = self.inner.spawn(spec).await?;
+        if is_turn && self.fails_launch {
+            lock(&self.controls).push(Arc::clone(&child.control));
+            return Err(Error::CleanupRequired {
+                control: child.control,
+                source: Box::new(Error::Closed {
+                    subject: REFUSED_LAUNCH,
+                }),
+            });
+        }
+        if is_turn && self.kill != KillMode::Passed {
+            let foreign = (self.kill == KillMode::OwnCleanup).then(|| {
+                let foreign: Arc<dyn ProcessControl> = Arc::new(HostControl {
+                    inner: Arc::clone(&child.control),
+                    kill: KillMode::Refused,
+                    asked: Arc::clone(&self.refused),
+                    foreign: None,
+                });
+                *lock(&self.foreign) = Some(Arc::clone(&foreign));
+                foreign
+            });
+            child.control = Arc::new(HostControl {
+                inner: child.control,
+                kill: self.kill,
+                asked: Arc::clone(&self.refused),
+                foreign,
+            });
+        }
+        if is_turn {
+            lock(&self.controls).push(Arc::clone(&child.control));
+        }
+        Ok(child)
+    }
+}
+
+/// What a [`ControlTap`]'s control does when it is asked to kill.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KillMode {
+    /// Whatever the fake child does.
+    Passed,
+    /// Fails with an error of the host's own.
+    Refused,
+    /// Panics.
+    Panics,
+    /// Fails with a `CleanupRequired` that names another control.
+    OwnCleanup,
+}
+
+/// A host control whose kill fails or panics, in the way a host's own would.
+struct HostControl {
+    inner: Arc<dyn ProcessControl>,
+    kill: KillMode,
+    asked: Arc<std::sync::atomic::AtomicUsize>,
+    foreign: Option<Arc<dyn ProcessControl>>,
+}
+
+#[async_trait::async_trait]
+impl ProcessControl for HostControl {
+    fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
+
+    fn stderr_tail(&self) -> String {
+        self.inner.stderr_tail()
+    }
+
+    async fn wait(&self) -> Result<ExitStatus> {
+        self.inner.wait().await
+    }
+
+    async fn interrupt(&self, reason: CancelReason) -> Result<InterruptOutcome> {
+        self.inner.interrupt(reason).await
+    }
+
+    async fn kill(&self, _reason: CancelReason) -> Result<()> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.kill == KillMode::Panics {
+            panic!("{REFUSED_KILL}: a host control that panics");
+        }
+        if let (KillMode::OwnCleanup, Some(control)) = (self.kill, &self.foreign) {
+            return Err(Error::CleanupRequired {
+                control: Arc::clone(control),
+                source: Box::new(Error::Closed {
+                    subject: REFUSED_KILL,
+                }),
+            });
+        }
+        Err(Error::Closed {
+            subject: REFUSED_KILL,
+        })
+    }
 }

@@ -12,6 +12,14 @@
 //! that is a property of one launcher, so nothing here folds it in. Every method names its start
 //! point, because a bound is only useful to a caller that knows when to start counting.
 //!
+//! A bound that runs out is not an error type of its own. A stop that spends its bound, or fails
+//! sooner with the host control's own error, reaches the caller of `cancel` or `close` as
+//! `Error::CleanupRequired`, carrying the host's `ProcessControl`, with the stage's
+//! `Error::Timeout` as its `cause()`; the figures here say when, and the guide says what then. A
+//! close still returns a bare `Error::Timeout` for the wait on a launch the launcher never
+//! finished, where no child exists yet to carry a control for, and for an artifact removal that ran
+//! out, after a stop that succeeded; neither is a failed stop.
+//!
 //! Arithmetic saturates, so a `Limits` holding `Duration::MAX` yields `Duration::MAX` rather than
 //! a panic.
 //!
@@ -108,6 +116,11 @@ impl Deadlines {
     /// the kill (`shutdown_timeout`) and the reap (`shutdown_timeout`). Formula:
     /// `2 * kill_grace + 2 * shutdown_timeout`. This is the bound for any launcher, not the smaller
     /// figure the core `TokioLauncher` comes to. At `Limits::default()` it is 14 s.
+    ///
+    /// A stop that is still not done at this bound, or ended sooner by an error from the host's
+    /// control, is returned as `Error::CleanupRequired` carrying that control; the stage that ran
+    /// out is its `cause()`, an `Error::Timeout` naming `process-tree termination` or
+    /// `process reaping`.
     ///
     /// # Example
     ///
@@ -243,6 +256,9 @@ impl Deadlines {
     /// The other branch, a launcher that returns nothing within `shutdown_timeout`, ends the close
     /// at [`close_no_turn`](Self::close_no_turn)'s figure with `Error::Timeout` naming the pending
     /// launch and leaves the session `Closing`.
+    /// A later `close` that finds that timeout kept is bounded by
+    /// [`close_after_pending_launch`](Self::close_after_pending_launch); it is not part of this
+    /// figure.
     ///
     /// The 24 s branch needs the stop to have started by the end of the first wait, and the stop
     /// starts when the `start_turn` call that owns the launch runs again after the launcher
@@ -269,6 +285,30 @@ impl Deadlines {
         launch_wait(&self.limits)
             .saturating_add(self.process_stop())
             .saturating_add(removal_bound(&self.limits))
+    }
+
+    /// From the call to a later `Session::close` that finds a close which gave up on a pending
+    /// launch, until it returns, when the child that arrived since has a stop still running.
+    ///
+    /// That close waits for the stop and returns its `Error::CleanupRequired` if it failed. The
+    /// wait is the rest of one stop, so at most [`process_stop`](Self::process_stop). A later
+    /// close that finds the launch still in the launcher, or the stop already finished, returns
+    /// at once, so this is the bound, not the usual cost. Formula: `process_stop`. At
+    /// `Limits::default()` it is 14 s.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use mango_agent_claude::deadlines::Deadlines;
+    /// use mango_external_agents::Limits;
+    ///
+    /// let deadlines = Deadlines::from_limits(&Limits::default());
+    /// assert_eq!(deadlines.close_after_pending_launch(), Duration::from_secs(14));
+    /// ```
+    #[must_use]
+    pub fn close_after_pending_launch(&self) -> Duration {
+        self.process_stop()
     }
 
     /// How long any `Session::close` can take, counted from the call to `close`.
