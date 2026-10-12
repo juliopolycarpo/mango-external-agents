@@ -119,6 +119,20 @@ impl Teardown {
         Some(self.wait().await)
     }
 
+    /// The outcome if one is published, and otherwise the wait for it when a worker has started.
+    ///
+    /// `None` says no worker owns a child yet. It reads two flags and arms no timer, so it is safe
+    /// on any runtime a host calls in from, one built without a time driver included.
+    async fn wait_if_started(&self) -> Option<Result<()>> {
+        if let Some(outcome) = self.outcome() {
+            return Some(outcome);
+        }
+        if !self.worker_started.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(self.wait().await)
+    }
+
     fn starts_worker(&self) -> bool {
         !self.worker_started.swap(true, Ordering::AcqRel)
     }
@@ -374,10 +388,9 @@ impl ClaudeSession {
             // child to stop here, so this call returns at once, as the first cancel did, instead
             // of waiting for a launcher nothing here bounds. A teardown whose worker has started
             // is waited for: its stop is bounded stage by stage.
-            StopClaim::Existing(Some(teardown)) if launching => teardown
-                .wait_past_launch(Duration::ZERO)
-                .await
-                .unwrap_or(Ok(())),
+            StopClaim::Existing(Some(teardown)) if launching => {
+                teardown.wait_if_started().await.unwrap_or(Ok(()))
+            }
             claim => await_stop_claim(&self.shared, claim, reason, false).await,
         }
     }
@@ -434,12 +447,17 @@ fn claim_stop(
     if taken.control.is_none() {
         // A reservation with no control has no native process yet. Its start guard owns the child
         // if one arrives; claiming it stopped here would free or taint the wrong lifecycle.
-        state
+        let teardown = state
             .active
             .as_mut()
             .filter(|active| Arc::ptr_eq(&active.end, &taken.end))
             .map(|active| turn_teardown(active, true))
             .expect("expected the pending stop claim to retain its active Claude turn");
+        // A launch that already failed over a child it could not end published that failure; the
+        // caller hears it rather than a pending launch's `Ok`.
+        if teardown.outcome().is_some() {
+            return StopClaim::Existing(Some(teardown));
+        }
         return StopClaim::PendingStart;
     }
     if let Some(teardown) = existing_teardown {
@@ -597,6 +615,24 @@ fn finish_unstarted_teardown(shared: &Shared, end: &Arc<TurnEnd>) {
         && teardown.starts_worker()
     {
         teardown.finish(Ok(()));
+    }
+}
+
+/// Keeps a launch that failed over a child it could not end as the turn's failed teardown.
+///
+/// The reservation stays taken, as it does after any stop that failed, and the error is what every
+/// later `cancel` and `close` repeats. `error` must carry the control, as `CleanupRequired` does.
+fn retain_failed_launch(shared: &Shared, end: &Arc<TurnEnd>, error: &Error) {
+    let teardown = shared
+        .lock()
+        .active
+        .as_mut()
+        .filter(|active| Arc::ptr_eq(&active.end, end))
+        .map(|active| turn_teardown(active, true));
+    if let Some(teardown) = teardown
+        && teardown.starts_worker()
+    {
+        teardown.finish(Err(copy_error(error)));
     }
 }
 
@@ -828,6 +864,11 @@ impl Drop for AbandonedStart {
             let control = match spawn {
                 Some(task) => match task.await {
                     Ok(Ok(transport)) => Some(transport.control),
+                    Ok(Err(error)) if error.cleanup_control().is_some() => {
+                        retain_failed_launch(&shared, &taken.end, &error);
+                        crate::mcp::release_after_stop(lease, false).await;
+                        return;
+                    }
                     Ok(Err(_)) | Err(_) => None,
                 },
                 None => owned_control.or(taken.control),
@@ -1218,6 +1259,15 @@ impl mango_external_agents::Session for ClaudeSession {
             // this call made above, and only if a stop has not already taken it.
             Err(error) => {
                 abandoned.disarm();
+                if error.cleanup_control().is_some() {
+                    // The launcher failed after it created a child it could not end. That child
+                    // may still read the artifact, and the host needs the control the error
+                    // carries from the next `cancel` or `close` too.
+                    retain_failed_launch(&self.shared, &end, &error);
+                    crate::mcp::release_after_stop(mcp_lease.take(), false).await;
+                    crate::mcp::release_after_stop(abandoned.mcp_lease.take(), false).await;
+                    return Err(error);
+                }
                 finish_unstarted_teardown(&self.shared, &end);
                 forget_reservation(&self.shared, &end);
                 crate::mcp::release_off_worker(mcp_lease.take()).await;
@@ -1532,7 +1582,7 @@ impl ClaudeSession {
             (state.active.is_none(), late)
         };
         let outcome = match late {
-            Some(late) => late.wait_past_launch(Duration::ZERO).await,
+            Some(late) => late.wait_if_started().await,
             None => None,
         };
         match outcome {

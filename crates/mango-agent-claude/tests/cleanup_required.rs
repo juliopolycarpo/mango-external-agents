@@ -18,7 +18,7 @@ use mango_external_agents::{
     CancelReason, CloseReason, Error, EventKind, Harness, HostContext, Limits, OpenSession,
     Session, SessionStatus, TurnRequest, TurnStream,
 };
-use support::{ControlTap, FakeClaudeCli, REFUSED_KILL, Run, SlowStop, host_under};
+use support::{ControlTap, FakeClaudeCli, REFUSED_KILL, REFUSED_LAUNCH, Run, SlowStop, host_under};
 
 const NEVER: Duration = Duration::from_secs(60 * 60);
 const MILLISECOND: Duration = Duration::from_millis(1);
@@ -1020,6 +1020,130 @@ mod pending_launch_cancel {
 
         gate.release();
         let _ = starting.await;
+    }
+}
+
+/// A launch that fails over a child the launcher could not end leaves that child to the host.
+/// The session must not call itself done with it: it keeps the failure and the control.
+mod failed_launch {
+    use super::*;
+
+    fn assert_refused_launch(path: &str, error: &Error) {
+        assert!(
+            matches!(error.cause(), Error::Closed { subject } if *subject == REFUSED_LAUNCH),
+            "expected {path} to have the launcher's failure as its cause ({REFUSED_LAUNCH}) | received {error:?}"
+        );
+    }
+
+    async fn hold_failing_launch() -> Held {
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(stalled()));
+        open_over(launcher, ControlTap::failing_launch_over_a_child).await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_start_reports_it_and_the_next_cancel_and_close_repeat_it() {
+        let held = hold_failing_launch().await;
+
+        let started = held
+            .session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .map(drop)
+            .expect_err("expected the failed launch to fail the start");
+        assert_carries_host_control("the start", &started, &held);
+        assert_refused_launch("the start", &started);
+
+        let cancelled = held
+            .session
+            .cancel(CancelReason::Requested)
+            .await
+            .expect_err("expected the next cancel to repeat the failed launch");
+        assert_carries_host_control("the next cancel", &cancelled, &held);
+        let closed = held
+            .session
+            .close(CloseReason::Requested)
+            .await
+            .expect_err("expected the close to repeat the failed launch");
+        assert_cleanup_required("the close", &closed, &held);
+        assert_refused_launch("the close", &closed);
+        let status = held.session.snapshot().status;
+        assert_eq!(
+            status,
+            SessionStatus::Closing,
+            "expected a session with an unended child to stay Closing | received {status:?}"
+        );
+        held.reconcile();
+    }
+
+    /// The close gave up on the launch; the launch then fails over a child. A host that only
+    /// closes again must hear of that child, not be told the session is closed.
+    #[tokio::test(start_paused = true)]
+    async fn a_later_close_after_a_timed_out_close_reports_it_instead_of_closed() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(stalled()));
+        let gate = launcher.gate_turn_spawns();
+        let held = open_over(launcher, ControlTap::failing_launch_over_a_child).await;
+        let starting = tokio::spawn({
+            let session = Arc::clone(&held.session);
+            async move {
+                session
+                    .start_turn(TurnRequest::new("turn-1", "hold"))
+                    .await
+                    .map(drop)
+            }
+        });
+        gate.wait_for_spawn().await;
+        let _ = tokio::time::timeout(NEVER, held.session.close(CloseReason::Requested)).await;
+        gate.release();
+        let _ = tokio::time::timeout(NEVER, starting).await;
+
+        let again = held
+            .session
+            .close(CloseReason::Requested)
+            .await
+            .expect_err("expected the later close to report the child the launch left");
+
+        assert_cleanup_required("the later close", &again, &held);
+        assert_refused_launch("the later close", &again);
+        let status = held.session.snapshot().status;
+        assert_eq!(
+            status,
+            SessionStatus::Closing,
+            "expected a session with an unended child to stay Closing | received {status:?}"
+        );
+        held.reconcile();
+    }
+
+    /// The same, when the host dropped its `start_turn`: the guard that owns the launch reports.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_start_leaves_the_failure_for_a_later_close() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(stalled()));
+        let gate = launcher.gate_turn_spawns();
+        let held = open_over(launcher, ControlTap::failing_launch_over_a_child).await;
+        let starting = tokio::spawn({
+            let session = Arc::clone(&held.session);
+            async move {
+                session
+                    .start_turn(TurnRequest::new("turn-1", "hold"))
+                    .await
+                    .map(drop)
+            }
+        });
+        gate.wait_for_spawn().await;
+        let _ = tokio::time::timeout(NEVER, held.session.close(CloseReason::Requested)).await;
+        starting.abort();
+        let _ = starting.await;
+        gate.release();
+        tokio::time::sleep(held.limits.shutdown_timeout).await;
+
+        let again = held
+            .session
+            .close(CloseReason::Requested)
+            .await
+            .expect_err("expected the later close to report the child the launch left");
+
+        assert_cleanup_required("the later close", &again, &held);
+        assert_refused_launch("the later close", &again);
+        held.reconcile();
     }
 }
 

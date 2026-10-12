@@ -844,6 +844,9 @@ pub fn host_under(launcher: Arc<dyn ProcessLauncher>, limits: Limits) -> HostCon
         .expect("expected a host")
 }
 
+/// What the launcher says when it fails a launch over a child it could not end.
+pub const REFUSED_LAUNCH: &str = "the host's launcher could not end the child it failed to use";
+
 /// What the host's control says when it refuses the kill: the cause a host reads back.
 pub const REFUSED_KILL: &str = "the host's process control refused the kill";
 
@@ -859,6 +862,7 @@ pub struct ControlTap {
     refused: Arc<std::sync::atomic::AtomicUsize>,
     controls: Mutex<Vec<Arc<dyn ProcessControl>>>,
     foreign: Mutex<Option<Arc<dyn ProcessControl>>>,
+    fails_launch: bool,
 }
 
 impl ControlTap {
@@ -870,6 +874,17 @@ impl ControlTap {
             refused: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             controls: Mutex::new(Vec::new()),
             foreign: Mutex::new(None),
+            fails_launch: false,
+        }
+    }
+
+    /// The same, with a launcher that creates the turn child and then fails the launch with a
+    /// `CleanupRequired` carrying that child's control, as `stdio::open` does when it cannot end
+    /// a child it could not use.
+    pub fn failing_launch_over_a_child(inner: Arc<FakeClaudeCli>) -> Self {
+        Self {
+            fails_launch: true,
+            ..Self::new(inner)
         }
     }
 
@@ -920,6 +935,15 @@ impl ProcessLauncher for ControlTap {
     async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
         let is_turn = !is_probe(&spec.argv);
         let mut child = self.inner.spawn(spec).await?;
+        if is_turn && self.fails_launch {
+            lock(&self.controls).push(Arc::clone(&child.control));
+            return Err(Error::CleanupRequired {
+                control: child.control,
+                source: Box::new(Error::Closed {
+                    subject: REFUSED_LAUNCH,
+                }),
+            });
+        }
         if is_turn && self.kill != KillMode::Passed {
             let foreign = (self.kill == KillMode::OwnCleanup).then(|| {
                 let foreign: Arc<dyn ProcessControl> = Arc::new(HostControl {
