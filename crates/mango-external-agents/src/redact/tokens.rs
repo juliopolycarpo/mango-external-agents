@@ -59,10 +59,24 @@ pub(super) fn redact(text: &str, pass: Pass) -> Option<String> {
     }
 }
 
-/// What stands for a redacted private-key block while the name rules read the text, and is
-/// replaced by `[REDACTED]` when they are done. The marker itself would read as a closed container
-/// to a rule that is reading a value (`password: [REDACTED] more`), and this reads as a word.
-pub(super) const BLOCK_MARK: &str = "\u{e000}key-block\u{e001}";
+/// What stands for a redacted private-key block while the name rules read the text.
+///
+/// It is read the way the rules read the marker it replaces, `-----BEGIN PRIVATE KEY-----`: a word
+/// that a value in front of it may take, then a space, then a name with its dashes glued on
+/// (`PRIVATE KEY-----`). A name glued to the end of it (`-----END PRIVATE KEY-----abc: x`), a
+/// separator right after it or one on the next line is an assignment to the rules, and the block
+/// must not change that by being gone. The marker itself (`[REDACTED]`) would read as a closed
+/// container to a rule that is reading a value (`password: [REDACTED] more`).
+const BLOCK_MARK: &str = "\u{e000} \u{e001}PRIVATE_KEY-----";
+
+/// What is left of [`BLOCK_MARK`] when a value in front of it took its first word.
+const BLOCK_TAIL: &str = " \u{e001}PRIVATE_KEY-----";
+
+/// What the redacted text is left with once the rules are done: a mark that is whole is a
+/// `[REDACTED]`, and what a value left of one is gone.
+pub(super) fn settle_marks(text: &str) -> String {
+    text.replace(BLOCK_MARK, REDACTED).replace(BLOCK_TAIL, "")
+}
 
 /// The private-key blocks of `text`, found by a search for the begin marker and not a read of
 /// every run, each replaced by [`BLOCK_MARK`].
@@ -353,8 +367,12 @@ impl Ends {
 /// A private-key block: `-----BEGIN ... PRIVATE KEY-----` to the line that ends it. A certificate
 /// and a public key are not secrets and are left.
 ///
-/// A header with no end marker within [`MAX_BLOCK_BYTES`] is a key that was cut, or a sentence
-/// that mentions one: the marker goes, and the lines of base64 directly under it, and nothing else.
+/// Only a private key's own end marker closes it: `-----END PASSWORD-----` is a label that names a
+/// credential, and the rules have to read it. Nor does a marker close a block whose inside leaves a
+/// name waiting for its value: that value would run on past the marker, and the rules, which run
+/// after this pass, would never see the name. A header with no end marker within
+/// [`MAX_BLOCK_BYTES`] is a key that was cut, or a sentence that mentions one: the marker goes, and
+/// the lines of base64 directly under it, and nothing else.
 fn private_key_block(text: &str, start: usize, ends: &mut Ends) -> Option<usize> {
     let bytes = text.as_bytes();
     let label_start = start + b"-----BEGIN ".len();
@@ -362,25 +380,62 @@ fn private_key_block(text: &str, start: usize, ends: &mut Ends) -> Option<usize>
         return None;
     }
     let after_begin = closing_dashes(bytes, label_start, true)?;
-    let label = &bytes[label_start..after_begin - 5];
-    if !label.ends_with(b"PRIVATE KEY") && !label.ends_with(b"PRIVATE KEY BLOCK") {
+    if !is_private_key_label(&bytes[label_start..after_begin - 5]) {
         return None;
     }
-    let Some(at) = ends
+    // A name can be made of the header and what is glued to it (`PRIVATE KEY-----spo=`), and then
+    // the header belongs to the text a value is waited for in.
+    let from = if header_joins_the_text(bytes, after_begin) {
+        start
+    } else {
+        after_begin
+    };
+    let closing = ends
         .after(text, after_begin)
         .filter(|at| at - after_begin <= MAX_BLOCK_BYTES)
-    else {
-        return Some(body_lines(bytes, after_begin));
-    };
-    let marker = at + b"-----END ".len();
-    Some(closing_dashes(bytes, marker, false).unwrap_or(marker))
+        .filter(|at| !waits_on_a_value(&text[from..*at]))
+        .and_then(|at| {
+            let label = at + b"-----END ".len();
+            let close = closing_dashes(bytes, label, true)?;
+            is_private_key_label(&bytes[label..close - 5]).then_some(close)
+        });
+    Some(closing.unwrap_or_else(|| body_lines(text, after_begin, from)))
+}
+
+/// Whether the text after a header makes it part of a name: something is glued to the dashes, or
+/// a `:` or an `=` follows them, after blanks and breaks as the rules skip them.
+fn header_joins_the_text(bytes: &[u8], after: usize) -> bool {
+    let mut at = after;
+    while let Some(&byte) = bytes.get(at) {
+        count_steps(1);
+        if let Some(next) = line_break(bytes, at) {
+            at = next;
+        } else if byte.is_ascii_whitespace() {
+            at += 1;
+        } else {
+            return at == after || matches!(byte, b':' | b'=');
+        }
+    }
+    false
+}
+
+/// Whether a label between `BEGIN ` or `END ` and the dashes is a private key's.
+fn is_private_key_label(label: &[u8]) -> bool {
+    label.ends_with(b"PRIVATE KEY") || label.ends_with(b"PRIVATE KEY BLOCK")
 }
 
 /// Where the lines of base64 that start at `from`, right under a header, end. A line break is a
 /// real one or the two characters a JSON string writes it as. Lines of [`MIN_BODY_LINE`]
 /// characters or more are the body, up to [`MAX_BODY_LINES`]; one shorter line after them is the
 /// last. The first line may follow the header without a break.
-fn body_lines(bytes: &[u8], from: usize) -> usize {
+///
+/// A line counts only when it ends where a line ends: at a break, at the end of the text or at the
+/// quote of a JSON string. A run that stops at a `:` or a space is a word, or the name of a
+/// credential glued to base64, and the rules need to read it. For the same reason a line that a
+/// name is waiting on (`pwd=` and a value on the next line) is left: this pass runs before the
+/// rules, so whatever it takes they never see.
+fn body_lines(text: &str, from: usize, header: usize) -> usize {
+    let bytes = text.as_bytes();
     let (mut end, mut long) = (from, 0);
     for line in 0..MAX_BODY_LINES {
         let start = match line_break(bytes, end) {
@@ -391,16 +446,52 @@ fn body_lines(bytes: &[u8], from: usize) -> usize {
         let run_end = take_while(bytes, start, is_base64);
         count_steps(run_end - start + 1);
         let length = run_end - start;
-        if length >= MIN_BODY_LINE {
-            (end, long) = (run_end, long + 1);
-            continue;
+        let accepted = length >= MIN_BODY_LINE || (long > 0 && length >= 4);
+        if !accepted
+            || !is_padded_base64(&bytes[start..run_end])
+            || !ends_a_line(bytes, run_end)
+            || waits_on_a_value(&text[if line == 0 { header } else { start }..run_end])
+        {
+            break;
         }
-        if long > 0 && length >= 4 {
-            end = run_end;
+        end = run_end;
+        if length < MIN_BODY_LINE {
+            break;
         }
-        break;
+        long += 1;
     }
     end
+}
+
+/// Whether a line of base64 that stops at `at` ends where a line ends: at a break, at the end of
+/// the text, or at the quote of a JSON string, when no `:` or `=` follows the quote (that would
+/// make the run the name of a quoted pair).
+fn ends_a_line(bytes: &[u8], at: usize) -> bool {
+    if at == bytes.len() || line_break(bytes, at).is_some() {
+        return true;
+    }
+    let rest = &bytes[at..];
+    let after = match rest {
+        [b'"' | b'\'', tail @ ..] => tail,
+        [b'\\', b'"' | b'\'', tail @ ..] => tail,
+        _ => return false,
+    };
+    let next = after
+        .iter()
+        .find(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'));
+    !matches!(next, Some(b':' | b'='))
+}
+
+/// Whether `run` is base64 with `=` only as padding: one or two at its end. An `=` in the middle
+/// makes it an assignment (`ApiKey=value`), which the rules read.
+fn is_padded_base64(run: &[u8]) -> bool {
+    let padding = run.iter().rev().take_while(|byte| **byte == b'=').count();
+    padding <= 2 && !run[..run.len() - padding].contains(&b'=')
+}
+
+/// Whether a credential's name stands at the end of `line` with its value still to come.
+fn waits_on_a_value(line: &str) -> bool {
+    super::ends_awaiting_value(line)
 }
 
 fn is_base64(byte: u8) -> bool {

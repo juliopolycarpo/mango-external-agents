@@ -500,3 +500,59 @@ fn an_end_marker_past_the_window_does_not_close_the_block() {
         received.get(..60)
     );
 }
+
+const KEY_LINE: &str = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj";
+
+/// A credential name under a key that has no end marker is still a name: the block takes the header
+/// and the lines of base64, and the rules read what is left as they read it with no key above it.
+#[test]
+fn a_name_under_an_unclosed_key_keeps_its_value_redacted() {
+    let begin = concat!("-----BEGIN RSA PRIV", "ATE KEY-----");
+    for (what, after) in [
+        ("a name on its own line", "password: CNRY1\n"),
+        ("a name whose value is on the next line", "pwd=\nCNRY2"),
+        (
+            "a name glued to the base64 before it",
+            "AAAAAAAAAAAAAsecret: CNRY4",
+        ),
+        (
+            "an end label that is not a key's",
+            "-----END PASSWORD-----: CNRY5",
+        ),
+    ] {
+        let text = format!("{begin}\n{KEY_LINE}\n{after}");
+        let received = shown(&text);
+        let expected = format!("[REDACTED]\n{}", stderr_text(after));
+        assert!(
+            !received.contains("CNRY") && received == expected,
+            "expected {what} read as a name after the key | input {text:?} received: {received:?}, expected: {expected:?}"
+        );
+    }
+}
+
+/// The lines under a header end where a line ends. A run that stops in the middle of a line is a
+/// word, or the name of a credential, and no part of the key.
+#[test]
+fn a_base64_run_that_stops_mid_line_is_not_a_line_of_the_key() {
+    let begin = concat!("-----BEGIN PRIV", "ATE KEY-----");
+    let text = format!("{begin}\n{KEY_LINE}\n{KEY_LINE} trailing words\nAbCd+/==\n");
+    assert_eq!(
+        shown(&text),
+        format!("[REDACTED]\n{KEY_LINE} trailing words\nAbCd+/==\n"),
+        "expected a line followed by words to stay | input {text:?}"
+    );
+    // A JSON string ends its last line with a quote, and the key is still gone.
+    let json = format!("{{\"error\":\"{begin}\\n{KEY_LINE}\\n{KEY_LINE}\"}}");
+    assert_eq!(shown(&json), "{\"error\":\"[REDACTED]\"}");
+}
+
+/// Only a private key's end marker closes a private key.
+#[test]
+fn an_end_marker_with_another_label_does_not_close_the_block() {
+    let begin = concat!("-----BEGIN PRIV", "ATE KEY-----");
+    let text = format!("{begin}\n{KEY_LINE}\n-----END CERTIFICATE-----\nkept: words\n");
+    assert_eq!(
+        shown(&text),
+        "[REDACTED]\n-----END CERTIFICATE-----\nkept: words\n"
+    );
+}

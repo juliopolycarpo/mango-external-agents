@@ -144,7 +144,7 @@ fn rules_round(plain: &str, tokens: bool) -> String {
         .flatten();
     let text = remove_boundaries(named_last.unwrap_or(settled));
     if blocks.is_some() {
-        return text.replace(tokens::BLOCK_MARK, REDACTED);
+        return tokens::settle_marks(&text);
     }
     text
 }

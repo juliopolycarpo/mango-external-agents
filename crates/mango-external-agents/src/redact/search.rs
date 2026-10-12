@@ -196,27 +196,76 @@ fn no_entry_point_panics_on_generated_text() {
     search(assert_nothing_panics);
 }
 
-/// The message entry points add to the rules and never get in their way: where `stderr_text`
-/// takes [`SECRET`] out, `message_text` does too. Text with a private-key marker is left out: a
-/// block is replaced whole, and the words in it (`password`, `Bearer`) are no longer names for the
-/// text after it, so a secret glued to the end marker is read as the stderr rules read it only by
-/// accident.
-fn assert_messages_redact_what_stderr_redacts(raw: &str) {
-    if stderr_text(raw).contains(SECRET) || raw.contains("PRIVATE KEY") {
-        return;
+/// How many occurrences of [`SECRET`] get a label of their own.
+const LABELS: usize = 10;
+
+/// `raw` with its first [`LABELS`] occurrences of [`SECRET`] written `SEKRET0`, `SEKRET1`, ...: a
+/// value that survives can then be told from the one next to it.
+fn labelled(raw: &str) -> String {
+    let stem = &SECRET[..SECRET.len() - 1];
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    for index in 0..LABELS {
+        let Some(at) = rest.find(SECRET) else { break };
+        out.push_str(&rest[..at]);
+        out.push_str(&format!("{stem}{index}"));
+        rest = &rest[at + SECRET.len()..];
     }
-    let received = message_text(raw);
-    assert!(
-        !received.contains(SECRET),
-        "expected {SECRET:?} gone from the message form as it is from stderr_text | input {raw:?} (seed {}) received: {received:?}",
-        seed()
-    );
+    out.push_str(rest);
+    out
+}
+
+/// The token pass only adds: a value the name rules redact (`stderr_text`) is redacted by the
+/// message entry points too, occurrence by occurrence, whatever the text holds, private-key blocks
+/// included. A block or a token that takes a name with it, or ends where a rule would have carried
+/// on, shows here as a label that survives the message form and not the stderr form.
+fn assert_the_token_pass_only_adds(raw: &str) {
+    let text = labelled(raw);
+    let (rules, message) = (stderr_text(&text), message_text(&text));
+    let structured_form = bounded(&text, TextLimit::ErrorMessage).text;
+    for index in 0..LABELS {
+        let label = format!("{}{index}", &SECRET[..SECRET.len() - 1]);
+        for (entry, received) in [("message_text", &message), ("bounded", &structured_form)] {
+            assert!(
+                !received.contains(&label) || rules.contains(&label),
+                "expected {label} gone from {entry} as it is from stderr_text | input {text:?} (seed {}) stderr_text: {rules:?}, {entry}: {received:?}",
+                seed()
+            );
+        }
+    }
 }
 
 #[test]
 #[ignore = "a long search; see the module docs"]
-fn the_message_form_redacts_whatever_stderr_text_redacts_in_generated_text() {
-    search(assert_messages_redact_what_stderr_redacts);
+fn the_token_pass_only_adds_to_what_the_name_rules_redact_in_generated_text() {
+    search(assert_the_token_pass_only_adds);
+}
+
+#[test]
+fn the_token_pass_only_adds_in_both_corpora_and_their_pieces() {
+    let corpus = LEAKS
+        .iter()
+        .chain(BARE_TOKENS)
+        .map(|leak| leak.text)
+        .chain(BENIGN.iter().copied())
+        .chain(BENIGN_NEAR_TOKENS.iter().copied())
+        .chain(FRAGMENTS.iter().copied())
+        .chain(SHAPES.iter().copied());
+    for text in corpus {
+        assert_the_token_pass_only_adds(text);
+    }
+}
+
+#[test]
+fn the_labels_tell_one_occurrence_from_the_next() {
+    let text = format!("a {SECRET} b {SECRET} c");
+    assert_eq!(labelled(&text), "a SEKRET0 b SEKRET1 c");
+    let many = SECRET.repeat(LABELS + 2);
+    assert!(
+        labelled(&many).ends_with(&SECRET.repeat(2)),
+        "expected the occurrences past {LABELS} left as they are | received: {:?}",
+        labelled(&many)
+    );
 }
 
 #[test]
