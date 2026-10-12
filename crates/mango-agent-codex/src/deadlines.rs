@@ -49,9 +49,11 @@ pub(crate) fn interrupt_bound(limits: &Limits) -> Duration {
 /// The client bounds its own close at twice `shutdown_timeout`: one for a notification call
 /// that holds its cancellation off and for the answers still owed to the app-server, and one for
 /// the queue and the link; a connection that had already ended has the report of that end waited
-/// for inside the same two. This is one `shutdown_timeout` more than that, so a close that uses
-/// all of its own time still returns its own result, and the reap never depends on a client that
-/// overran it. A bound equal to the client's would cut such a close short and report a timeout
+/// for inside the same two. A handler that blocks its thread costs the client up to 100 ms more,
+/// 50 ms for each of two aborts it waits to land. This is one `shutdown_timeout` more than the
+/// two, so a close that uses all of its own time, those 100 ms among it, still returns its own
+/// result as long as `shutdown_timeout` is at least 100 ms, and the reap never depends on a client
+/// that overran it. A bound equal to the client's would cut such a close short and report a timeout
 /// for a teardown that delivered the terminal and reaped the child.
 ///
 /// ```ignore

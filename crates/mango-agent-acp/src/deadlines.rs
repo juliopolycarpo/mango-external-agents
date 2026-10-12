@@ -295,8 +295,9 @@ impl Deadlines {
 
 /// How long a connection's close is given before the child goes to the reaper.
 ///
-/// The peer's own close may take twice this; the harness gives it one `shutdown_timeout` and moves
-/// on. Read by `ConnectionHandle::shutdown`.
+/// The peer's own close may take twice this, and 100 ms more behind a handler that blocks its
+/// thread; the harness gives it one `shutdown_timeout`, cuts it there and moves on. Read by
+/// `ConnectionHandle::shutdown`.
 ///
 /// ```ignore
 /// tokio::time::timeout(connection_close_bound(&limits), client.close()).await

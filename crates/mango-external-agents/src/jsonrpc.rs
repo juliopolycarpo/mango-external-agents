@@ -12,6 +12,32 @@
 //!
 //! Framing, byte caps and process teardown all belong to the transport underneath; this speaks the
 //! protocol on top of them.
+//!
+//! # The timeouts of a close
+//!
+//! A [`Client::close`] that runs out of time returns [`Error::Timeout`], and which of its waits
+//! ran out is told by type, not by the text of the error. The classifiers read through a
+//! [`Dispatch`] annotation, as [`Error::cause`] does, and each is `false` for every other
+//! timeout, a request left unanswered and a frame left unwritten among them.
+//!
+//! - [`is_link_shutdown_timeout`]: closing the link, behind whatever was still queued for it, did
+//!   not finish within [`ClientOptions::shutdown_timeout`]. The link may still be open and the
+//!   peer still running, which a host that owns the process has to deal with.
+//! - [`is_reader_shutdown_timeout`]: the link was dealt with, and the reader had not let go by
+//!   the close's bound of twice `shutdown_timeout`. Either another close, kept and not polled,
+//!   holds the reader while it waits for the handler to be told that the peer exited, or this
+//!   close took the reader down and a handler that blocks its thread kept it from stopping. The
+//!   link is closed; the handler's call may still be running.
+//! - [`is_handler_shutdown_timeout`]: the link was dealt with, and the task that runs
+//!   [`on_notification`](PeerHandler::on_notification) and
+//!   [`on_request_handoff`](PeerHandler::on_request_handoff) was still running as the close
+//!   ended, because a call that blocks its thread never reaches the await where an abort lands.
+//!   The close waited for it for what the first of its two graces had left, or for the allowance
+//!   an abort needs to land, and looked at it again when the link was closed. The link is
+//!   closed; the task stays on its blocked thread until the call returns.
+//!
+//! A close whose link failed to close returns that failure rather than the reader's or the
+//! handler's timeout, and the reader's timeout rather than the handler's.
 
 mod outbox;
 
@@ -303,10 +329,24 @@ const LINK_SHUTDOWN: &str = "JSON-RPC link shutdown";
 /// not [`LINK_SHUTDOWN`].
 const READER_SHUTDOWN: &str = "JSON-RPC reader shutdown";
 
+/// What a [`Client::close`] that ran out of its bound waiting for the handler's task to stop names
+/// as the call that stalled. The link was dealt with by then, as for [`READER_SHUTDOWN`], and the
+/// reader is not what was waited for.
+const HANDLER_SHUTDOWN: &str = "JSON-RPC handler shutdown";
+
+/// What a [`Client::close`] that has spent its bound still gives a task it has just aborted, the
+/// reader or the handler's, to notice the abort. The abort reaches a task at its next await, a
+/// scheduler turn away, so a bound already spent would otherwise read a task that was about to
+/// stop as one that cannot, whatever `shutdown_timeout` is. It is how long the close waits, not
+/// its verdict: the handler's task is looked at again as the close ends.
+const ABORT_SETTLE: Duration = Duration::from_millis(50);
+
 /// Whether `error` is a [`Client::close`] that gave up: closing the link, behind whatever
 /// was still queued for it, did not finish within
 /// [`ClientOptions::shutdown_timeout`]. The link may still be open and the peer still
-/// running, which a host that owns the process has to deal with.
+/// running, which a host that owns the process has to deal with. The other timeouts of a
+/// close are [`is_reader_shutdown_timeout`] and [`is_handler_shutdown_timeout`]; the
+/// [module documentation](self) says what each means.
 ///
 /// It is `false` for every other timeout, a request left unanswered and a frame left
 /// unwritten among them. It reads through what [`Error::cause`] reads through, a
@@ -327,6 +367,65 @@ const READER_SHUTDOWN: &str = "JSON-RPC reader shutdown";
 #[must_use]
 pub fn is_link_shutdown_timeout(error: &Error) -> bool {
     matches!(error.cause(), Error::Timeout { operation, .. } if operation == LINK_SHUTDOWN)
+}
+
+/// Whether `error` is a [`Client::close`] that gave up on the reader: the link was dealt with,
+/// and the reader had not let go within the close's bound of twice
+/// [`ClientOptions::shutdown_timeout`]. Another close that was kept and not polled again can hold
+/// the reader while it waits for the handler to be told the peer exited, and a handler that blocks
+/// its thread keeps a reader that was taken down from stopping. The link is closed by then, which
+/// is what tells this from [`is_link_shutdown_timeout`], and the handler's call may still be
+/// running. The [module documentation](self) says what each timeout means.
+///
+/// It is `false` for every other timeout, and for the link's own. It reads through what
+/// [`Error::cause`] reads through, a [`Dispatch`] annotation among it. A close that gave up is
+/// known by the operation text this client names it by, so another layer's `Timeout` that carries
+/// that very text reads as one.
+///
+/// ```no_run
+/// # async fn example(client: &mango_external_agents::jsonrpc::Client) {
+/// use mango_external_agents::jsonrpc::is_reader_shutdown_timeout;
+///
+/// if let Err(error) = client.close().await {
+///     if is_reader_shutdown_timeout(&error) {
+///         eprintln!("the link is closed; the handler's call has not returned");
+///     }
+/// }
+/// # }
+/// ```
+#[must_use]
+pub fn is_reader_shutdown_timeout(error: &Error) -> bool {
+    matches!(error.cause(), Error::Timeout { operation, .. } if operation == READER_SHUTDOWN)
+}
+
+/// Whether `error` is a [`Client::close`] that gave up on the handler's task: the link was dealt
+/// with, and the task that runs [`on_notification`](PeerHandler::on_notification) and
+/// [`on_request_handoff`](PeerHandler::on_request_handoff) was still running as the close ended,
+/// because a call that blocks its thread never reaches the await where an abort lands. The close
+/// looks at the task again when the link is closed, so a task that ended late is not this. The
+/// link is closed by then, which is what tells this from
+/// [`is_link_shutdown_timeout`], and the task stays on its blocked thread until the call returns.
+/// The [module documentation](self) says what each timeout of a close means.
+///
+/// It is `false` for every other timeout, and for the link's and the reader's. It reads through
+/// what [`Error::cause`] reads through, a [`Dispatch`] annotation among it. A close that gave up
+/// is known by the operation text this client names it by, so another layer's `Timeout` that
+/// carries that very text reads as one.
+///
+/// ```no_run
+/// # async fn example(client: &mango_external_agents::jsonrpc::Client) {
+/// use mango_external_agents::jsonrpc::is_handler_shutdown_timeout;
+///
+/// if let Err(error) = client.close().await {
+///     if is_handler_shutdown_timeout(&error) {
+///         eprintln!("the link is closed; a handler call is blocking its thread");
+///     }
+/// }
+/// # }
+/// ```
+#[must_use]
+pub fn is_handler_shutdown_timeout(error: &Error) -> bool {
+    matches!(error.cause(), Error::Timeout { operation, .. } if operation == HANDLER_SHUTDOWN)
 }
 
 impl PeerTermination {
@@ -435,6 +534,46 @@ fn json_value_type(value: &Value) -> &'static str {
 }
 
 /// What the harness above does with what the peer said.
+///
+/// # A handler must not block its thread
+///
+/// Every method here is `async` and runs on the connection's runtime. This client stops a call
+/// by aborting its task, and an abort takes effect at the call's next await. A call that blocks
+/// its thread without awaiting, with `std::thread::sleep`, a `std` lock held across a wait or a
+/// blocking read, cannot be stopped that way, and it holds a worker thread of the runtime while
+/// it blocks. Wait on the runtime's own primitives, or hand blocking work to
+/// [`tokio::task::spawn_blocking`]. The bounds below also rely on another worker thread being
+/// free to run the client's timers, which a runtime whose workers are all blocked cannot do.
+///
+/// What a handler that blocks does to [`Client::close`] depends on the call. In every case the
+/// close ends within its bound, twice `shutdown_timeout`, plus at most 50 ms for each abort it
+/// has to wait to land, the link is closed, and the call stays on its blocked thread until it
+/// returns, when nothing is reported and nothing panics. The client stays closed,
+/// [`Client::ended`] keeps the end it recorded, no end is told to the handler through a further
+/// call (`on_terminated`, where it is the call that blocks, was made once), and a later close or
+/// a drop does not wait for the call again: a later close that returns `Ok` says nothing of
+/// whether the call has returned.
+///
+/// - [`on_notification`](Self::on_notification) and
+///   [`on_request_handoff`](Self::on_request_handoff), on a connection that has not ended: these
+///   run on the handler's task. The close aborts it and waits for it as long as the first of its
+///   two graces has left, as it would for a slow call, or 50 ms if that is spent, and then goes
+///   on to close the link. It returns [`Error::Timeout`] for the operation "JSON-RPC handler
+///   shutdown" ([`is_handler_shutdown_timeout`]) if the task is still running as it ends, or
+///   the link's own error if closing the link failed. A task that ended in the meantime, however
+///   late, is not a failure.
+/// - [`on_terminated`](Self::on_terminated), and a call of either kind above on a connection that
+///   ended under this side once the reader has taken the handler's task to drain it (a close that
+///   gets to the task first, while the reader has recorded the end but not yet reached it, is
+///   in the case above): the reader is the one waiting, for the call or for the task. The
+///   close waits for the reader within its bound, then takes it down, gives the abort 50 ms to
+///   land when its bound is already spent, and returns [`Error::Timeout`] for the operation
+///   "JSON-RPC reader shutdown" ([`is_reader_shutdown_timeout`]) when the reader is inside a call
+///   that blocks, or the link's own error. A reader parked at an await, waiting for a task whose
+///   call blocks, is taken down by the abort, and the close then returns `Ok`.
+/// - [`on_request`](Self::on_request) runs on tasks that a close lets write their refusals for up
+///   to `shutdown_timeout`, which a call that blocks uses whole, and then aborts without waiting
+///   for them: the close returns `Ok`.
 #[async_trait::async_trait]
 pub trait PeerHandler: Send + Sync {
     /// The peer announced something.
@@ -1189,6 +1328,9 @@ pub struct Client {
     /// The reader's task, so that a close can tell it is being made from that task without
     /// taking the lock a close that waits for the reader holds.
     reader: tokio::task::Id,
+    /// Stops the reader without the lock on its handle, which a close that was leaked, polled
+    /// and never dropped, holds for good.
+    reader_abort: tokio::task::AbortHandle,
 }
 
 /// How a connection came to its end.
@@ -1760,6 +1902,10 @@ struct ClientState {
     /// the holds, so a test can ask for a hold exactly there.
     #[cfg(test)]
     after_cancelling_raised: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once in [`ClientState::drain_in_flight_until`] right after it took the set of
+    /// answers, so a test can have the handler's task start one into the set that follows.
+    #[cfg(test)]
+    after_in_flight_taken: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs once in [`Client::hold_cancellation`] between counting the hold and reading the
     /// flag, so a test can have a cancellation land exactly there.
     #[cfg(test)]
@@ -2579,6 +2725,8 @@ impl Client {
             #[cfg(test)]
             after_cancelling_raised: StdMutex::new(None),
             #[cfg(test)]
+            after_in_flight_taken: StdMutex::new(None),
+            #[cfg(test)]
             after_hold_counted: StdMutex::new(None),
             #[cfg(test)]
             after_queue_length_read: StdMutex::new(None),
@@ -2627,6 +2775,7 @@ impl Client {
         Self {
             state,
             reader: pump.id(),
+            reader_abort: pump.abort_handle(),
             pump: Mutex::new(Some(pump)),
         }
     }
@@ -3090,8 +3239,18 @@ impl Client {
     /// owes the peer to be written, and once for what was queued before the close to be written
     /// and the link closed. Both waits are over at once on a link that takes its writes. The
     /// handler's tasks are cancelled, not waited out, which takes no time unless a handler is
-    /// blocking its thread without yielding; nothing here can bound that. Two things are waited
-    /// for inside the same bound: a notification call or a hand-off that asked for a
+    /// blocking its thread without yielding. That is waited against: the handler's task is
+    /// given what is left of the first grace and the reader what is left of the whole bound, and
+    /// each, when its time is spent, 50 ms more for the abort to land. A close thus ends within
+    /// twice `shutdown_timeout`, plus at most 100 ms, and only a handler that blocks its thread
+    /// can use that, whatever else a handler does. A call that blocks its thread for longer than
+    /// the first grace and then returns is treated as one that never does: the close returns the
+    /// handler's timeout, with the link closed, where it used to wait the call out. A task that
+    /// ended in the meantime, even late, does not fail the close: it is looked at again as the
+    /// close ends. [`PeerHandler`] says what each call leaves behind. The exceptions are not
+    /// handlers: a link whose own `send` or `close` blocks its thread, and a runtime whose every
+    /// worker thread is blocked, which cannot run the timers that bound the close. Two things
+    /// are waited for inside the same bound: a notification call or a hand-off that asked for a
     /// [`hold`](Self::hold_cancellation), during the first wait, and, on a connection that had
     /// already ended under this side, the handler's
     /// [`on_terminated`](PeerHandler::on_terminated), with whatever is left of the bound. A caller that wants
@@ -3162,9 +3321,17 @@ impl Client {
     /// is the first close's expiry plus about a scheduler turn, in which it still holds the
     /// reader while it takes it down, and a second close whose own bound runs out in that window
     /// returns the timeout where it used to return `Ok`. The first close, polled again after the
-    /// second gave up, still completes with `Ok`. For now a host tells this timeout from the
-    /// link's only by its `operation` text, "JSON-RPC reader shutdown";
-    /// [`is_link_shutdown_timeout`] is `false` for it.
+    /// second gave up, still completes with `Ok`. A host tells this timeout from the link's by
+    /// type: [`is_reader_shutdown_timeout`] is `true` for it and [`is_link_shutdown_timeout`] is
+    /// `false`.
+    ///
+    /// # A close that is kept
+    ///
+    /// A close future borrows the client it was called on, or owns a share of it, so a client
+    /// cannot be dropped under a close that is kept. While the future is parked in its wait for
+    /// the reader, the reader lives no longer than the future: dropping it takes the reader down.
+    /// Drop a kept close before the client it belongs to. A future that is leaked, with [`std::mem::forget`], holds the lock on the
+    /// reader's handle for good; dropping the client stops the reader without that lock.
     ///
     /// # Wrapping a close
     ///
@@ -3179,10 +3346,17 @@ impl Client {
     ///
     /// [`Error::Link`] when closing the link itself failed, [`Error::Timeout`] when the link
     /// could not be reached within `shutdown_timeout` (that one is
-    /// [`is_link_shutdown_timeout`]), and [`Error::Timeout`] naming the reader when another
-    /// close that holds it was still waiting for the handler to be told after this one's bound
-    /// of twice `shutdown_timeout` had run out. The link is closed by then. Nothing in the
-    /// second case waits for good, whether or not the other close is ever polled again.
+    /// [`is_link_shutdown_timeout`]), [`Error::Timeout`] naming the reader
+    /// ([`is_reader_shutdown_timeout`]) when the reader had not let go once this close's bound of
+    /// twice `shutdown_timeout` had run out: because another close that holds it was still
+    /// waiting for the handler to be told, or because the reader was taken down and a handler
+    /// that blocks its thread (see [`PeerHandler`]) kept it from stopping; and [`Error::Timeout`]
+    /// naming the handler ([`is_handler_shutdown_timeout`]) when the handler's task was still
+    /// inside a call that blocks its thread. The link is closed by then in the last two. Nothing
+    /// in any of them waits for good, whether or not the other close is ever polled again. A
+    /// close that took a task down after its time was spent ends up to 50 ms later than that, for
+    /// the abort to land, as "How long it takes" says. The [module documentation](self) says what
+    /// the timeouts mean.
     pub async fn close(&self) -> Result<()> {
         // Stored before the drain rather than inside it, and that order is the contract `call`
         // reads: a caller that finds the map open has, by that fact, arrived before this store,
@@ -3207,6 +3381,9 @@ impl Client {
         // takes the reader down.
         let ended_under_this_side = matches!(self.state.ended(), Some(ConnectionEnd::Peer(_)));
         let latest = deadline_after(self.state.options.shutdown_timeout.saturating_mul(2));
+        // The first of the two graces, for what is owed before the link is closed: the answers to
+        // the peer, a hold on a call, and the handler's task. The second is the link's.
+        let owed_by = deadline_after(self.state.options.shutdown_timeout);
         self.state.fail_pending(failure).await;
         // The peer's own questions are answered on tasks of their own, and one waiting for a
         // person would otherwise outlive the client that spawned it — holding its share of the
@@ -3216,13 +3393,28 @@ impl Client {
         //
         // A notification call or a hand-off that holds its cancellation off is waited for at the
         // same time: the two waits overlap, so the close takes no longer for it.
-        if self.state.cancellation_held() {
+        //
+        // The handler's task is aborted, and waited for only as long as the first grace has left,
+        // or, when that is spent, for the allowance an abort needs to land: a call that blocks its
+        // thread never reaches the await where it would, and the link must still be closed
+        // after it, in the second grace.
+        let straggler = if self.state.cancellation_held() {
             tokio::join!(self.state.wait_for_holds(), self.state.drain_in_flight());
-            self.state.stop_notifications().await;
+            self.state.stop_notifications_until(owed_by).await
         } else {
-            self.state.stop_notifications().await;
-            self.state.drain_in_flight().await;
-        }
+            // Together, so that the two share the first grace: one after the other, a handler
+            // that blocks and an answer that cannot be written would take a grace each, and the
+            // link's would come on top. The task is aborted first, as `join!` polls in order.
+            let (straggler, ()) = tokio::join!(
+                self.state.stop_notifications_until(owed_by),
+                self.state.drain_in_flight()
+            );
+            straggler
+        };
+        // The handler's task may have started an answer after the set was taken above, in the
+        // moment before it noticed it was stopped. The task is down, or given up on, by now:
+        // whatever that left is waited for within what the first grace has left, and aborted.
+        self.state.drain_in_flight_until(owed_by).await;
 
         let closed = tokio::time::timeout(self.state.options.shutdown_timeout, async {
             // Behind whatever is already queued, as a close has always waited its turn behind
@@ -3247,17 +3439,14 @@ impl Client {
         // waiting for this. Decided without the lock, which a close that is waiting for that
         // very call holds.
         if tokio::task::try_id() == Some(self.reader) {
-            return closed;
+            return closed.and(self.state.handler_held(&straggler));
         }
         // The lock is kept across the wait, so that a second close waits for the handler to be
         // told as the first one does. Not for longer than a close may take: a first close that
         // was kept and is never polled again holds it for good, and this close must still end.
         let Ok(mut reader) = tokio::time::timeout_at(latest, self.pump.lock()).await else {
             // The link was dealt with above, and a failure to close it is the better answer.
-            return closed.and(Err(Error::Timeout {
-                operation: String::from(READER_SHUTDOWN),
-                after: self.state.options.shutdown_timeout.saturating_mul(2),
-            }));
+            return closed.and(Err(self.state.reader_shutdown_timeout()));
         };
         if let Some(pump) = reader.take() {
             // The reader of a connection that ended under this side is on its way to telling
@@ -3275,10 +3464,20 @@ impl Client {
             // turn stream parks it — would never reach the flag, and closing would never return.
             if !told {
                 pump.abort();
-                let _ = pump.await;
+                // An abort reaches a task at its next await. A handler that blocks its thread
+                // never gets there, and waiting for it would be waiting for the handler. The
+                // wait ends with this close's own bound, or, when that is spent, after the
+                // short allowance a task needs to notice the abort. The reader is left to stop
+                // whenever the handler returns; nothing is left to wait for it.
+                let settled = latest.max(deadline_after(ABORT_SETTLE));
+                if tokio::time::timeout_at(settled, &mut *pump).await.is_err()
+                    && !pump.is_finished()
+                {
+                    return closed.and(Err(self.state.reader_shutdown_timeout()));
+                }
             }
         }
-        closed
+        closed.and(self.state.handler_held(&straggler))
     }
 
     /// Whether this client has been closed or the peer has gone.
@@ -3478,11 +3677,10 @@ impl Drop for Client {
         self.state.abort_in_flight();
         self.state.cancelling_handler.store(true, Ordering::SeqCst);
         self.state.abort_notifications();
-        if let Ok(mut pump) = self.pump.try_lock()
-            && let Some(pump) = pump.take()
-        {
-            pump.abort();
-        }
+        // Not through the lock on the reader's handle: a close future holds it while it waits for
+        // the reader, and one that was leaked holds it for good. An abort of a task that has
+        // ended is nothing.
+        self.reader_abort.abort();
     }
 }
 
@@ -3509,6 +3707,24 @@ impl ClientState {
         Ok(Value::Object(frame).to_string())
     }
 
+    /// What a close returns when the reader did not let go within its bound of twice
+    /// `shutdown_timeout`.
+    fn reader_shutdown_timeout(&self) -> Error {
+        Error::Timeout {
+            operation: String::from(READER_SHUTDOWN),
+            after: self.options.shutdown_timeout.saturating_mul(2),
+        }
+    }
+
+    /// What a close returns when the handler's task did not stop within the part of the close's
+    /// bound that is given to it, one `shutdown_timeout`.
+    fn handler_shutdown_timeout(&self) -> Error {
+        Error::Timeout {
+            operation: String::from(HANDLER_SHUTDOWN),
+            after: self.options.shutdown_timeout,
+        }
+    }
+
     /// What a call still waiting is failed with once this side has stopped speaking.
     fn closed_error(&self) -> JsonRpcError {
         JsonRpcError {
@@ -3524,13 +3740,22 @@ impl ClientState {
     /// than a wait on whoever was being asked. The grace is a bound on a slow link, not on a slow
     /// person.
     async fn drain_in_flight(&self) {
+        self.drain_in_flight_until(deadline_after(self.options.shutdown_timeout))
+            .await;
+    }
+
+    /// [`drain_in_flight`](Self::drain_in_flight) with its grace ending at `until`. What is left
+    /// by then is aborted.
+    async fn drain_in_flight_until(&self, until: tokio::time::Instant) {
         let mut in_flight = std::mem::take(
             &mut *self
                 .in_flight
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
         );
-        let drained = tokio::time::timeout(self.options.shutdown_timeout, async {
+        #[cfg(test)]
+        Self::run_hook(&self.after_in_flight_taken);
+        let drained = tokio::time::timeout_at(until, async {
             while in_flight.join_next().await.is_some() {}
         })
         .await;
@@ -3545,6 +3770,43 @@ impl ClientState {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .abort_all();
+    }
+
+    /// Takes the handler's task down for a close, and gives back its handle if it had not
+    /// stopped by `owed_by`, or, when that is past, within the allowance for an abort to land,
+    /// counted from now.
+    ///
+    /// An abort lands at the task's next await, so a task that stops does so at once; one that
+    /// has not by then is inside a call that blocks its thread, and waiting longer cannot tell it
+    /// from one that never returns. The task is then left to stop whenever that call does, and
+    /// the close looks at the handle again as it ends. `None` also when there is nothing to wait
+    /// for: the reader or another close has the task's handle, and answers for it.
+    async fn stop_notifications_until(
+        &self,
+        owed_by: tokio::time::Instant,
+    ) -> Option<JoinHandle<()>> {
+        self.abort_worker();
+        let mut handle = self
+            .notifications
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()?;
+        handle.abort();
+        let until = owed_by.max(deadline_after(ABORT_SETTLE));
+        match tokio::time::timeout_at(until, &mut handle).await {
+            Ok(_) => None,
+            Err(_) => Some(handle),
+        }
+    }
+
+    /// What a close that went on past the handler's task answers with once the rest is done:
+    /// the handler's timeout if the task is still running now, and `Ok` if it finished in the
+    /// meantime, however late.
+    fn handler_held(&self, straggler: &Option<JoinHandle<()>>) -> Result<()> {
+        match straggler {
+            Some(task) if !task.is_finished() => Err(self.handler_shutdown_timeout()),
+            _ => Ok(()),
+        }
     }
 
     async fn stop_notifications(&self) {
@@ -5093,10 +5355,13 @@ fn oversized_frame(error: &Error) -> bool {
 #[cfg(test)]
 mod tests {
     mod abandoned_close_tests;
+    mod blocked_handler_tests;
     mod cancellation_hold_tests;
     mod handoff_hold_tests;
     mod handoff_queue_tests;
     mod invalid_request_tests;
+    mod kept_close_drop_tests;
+    mod late_answer_tests;
     mod on_request_end_tests;
     mod ordered_response_tests;
     mod outbound_bound_tests;

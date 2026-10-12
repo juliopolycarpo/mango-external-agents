@@ -1,12 +1,16 @@
 //! Which outbound bound an error or an end names, and which timeout is a close giving up, told
 //! by type from the values the client really produces.
 
+use super::abandoned_close_tests::{Closing, park, peer_exited_with_the_handler_held};
 use super::outbox_tests::{
     eventually, gated, limits, link_held, methods, one_termination, options, within,
 };
 use super::*;
 use crate::Dispatch;
-use crate::jsonrpc::{OutboundBound, WireOptions, is_link_shutdown_timeout};
+use crate::jsonrpc::{
+    HANDLER_SHUTDOWN, LINK_SHUTDOWN, OutboundBound, READER_SHUTDOWN, WireOptions,
+    is_handler_shutdown_timeout, is_link_shutdown_timeout, is_reader_shutdown_timeout,
+};
 
 /// What an error says of the outbound bounds and of a close giving up.
 fn told(error: &Error) -> (Option<OutboundBound>, bool) {
@@ -215,11 +219,16 @@ async fn a_close_that_gives_up_is_told_as_the_link_shutdown_timing_out() {
         .await
         .expect_err("expected the close to run out of its grace");
     let annotated = error.clone().with_dispatch(Dispatch::Accepted);
-    let observed = (told(&error), told(&annotated));
-    let expected = ((None, true), (None, true));
+    let observed = (
+        told(&error),
+        told(&annotated),
+        is_reader_shutdown_timeout(&error),
+        is_reader_shutdown_timeout(&annotated),
+    );
+    let expected = ((None, true), (None, true), false, false);
     assert_eq!(
         observed, expected,
-        "expected a link shutdown that timed out, annotated or not, naming no bound: {expected:?} | received {observed:?} ({error:?})"
+        "expected a link shutdown that timed out, annotated or not, naming no bound and not the reader's: {expected:?} | received {observed:?} ({error:?})"
     );
 
     gated.gate.add_permits(1);
@@ -340,4 +349,69 @@ async fn an_end_that_is_not_outbound_backpressure_names_no_bound() {
         "expected a peer that exited, one that flooded and a failed link to name no bound: {expected:?} | received {observed:?}"
     );
     let _ = within("the close", gated.client.close()).await;
+}
+
+/// What an error says of the timeouts of a close: whether it is the link's, the reader's and
+/// the handler's.
+fn close_timeout(error: &Error) -> (bool, bool, bool) {
+    (
+        is_link_shutdown_timeout(error),
+        is_reader_shutdown_timeout(error),
+        is_handler_shutdown_timeout(error),
+    )
+}
+
+/// Each timeout of a close is told from the others by type, with or without a dispatch
+/// annotation, and no other error reads as any of them: not a timeout of another operation, not a
+/// different error.
+#[test]
+fn the_timeouts_of_a_close_are_told_apart() {
+    let after = Duration::from_secs(1);
+    let timeout = |operation: &str| Error::Timeout {
+        operation: String::from(operation),
+        after,
+    };
+    let observed = (
+        close_timeout(&timeout(LINK_SHUTDOWN)),
+        close_timeout(&timeout(LINK_SHUTDOWN).with_dispatch(Dispatch::Accepted)),
+        close_timeout(&timeout(READER_SHUTDOWN)),
+        close_timeout(&timeout(READER_SHUTDOWN).with_dispatch(Dispatch::Accepted)),
+        close_timeout(&timeout(HANDLER_SHUTDOWN)),
+        close_timeout(&timeout(HANDLER_SHUTDOWN).with_dispatch(Dispatch::Accepted)),
+        close_timeout(&timeout("a JSON-RPC request")),
+        close_timeout(&timeout("JSON-RPC frame write")),
+        close_timeout(&Error::Closed { subject: "link" }),
+    );
+    let expected = (
+        (true, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, true, false),
+        (false, false, true),
+        (false, false, true),
+        (false, false, false),
+        (false, false, false),
+        (false, false, false),
+    );
+    assert_eq!(
+        observed, expected,
+        "expected (link, reader, handler) to be true for its own timeout only, annotated or not: {expected:?} | received {observed:?}"
+    );
+}
+
+/// The timeout a second close returns behind a first that is held in its wait for the handler is
+/// the reader's, as the client produces it, and not the link's: the link was closed by then.
+#[tokio::test(start_paused = true)]
+async fn a_second_close_behind_a_held_first_returns_the_reader_shutdown_timeout() {
+    let (client, _handler) = peer_exited_with_the_handler_held().await;
+    let mut first: Closing = Box::pin(client.close());
+    park("the first close", &mut first).await;
+
+    let second = eventually("the second close", client.close()).await;
+    let observed = second.as_ref().err().map(close_timeout);
+    assert_eq!(
+        observed,
+        Some((false, true, false)),
+        "expected the second close to return the reader's timeout, not the link's: Some((false, true, false)) | received {observed:?} ({second:?})"
+    );
 }
