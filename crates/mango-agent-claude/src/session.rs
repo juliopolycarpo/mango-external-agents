@@ -1099,7 +1099,12 @@ impl Drop for LostWorker {
                 "expected the runtime that opened the session to run its teardown | received: it shut down first",
             ),
         };
-        let gone = self.teardown.proven_gone.load(Ordering::Acquire)
+        // A close reads the turn under the lifecycle gate that refuses every later start, so a
+        // close that found no turn has no child, now or later.
+        let never_had_a_child =
+            self.closing.is_some() && self.child_stop.is_none() && self.control.is_none();
+        let gone = never_had_a_child
+            || self.teardown.proven_gone.load(Ordering::Acquire)
             || self.child_stop.as_ref().is_some_and(|stop| {
                 stop.proven_gone.load(Ordering::Acquire) || matches!(stop.outcome(), Some(Ok(())))
             });

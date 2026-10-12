@@ -241,6 +241,46 @@ fn a_close_lost_inside_the_removal_after_the_child_was_reaped_demands_no_cleanup
     launcher.end_turns_for_host_cleanup();
 }
 
+/// A session that never ran a turn has no child, so a close whose worker never ran because the
+/// opening runtime is gone has nothing left to stop: the outcome is lost, the session is `Closed`.
+#[test]
+fn a_close_that_never_ran_over_a_session_without_a_turn_settles_closed() {
+    let runtime = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("expected a runtime")
+    };
+    let opening = runtime();
+    let launcher = Arc::new(FakeClaudeCli::new());
+    let session =
+        opening.block_on(async { session_over(Arc::new(ControlTap::new(Arc::clone(&launcher)))) });
+    opening.shutdown_background();
+
+    let later = runtime().block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            session.close(mango_external_agents::CloseReason::Requested),
+        )
+        .await
+    });
+
+    let outcome = later.unwrap_or_else(|_| {
+        panic!("expected the close to return within 1s | received: still waiting after 1s")
+    });
+    let error = outcome.expect_err("expected the lost outcome to be reported");
+    assert!(
+        matches!(&error, Error::Link { peer, .. } if peer == "tokio runtime"),
+        "expected a bare Link naming the runtime | received {error:?}"
+    );
+    assert_eq!(
+        session.snapshot().status,
+        mango_external_agents::SessionStatus::Closed,
+        "expected session status: Closed | received: {:?}",
+        session.snapshot().status
+    );
+}
+
 /// A turn worker lost after its stop task proved the child gone, and before it published, owes no
 /// cleanup either; the instant between the two cannot be hit from outside, so the guard is dropped
 /// directly with the flag the stop task sets.
