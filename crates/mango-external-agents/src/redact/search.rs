@@ -403,6 +403,53 @@ fn the_token_pass_only_adds_in_both_corpora_and_their_pieces() {
     }
 }
 
+/// The JSON text a vendor sends in a field: an object with the generated text as a member's string,
+/// beside a pair the walk reads and a member it does not.
+fn embedded_json(text: &str) -> String {
+    serde_json::json!({ "note": text, "name": "x", "n": 1 }).to_string()
+}
+
+/// Reading a JSON text as structure never leaves more than reading it as text: a label the text
+/// rules redact in the JSON as it is written is gone from the walk's answer too, whatever the
+/// string inside holds and however it is escaped there.
+fn assert_the_walk_never_leaves_more_than_the_text_rules(raw: &str) {
+    let json_text = embedded_json(&labelled(raw));
+    let by_text = message_text(&json_text);
+    let shown = structured(&serde_json::json!({ "request": json_text }));
+    let by_walk = shown["request"].as_str().unwrap_or_default();
+    let again = structured(&shown);
+    assert!(
+        again == shown,
+        "expected a second walk to change nothing | input {json_text:?} (seed {}) first: {shown}, second: {again}",
+        seed()
+    );
+    for index in 0..LABELS {
+        let label = format!("{}{index}", &SECRET[..SECRET.len() - 1]);
+        assert!(
+            !by_walk.contains(&label) || by_text.contains(&label) || !json_text.contains(&label),
+            "expected {label} gone from the walk's answer as it is from the text rules' | input {json_text:?} (seed {}) text rules: {by_text:?}, walk: {by_walk:?}",
+            seed()
+        );
+    }
+}
+
+#[test]
+#[ignore = "a long search; see the module docs"]
+fn the_walk_never_leaves_more_than_the_text_rules_on_generated_structures() {
+    search_in(
+        structured_text,
+        assert_the_walk_never_leaves_more_than_the_text_rules,
+    );
+}
+
+#[test]
+fn the_walk_never_leaves_more_than_the_text_rules_on_a_few_structures() {
+    let mut random = Random::new(2, 0);
+    for _ in 0..2_000 {
+        assert_the_walk_never_leaves_more_than_the_text_rules(&structured_text(&mut random));
+    }
+}
+
 #[test]
 fn a_bracket_in_a_key_body_is_found_and_one_outside_is_not() {
     let key =
