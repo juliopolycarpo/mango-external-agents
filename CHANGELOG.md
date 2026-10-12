@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.7.0] - 2026-10-12
+
+### 🐛 Bug Fixes
+
+- **(core)** Redact well-known bare tokens, escaped JSON and values on the next line (#186)
+- **(claude)** Keep a closing session Closing until its artifact removal ends (#187)
+- [**breaking**] **(claude)** Return CleanupRequired when a stop cannot prove the child gone (#184)
+- **(codex)** Finish a terminal raised inside a request when the connection is cut (#185)
+- **(core)** Bound a close behind a handler that blocks its thread (#182)
+
+### 📚 Documentation
+
+- **(core)** Say which task a close looks at again (#183)
+
+### 🧪 Testing
+
+- **(core)** Pin the registry consumer to the published 0.6.1 (#181)
+
 ## [0.6.1] - 2026-10-12
 
 ### 🚀 Features
