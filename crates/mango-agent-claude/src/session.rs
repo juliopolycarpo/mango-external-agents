@@ -681,15 +681,18 @@ async fn run_close_teardown(
     };
     let result = match native {
         Ok(()) => {
-            // The child is gone and close is terminal from here, even when the host's scratch
-            // mount refuses the final unlink or never answers it. Recorded before the removal
-            // starts, so a worker dropped inside it reports no child left behind. The typed
-            // error below still tells the caller which resource remained, and the wait for it is
-            // one more shutdown stage.
+            // The child is gone. Recorded before the removal starts, so a worker dropped inside
+            // it reports no child left behind and its guard settles the session.
             close.proven_gone.store(true, Ordering::Release);
-            shared.core_state.set_status(SessionStatus::Closed);
             let removal_bound = crate::deadlines::removal_bound(shared.host.limits());
-            crate::mcp::remove_on_close(mcp_config.take(), removal_bound).await
+            let result = crate::mcp::remove_on_close(mcp_config.take(), removal_bound).await;
+            // Close is terminal after native cleanup, even when the host's scratch mount refuses
+            // the final unlink or never answers it. The typed error still tells the caller which
+            // resource remained, and the wait for it is one more shutdown stage. The session
+            // stays `Closing` until that wait is over, so a host watching the status never sees
+            // `Closed` while the artifact's removal is still running.
+            shared.core_state.set_status(SessionStatus::Closed);
+            result
         }
         Err(error) => {
             crate::mcp::preserve_after_failed_native_cleanup(mcp_config);
@@ -1065,6 +1068,9 @@ struct LostWorker {
     mcp: Option<crate::mcp::Prepared<Arc<ConfigFile>>>,
     /// The stop a close waits on, whose proof of a reaped child also clears this guard's control.
     child_stop: Option<Arc<Teardown>>,
+    /// The session a close worker settles. A close lost after its child was reaped has no worker
+    /// left to mark the session `Closed`, so the guard does.
+    closing: Option<Arc<Shared>>,
 }
 
 impl LostWorker {
@@ -1077,6 +1083,7 @@ impl LostWorker {
             control,
             mcp: None,
             child_stop: None,
+            closing: None,
         }
     }
 }
@@ -1101,6 +1108,9 @@ impl Drop for LostWorker {
             // no cleanup is owed, so nothing here asks the host to reconcile.
             self.control = None;
             self.mcp = None;
+            if let Some(shared) = self.closing.take() {
+                shared.core_state.set_status(SessionStatus::Closed);
+            }
         }
         let lost = match self.control.take() {
             Some(control) => {
@@ -1604,6 +1614,7 @@ impl mango_external_agents::Session for ClaudeSession {
         let mut lost = LostWorker::new(&close, child);
         lost.child_stop = active.clone();
         lost.mcp = Some(mcp_config);
+        lost.closing = Some(Arc::clone(&self.shared));
         spawn_owned(&self.shared, async move {
             let Some(mcp_config) = lost.mcp.take() else {
                 return;
