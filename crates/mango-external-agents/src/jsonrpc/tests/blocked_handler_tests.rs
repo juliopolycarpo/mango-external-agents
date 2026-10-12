@@ -10,7 +10,8 @@ use super::abandoned_close_tests::ParkedTermination;
 use super::outbox_tests::{options, until, within};
 use super::*;
 use crate::jsonrpc::{
-    ConnectionEnd, READER_ABORT_SETTLE, READER_SHUTDOWN, is_reader_shutdown_timeout,
+    ABORT_SETTLE, ConnectionEnd, READER_SHUTDOWN, Responder, WireOptions,
+    is_handler_shutdown_timeout, is_link_shutdown_timeout, is_reader_shutdown_timeout,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex as StdMutex, PoisonError};
@@ -93,7 +94,13 @@ impl PeerHandler for ThreadBlockedTermination {
 /// The documented bound of a close: twice `shutdown_timeout`, and the allowance the reader gets to
 /// observe the abort when that time is spent.
 fn bound() -> Duration {
-    options().shutdown_timeout * 2 + READER_ABORT_SETTLE
+    options().shutdown_timeout * 2 + ABORT_SETTLE
+}
+
+/// The bound of a close behind a handler that blocks its thread on a live connection: the same,
+/// and one more allowance, for the handler's own task.
+fn bound_with_both_allowances() -> Duration {
+    options().shutdown_timeout * 2 + ABORT_SETTLE * 2
 }
 
 /// A close on a connection the peer ended, with a handler blocked in `on_terminated`, returns
@@ -300,7 +307,7 @@ async fn a_close_with_no_time_left_gives_up_behind_a_blocked_handler() {
     })
     .await;
 
-    let bound = READER_ABORT_SETTLE;
+    let bound = ABORT_SETTLE;
     let began = Instant::now();
     let closed = tokio::time::timeout(bound + LOAD_MARGIN, client.close()).await;
     let waited = began.elapsed();
@@ -313,4 +320,274 @@ async fn a_close_with_no_time_left_gives_up_behind_a_blocked_handler() {
         matches!(&closed, Err(error) if is_reader_shutdown_timeout(error)),
         "expected the reader's timeout | received {closed:?} after {waited:?}"
     );
+}
+
+/// Which call of a handler blocks its thread.
+#[derive(Clone, Copy, Debug)]
+enum BlockedCall {
+    Notification,
+    RequestHandoff,
+    Request,
+}
+
+/// A handler that blocks its thread, with no await, in the one call it is told to, and answers
+/// every other call as the default handler does.
+struct ThreadBlockedCall {
+    blocked: BlockedCall,
+    entered: AtomicUsize,
+    returned: AtomicUsize,
+    terminated: AtomicUsize,
+    gate: Arc<ThreadGate>,
+}
+
+impl ThreadBlockedCall {
+    fn arc(blocked: BlockedCall, gate: &Arc<ThreadGate>) -> Arc<Self> {
+        Arc::new(Self {
+            blocked,
+            entered: AtomicUsize::new(0),
+            returned: AtomicUsize::new(0),
+            terminated: AtomicUsize::new(0),
+            gate: Arc::clone(gate),
+        })
+    }
+
+    fn block_if(&self, call: BlockedCall) {
+        if std::mem::discriminant(&self.blocked) != std::mem::discriminant(&call) {
+            return;
+        }
+        self.entered.fetch_add(1, Ordering::AcqRel);
+        self.gate.block();
+        self.returned.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[async_trait::async_trait]
+impl PeerHandler for ThreadBlockedCall {
+    async fn on_notification(&self, _method: String, _params: Value) {
+        self.block_if(BlockedCall::Notification);
+    }
+
+    async fn on_request(
+        &self,
+        _method: String,
+        _params: Value,
+        _id: RequestId,
+    ) -> ServerRequestOutcome {
+        self.block_if(BlockedCall::Request);
+        ServerRequestOutcome::Answer(json!({}))
+    }
+
+    async fn on_request_handoff(&self, method: String, params: Value, responder: Responder) {
+        self.block_if(BlockedCall::RequestHandoff);
+        let outcome = self
+            .on_request(method, params, responder.id().clone())
+            .await;
+        let _ = responder.answer_or_refuse(outcome);
+    }
+
+    async fn on_terminated(&self, _termination: PeerTermination) {
+        self.terminated.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// What a close that was made behind a handler blocked in `blocked` did, and how long it took.
+struct ClosedBehind {
+    link: ScriptedLink,
+    client: Client,
+    handler: Arc<ThreadBlockedCall>,
+    gate: Arc<ThreadGate>,
+    closed: crate::Result<()>,
+    waited: Duration,
+    _release: ReleaseOnDrop,
+}
+
+/// Connects a client whose handler blocks its thread in `blocked`, feeds it the frame that makes
+/// the peer call it, waits for the handler to block, and closes the client while it is blocked.
+/// The connection has not ended, unless `peer_exits`, in which case the peer exits first. Panics
+/// with the bound it missed when the close does not return.
+async fn close_behind_a_handler_blocked_in(blocked: BlockedCall, peer_exits: bool) -> ClosedBehind {
+    let gate = ThreadGate::arc();
+    let release = ReleaseOnDrop(Arc::clone(&gate));
+    let handler = ThreadBlockedCall::arc(blocked, &gate);
+    let link = ScriptedLink::new();
+    let client = Client::connect_with(
+        link.clone().into_link(),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        options(),
+        match blocked {
+            // Every question goes to the handler's task on a client made with the option.
+            BlockedCall::RequestHandoff => WireOptions::new().with_request_handoff(),
+            BlockedCall::Notification | BlockedCall::Request => WireOptions::new(),
+        },
+    );
+    let frame = match blocked {
+        BlockedCall::Notification => r#"{"jsonrpc":"2.0","method":"note","params":{}}"#,
+        BlockedCall::RequestHandoff | BlockedCall::Request => {
+            r#"{"jsonrpc":"2.0","id":7,"method":"ask","params":{}}"#
+        }
+    };
+    link.push_line(frame);
+    until("the handler to block inside the call", || {
+        handler.entered.load(Ordering::Acquire) == 1
+    })
+    .await;
+    if peer_exits {
+        link.end();
+        // The reader takes the handler's task to drain it once it has seen the exit.
+        until("the reader to take the handler's task", || {
+            client
+                .state
+                .notifications
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none()
+        })
+        .await;
+    }
+
+    let bound = bound_with_both_allowances();
+    let began = Instant::now();
+    let closed = tokio::time::timeout(bound + LOAD_MARGIN, client.close()).await;
+    let waited = began.elapsed();
+    let Ok(closed) = closed else {
+        panic!(
+            "expected close to return within {bound:?} | received: still waiting after {waited:?}"
+        );
+    };
+    ClosedBehind {
+        link,
+        client,
+        handler,
+        gate,
+        closed,
+        waited,
+        _release: release,
+    }
+}
+
+impl ClosedBehind {
+    /// What the client says while the handler's call is still blocked: closed, the close on
+    /// record as its end, the call entered once and not returned, and nobody told of an end.
+    fn assert_closed_with_the_call_still_blocked(&self, ended: Option<ConnectionEnd>) {
+        let observed = (
+            self.client.is_closed(),
+            self.client.ended(),
+            self.handler.entered.load(Ordering::Acquire),
+            self.handler.returned.load(Ordering::Acquire),
+            self.handler.terminated.load(Ordering::Acquire),
+        );
+        let expected = (true, ended, 1, 0, 0);
+        assert_eq!(
+            observed, expected,
+            "expected the client closed, its end on record, the call blocked once and no end told: {expected:?} | received {observed:?}"
+        );
+    }
+
+    /// Lets the blocked call return, and checks that nothing was reported or broken by that: the
+    /// end is as it was, nobody is told of one, and a later close and a drop are quiet.
+    async fn assert_quiet_when_the_call_returns_late(self, ended: Option<ConnectionEnd>) {
+        let again = within("a close with the call still blocked", self.client.close()).await;
+        assert!(
+            again.is_ok(),
+            "expected a later close to find nothing to wait for: Ok(()) | received {again:?}"
+        );
+        self.gate.release();
+        until("the blocked call to return", || {
+            self.handler.returned.load(Ordering::Acquire) == 1
+        })
+        .await;
+        let after = (
+            self.client.ended(),
+            self.handler.entered.load(Ordering::Acquire),
+            self.handler.terminated.load(Ordering::Acquire),
+        );
+        let expected = (ended, 1, 0);
+        assert_eq!(
+            after, expected,
+            "expected the end unchanged and no end told after the call returned late: {expected:?} | received {after:?}"
+        );
+        let last = within("a close after the call returned", self.client.close()).await;
+        assert!(
+            last.is_ok(),
+            "expected a close after the late return to be quiet: Ok(()) | received {last:?}"
+        );
+        drop(self.client);
+        drop(self.link);
+    }
+}
+
+/// A handler that blocks its thread in `on_notification` on a connection that has not ended does
+/// not hold the close for as long as it blocks: the close waits the first grace for the call, as
+/// it would for a slow one, closes the link, and returns the handler's timeout within its bound.
+/// The task stays on its blocked thread; when the call returns late nothing is reported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_returns_within_its_bound_when_on_notification_blocks_its_thread() {
+    let behind = close_behind_a_handler_blocked_in(BlockedCall::Notification, false).await;
+    let closed = &behind.closed;
+    assert!(
+        matches!(closed, Err(error) if is_handler_shutdown_timeout(error) && !is_reader_shutdown_timeout(error) && !is_link_shutdown_timeout(error)),
+        "expected the handler's timeout | received {closed:?} after {:?}",
+        behind.waited
+    );
+    assert!(
+        behind.waited >= options().shutdown_timeout,
+        "expected close to give the call one shutdown_timeout ({:?}) first | received: gave up after {:?}",
+        options().shutdown_timeout,
+        behind.waited
+    );
+    behind.assert_closed_with_the_call_still_blocked(Some(ConnectionEnd::Closed));
+    behind
+        .assert_quiet_when_the_call_returns_late(Some(ConnectionEnd::Closed))
+        .await;
+}
+
+/// The same for `on_request_handoff`, which the handler's task awaits as it does a notification.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_returns_within_its_bound_when_on_request_handoff_blocks_its_thread() {
+    let behind = close_behind_a_handler_blocked_in(BlockedCall::RequestHandoff, false).await;
+    let closed = &behind.closed;
+    assert!(
+        matches!(closed, Err(error) if is_handler_shutdown_timeout(error)),
+        "expected the handler's timeout | received {closed:?} after {:?}",
+        behind.waited
+    );
+    behind.assert_closed_with_the_call_still_blocked(Some(ConnectionEnd::Closed));
+    behind
+        .assert_quiet_when_the_call_returns_late(Some(ConnectionEnd::Closed))
+        .await;
+}
+
+/// `on_request` runs on a task of its own that a close lets write its refusal for one grace and
+/// then aborts without waiting for it: the close ends within its bound, with `Ok`, whatever the
+/// call does. The task stays on its blocked thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_returns_within_its_bound_when_on_request_blocks_its_thread() {
+    let behind = close_behind_a_handler_blocked_in(BlockedCall::Request, false).await;
+    let closed = &behind.closed;
+    assert!(
+        closed.is_ok(),
+        "expected the close to end with Ok(()) having aborted the call without waiting | received {closed:?} after {:?}",
+        behind.waited
+    );
+    behind.assert_closed_with_the_call_still_blocked(Some(ConnectionEnd::Closed));
+    behind
+        .assert_quiet_when_the_call_returns_late(Some(ConnectionEnd::Closed))
+        .await;
+}
+
+/// On a connection the peer ended, the reader is the one waiting for the handler's task, parked at
+/// an await, so the close takes the reader down within its bound and the call stays blocked: the
+/// handler is told of no end, and the close ends with `Ok`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_returns_within_its_bound_when_on_notification_blocks_after_the_peer_exited() {
+    let behind = close_behind_a_handler_blocked_in(BlockedCall::Notification, true).await;
+    let closed = &behind.closed;
+    assert!(
+        closed.is_ok(),
+        "expected the close to end with Ok(()) having taken the parked reader down | received {closed:?} after {:?}",
+        behind.waited
+    );
+    let ended = Some(ConnectionEnd::Peer(PeerTermination::Exited));
+    behind.assert_closed_with_the_call_still_blocked(ended.clone());
+    behind.assert_quiet_when_the_call_returns_late(ended).await;
 }

@@ -8,8 +8,8 @@ use super::outbox_tests::{
 use super::*;
 use crate::Dispatch;
 use crate::jsonrpc::{
-    LINK_SHUTDOWN, OutboundBound, READER_SHUTDOWN, WireOptions, is_link_shutdown_timeout,
-    is_reader_shutdown_timeout,
+    HANDLER_SHUTDOWN, LINK_SHUTDOWN, OutboundBound, READER_SHUTDOWN, WireOptions,
+    is_handler_shutdown_timeout, is_link_shutdown_timeout, is_reader_shutdown_timeout,
 };
 
 /// What an error says of the outbound bounds and of a close giving up.
@@ -351,46 +351,51 @@ async fn an_end_that_is_not_outbound_backpressure_names_no_bound() {
     let _ = within("the close", gated.client.close()).await;
 }
 
-/// What an error says of the two timeouts of a close: whether it is the link's, and whether it
-/// is the reader's.
-fn close_timeout(error: &Error) -> (bool, bool) {
+/// What an error says of the timeouts of a close: whether it is the link's, the reader's and
+/// the handler's.
+fn close_timeout(error: &Error) -> (bool, bool, bool) {
     (
         is_link_shutdown_timeout(error),
         is_reader_shutdown_timeout(error),
+        is_handler_shutdown_timeout(error),
     )
 }
 
-/// The reader's timeout is told from the link's by type, with or without a dispatch annotation,
-/// and no other error reads as either: not a timeout of another operation, not a different
-/// error.
+/// Each timeout of a close is told from the others by type, with or without a dispatch
+/// annotation, and no other error reads as any of them: not a timeout of another operation, not a
+/// different error.
 #[test]
-fn the_reader_shutdown_timeout_is_told_from_the_link_shutdown_timeout() {
+fn the_timeouts_of_a_close_are_told_apart() {
     let after = Duration::from_secs(1);
     let timeout = |operation: &str| Error::Timeout {
         operation: String::from(operation),
         after,
     };
     let observed = (
-        close_timeout(&timeout(READER_SHUTDOWN)),
-        close_timeout(&timeout(READER_SHUTDOWN).with_dispatch(Dispatch::Accepted)),
         close_timeout(&timeout(LINK_SHUTDOWN)),
         close_timeout(&timeout(LINK_SHUTDOWN).with_dispatch(Dispatch::Accepted)),
+        close_timeout(&timeout(READER_SHUTDOWN)),
+        close_timeout(&timeout(READER_SHUTDOWN).with_dispatch(Dispatch::Accepted)),
+        close_timeout(&timeout(HANDLER_SHUTDOWN)),
+        close_timeout(&timeout(HANDLER_SHUTDOWN).with_dispatch(Dispatch::Accepted)),
         close_timeout(&timeout("a JSON-RPC request")),
         close_timeout(&timeout("JSON-RPC frame write")),
         close_timeout(&Error::Closed { subject: "link" }),
     );
     let expected = (
-        (false, true),
-        (false, true),
-        (true, false),
-        (true, false),
-        (false, false),
-        (false, false),
-        (false, false),
+        (true, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, true, false),
+        (false, false, true),
+        (false, false, true),
+        (false, false, false),
+        (false, false, false),
+        (false, false, false),
     );
     assert_eq!(
         observed, expected,
-        "expected (link, reader) to be true for its own timeout only, annotated or not: {expected:?} | received {observed:?}"
+        "expected (link, reader, handler) to be true for its own timeout only, annotated or not: {expected:?} | received {observed:?}"
     );
 }
 
@@ -406,7 +411,7 @@ async fn a_second_close_behind_a_held_first_returns_the_reader_shutdown_timeout(
     let observed = second.as_ref().err().map(close_timeout);
     assert_eq!(
         observed,
-        Some((false, true)),
-        "expected the second close to return the reader's timeout, not the link's: Some((false, true)) | received {observed:?} ({second:?})"
+        Some((false, true, false)),
+        "expected the second close to return the reader's timeout, not the link's: Some((false, true, false)) | received {observed:?} ({second:?})"
     );
 }
