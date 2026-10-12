@@ -498,3 +498,105 @@ fn a_password_phrase_that_goes_on_after_its_status_is_a_value() {
         ("token: expired (ghp_abc)", "token: expired (ghp_abc)"),
     ]);
 }
+
+#[test]
+fn text_glued_to_a_quoted_values_closing_quote_goes_with_the_value() {
+    assert_shown(&[
+        ("password=\"pa\"ss\"word\"", "password=\"[REDACTED]\""),
+        ("token='abc'XYZ'", "token='[REDACTED]'"),
+        ("PASSWORD=\"p@ss\"XYZ\"", "PASSWORD=\"[REDACTED]\""),
+        ("API_KEY: \"expired\"XYZ", "API_KEY: \"[REDACTED]\""),
+        ("token=\"\"XYZ", "token=\"[REDACTED]\""),
+        ("token=\\\"a\\\"XYZ", "token=\\\"[REDACTED]\\\""),
+        ("max_tokens=\"401\"XYZ", "max_tokens=\"[REDACTED]\""),
+        ("token_type=\"Bearer\"XYZ", "token_type=\"[REDACTED]\""),
+        // A closing quote followed by the end of a value is still the end of it.
+        (
+            r#"{"token":"abc","x":1}"#,
+            r#"{"token":"[REDACTED]","x":1}"#,
+        ),
+        (r#"{"token":"abc"}"#, r#"{"token":"[REDACTED]"}"#),
+        ("(token=\"abc\")", "(token=\"[REDACTED]\")"),
+        ("token=\"abc\".", "token=\"[REDACTED]\"."),
+        ("?token='a'&page=2", "?token='[REDACTED]'&page=2"),
+    ]);
+}
+
+#[test]
+fn only_a_real_query_string_ends_a_value_at_an_ampersand() {
+    assert_shown(&[
+        ("cmd &password=pa&ss", "cmd &password=[REDACTED]"),
+        ("x &token: abc&def", "x &token=[REDACTED]"),
+        ("run a&token=abc&page=2", "run a&token=[REDACTED]"),
+        (
+            "https://h/p?a=1&token=abc&page=2",
+            "https://h/p?a=1&token=[REDACTED]&page=2",
+        ),
+        ("GET /v1?token=a&page=2", "GET /v1?token=[REDACTED]&page=2"),
+    ]);
+}
+
+#[test]
+fn a_header_with_an_equals_sign_or_a_vendors_own_name_is_a_credential() {
+    assert_shown(&[
+        ("Authorization=Bearer x1", "Authorization=Bearer [REDACTED]"),
+        ("AUTHORIZATION=Bearer x1", "AUTHORIZATION=Bearer [REDACTED]"),
+        ("x-functions-key: abc", "x-functions-key=[REDACTED]"),
+        (
+            "Ocp-Apim-Subscription-Key: abc",
+            "Ocp-Apim-Subscription-Key=[REDACTED]",
+        ),
+        ("x-api-key: abc", "x-api-key=[REDACTED]"),
+        ("x-auth-token: abc", "x-auth-token=[REDACTED]"),
+        (
+            "x-amz-security-token: abc",
+            "x-amz-security-token=[REDACTED]",
+        ),
+        ("x-goog-api-key: abc", "x-goog-api-key=[REDACTED]"),
+        (
+            "Proxy-Authorization: Basic abc",
+            "Proxy-Authorization: Basic [REDACTED]",
+        ),
+        // Not every name that ends in `key` is a credential.
+        ("sort-key: name", "sort-key: name"),
+        ("x-request-id: abc", "x-request-id: abc"),
+    ]);
+}
+
+#[test]
+fn words_that_start_with_a_keyword_are_words() {
+    assert_shown(&[
+        ("tokenizer: gpt-4o-mini", "tokenizer: gpt-4o-mini"),
+        ("tokenizers=2", "tokenizers=2"),
+        ("tokenization: bpe", "tokenization: bpe"),
+        ("tokenize=true", "tokenize=true"),
+        ("secretary: bob", "secretary: bob"),
+        ("secretariat=un", "secretariat=un"),
+        ("passwordless: enabled", "passwordless: enabled"),
+        ("keyboard: us", "keyboard: us"),
+        ("tokenizer_path=/x", "tokenizer_path=/x"),
+        // A credential word later in the name is still asked.
+        ("tokenizer_secret=abc", "tokenizer_secret=[REDACTED]"),
+    ]);
+}
+
+#[test]
+fn a_credential_word_beside_the_matched_one_vetoes_a_keep() {
+    assert_shown(&[
+        (
+            "session_token_cookie: ;a=b",
+            "session_token_cookie: [REDACTED]",
+        ),
+        ("password_token: expired", "password_token=[REDACTED]"),
+        ("secret_token=401", "secret_token=[REDACTED]"),
+        ("token_password: not set", "token_password=[REDACTED] set"),
+        ("api_key_secret: missing", "api_key_secret=[REDACTED]"),
+        // One keyword, repeated or in a key shape, is one credential.
+        ("OPENAI_API_KEY: not set", "OPENAI_API_KEY: not set"),
+        (
+            "AWS_SECRET_ACCESS_KEY: not set",
+            "AWS_SECRET_ACCESS_KEY: not set",
+        ),
+        ("token_token: expired", "token_token: expired"),
+    ]);
+}

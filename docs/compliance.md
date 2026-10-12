@@ -34,18 +34,20 @@ own deployment.
 - **Redaction.** A vendor's own diagnostic text is redacted for credential-shaped text before it is
   bounded, wherever it enters, and a vendor's transcript content is not. What is redacted where:
 
-  | Text                                                                                | Redacted | By                                                              |
-  | ----------------------------------------------------------------------------------- | -------- | --------------------------------------------------------------- |
-  | stderr crossing a diagnostic boundary                                               | yes      | `redact::stderr_text`                                           |
-  | an `EventKind::Error` message and its vendor code                                   | yes      | the core, whichever harness produced it                         |
-  | the title, description and unknown severity of an `EventKind::Notice`               | yes      | `EventKind::notice`                                             |
-  | a JSON-RPC peer's error message, when it is an error object                         | yes      | `JsonRpcError::into_vendor_error`                               |
-  | a setup `Error::Vendor` message                                                     | yes      | the core, then bounded                                          |
-  | an ACP agent's error message and its `data`, a JSON value read as structure         | yes      | `redact::structured`, then `stderr_text`                        |
-  | an ACP compaction error                                                             | yes      | `redact::bounded`                                               |
-  | a malformed JSON-RPC `error` member                                                 | n/a      | a fixed description; the member is never quoted                 |
-  | `CallFailureCause::Peer`, the peer's message exactly as sent                        | **no**   | exact by design, so a harness may compare it; never show it raw |
-  | assistant text, reasoning, tool output and tool errors (`is_error`, denial reasons) | no       | the answer, not a diagnostic                                    |
+  | Text                                                                                        | Redacted | By                                                              |
+  | ------------------------------------------------------------------------------------------- | -------- | --------------------------------------------------------------- |
+  | stderr crossing a diagnostic boundary                                                       | yes      | `redact::stderr_text`                                           |
+  | an `EventKind::Error` message and its vendor code                                           | yes      | the core, whichever harness produced it                         |
+  | the title, description and unknown severity of an `EventKind::Notice`                       | yes      | `EventKind::notice`                                             |
+  | a JSON-RPC peer's error message, when it is an error object                                 | yes      | `JsonRpcError::into_vendor_error`                               |
+  | a setup `Error::Vendor` message                                                             | yes      | the core, then bounded                                          |
+  | the version a probe printed, a `VersionTooOld` `found`, an unsupported option's explanation | yes      | `redact::bounded`, in `Discovery::normalized` and the matrix    |
+  | a session's title and preview (the conversation's own words), a login hint, an account plan | no       | content or host text, bounded only                              |
+  | an ACP agent's error message and its `data`, a JSON value read as structure                 | yes      | `redact::structured`, then `stderr_text`                        |
+  | an ACP compaction error                                                                     | yes      | `redact::bounded`                                               |
+  | a malformed JSON-RPC `error` member                                                         | n/a      | a fixed description; the member is never quoted                 |
+  | `CallFailureCause::Peer`, the peer's message exactly as sent                                | **no**   | exact by design, so a harness may compare it; never show it raw |
+  | assistant text, reasoning, tool output and tool errors (`is_error`, denial reasons)         | no       | the answer, not a diagnostic                                    |
 
   `CallFailureCause::Peer` holds the peer's error exactly as sent, because the caller of a request
   may need its words and its data. A harness must not show it to a host raw: it converts it with
@@ -56,36 +58,60 @@ own deployment.
 
   Beyond `name=value` and `Authorization: Bearer`, the rules read quoted pairs (`{"api_key":"sk-x"}`),
   names with a keyword at the end or after a capital (`accessToken`, `PGPASSWORD`), any authorization
-  scheme, cookies, a `password:` phrase, a query-string credential and a token used as a URL's user.
+  scheme (also with an equals sign), cookies, a `password:` phrase, a query-string credential, a
+  token used as a URL's user, and the header names `x-functions-key` and
+  `Ocp-Apim-Subscription-Key`. Text glued to the closing quote of a quoted value goes with the value
+  (`password="pa"ss"word"`). A `&` ends a value only in a query string, one with a `?` before it in
+  the same run of non-blank text. Words that begin with a keyword and are not credentials
+  (`tokenizer`, `secretary`, `passwordless`) are left alone.
+
   A status after a name (`OPENAI_API_KEY: not set`), a number under a name that counts tokens
   (`max_tokens: 100000`) and the rest of a query string are kept; a value that could be a credential
-  is redacted. `testing::redaction` holds the corpus of both kinds.
-  `Debug` and `Display` for process, transport, MCP, JSON-RPC, error, session-listing, stream-handle
-  and event payload carriers report only safe metadata. The same policy covers discovery and receipts,
-  configuration, interactions, identity containers and extension values; callers handle originals through
-  typed fields rather than diagnostics. The exceptions are the refusals whose whole content is an
-  instruction: a host configuration refusal, a launch failure, a link failure, a protocol refusal
-  and a timeout name the payload-free summary the library crates themselves wrote — a structured
-  `io::ErrorKind`, an HTTP status, a duration, a fixed protocol operation or a static phrase, never a path, a
-  URL, a vendor message or a line a program printed — so the operator can see what to fix. The
-  pinned minimum version is named because it is a library constant; a login hint remains a typed
-  value for the host UI and is not diagnostic text. A launch failure still reports its executable through
-  `redact::program_name`, and a link failure never names its peer at all, because a WebSocket
-  transport puts the dialled URL there. The guarantee is about carriers — types that hold a value
-  among others, where a derived `Debug` would print it as a side effect. `SessionId` and `TurnId`
-  are not carriers but the ids themselves: they are the host's own, minted by the host and printed
-  for it, and a host formatting a value it created is not a boundary this library stands on.
-  `ErrorCode` is the other side of that line: also host- or vendor-filled, but
-  written into sentences the library composes and a third party may read, so `Display` and `Debug`
-  both write it only when it has a label's shape — at most 48 bytes of `a-z`, `0-9`, `-` and `_` — and write
-  `vendor-code` when it does not. `Debug` is named because it is the formatter a
-  derive would silently leave open, and because an assertion made through an `Error` cannot see
-  it: `Error`'s own `Debug` forwards to its `Display`. `as_str` stays the unbounded protocol field.
-  `HarnessId`, `ProtocolFamily` and `ProfileId` validate a bounded identifier grammar before
-  construction; their explicit `Display` preserves the registered spelling and their `Debug`
-  omits it.
-  `examples/mea` is an unpublished smoke tool, not part of the guarantee either: its own refusals
-  name the paths and OS messages its operator needs.
+  is redacted, and a second credential word in the name (`session_token_cookie: expired`) vetoes a
+  keep. `testing::redaction` holds the corpus of both kinds.
+
+  What the rules do not read, and a host should not rely on them for:
+
+  - doubly escaped JSON, and a quoted value with an embedded quote
+    (`'it''s'`);
+  - a pretty-printed multi-line array, which is read one line at a time, since an array that never
+    closes must not take the rest of the text with it;
+  - a credential that is itself a kept word or count: `password=404`, `secret=required`,
+    `tokens: 123456789012`;
+  - a bare token with no name on the line: `token: expired (ghp_...)`, `api_key: 500 sk-live-...`.
+    A list of well-known prefixes (`ghp_`, `sk-`, `AKIA`, `eyJ...`) redacted wherever they appear
+    was measured and not added: the cheapest form, one vectorised search for a byte the prefixes
+    share, costs the plain path 6 to 8 percent of its instructions before it checks a single
+    candidate, past the 3 percent this path is held to.
+  - a text that carried a removed byte is read again until it stops changing; a text that did not
+    is read once, and a second call can differ only where a URL's user is itself a credential name
+    (`redact/boundaries.rs` pins those).
+    `Debug` and `Display` for process, transport, MCP, JSON-RPC, error, session-listing, stream-handle
+    and event payload carriers report only safe metadata. The same policy covers discovery and receipts,
+    configuration, interactions, identity containers and extension values; callers handle originals through
+    typed fields rather than diagnostics. The exceptions are the refusals whose whole content is an
+    instruction: a host configuration refusal, a launch failure, a link failure, a protocol refusal
+    and a timeout name the payload-free summary the library crates themselves wrote — a structured
+    `io::ErrorKind`, an HTTP status, a duration, a fixed protocol operation or a static phrase, never a path, a
+    URL, a vendor message or a line a program printed — so the operator can see what to fix. The
+    pinned minimum version is named because it is a library constant; a login hint remains a typed
+    value for the host UI and is not diagnostic text. A launch failure still reports its executable through
+    `redact::program_name`, and a link failure never names its peer at all, because a WebSocket
+    transport puts the dialled URL there. The guarantee is about carriers — types that hold a value
+    among others, where a derived `Debug` would print it as a side effect. `SessionId` and `TurnId`
+    are not carriers but the ids themselves: they are the host's own, minted by the host and printed
+    for it, and a host formatting a value it created is not a boundary this library stands on.
+    `ErrorCode` is the other side of that line: also host- or vendor-filled, but
+    written into sentences the library composes and a third party may read, so `Display` and `Debug`
+    both write it only when it has a label's shape — at most 48 bytes of `a-z`, `0-9`, `-` and `_` — and write
+    `vendor-code` when it does not. `Debug` is named because it is the formatter a
+    derive would silently leave open, and because an assertion made through an `Error` cannot see
+    it: `Error`'s own `Debug` forwards to its `Display`. `as_str` stays the unbounded protocol field.
+    `HarnessId`, `ProtocolFamily` and `ProfileId` validate a bounded identifier grammar before
+    construction; their explicit `Display` preserves the registered spelling and their `Debug`
+    omits it.
+    `examples/mea` is an unpublished smoke tool, not part of the guarantee either: its own refusals
+    name the paths and OS messages its operator needs.
 - **Raw records and reducers.** The `Debug` boundary reaches the records decoded from a vendor's
   wire and the reducers that hold them, not only the interaction and identity carriers above. A
   record that can carry what the agent wrote or read — message and reasoning text, command text

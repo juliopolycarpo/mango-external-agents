@@ -55,6 +55,7 @@ fn is_quote(byte: u8) -> bool {
 /// Where a closing quote that ends at `end` begins, with the backslash that escapes it, or `end`
 /// when the byte before it is not a quote.
 fn before_quote(bytes: &[u8], end: usize) -> usize {
+    count_steps(1);
     match end.checked_sub(1) {
         Some(quote) if bytes.get(quote).is_some_and(|byte| is_quote(*byte)) => {
             match quote.checked_sub(1) {
@@ -102,6 +103,9 @@ struct Keyword {
     whole: bool,
     /// Whether it counts tokens when its name says so (`tokens`, `token_limit`).
     token: bool,
+    /// Whether it is a key by its shape (`api_key`, `x-functions-key`), which a status may follow
+    /// (`OPENAI_API_KEY: not set`) without another credential word in the name vetoing it.
+    key_shape: bool,
 }
 
 /// `api`, `private`, `secret` or `access`, an optional separator, a dot or spaces, then `key`.
@@ -136,7 +140,24 @@ fn match_keyword(bytes: &[u8], at: usize) -> Option<Keyword> {
             kind: Kind::Token,
             whole: false,
             token: false,
+            key_shape: true,
         });
+    }
+    if first == b'x' || (first == b's' && bytes.get(at + 1).is_some_and(|byte| byte | 0x20 == b'u'))
+    {
+        // Header names that are a key without a keyword in them (`Ocp-Apim-Subscription-Key` is
+        // found at its last word).
+        for name in ["x-functions-key", "subscription-key"] {
+            if let Some(end) = match_word(bytes, at, name.as_bytes()) {
+                return Some(Keyword {
+                    end,
+                    kind: Kind::Token,
+                    whole: false,
+                    token: false,
+                    key_shape: true,
+                });
+            }
+        }
     }
     for word in CREDENTIAL_WORDS {
         // Most words start with another letter, and a string compare is dearer than this one.
@@ -155,6 +176,7 @@ fn match_keyword(bytes: &[u8], at: usize) -> Option<Keyword> {
                 kind,
                 whole: false,
                 token: word == "token",
+                key_shape: false,
             });
         }
     }
@@ -169,10 +191,35 @@ fn starts_a_parameter(bytes: &[u8], at: usize) -> bool {
     )
 }
 
+/// How far back a `?` is looked for before a `&` is taken for the join of two parameters.
+const QUERY_LOOKBACK: usize = 64;
+
+/// Whether the parameter that starts at `at` is in a query string: right after a `?`, or after a
+/// `&` with a `?` earlier in the same run of non-blank bytes. `cmd &password=pa&ss` is a shell's
+/// ampersand, not a query's, and its value runs to the next blank.
+fn in_a_query(bytes: &[u8], at: usize) -> bool {
+    match at.checked_sub(1).and_then(|before| bytes.get(before)) {
+        Some(b'?') => true,
+        Some(b'&') => {
+            let from = at.saturating_sub(QUERY_LOOKBACK);
+            for byte in bytes[from..at].iter().rev() {
+                count_steps(1);
+                match *byte {
+                    b'?' => return true,
+                    byte if is_space_byte(byte) => return false,
+                    _ => {}
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 /// A query parameter that is a credential's only when it is the whole name (`key`, `auth`,
 /// `sig`), or when it ends in `signature` or `sig` (`X-Amz-Signature`).
 fn match_query_name(bytes: &[u8], at: usize) -> Option<Keyword> {
-    if !starts_a_parameter(bytes, at) {
+    if !starts_a_parameter(bytes, at) || !in_a_query(bytes, at) {
         return None;
     }
     let end = take_while(bytes, at, |byte| {
@@ -192,6 +239,7 @@ fn match_query_name(bytes: &[u8], at: usize) -> Option<Keyword> {
         kind: Kind::Token,
         whole: true,
         token: false,
+        key_shape: false,
     })
 }
 
@@ -223,20 +271,22 @@ fn starts_a_keyword(bytes: &[u8], at: usize) -> bool {
     };
     let second = next | 0x20;
     match opening | 0x20 {
-        b's' => (second == b'e') | (second == b'i'),
+        b's' => (second == b'e') | (second == b'i') | (second == b'u'),
         b't' => second == b'o',
         b'p' => (second == b'a') | (second == b'w') | (second == b'r'),
         b'c' => (second == b'r') | (second == b'o'),
+        b'x' => second == b'-',
         b'a' => (second == b'p') | (second == b'u') | (second == b'c'),
         _ => second == b'e',
     }
 }
 
-/// Whether a byte is the first letter of some keyword: `a`, `c`, `k`, `p`, `s` or `t`, either case.
+/// Whether a byte is the first letter of some keyword: `a`, `c`, `k`, `p`, `s`, `t` or `x`, either
+/// case.
 fn opens_a_keyword(byte: u8) -> bool {
     /// Bit `n` is set when the letter `a + n` opens a keyword.
     const OPENING_LETTERS: u32 =
-        (1 << 0) | (1 << 2) | (1 << 10) | (1 << 15) | (1 << 18) | (1 << 19);
+        (1 << 0) | (1 << 2) | (1 << 10) | (1 << 15) | (1 << 18) | (1 << 19) | (1 << 23);
     let letter = (byte | 0x20).wrapping_sub(b'a');
     (letter < 26) & ((OPENING_LETTERS >> (letter & 31)) & 1 == 1)
 }
@@ -257,6 +307,81 @@ fn keyword_may_start(bytes: &[u8], at: usize, end: usize) -> bool {
     starts_a_word(bytes, at)
         || is_camel_boundary(bytes, at)
         || !bytes.get(end).is_some_and(|byte| is_name_byte(*byte))
+}
+
+/// Words that begin with a keyword and are not credentials' names: `tokenizer`, `secretary`.
+const PLAIN_WORDS: [&str; 11] = [
+    "tokenizer",
+    "tokenizers",
+    "tokenization",
+    "tokenize",
+    "tokenized",
+    "tokenise",
+    "tokenised",
+    "secretary",
+    "secretariat",
+    "secretaries",
+    "passwordless",
+];
+
+/// Whether the word that starts at `at` and runs longer than its keyword is one of [`PLAIN_WORDS`].
+fn is_a_plain_word(bytes: &[u8], at: usize, keyword_end: usize) -> bool {
+    let end = take_while(bytes, at, |byte| byte.is_ascii_alphabetic());
+    // A word of 12 letters at most; a longer run cannot be one of them, and is not copied.
+    if end == keyword_end || end - at > 12 {
+        return false;
+    }
+    let word = &bytes[at..end];
+    PLAIN_WORDS
+        .iter()
+        .any(|plain| word.eq_ignore_ascii_case(plain.as_bytes()))
+}
+
+/// Whether the name that runs from `from` to `name_end` ends in a cookie keyword that starts
+/// within [`NEARBY`] bytes: `session_token_cookie`.
+fn ends_in_cookie(bytes: &[u8], from: usize, name_end: usize) -> bool {
+    if name_end <= from {
+        return false;
+    }
+    (from..name_end.min(from + NEARBY)).any(|place| {
+        starts_a_keyword(bytes, place)
+            && match_keyword(bytes, place).is_some_and(|other| {
+                other.kind == Kind::Line
+                    && other.end == name_end
+                    && keyword_may_start(bytes, place, other.end)
+            })
+    })
+}
+
+/// How far from a keyword another is looked for.
+const NEARBY: usize = 64;
+
+/// Whether the name around the keyword at `at` holds another credential word, which vetoes a keep:
+/// `session_token_cookie: expired` names two credentials, and a status that suits one does not
+/// excuse the other. The same word again and a key by its shape (`OPENAI_API_KEY`) do not count.
+/// Reads at most [`NEARBY`] bytes each way.
+fn another_keyword_nearby(bytes: &[u8], at: usize, keyword: &Keyword) -> bool {
+    let own = &bytes[at..keyword.end];
+    let mut low = at;
+    while low > 0 && at - low < NEARBY && is_name_byte(bytes[low - 1]) {
+        count_steps(1);
+        low -= 1;
+    }
+    let mut high = keyword.end;
+    while high < bytes.len() && high - keyword.end < NEARBY && is_name_byte(bytes[high]) {
+        count_steps(1);
+        high += 1;
+    }
+    (low..high)
+        .filter(|place| *place < at || *place >= keyword.end)
+        .any(|place| {
+            starts_a_keyword(bytes, place)
+                && match_keyword(bytes, place).is_some_and(|other| {
+                    !other.key_shape
+                        && keyword_may_start(bytes, place, other.end)
+                        && !bytes[place..other.end].eq_ignore_ascii_case(own)
+                })
+        })
 }
 
 /// Whether the rest of a name after `token` says it counts tokens: `tokens`, `token_limit`,
@@ -412,12 +537,18 @@ fn only_digits(text: &[u8]) -> bool {
 /// Unauthorized`) are kept.
 #[inline]
 pub(super) fn bearer_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
+    read_header(bytes, at, b':')
+}
+
+/// [`bearer_rule`] for the separator `separator`: a colon, or the equals sign that the assignment
+/// rule hands over (`Authorization=Bearer x`).
+fn read_header(bytes: &[u8], at: usize, separator: u8) -> Option<Outcome> {
     if !(starts_a_word(bytes, at) || is_camel_boundary(bytes, at)) {
         return None;
     }
     let after_keyword = match_word(bytes, at, AUTHORIZATION)?;
     let after_quote = skip_quote(bytes, after_keyword);
-    let after_colon = match_byte(bytes, skip_spaces(bytes, after_quote), b':')?;
+    let after_colon = match_byte(bytes, skip_spaces(bytes, after_quote), separator)?;
     let value = skip_spaces(bytes, after_colon);
     let scheme_start = skip_quote(bytes, value);
     let quoted = scheme_start != value;
@@ -492,6 +623,7 @@ pub(super) fn bearer_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
         end,
         kept_end,
         joiner,
+        tail: "",
     }))
 }
 
@@ -542,7 +674,9 @@ fn is_known_scheme(scheme: &[u8]) -> bool {
 
 /// The next `:` and the one place [`bearer_rule`] can start to reach it.
 ///
-/// The rule wants `authorization`, an optional quote, any spaces, then the colon. The name ends in
+/// The rule wants `authorization`, an optional quote, any spaces, then the colon. (With an equals
+/// sign the header is found by the assignment locator, which already looks at every `=`: a second
+/// scan for it here made the scan of every tail dearer; see [`assignment_rule`].) The name ends in
 /// a letter, so it ends where the quote and the spaces before the colon begin and starts its own
 /// length before that.
 #[inline]
@@ -580,9 +714,20 @@ pub(super) fn assignment_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
     if !(starts_a_keyword(bytes, at) || starts_a_parameter(bytes, at)) {
         return None;
     }
+    // `Authorization=Bearer x`: the bearer rule's header, written with an equals sign.
+    if bytes[at] | 0x20 == b'a'
+        && let Some(after_name) = match_word(bytes, at, AUTHORIZATION)
+        && starts_a_word(bytes, at)
+        && bytes.get(skip_spaces(bytes, skip_quote(bytes, after_name))) == Some(&b'=')
+    {
+        return read_header(bytes, at, b'=');
+    }
     let keyword = match_keyword(bytes, at)
         .filter(|keyword| keyword_may_start(bytes, at, keyword.end))
         .or_else(|| match_query_name(bytes, at))?;
+    if !keyword.whole && is_a_plain_word(bytes, at, keyword.end) {
+        return None;
+    }
     // `AWS_SECRET_ACCESS_KEY=` is a keyword with the rest of a name after it. Requiring the
     // separator to follow the keyword itself would redact only the spellings that happen to
     // end on one, which is a minority of the names credentials actually have.
@@ -591,15 +736,16 @@ pub(super) fn assignment_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
     } else {
         take_while(bytes, keyword.end, is_name_byte)
     };
-    // `cookies: 3 stored` is a count; only a header named `cookie` has a line of values.
-    let keyword = Keyword {
-        kind: if keyword.kind == Kind::Line && name_end != keyword.end {
-            Kind::Token
-        } else {
-            keyword.kind
-        },
-        ..keyword
+    // `cookies: 3 stored` is a count; only a header named `cookie` has a line of values. And a name
+    // that ends in `cookie` is a cookie header whatever opens it (`session_token_cookie`), so its
+    // line is redacted from whichever of its starts is asked first.
+    let kind = match keyword.kind {
+        Kind::Line if name_end != keyword.end => Kind::Token,
+        Kind::Line => Kind::Line,
+        _ if ends_in_cookie(bytes, keyword.end, name_end) => Kind::Line,
+        kind => kind,
     };
+    let keyword = Keyword { kind, ..keyword };
     let after_name = skip_quote(bytes, name_end);
     // `{"token": 12345}`: a bare value in JSON ends where its object does.
     let quoted_name = after_name != name_end;
@@ -609,9 +755,11 @@ pub(super) fn assignment_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
         match_byte(bytes, separator, b'=').or_else(|| match_byte(bytes, separator, b':'))?;
     let value_start = skip_spaces(bytes, after_separator);
     if let Some(opened) = open_quote(bytes, value_start) {
-        return quoted_value(bytes, &keyword, opened, after_separator);
+        return quoted_value(bytes, &keyword, at, opened, after_separator);
     }
-    let in_query = starts_a_parameter(bytes, run_start(bytes, at, is_name_byte));
+    // A `&` ends a value only in a query string, and a query string separates with `=`.
+    let in_query = !colon && in_a_query(bytes, run_start(bytes, at, is_name_byte));
+    let vetoed = || another_keyword_nearby(bytes, at, &keyword);
     let ends_value = |byte: u8| {
         !is_value_byte(byte)
             || (in_query && matches!(byte, b'&' | b'#'))
@@ -620,6 +768,7 @@ pub(super) fn assignment_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
     let phrase = keyword.kind == Kind::Phrase && colon && !in_query;
     if let Some(end) = status_phrase_end(bytes, value_start)
         && (!phrase || phrase_closes(bytes, end))
+        && !vetoed()
     {
         return Some(Outcome::Keep { end });
     }
@@ -628,10 +777,11 @@ pub(super) fn assignment_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
         && digits_end > value_start
         && bytes.get(digits_end).is_none_or(|byte| ends_value(*byte))
         && counts_tokens(bytes, keyword.end)
+        && !vetoed()
     {
         return Some(Outcome::Keep { end: digits_end });
     }
-    if is_a_path_for_pwd(bytes, at, &keyword, value_start) {
+    if is_a_path_for_pwd(bytes, at, &keyword, value_start) && !vetoed() {
         return Some(Outcome::Keep { end: value_start });
     }
     // `token_type: Bearer` names a scheme; `token_type: Bearer eyJ...` has the credential after it,
@@ -642,7 +792,7 @@ pub(super) fn assignment_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
             let alone = bytes
                 .get(after)
                 .is_none_or(|byte| matches!(byte, b'\n' | b'\r') || ends_value(*byte));
-            if alone {
+            if alone && !vetoed() {
                 return Some(Outcome::Keep { end: scheme_end });
             }
             true
@@ -675,6 +825,7 @@ pub(super) fn assignment_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
         end: value_end,
         kept_end,
         joiner,
+        tail: "",
     }))
 }
 
@@ -796,6 +947,7 @@ fn open_quote(bytes: &[u8], at: usize) -> Option<Opened> {
 fn close_quote(bytes: &[u8], opened: &Opened) -> usize {
     let mut at = opened.inner;
     while let Some(byte) = bytes.get(at) {
+        count_steps(1);
         match *byte {
             b'\n' | b'\r' => return at,
             b'\\' if opened.escaped && bytes.get(at + 1) == Some(&opened.quote) => return at,
@@ -813,23 +965,46 @@ fn close_quote(bytes: &[u8], opened: &Opened) -> usize {
 fn quoted_value(
     bytes: &[u8],
     keyword: &Keyword,
+    at: usize,
     opened: Opened,
     after_separator: usize,
 ) -> Option<Outcome> {
     let end = close_quote(bytes, &opened);
+    // Text glued to the closing quote (`"pa"ss"word"`) is more of the value, not the end of it:
+    // the value is redacted through the glued tail, and no keep below applies.
+    if let Some(tail_end) = glued_tail(bytes, &opened, end) {
+        // The closing quote goes back after the marker, so that the text still reads as a quoted
+        // value and a second pass over it leaves it as it is.
+        let tail = match (opened.quote, opened.escaped) {
+            (b'"', false) => "\"",
+            (b'"', true) => "\\\"",
+            (_, false) => "'",
+            (_, true) => "\\'",
+        };
+        return Some(Outcome::Redact(Rewrite {
+            end: tail_end,
+            kept_end: opened.inner,
+            joiner: "",
+            tail,
+        }));
+    }
     if end == opened.inner {
         return Some(Outcome::Keep {
             end: after_separator,
         });
     }
-    if status_phrase_end(bytes, opened.inner).is_some_and(|status| status == end) {
+    let vetoed = || another_keyword_nearby(bytes, at, keyword);
+    if status_phrase_end(bytes, opened.inner).is_some_and(|status| status == end) && !vetoed() {
         return Some(Outcome::Keep { end });
     }
     // `"token_type": "Bearer"`; `"Bearer eyJ..."` is a credential and is redacted whole.
-    if token_type_scheme(bytes, keyword, opened.inner) == Some(end) {
+    if token_type_scheme(bytes, keyword, opened.inner) == Some(end) && !vetoed() {
         return Some(Outcome::Keep { end });
     }
-    if keyword.token && counts_tokens(bytes, keyword.end) && only_digits(&bytes[opened.inner..end])
+    if keyword.token
+        && counts_tokens(bytes, keyword.end)
+        && only_digits(&bytes[opened.inner..end])
+        && !vetoed()
     {
         return Some(Outcome::Keep { end });
     }
@@ -837,7 +1012,49 @@ fn quoted_value(
         end,
         kept_end: opened.inner,
         joiner: "",
+        tail: "",
     }))
+}
+
+/// Where the value ends when text is glued to the quote that closes it: the closing quote at `end`
+/// (a backslash and a quote when the value was written escaped), then a byte that goes on with the
+/// value instead of ending it. A comma, a space, a closing bracket or a `)`, `.`, `&` or `>` ends
+/// a value; a letter, a digit, another quote or an operator does not.
+fn glued_tail(bytes: &[u8], opened: &Opened, end: usize) -> Option<usize> {
+    if !bytes
+        .get(end)
+        .is_some_and(|byte| *byte == opened.quote || *byte == b'\\')
+    {
+        return None;
+    }
+    let after = end + if opened.escaped { 2 } else { 1 };
+    let glued = bytes.get(after).is_some_and(|byte| {
+        byte.is_ascii_alphanumeric()
+            || is_quote(*byte)
+            || matches!(
+                byte,
+                b'_' | b'-'
+                    | b'+'
+                    | b'/'
+                    | b'='
+                    | b'@'
+                    | b'!'
+                    | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'^'
+                    | b'*'
+                    | b'~'
+                    | b'|'
+                    | b'?'
+                    | b'\\'
+            )
+    });
+    glued.then(|| {
+        take_while(bytes, after, |byte| {
+            is_value_byte(byte) && !matches!(byte, b'}' | b']')
+        })
+    })
 }
 
 /// The end of the line from `start`, without the spaces that trail it.
@@ -859,6 +1076,7 @@ fn phrase_end(bytes: &[u8], start: usize) -> usize {
 
 fn trim_end(bytes: &[u8], start: usize, mut end: usize) -> usize {
     while end > start && matches!(bytes[end - 1], b' ' | b'\t') {
+        count_steps(1);
         end -= 1;
     }
     end
@@ -970,6 +1188,7 @@ pub(super) fn url_password_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
         end: password.end,
         kept_end: password.start,
         joiner: "",
+        tail: "",
     }))
 }
 

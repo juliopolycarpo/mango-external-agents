@@ -78,10 +78,38 @@ pub fn stderr_text(raw: &str) -> String {
     // Stripped first rather than last. A CLI that colours its output writes `Authorization:` and
     // ` Bearer sk-live-x` either side of an escape sequence, and a rule that reads the two as
     // neighbours never sees the token at all if the sequence is still sitting between them.
-    let plain = strip_control_characters(raw);
-    let bearer = redact_bearer(&plain);
+    let (plain, marked) = strip::strip_marking(raw);
+    let mut redacted = rules_round(&plain);
+    // A marker the stripper left parts a name from the word before it for the rules, and is gone
+    // from what they return, so a second call over that would read the same text differently.
+    // Reading it again here, until it stops changing, makes the answer one a second call leaves
+    // alone. Text with no removed byte, nearly all of it, pays for one round.
+    if marked {
+        for _ in 0..EXTRA_ROUNDS {
+            let next = rules_round(&redacted);
+            if next == redacted {
+                break;
+            }
+            redacted = next;
+        }
+    }
+    redacted
+}
+
+/// The most times text that carried a marker is read again.
+const EXTRA_ROUNDS: usize = 3;
+
+/// The three rules over text the stripper has handled, and the markers taken out after.
+fn rules_round(plain: &str) -> String {
+    let bearer = redact_bearer(plain);
     let assignments = redact_assignments(&bearer);
     remove_boundaries(redact_url_passwords(&assignments))
+}
+
+/// [`stderr_text`] without the rounds that follow a marker: what one reading of the rules gives.
+#[cfg(test)]
+fn single_round(raw: &str) -> String {
+    rules_round(&strip_control_characters(raw))
 }
 
 /// Redacts `raw` and then bounds it to `limit`: the order every vendor-written diagnostic needs.
@@ -222,6 +250,8 @@ struct Rewrite {
     end: usize,
     kept_end: usize,
     joiner: &'static str,
+    /// What follows the marker: the closing quote of a value whose glued tail was redacted with it.
+    tail: &'static str,
 }
 
 /// What a rule makes of a place it was asked about.
@@ -266,6 +296,7 @@ fn rewrite(
         out.push_str(&as_text(bytes, at, found.kept_end));
         out.push_str(found.joiner);
         out.push_str(REDACTED);
+        out.push_str(found.tail);
         copied = found.end;
         from = found.end;
     }
@@ -418,6 +449,7 @@ mod tests {
                         end: 3,
                         kept_end: 1,
                         joiner: "=",
+                        tail: "",
                     }))
                 },
             )

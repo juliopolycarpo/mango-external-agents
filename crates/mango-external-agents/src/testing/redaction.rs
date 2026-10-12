@@ -172,6 +172,31 @@ pub const LEAKS: &[Leak] = &[
         &["presigned GET /b/k?", "X-Amz-Expires=60 failed"],
     ),
     leak(
+        "denied Authorization=Bearer sk-20abc on retry",
+        "sk-20abc",
+        &["denied Authorization=Bearer", "on retry"],
+    ),
+    leak(
+        "request headers x-functions-key: fk-21abc\nHost: h",
+        "fk-21abc",
+        &["request headers x-functions-key", "Host: h"],
+    ),
+    leak(
+        "Ocp-Apim-Subscription-Key: ak-22abc and Host",
+        "ak-22abc",
+        &["Ocp-Apim-Subscription-Key", "and Host"],
+    ),
+    leak(
+        r#"login failed password="pa"ss-23word" for ann"#,
+        "ss-23word",
+        &["login failed password=\"", "for ann"],
+    ),
+    leak(
+        "run cmd &password=pw-24x&ss-24y after",
+        "ss-24y",
+        &["run cmd &password=", "after"],
+    ),
+    leak(
         r#"call failed {"error":"bad","env":[{"name":"HOME","value":"/h"}],"token":"tk-15"}"#,
         "tk-15",
         &["call failed", r#""error":"bad""#, r#""value":"/h""#],
@@ -211,6 +236,10 @@ pub const BENIGN: &[&str] = &[
     "env OLDPWD=/home/u PWD=/home/u/project",
     "clone failed for ssh://jenkins-deploy-agent-01@build.example.com/repo.git",
     r#"{"access_token":"[REDACTED]","token_type":"Bearer","expires_in":3600}"#,
+    "tokenizer: gpt-4o-mini",
+    "secretary: bob",
+    "tokenization: bpe",
+    "passwordless: enabled",
     "the secret service is unavailable",
     "key not found in cache",
     "cache_key: layer-3",

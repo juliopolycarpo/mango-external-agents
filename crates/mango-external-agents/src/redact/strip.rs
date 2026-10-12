@@ -86,10 +86,17 @@ const CHARSET_INTRODUCERS: &[u8] = b"()*+";
 /// space: a value the rules are reading goes on through it, and a half-credential after a removed
 /// byte is not left in the clear. [`remove_boundaries`] takes it out of the redacted text.
 pub(super) fn strip_control_characters(raw: &str) -> String {
+    strip_marking(raw).0
+}
+
+/// [`strip_control_characters`], and whether it left a [`BOUNDARY`] in the text it returns. The
+/// marker is a control character, which the stripper removes, so one in the text is its own.
+pub(super) fn strip_marking(raw: &str) -> (String, bool) {
     let bytes = raw.as_bytes();
     let mut out = String::with_capacity(raw.len());
     let mut at = 0;
     let mut removed = false;
+    let mut marked = false;
     loop {
         count_steps(1);
         // Nothing is removed from, or marked in, text that follows a kept character and holds
@@ -119,12 +126,13 @@ pub(super) fn strip_control_characters(raw: &str) -> String {
             && (starts_credential_name(bytes, at) || ends_with_scheme(&out))
         {
             out.push(BOUNDARY);
+            marked = true;
         }
         removed = false;
         out.push(character);
         at = after;
     }
-    out
+    (out, marked)
 }
 
 /// Where the text from `at` first holds a byte a removed character can start with: the end of

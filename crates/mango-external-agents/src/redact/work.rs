@@ -19,10 +19,11 @@ use crate::ExtensionValue;
 const SMALL: usize = 16 * 1024;
 
 /// What a byte of text may cost across the passes (the stripper and the three rules, with the
-/// keyword look-ups behind them): 1 to 9 on the shapes below, so 16 leaves room for a compiler or
+/// keyword look-ups behind them): 1 to 9 on the shapes below, and up to twice that where a removed
+/// byte makes the rules read the text a second time, so 24 leaves room for a compiler or
 /// a pass more without hiding a rule that reads a suffix per candidate, which costs thousands of
 /// steps a byte at this size.
-const STEPS_PER_BYTE: usize = 16;
+const STEPS_PER_BYTE: usize = 24;
 
 /// [`ends_awaiting_value`] runs two rules over the text four times and sweeps it once more.
 const AWAITING_STEPS_PER_BYTE: usize = 40;
@@ -255,6 +256,30 @@ const SHAPES: &[Shape] = &[
         build: |len| repeated("token=[\\\"a", "", len),
     },
     Shape {
+        what: "two different keywords alternating in one name before a status",
+        build: |len| repeated("token_secret_", ": expired", len),
+    },
+    Shape {
+        what: "a token and a cookie alternating in one name before an empty value",
+        build: |len| repeated("token_cookie_", "=,", len),
+    },
+    Shape {
+        what: "ampersands with no query string, repeated",
+        build: |len| repeated("&token=x", "", len),
+    },
+    Shape {
+        what: "a quoted value with text glued to its closing quote, repeated",
+        build: |len| repeated("password=\"a\"b", "", len),
+    },
+    Shape {
+        what: "a quoted value with a glued tail that never ends, repeated",
+        build: |len| repeated("token=\"a\"", &"b".repeat(len), len),
+    },
+    Shape {
+        what: "plain words that start with a keyword, repeated",
+        build: |len| repeated("tokenizer: ", "", len),
+    },
+    Shape {
         what: "token-length userinfo with no password, repeated",
         build: |len| repeated("a://aaaaaaaaaaaaaaaaaaa1@", "", len),
     },
@@ -376,6 +401,16 @@ fn every_loop_over_the_text_counts_its_steps() {
             len / 8,
         ),
         ("text with nothing to strip", "x".repeat(len), len),
+        (
+            "a quoted value",
+            format!("token=\"{}\"", "a".repeat(len)),
+            4 * len,
+        ),
+        (
+            "a cookie line with trailing blanks",
+            format!("Cookie: x{}\n", " ".repeat(len)),
+            5 * len,
+        ),
     ] {
         let received = redaction_steps(&text);
         assert!(

@@ -30,7 +30,7 @@ use super::rules::{assignment_rule, bearer_rule, url_password_rule};
 use super::strip::strip_control_characters;
 use super::{
     REDACTED, as_text, ends_awaiting_value, redact_assignments, redact_bearer,
-    redact_url_passwords, stderr_text,
+    redact_url_passwords, single_round, stderr_text,
 };
 
 /// A rule under test, described the way the replaced scan wants it: where the match ends and the
@@ -45,7 +45,7 @@ fn described(
                 let kept = as_text(bytes, at, found.kept_end);
                 Described::Redact(Rewrite {
                     end: found.end,
-                    replacement: format!("{kept}{}{REDACTED}", found.joiner),
+                    replacement: format!("{kept}{}{REDACTED}{}", found.joiner, found.tail),
                 })
             }
         })
@@ -219,6 +219,9 @@ fn triggers_in(plain: &str) -> bool {
         }
         let after_name = lower[at + "authorization".len()..]
             .trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '\u{1}');
+        if after_name.starts_with('=') {
+            return true;
+        }
         let Some(rest) = after_name.strip_prefix(':') else {
             continue;
         };
@@ -258,7 +261,7 @@ fn as_a_hyphen(raw: &str) -> String {
 /// has to be the one 0.4.1's rules give with the marker read as a hyphen, compared with the hyphens
 /// of both taken out.
 fn agreement_with_0_4_1(raw: &str) -> Result<Agreement, String> {
-    let (shipped, head) = (reference::stderr_text(raw), stderr_text(raw));
+    let (shipped, head) = (reference::stderr_text(raw), single_round(raw));
     if shipped == head {
         return Ok(Agreement::Same);
     }
@@ -322,17 +325,6 @@ fn next_char_boundary(raw: &str, at: usize) -> usize {
 fn assert_one_pass_is_a_fixed_point(raw: &str) {
     let once = stderr_text(raw);
     let twice = stderr_text(&once);
-    // Where a rule added after 0.4.1 reads the text, a second pass may read it differently, since
-    // the stripper's markers are gone from what it is given (`redact::boundaries` pins the same
-    // for 0.4.1's rules). It may take more out and never put anything in.
-    if carries_a_new_trigger(raw) {
-        assert!(
-            twice.len() <= once.len(),
-            "expected a second pass not to grow the text | input {raw:?} first pass {once:?}, \
-             second pass {twice:?}"
-        );
-        return;
-    }
     assert!(
         once == twice,
         "expected one pass of the redactor to be a fixed point | input {raw:?} first pass \
@@ -404,7 +396,7 @@ fn assert_matches_the_replaced_scan(raw: &str) {
     expect(
         "the whole redactor",
         raw,
-        stderr_text,
+        single_round,
         remove_boundaries(urls),
     );
     if let Err(why) = agreement_with_0_4_1(raw) {
