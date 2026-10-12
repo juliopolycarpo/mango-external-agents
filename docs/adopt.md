@@ -139,11 +139,15 @@ limits, including custom `turn_buffer_bytes`; other harness transports retain th
 There is no credential field, and there never will be. The library reuses whatever the user
 already logged into with the vendor's own CLI.
 
-When an ACP agent refuses a prompt because the user is signed out, the turn ends with the code
-`acp-auth-required` and a message that carries the agent profile's sign-in text; the session stays
-`Ready`, so a host shows that text, lets the user sign in with the vendor's CLI, and prompts
-again. Error text a vendor supplies is redacted for credential-shaped content before the host
-sees it, so match a failure on its `code` and `vendor_code`, never on its message.
+When an ACP agent answers a prompt with the auth-required error, because the user is signed out
+or a credential expired during the session, the turn ends with the code `acp-auth-required`. Its
+message is the agent profile's sign-in text (the login command, or the documentation link when the
+profile has no command), never the agent's own words. The session stays `Ready`, so a host shows
+that text, lets the user sign in with the vendor's CLI, and prompts again; an agent that keeps the
+old credential in memory answers the same way, and the host then closes and reopens the session.
+
+Error text a vendor supplies is redacted for credential-shaped content before the host sees it, so
+match a failure on its `code` and `vendor_code`, never on its message.
 
 ## What the host reads
 
