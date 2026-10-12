@@ -196,12 +196,14 @@ fn walk(value: &Value, under: Under, embedded: usize) -> Value {
     match (value, under) {
         // A container under a credential name is one marker, so that redacting never makes the
         // value larger: a megabyte of `1,` under `"token"` would otherwise come back as six.
-        (Value::Object(_), Under::Credential { .. }) => Value::String(String::from(REDACTED)),
-        (Value::Array(items), Under::Credential { counts: true })
-            if items.iter().all(is_a_count) =>
+        // Except under a name that counts tokens, where a container of counts is counts
+        // (`"output_tokens_details": {"reasoning_tokens": 12}`).
+        (Value::Object(_) | Value::Array(_), Under::Credential { counts: true })
+            if holds_only_counts(value) =>
         {
             value.clone()
         }
+        (Value::Object(_), Under::Credential { .. }) => Value::String(String::from(REDACTED)),
         (Value::Array(_), Under::Credential { .. }) => Value::String(String::from(REDACTED)),
         _ => walk_leaf_or_free(value, under, embedded),
     }
@@ -220,6 +222,18 @@ fn walk_leaf_or_free(value: &Value, under: Under, embedded: usize) -> Value {
             _ => value.clone(),
         },
         other => other.clone(),
+    }
+}
+
+/// Whether `value` is a number with few enough digits to be a count, or an array or an object
+/// that holds nothing but those, under keys that are no credential's name or count something.
+fn holds_only_counts(value: &Value) -> bool {
+    match value {
+        Value::Object(members) => members
+            .iter()
+            .all(|(key, member)| key_is_no_secret(key) && holds_only_counts(member)),
+        Value::Array(items) => items.iter().all(holds_only_counts),
+        other => is_a_count(other),
     }
 }
 
@@ -320,9 +334,9 @@ fn redact_span(
     };
     match (&node.node, under) {
         // A container under a credential name is one marker, as in `walk`.
+        (Node::Object(_) | Node::Array(_), Under::Credential { counts: true })
+            if holds_only_counts_span(node, text) => {}
         (Node::Object(_), Under::Credential { .. }) => replace(edits),
-        (Node::Array(items), Under::Credential { counts: true })
-            if items.iter().all(|item| is_a_count_span(item, text)) => {}
         (Node::Array(_), Under::Credential { .. }) => replace(edits),
         (Node::Object(members), _) => {
             let names = |keys: &[&str]| {
@@ -395,6 +409,25 @@ fn redact_span(
             }
         }
         (Node::Number | Node::Other, _) => {}
+    }
+}
+
+/// Whether a member's key leaves its value a count: no credential's name, or one that counts.
+fn key_is_no_secret(key: &str) -> bool {
+    !matches!(
+        Under::credential(key),
+        Some(Under::Credential { counts: false })
+    )
+}
+
+/// [`holds_only_counts`] over a text and its spans.
+fn holds_only_counts_span(node: &spans::Spanned, text: &str) -> bool {
+    match &node.node {
+        spans::Node::Object(members) => members.iter().all(|member| {
+            key_is_no_secret(&member.key) && holds_only_counts_span(&member.value, text)
+        }),
+        spans::Node::Array(items) => items.iter().all(|item| holds_only_counts_span(item, text)),
+        _ => is_a_count_span(node, text),
     }
 }
 
@@ -736,6 +769,32 @@ mod tests {
 
     /// A count has at most ten digits; twelve or more under a name that counts tokens is a secret
     /// that is made of digits, as the text rules read it.
+    /// A container of counts under a name that counts tokens is counts: Claude's usage objects carry
+    /// `output_tokens_details` and `cache_creation` that way, and a host that reads its usage back
+    /// needs them.
+    #[test]
+    fn a_container_of_counts_under_a_count_name_keeps_its_counts() {
+        let usage = json!({
+            "output_tokens_details": { "reasoning_tokens": 12, "nested": { "audio_tokens": 3 } },
+            "input_tokens": [1, 2, 3],
+            "max_tokens": { "limit": 100_000_000_000_000_i64 },
+            "total_tokens": { "note": "sk-live-1" },
+            "api_key": { "n": 1 },
+        });
+        let shown = structured(&usage);
+        assert_eq!(
+            shown["output_tokens_details"], usage["output_tokens_details"],
+            "expected an object of counts under a count name kept | received: {shown}"
+        );
+        assert_eq!(shown["input_tokens"], usage["input_tokens"]);
+        for name in ["max_tokens", "total_tokens", "api_key"] {
+            assert_eq!(
+                shown[name], "[REDACTED]",
+                "expected {name} redacted whole, since it holds more than counts | received: {shown}"
+            );
+        }
+    }
+
     #[test]
     fn a_number_of_twelve_digits_under_a_count_name_is_redacted() {
         let shown = structured(&json!({
