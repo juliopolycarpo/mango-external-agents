@@ -122,11 +122,12 @@ let host = HostContext::builder()
    [harness-acp.md](harness-acp.md#deadlines), [harness-claude.md](harness-claude.md#deadlines) and
    the stop-a-turn deadlines of [harness-codex.md](harness-codex.md#sessions-turns-and-steering).
    Add a margin of your own; these are the harness's bounds, not a promise about a typical stop.
-   When a bound runs out, `cancel` and `close` return `Error::CleanupRequired` on all three
-   harnesses: `cleanup_control()` is the control your launcher returned for the child, `cause()` is
-   the stage that failed, and a repeated `close` returns the same error without asking the child
-   again. One rule reconciles a leftover child whichever harness raised it; see
-   [lifecycle.md](lifecycle.md#owners-and-cancellation).
+   When a bound runs out, `close` returns `Error::CleanupRequired` on all three harnesses, and so
+   does `cancel` on Claude and Codex (an ACP `cancel` only queues `session/cancel`):
+   `cleanup_control()` is the control your launcher returned for the child, and a repeated `close`
+   returns the same error without asking the child again. `cause()` is the stage that failed on
+   Claude and Codex, and `Error::Vendor` text on ACP. One rule reconciles a leftover child
+   whichever harness raised it; see [lifecycle.md](lifecycle.md#owners-and-cancellation).
 
 For ACP, one outgoing frame may be `Limits::turn_buffer_bytes` by default, and the writer queue
 holds twice that, counting the frame being written, so a full-size prompt can still be followed by
@@ -280,13 +281,13 @@ is the one your supervisor spends its time in.
 Replay safety answers whether a second submission can duplicate accepted work. It never commands
 a retry. Decide using the existing queries together:
 
-| Fact                        | Meaning and host decision                                                                                                                       |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `dispatch()`                | `NotSubmitted` proves absence; accepted or unknown work cannot be replayed on a hunch.                                                          |
-| `retryable()`               | Busy can become free, and some vendor refusals advise another attempt. `false` also covers broken links and timeouts.                           |
-| `cause()`                   | Match the typed underlying cause. A caller's oversized prompt needs changed input; Link/Timeout need recovery rather than a caller-error label. |
-| `cleanup_control()`         | Retain and finish bounded process cleanup even when submission never happened. `cancel` and `close` return it on all three harnesses.           |
-| `session.snapshot().status` | Session usability is separate from the error. A nonretryable error does not prove the session remains healthy.                                  |
+| Fact                        | Meaning and host decision                                                                                                                               |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `dispatch()`                | `NotSubmitted` proves absence; accepted or unknown work cannot be replayed on a hunch.                                                                  |
+| `retryable()`               | Busy can become free, and some vendor refusals advise another attempt. `false` also covers broken links and timeouts.                                   |
+| `cause()`                   | Match the typed underlying cause. A caller's oversized prompt needs changed input; Link/Timeout need recovery rather than a caller-error label.         |
+| `cleanup_control()`         | Retain and finish bounded process cleanup even when submission never happened. `close` returns it on all three harnesses, `cancel` on Claude and Codex. |
+| `session.snapshot().status` | Session usability is separate from the error. A nonretryable error does not prove the session remains healthy.                                          |
 
 An ACP agent's readable JSON-RPC error answer to a prompt ends that turn only: the session stays
 `Ready`, and a host that treats the failure as fatal for the conversation calls `close` itself. An

@@ -27,10 +27,13 @@ have received `kill`; the host owns reconciliation and any bounded retry, includ
 tree. The library does not retain a global cleanup registry or promise cleanup after the host
 runtime ends.
 
-The rule is the same for the Claude, Codex and ACP harnesses. A `cancel` or `close` whose stop did
-not prove the child gone, because a stage ran out of time, the host's control returned an error or
-its code panicked, returns `Error::CleanupRequired`. `cause()` is the stage's failure, and
-`cleanup_control()` is the control the host's launcher returned. The first outcome of a teardown is
+One rule reconciles a leftover child on all three harnesses: branch on `cleanup_control()`. A
+`close` whose stop did not prove the child gone returns `Error::CleanupRequired` on Claude, Codex
+and ACP, and so does a Claude or Codex `cancel` that has to stop the process; an ACP `cancel` only
+queues `session/cancel` and never stops one. A stage that ran out of time, an error from the host's
+control and a panic in its code all count. `cleanup_control()` is the control the host's launcher
+returned. The cause differs: Claude and Codex keep the typed failure of the stage, readable
+through `cause()`, where ACP carries it as `Error::Vendor` text. The first outcome of a teardown is
 kept: a later `close` returns a copy of it, with the same control, and does not ask the child to
 stop again. A `close` that gave up on a launch still inside the launcher has no child and so no
 control; the `start_turn` that owns the launch gets the `CleanupRequired` if its stop then fails,
