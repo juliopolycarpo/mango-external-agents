@@ -306,10 +306,24 @@ impl Survey {
                 .map(str::trim)
                 .filter(|line| !line.is_empty())
         };
-        lines()
+        let line = lines()
             .find(|line| self.version.is_some() && version::parse(line) == self.version)
-            .or_else(|| lines().next())
-            .map(str::to_owned)
+            .or_else(|| lines().next())?;
+        // The version was read from the raw line. What a host is shown is that line redacted and
+        // bounded, and opening parses the receipt's copy again: a line the redactor rewrites
+        // (`tool token: 2.1.270` reads as an assignment) would lose its version there and fail
+        // closed. Such a line is shown as the version alone.
+        let shown = mango_external_agents::redact::bounded(
+            line,
+            mango_external_agents::normalize::TextLimit::AccountLabel,
+        )
+        .text;
+        match &self.version {
+            Some(version) if version::parse(&shown).as_ref() != Some(version) => {
+                Some(version.to_string())
+            }
+            _ => Some(line.to_owned()),
+        }
     }
 
     /// The version as a host should read it: what the CLI reported, bounded by the core.

@@ -954,6 +954,60 @@ mod opening_a_session {
         );
     }
 
+    /// The version is read from what the CLI printed, and the receipt carries a redacted line.
+    /// Opening parses the receipt's line again, so a banner the redactor rewrites
+    /// (`token: 2.1.270` reads as an assignment) must not take its version with it.
+    #[tokio::test]
+    async fn a_banner_the_redactor_rewrites_keeps_its_version_through_a_receipt() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_version("tool token: 2.1.270"));
+        let harness = ClaudeHarness::new();
+        let host = host(Arc::clone(&launcher));
+        let discovery = harness.discover(&host).await.expect("expected a discovery");
+        assert_eq!(
+            discovery.gate,
+            GateVerdict::Usable,
+            "expected the version read from the raw banner to pass the gate | received {:?}",
+            discovery.gate
+        );
+        let shown = discovery.version.clone().unwrap_or_default();
+        assert_eq!(
+            mango_agent_claude::version::parse(&shown).map(|version| version.to_string()),
+            Some(String::from("2.1.270")),
+            "expected the reported version to parse again to 2.1.270 | received {shown:?}"
+        );
+        assert!(
+            !shown.contains("token"),
+            "expected the rewritten banner not to be shown as it was printed | received {shown:?}"
+        );
+
+        let mut request = OpenSession::new("chat-1");
+        if let Some(executable) = &discovery.executable {
+            request = request.with_executable(ExecutablePath::resolved(executable.clone()));
+        }
+        let receipt = DiscoveryReceipt::new(HarnessId::claude(), discovery, host.now())
+            .with_executable_fingerprint("same-test-binary")
+            .with_environment_fingerprint("same-test-environment")
+            .with_authorization_fingerprint("same-test-authorization")
+            .bind_to_open(
+                harness.descriptor(),
+                &host,
+                &request,
+                DiscoveryReceiptMeasurements::new()
+                    .with_executable_fingerprint("same-test-binary")
+                    .with_environment_fingerprint("same-test-environment")
+                    .with_authorization_fingerprint("same-test-authorization"),
+            )
+            .expect("expected current receipt evidence to match");
+        let opened = harness
+            .open_session(&host, request.with_discovery(receipt))
+            .await;
+        assert!(
+            opened.is_ok(),
+            "expected a receipt of a rewritten banner to open a session | received {:?}",
+            opened.err()
+        );
+    }
+
     #[tokio::test]
     async fn a_fresh_usable_help_surface_recovers_a_missing_surface_receipt_gate() {
         let mut missing_flag_help = String::from(HELP_2_1_270);

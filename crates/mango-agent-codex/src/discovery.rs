@@ -159,6 +159,26 @@ mod tests {
         );
     }
 
+    /// The gate reads the version off the raw line, and the host is shown the token alone. A banner
+    /// the redactor rewrites (`token: 0.153.4` reads as an assignment) keeps its version, and the
+    /// token survives the redaction a discovery goes through.
+    #[test]
+    fn a_banner_the_redactor_rewrites_still_yields_a_version_that_survives_redaction() {
+        let banner = "tool token: 0.153.4\n";
+        let redacted = mango_external_agents::redact::stderr_text(banner);
+        assert_eq!(
+            parse_version(&redacted),
+            None,
+            "expected the redacted banner {redacted:?} to have lost its version | received one"
+        );
+        let version = parse_version(banner).expect("expected a version off the raw banner");
+        assert_eq!(
+            mango_external_agents::redact::stderr_text(&version),
+            version,
+            "expected the version token to survive redaction | received a different text"
+        );
+    }
+
     /// A CLI that changed the shape of `--version` has not stopped working. Reporting nothing lets
     /// the caller say `Unknown` rather than refuse a build that would run.
     #[test]
