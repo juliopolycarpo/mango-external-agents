@@ -860,3 +860,90 @@ fn escaped_single_quotes_close_a_value_with_the_backslashes_that_opened_it() {
         ),
     ]);
 }
+
+/// A pretty-printed array or object under a credential's name is one value, however many lines it
+/// takes, and a YAML sequence under one is a value of its items. The text rules used to read a
+/// line at a time, so only the line with the name was redacted and the entries below it stayed.
+#[test]
+fn a_container_that_spans_lines_is_one_value() {
+    assert_shown(&[
+        (
+            "{\"tokens\":\n[\n\"sk-aaa\",\n\"sk-bbb\"\n]}",
+            "{\"tokens\":\n[REDACTED]}",
+        ),
+        (
+            "{\n  \"password\": [\n    \"sk-aaa\",\n    \"sk-bbb\"\n  ],\n  \"user\": \"ann\"\n}",
+            "{\n  \"password\": [REDACTED],\n  \"user\": \"ann\"\n}",
+        ),
+        (
+            "{\n  \"credentials\": {\n    \"user\": \"u\",\n    \"pass\": \"p\"\n  },\n  \"ok\": true\n}",
+            "{\n  \"credentials\": [REDACTED],\n  \"ok\": true\n}",
+        ),
+        (
+            "{\"tokens\": [\"sk-aaa\",\n \"sk-bbb\"], \"retry_after\": 30}",
+            "{\"tokens\": [REDACTED], \"retry_after\": 30}",
+        ),
+        // A bracket inside a string and a nested array do not close the value early.
+        (
+            "{\"secret\": [\n  \"a]b\",\n  [\"c\"],\n  \"d\"\n], \"n\": 1}",
+            "{\"secret\": [REDACTED], \"n\": 1}",
+        ),
+        (
+            "tokens: [\n  sk-aaa,\n  sk-bbb\n]\nnext: ok",
+            "tokens=[REDACTED]\nnext: ok",
+        ),
+        // The carriage returns go with the rest of what the redactor strips.
+        (
+            "{\r\n  \"password\": [\r\n    \"sk-aaa\"\r\n  ]\r\n}",
+            "{\n  \"password\": [REDACTED]\n}",
+        ),
+        // One that never closes ends with its first line, as it always did.
+        (
+            "{\"token\": [\n\"sk-aaa\",\n\"sk-bbb\"",
+            "{\"token\": [REDACTED]\n\"sk-aaa\",\n\"sk-bbb\"",
+        ),
+    ]);
+}
+
+/// The container is read to the line that closes it, and no further than 64 lines on: a longer one
+/// is read as its first line, as an array that never closes is.
+#[test]
+fn a_container_past_the_line_bound_is_read_as_its_first_line() {
+    let body = |lines: usize| format!("{{\"token\": [\n{}\"z\"\n]}}", "\"a\",\n".repeat(lines));
+    let received = stderr_text(&body(60));
+    assert_eq!(
+        received, "{\"token\": [REDACTED]}",
+        "expected a 62 line array redacted whole | received: {received:?}"
+    );
+    let text = body(100);
+    let received = stderr_text(&text);
+    assert!(
+        received.starts_with("{\"token\": [REDACTED]\n\"a\","),
+        "expected a 102 line array read as its first line | received: {received:?}"
+    );
+}
+
+#[test]
+fn a_yaml_sequence_under_a_credential_name_is_redacted_item_by_item() {
+    assert_shown(&[
+        (
+            "api_key:\n  - sk-live-aaa\n  - sk-live-bbb\nnext: ok",
+            "api_key=[REDACTED]\nnext: ok",
+        ),
+        (
+            "env:\n  tokens:\n    - sk-aaa\n    - sk-bbb\n  other: 1\n",
+            "env:\n  tokens=[REDACTED]\n  other: 1\n",
+        ),
+        // A sequence at another indentation, or under another name, is not this one's.
+        (
+            "tokens:\n  - a\nother:\n  - b",
+            "tokens=[REDACTED]\nother:\n  - b",
+        ),
+        ("tokens:\n  - a\n  - b\n - c", "tokens=[REDACTED]\n - c"),
+        ("api_key: - sk-live-aaa\nnext", "api_key=[REDACTED]\nnext"),
+        // A hyphen that starts a word is a value, as it was.
+        ("api_key:\n  -sk-live-aaa\nnext", "api_key=[REDACTED]\nnext"),
+        // A status stays.
+        ("token:\n  - expired\nnext", "token:\n  - expired\nnext"),
+    ]);
+}

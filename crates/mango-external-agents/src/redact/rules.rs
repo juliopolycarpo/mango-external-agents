@@ -267,6 +267,9 @@ pub(super) struct QueryRun {
     read_to: usize,
     /// Whether the last `?` or blank read was a `?`.
     question_mark: bool,
+    /// The bytes that containers spanning lines have been read for, past their first line: the
+    /// budget of [`closing_bracket`]. It belongs to the pass and is not reset with the query run.
+    container_bytes: usize,
 }
 
 impl QueryRun {
@@ -283,7 +286,8 @@ impl QueryRun {
 
     fn has_a_question_mark_before(&mut self, bytes: &[u8], at: usize) -> bool {
         if at < self.read_to {
-            *self = Self::default();
+            self.read_to = 0;
+            self.question_mark = false;
         }
         let unread = &bytes[self.read_to..at];
         count_steps(unread.len());
@@ -871,7 +875,7 @@ fn read_assignment(bytes: &[u8], at: usize, query: &mut QueryRun) -> Option<Outc
     let colon = bytes.get(separator) == Some(&b':');
     let after_separator =
         match_byte(bytes, separator, b'=').or_else(|| match_byte(bytes, separator, b':'))?;
-    let value_start = skip_spaces(bytes, after_separator);
+    let (value_start, list) = list_item(bytes, skip_spaces(bytes, after_separator));
     let mut context = Context {
         query,
         start: run_start(bytes, at, is_name_byte),
@@ -926,12 +930,15 @@ fn read_assignment(bytes: &[u8], at: usize, query: &mut QueryRun) -> Option<Outc
         None => false,
     };
     let value_end = match (keyword.kind, bytes.get(value_start)) {
+        _ if list.is_some() => list_end(bytes, value_start, list.flatten()),
         _ if with_a_token => line_end(bytes, value_start),
         (Kind::Line, _) => line_end(bytes, value_start),
         // The brackets close the value, and whatever is glued after them goes with it.
-        (_, Some(b'[' | b'{')) => take_while(bytes, closing_bracket(bytes, value_start), |byte| {
-            !ends_value(byte)
-        }),
+        (_, Some(b'[' | b'{')) => take_while(
+            bytes,
+            closing_bracket(bytes, value_start, &mut context.query.container_bytes),
+            |byte| !ends_value(byte),
+        ),
         (Kind::Phrase, _) if phrase => phrase_end(bytes, value_start),
         _ => take_while(bytes, value_start, |byte| !ends_value(byte)),
     };
@@ -953,6 +960,49 @@ fn read_assignment(bytes: &[u8], at: usize, query: &mut QueryRun) -> Option<Outc
         joiner,
         tail: "",
     }))
+}
+
+/// The most items of a YAML sequence that a credential's name takes.
+const MAX_LIST_ITEMS: usize = 64;
+
+/// Where the value of a YAML sequence item starts, when the value at `at` opens with the `- ` that
+/// marks one: the item's text, and, as `Some(Some(indent))`, the column of the marker when it
+/// stands first on its line, so that the items below it can be found.
+///
+/// A hyphen glued to its word (`-sk-live-x`) is part of a value, as it always was.
+fn list_item(bytes: &[u8], at: usize) -> (usize, Option<Option<usize>>) {
+    let marked =
+        bytes.get(at) == Some(&b'-') && bytes.get(at + 1).is_some_and(|b| is_space_byte(*b));
+    let item = skip_spaces(bytes, at + 1);
+    if !marked || item >= bytes.len() {
+        return (at, None);
+    }
+    let blanks = run_start(bytes, at, is_blank_byte);
+    let first_on_line = blanks == 0 || matches!(bytes[blanks - 1], b'\n' | b'\r');
+    (item, Some(first_on_line.then_some(at - blanks)))
+}
+
+/// Where the sequence whose first item starts at `item` ends: the end of that line, and of every
+/// line below it that opens with a marker in the same column (up to [`MAX_LIST_ITEMS`]). A marker
+/// in any other column belongs to another sequence.
+fn list_end(bytes: &[u8], item: usize, indent: Option<usize>) -> usize {
+    let mut end = line_end(bytes, item);
+    let Some(indent) = indent else {
+        return end;
+    };
+    for _ in 0..MAX_LIST_ITEMS {
+        let marker = skip_spaces(bytes, end);
+        let blanks = run_start(bytes, marker, is_blank_byte);
+        let in_column =
+            blanks > 0 && matches!(bytes[blanks - 1], b'\n' | b'\r') && marker - blanks == indent;
+        let marked = bytes.get(marker) == Some(&b'-')
+            && bytes.get(marker + 1).is_some_and(|b| is_space_byte(*b));
+        if !(in_column && marked) {
+            break;
+        }
+        end = line_end(bytes, skip_spaces(bytes, marker + 1));
+    }
+    end
 }
 
 /// Whether nothing is left of a phrase after the status that ends at `end`: the text ends, or a
@@ -1009,21 +1059,55 @@ fn token_type_scheme(bytes: &[u8], keyword: &Keyword, value_start: usize) -> Opt
     (scheme && bytes.get(value_end).is_none_or(|byte| !is_name_byte(*byte))).then_some(value_end)
 }
 
+/// The most lines a container under a credential name is read across.
+const MAX_CONTAINER_LINES: usize = 64;
+
+/// The most bytes a container is read across.
+const MAX_CONTAINER_BYTES: usize = 16 * 1024;
+
+/// What a pass may read for containers past their first line, over and above one byte for each
+/// byte of the text it has passed: a text of containers that never close must not read
+/// [`MAX_CONTAINER_BYTES`] for each of them.
+const CONTAINER_ALLOWANCE: usize = 8 * 1024;
+
 /// Where the bracket that opens at `start` closes, counting the brackets and the strings inside:
 /// a JSON array or object that is one credential's value. A string opens with a quote, or with
 /// backslashes and a quote when the JSON is itself inside a string (`{\\"a\\":1}`, and
 /// `{\\\\\\"a\\\\\\":1}` one string deeper), and a string opened with `n` backslashes ends at
-/// a quote with exactly `n`. An unclosed one ends with its line.
-fn closing_bracket(bytes: &[u8], start: usize) -> usize {
+/// a quote with exactly `n`.
+///
+/// A pretty-printed container takes many lines, so the bracket is looked for across line breaks, up
+/// to [`MAX_CONTAINER_LINES`] lines and [`MAX_CONTAINER_BYTES`] bytes, and a string ends with its
+/// line. One that does not close within that, or when the pass has used its allowance (`spent`,
+/// see [`CONTAINER_ALLOWANCE`]), ends with its first line: an array that never closes must not
+/// take the rest of the text with it. Everything read past the first line is added to `spent`.
+fn closing_bracket(bytes: &[u8], start: usize, spent: &mut usize) -> usize {
+    let across_lines = *spent < CONTAINER_ALLOWANCE.saturating_add(start);
     let mut depth = 0usize;
     // The quote that opened the string we are in, and the backslashes written in front of it.
     let mut string: Option<(u8, usize)> = None;
+    // Where the first line ends, and how many lines have been read.
+    let mut first_break: Option<usize> = None;
+    let mut lines = 1;
     let mut at = start;
+    let charge = |spent: &mut usize, first: Option<usize>, end: usize| {
+        *spent = spent.saturating_add(first.map_or(0, |first| end.saturating_sub(first)));
+    };
     while let Some(&byte) = bytes.get(at) {
         count_steps(1);
         at += 1;
         if matches!(byte, b'\n' | b'\r') {
-            return at - 1;
+            let first = *first_break.get_or_insert(at - 1);
+            if byte == b'\r' && bytes.get(at) == Some(&b'\n') {
+                at += 1;
+            }
+            if !across_lines || lines >= MAX_CONTAINER_LINES || at - start > MAX_CONTAINER_BYTES {
+                charge(spent, first_break, at);
+                return first;
+            }
+            lines += 1;
+            string = None;
+            continue;
         }
         match (string, byte) {
             (Some((_, 0)), b'\\') if !matches!(bytes.get(at), Some(b'\n' | b'\r')) => at += 1,
@@ -1050,13 +1134,15 @@ fn closing_bracket(bytes: &[u8], start: usize) -> usize {
             (None, b']' | b'}') => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
+                    charge(spent, first_break, at);
                     return at;
                 }
             }
             (None, _) => {}
         }
     }
-    bytes.len()
+    charge(spent, first_break, at);
+    first_break.unwrap_or(bytes.len())
 }
 
 /// A quote that opens a value at `at`: where its text starts, the quote and the backslashes that

@@ -144,6 +144,17 @@ fn status_follows_a_separator(lower: &str) -> bool {
     })
 }
 
+/// Whether a sequence marker, a hyphen then a blank, stands right after a `:` or an `=`, where a
+/// rule added after 0.4.1 reads the item after it as the value.
+fn marker_follows_a_separator(lower: &str) -> bool {
+    lower.match_indices([':', '=']).any(|(at, _)| {
+        let rest =
+            lower[at + 1..].trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '\u{1}');
+        rest.strip_prefix('-')
+            .is_some_and(|after| after.starts_with(|c: char| c.is_ascii_whitespace()))
+    })
+}
+
 /// The words a rule keeps after a name, as the rules spell them.
 const STATUS_WORDS: &[&str] = &[
     "not",
@@ -188,6 +199,7 @@ fn triggers_in(plain: &str) -> bool {
     if lower.contains(['"', '\'', '\\', '?', '&', '[', '{'])
         || NEW_WORDS.iter().any(|word| lower.contains(word))
         || status_follows_a_separator(&lower)
+        || marker_follows_a_separator(&lower)
     {
         return true;
     }
@@ -462,6 +474,8 @@ const FRAGMENTS: &[&str] = &[
     "\\\\\\\"",
     "\\\\\\\\\\\\\\\"",
     "\\",
+    "- ",
+    "\n  - ",
     "{",
     "}",
     "[",
@@ -573,6 +587,16 @@ const SHAPES: &[&str] = &[
     r#"{\\\"tokens\\\":[\\\"a\\\"],\\\"retry_after\\\":30}"#,
     r#"{\\\\\\\"password\\\\\\\":\\\\\\\"a b\\\\\\\",\\\\\\\"u\\\\\\\":1}"#,
     r#"{\\\"Authorization\\\":\\\"Bearer sk-live-1\\\",\\\"Accept\\\":\\\"a\\\"}"#,
+    "{\"tokens\":\n[\n\"a\",\n\"b\"\n]}",
+    "{\n  \"password\": [\n    \"x\"\n  ],\n  \"user\": \"u\"\n}",
+    "{\"credentials\": {\n  \"k\": [1,\n 2]\n}, \"n\": 1}",
+    "{\"token\": [\n\"never closed\",",
+    "tokens: [\n  a,\n  b\n]\nnext: ok",
+    "api_key:\n  - sk-live-1\n  - sk-live-2\nnext",
+    "tokens:\n  - a\n  - b\n - c\nother:\n  - d",
+    "api_key: - sk-live-1\nnext",
+    "token:\n  - expired\nnext",
+    "tokens:\n  -\n  - a",
     r#"{"password":"a b; c","user":"u"}"#,
     r#"{"token": 12345}"#,
     r#"{"tokens": ["a", "b"]}"#,

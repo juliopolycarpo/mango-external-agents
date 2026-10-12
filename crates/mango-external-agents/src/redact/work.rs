@@ -29,8 +29,9 @@ const STEPS_PER_BYTE: usize = 24;
 const AWAITING_STEPS_PER_BYTE: usize = 40;
 
 /// Doubling the text may add a little more than double the work: block searches round up to a
-/// whole block and each shape has a constant tail.
-const DOUBLING_SLACK: usize = 256;
+/// whole block, each shape has a constant tail, and a read bounded by a count of lines or items
+/// (a container, a sequence) costs less than a byte for each byte until its bound is reached.
+const DOUBLING_SLACK: usize = 1024;
 
 /// One shape of text that has cost a rule more than its length, and the length it is built to.
 struct Shape {
@@ -40,6 +41,13 @@ struct Shape {
 
 fn repeated(unit: &str, tail: &str, len: usize) -> String {
     format!("{}{tail}", unit.repeat(len / unit.len()))
+}
+
+/// `text` cut or padded with spaces to `len` bytes, for a shape whose size is not a multiple of
+/// its unit and would otherwise double to a little more or less than twice.
+fn exactly(mut text: String, len: usize) -> String {
+    text.truncate(len);
+    format!("{text:<len$}")
 }
 
 const SHAPES: &[Shape] = &[
@@ -344,6 +352,70 @@ const SHAPES: &[Shape] = &[
     Shape {
         what: "a long run of backslashes inside an array outside any string",
         build: |len| format!("token=[{}]", "\\".repeat(len)),
+    },
+    Shape {
+        what: "an array opened at the end of every line that never closes",
+        build: |len| repeated("token: [\n", "", len),
+    },
+    Shape {
+        what: "an array with entries on every line that never closes, repeated",
+        build: |len| repeated("\"token\": [\n  \"a\",\n", "", len),
+    },
+    Shape {
+        what: "a quoted name and an object opened at the end of every line",
+        build: |len| repeated("{\"password\":{\n", "", len),
+    },
+    Shape {
+        what: "arrays that close one line past the line bound, repeated",
+        build: |len| {
+            repeated(
+                &format!("token: [\n{}]\n{}", "a,\n".repeat(65), " ".repeat(50)),
+                "",
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "arrays that close on the last line the bound allows, repeated",
+        build: |len| {
+            repeated(
+                &format!("token: [\n{}]\n{}", "a,\n".repeat(61), " ".repeat(62)),
+                "",
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "one array as long as the text, one entry to a line",
+        build: |len| exactly(format!("token: [\n{}]", "a,\n".repeat(len / 3)), len),
+    },
+    Shape {
+        what: "strings that never close inside arrays that span lines, repeated",
+        build: |len| repeated("token: [\n\"a\n'b\n", "", len),
+    },
+    Shape {
+        what: "closing brackets and braces only, after a name",
+        build: |len| format!("token: [{}", "]}".repeat(len / 2)),
+    },
+    Shape {
+        what: "a sequence item under a name, repeated",
+        build: |len| repeated("tokens:\n  - a\n", "", len),
+    },
+    Shape {
+        what: "one sequence as long as the text",
+        build: |len| exactly(format!("tokens:\n{}", "  - a\n".repeat(len / 6)), len),
+    },
+    Shape {
+        what: "sequence markers with nothing after them, repeated",
+        build: |len| repeated("tokens:\n  -\n", "", len),
+    },
+    Shape {
+        what: "sequence markers in every column, repeated",
+        build: |len| repeated("tokens:\n - a\n  - b\n   - c\n", "", len),
+    },
+    Shape {
+        what: "blank lines between sequence items",
+        build: |len| repeated("tokens:\n  - a\n\n\n\n\n", "", len),
     },
     Shape {
         what: "escaped JSON quotes, three deep, one after another",

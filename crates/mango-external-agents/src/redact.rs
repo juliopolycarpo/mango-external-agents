@@ -166,8 +166,17 @@ pub(crate) fn ends_awaiting_value(dropped: &str) -> bool {
     // Each probe finishes one waiting state: a name that wants its separator, a separator that
     // wants its value, `Authorization` that wants `:`, `Authorization:` that wants a scheme and a
     // scheme that wants its token. `Z` is the value; it survives only when nothing claimed it.
-    // The last continues the line, as a cut inside a quoted JSON string does.
-    const PROBES: [&str; 5] = ["\n=Z", "\n:bearer Z", "\nbearer Z", "\nZ", " Z"];
+    // The fifth continues the line, as a cut inside a quoted JSON string does. The last closes a
+    // container that a credential's name opened (a bracket closes either kind): `Z]` survives
+    // only when no such container was open, since a bracket nothing opened stays text.
+    const PROBES: [(&str, &str); 6] = [
+        ("\n=Z", "Z"),
+        ("\n:bearer Z", "Z"),
+        ("\nbearer Z", "Z"),
+        ("\nZ", "Z"),
+        (" Z", "Z"),
+        ("\nZ]", "Z]"),
+    ];
     // Only the two rules that read across a line break: a URL password cannot span one.
     let plain = strip_control_characters(dropped);
     // Nothing is awaited without a keyword in the text, and most tails have none.
@@ -179,11 +188,11 @@ pub(crate) fn ends_awaiting_value(dropped: &str) -> bool {
     if !names_a_credential {
         return false;
     }
-    PROBES.iter().any(|probe| {
+    PROBES.iter().any(|(probe, survives)| {
         // The text is copied once with its probe, then redacted by the rules, which count their own.
         count_steps(plain.len());
         let probed = redact_assignments(&redact_bearer(&format!("{plain}{probe}")));
-        !probed.ends_with('Z')
+        !probed.ends_with(survives)
     })
 }
 
@@ -720,6 +729,11 @@ mod tests {
             "noise {\"Authorization\": \"Bearer",
             "noise accessToken",
             "noise Cookie:",
+            // A container a credential's name opened and nothing has closed.
+            "noise {\"tokens\": [",
+            "noise {\"password\": [\n  \"hunter2\",",
+            "noise \"credentials\": {\"user\": \"u\",\n",
+            "noise tokens: [\n  sk-aaa,",
         ] {
             assert!(
                 ends_awaiting_value(dropped),
@@ -737,6 +751,10 @@ mod tests {
             "Authorization: Bearer sk-live-42",
             "retry at https://user:url-secret@agent.internal",
             "an ordinary line ending in a colon:",
+            // A container that closed, and one a name that is no credential's opened.
+            "noise {\"tokens\": [\"a\"],",
+            "noise {\"password\": [\n  \"hunter2\"\n],\n",
+            "noise {\"items\": [\n  \"a\",",
         ] {
             assert!(
                 !ends_awaiting_value(dropped),
