@@ -1904,6 +1904,14 @@ impl Shared {
         if !self.stop_new_work() {
             return;
         }
+        self.fail_stopped(failure).await;
+    }
+
+    /// The rest of a poison, for the caller that won [`Shared::stop_new_work`].
+    ///
+    /// Whoever stopped new work first owns the turn's ending and the reaper's wake, so a caller
+    /// checks that before it comes here and a loser never does.
+    async fn fail_stopped(&self, failure: VendorError) {
         let _reaper = WakeReaper(&self.terminated);
         if let Some(client) = self.client.get() {
             let _ = tokio::time::timeout(
@@ -1945,9 +1953,9 @@ impl Shared {
     /// nobody left to release it, and the teardown waits `shutdown_timeout` for a committer that
     /// is gone before it releases the turn itself. So the poison runs on a task of the harness's
     /// own, which no end of the connection stops, and the request task only waits for it. A
-    /// request task that is dropped meanwhile detaches the poison, which finishes alone, wakes the
-    /// teardown as it ends, and leaves the request unanswered, as the connection that ended would
-    /// have left it.
+    /// request task that is dropped meanwhile detaches the poison, which finishes alone and wakes
+    /// the teardown as it ends. The client answers the dropped request itself, with its closed
+    /// error, if the link still takes the write; that is what it did before.
     ///
     /// The notification handler asks the client for a cancellation hold instead
     /// ([`Shared::hold_terminal_commit`]), because its call is the one the client tracks. A
@@ -1960,17 +1968,24 @@ impl Shared {
     /// }
     /// ```
     async fn poison_apart(self: &Arc<Self>, failure: VendorError) {
+        // Decided here, on the request's task, before anything can cut it: whoever stopped new
+        // work first owns the turn's ending and the reaper's wake, as in
+        // `connection_terminated`. A loser leaves both to the winner and spawns nothing, so the
+        // wake below is only ever the winner's.
+        if !self.stop_new_work() {
+            return;
+        }
         let shared = Arc::clone(self);
         // Woken only if this call is cut. A request task dropped while it waits would otherwise
         // leave the teardown waiting for a poison that may still be on its way to the
         // interrupt's answer; woken, the teardown starts at once and gives a stretch already
         // claimed the `shutdown_timeout` it gives any committer. A call that is not cut leaves
-        // the wake to the poison, or to whoever stopped new work first: they own it.
+        // the wake to the poison, which owns it.
         let wake = WakeReaper(&self.terminated);
         // A poison that panics is a join error here, and its guards have already woken the
         // teardown as they unwound. The request is then answered with its refusal, as after any
         // poison.
-        let _ = tokio::spawn(async move { shared.poison(failure).await }).await;
+        let _ = tokio::spawn(async move { shared.fail_stopped(failure).await }).await;
         std::mem::forget(wake);
     }
 
@@ -9668,42 +9683,62 @@ mod tests {
                     );
                 }
 
-                /// A request cut before its poison has claimed anything: the poison is still waiting
-                /// for the interrupt's answer when the overflow lands. The teardown starts at once
-                /// and ends the turn, and the host still reads the sink's failure.
+                /// A request cut while its poison is parked before the claim: nothing is claimed,
+                /// so nothing but the request task's own wake can start the teardown. It starts
+                /// at once and ends the turn, the host reads the sink's failure, and the poison
+                /// that is let go afterwards finds nothing to claim.
                 #[tokio::test(start_paused = true)]
-                async fn a_request_cut_before_its_poison_claims_does_not_delay_the_teardown() {
+                async fn a_request_cut_before_its_poison_claims_wakes_the_teardown_at_once() {
                     let shared = shared();
                     let grace = shared.host.limits().shutdown_timeout;
                     let options = options_for(End::Overflow, &shared);
                     let (shared, session, link, launcher, mut stream) =
                         running_session_with(shared, options, |control| control).await;
+                    // Kept: a dropped session starts the teardown itself.
+                    let session = Arc::new(session);
                     fill_the_interaction_reserve(&shared).await;
+                    let before_the_claim = Arc::clone(&shared.before_hold).lock_owned().await;
                     link.push_line(approval_request(1));
                     link.wait_for_sent(1).await;
+                    let sent: serde_json::Value = serde_json::from_str(&link.sent()[0])
+                        .expect("expected the poisoned request to write a JSON frame");
+                    link.push_line(serde_json::json!({"id": sent["id"], "result": {}}).to_string());
+                    until(
+                        "the poison: asking for its hold, ahead of the claim",
+                        || shared.holds_asked.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                    )
+                    .await;
 
                     let began = Instant::now();
-                    end_under(End::Overflow, &shared, &Arc::new(session), &link).await;
+                    end_under(End::Overflow, &shared, &session, &link).await;
                     let (events, ended_after) = ending(&mut stream, began).await;
                     let (teardown, reaped_after) = torn_down(&shared, began).await;
                     let live = launcher.live_children();
+                    drop(before_the_claim);
+                    tokio::time::sleep(grace).await;
                     assert!(
                         is_stream_overflow(&events) && ended_after < grace,
-                        "expected a request cut while its poison awaits the interrupt: stream-overflow within {grace:?} | received: {:?} after {ended_after:?}",
+                        "expected a request cut ahead of its poison's claim: stream-overflow within {grace:?} | received: {:?} after {ended_after:?}",
                         events.last()
                     );
                     assert!(
                         matches!(teardown, Some(Ok(()))) && live == 0 && reaped_after < grace,
-                        "expected the teardown at once: Ok(()) within {grace:?}, live children 0 | received: {teardown:?} after {reaped_after:?}, live children {live}"
+                        "expected the teardown woken by the cut request: Ok(()) within {grace:?}, live children 0 | received: {teardown:?} after {reaped_after:?}, live children {live}"
+                    );
+                    assert!(
+                        turn_is_released(&shared),
+                        "expected the turn slot after the late poison: released | received: still claimed"
                     );
                 }
 
                 /// A poison that finds new work already stopped leaves the turn and the reaper's
                 /// wake to whoever stopped it.
                 #[tokio::test(start_paused = true)]
-                async fn a_poison_that_lost_the_race_does_not_wake_the_reaper() {
+                async fn a_poison_that_lost_the_race_leaves_the_turn_and_the_reaper_to_the_winner()
+                {
                     let shared = shared();
                     shared.adopt_thread(String::from("thread-1"));
+                    let (_turn_id, _stream) = running(&shared, "vendor-turn-1").await;
                     assert!(
                         shared.stop_new_work(),
                         "expected the first stop of new work to win | received: lost"
@@ -9719,6 +9754,12 @@ mod tests {
                     assert!(
                         !shared.terminated.is_cancelled(),
                         "expected the reaper left to whoever stopped new work: not woken | received: woken"
+                    );
+                    assert!(
+                        !terminal_is_claimed(&shared) && !turn_is_released(&shared),
+                        "expected the turn left to whoever stopped new work: unclaimed and held | received: claimed {}, released {}",
+                        terminal_is_claimed(&shared),
+                        turn_is_released(&shared)
                     );
                 }
 

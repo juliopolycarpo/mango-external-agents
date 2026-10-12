@@ -265,8 +265,11 @@ read have reached the handler, which takes at most one `shutdown_timeout`; and o
 a call on its handler task, so `hold_cancellation` holds nothing there. The poison therefore runs
 on a task of the harness's own (`Shared::poison_apart`) and the request waits for it. The task is
 not tracked by the client, so no end of the connection stops it, and a request dropped meanwhile
-leaves it to finish alone. That drop also wakes the teardown at once, so a poison still on its way
-to the interrupt's answer does not delay it.
+leaves it to finish alone; the client answers the dropped request itself, with its closed error,
+if the link still takes the write. That drop also wakes the teardown at once, so a poison still on
+its way to the interrupt's answer does not delay it. Only the session's first stop of new work
+spawns a poison and owns that wake, as everywhere else in this section: a request that finds new
+work already stopped leaves the turn and the wake to whoever stopped it.
 
 Only two sites raise a poison there: an approval, or a question round, whose
 `ApprovalRequested` or `QuestionAsked` finds no room on the stream. By then the stream has
