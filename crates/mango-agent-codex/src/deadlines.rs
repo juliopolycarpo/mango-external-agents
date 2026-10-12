@@ -263,7 +263,7 @@ impl Deadlines {
     /// use mango_agent_codex::deadlines::Deadlines;
     /// use mango_external_agents::Limits;
     ///
-    /// let lost =Deadlines::from_limits(&Limits::default()).connection_lost_to_closed();
+    /// let lost = Deadlines::from_limits(&Limits::default()).connection_lost_to_closed();
     /// assert_eq!(lost.as_secs(), 46);
     /// ```
     #[must_use]
