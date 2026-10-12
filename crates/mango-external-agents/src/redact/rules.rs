@@ -143,21 +143,16 @@ fn match_keyword(bytes: &[u8], at: usize) -> Option<Keyword> {
             key_shape: true,
         });
     }
-    if first == b'x' || (first == b's' && bytes.get(at + 1).is_some_and(|byte| byte | 0x20 == b'u'))
+    if first == b'k'
+        && let Some(end) = match_header_key(bytes, at)
     {
-        // Header names that are a key without a keyword in them (`Ocp-Apim-Subscription-Key` is
-        // found at its last word).
-        for name in ["x-functions-key", "subscription-key"] {
-            if let Some(end) = match_word(bytes, at, name.as_bytes()) {
-                return Some(Keyword {
-                    end,
-                    kind: Kind::Token,
-                    whole: false,
-                    token: false,
-                    key_shape: true,
-                });
-            }
-        }
+        return Some(Keyword {
+            end,
+            kind: Kind::Token,
+            whole: false,
+            token: false,
+            key_shape: true,
+        });
     }
     for word in CREDENTIAL_WORDS {
         // Most words start with another letter, and a string compare is dearer than this one.
@@ -189,6 +184,24 @@ fn starts_a_parameter(bytes: &[u8], at: usize) -> bool {
         at.checked_sub(1).and_then(|before| bytes.get(before)),
         Some(b'?' | b'&')
     )
+}
+
+/// Vendor header names that are a key without a credential word in them, each read at its last
+/// word so that no new letter opens a start: `x-functions-key` (Azure Functions) and
+/// `Ocp-Apim-Subscription-Key` (Azure API Management).
+const KEY_HEADER_PREFIXES: [&str; 2] = ["x-functions-", "subscription-"];
+
+/// The end of the `key` at `at` when a header name above leads up to it.
+fn match_header_key(bytes: &[u8], at: usize) -> Option<usize> {
+    let end = match_word(bytes, at, b"key")?;
+    let before = &bytes[..at];
+    KEY_HEADER_PREFIXES
+        .iter()
+        .any(|prefix| {
+            before.len() >= prefix.len()
+                && before[before.len() - prefix.len()..].eq_ignore_ascii_case(prefix.as_bytes())
+        })
+        .then_some(end)
 }
 
 /// How far back a `?` is looked for before a `&` is taken for the join of two parameters.
@@ -271,22 +284,20 @@ fn starts_a_keyword(bytes: &[u8], at: usize) -> bool {
     };
     let second = next | 0x20;
     match opening | 0x20 {
-        b's' => (second == b'e') | (second == b'i') | (second == b'u'),
+        b's' => (second == b'e') | (second == b'i'),
         b't' => second == b'o',
         b'p' => (second == b'a') | (second == b'w') | (second == b'r'),
         b'c' => (second == b'r') | (second == b'o'),
-        b'x' => second == b'-',
         b'a' => (second == b'p') | (second == b'u') | (second == b'c'),
         _ => second == b'e',
     }
 }
 
-/// Whether a byte is the first letter of some keyword: `a`, `c`, `k`, `p`, `s`, `t` or `x`, either
-/// case.
+/// Whether a byte is the first letter of some keyword: `a`, `c`, `k`, `p`, `s` or `t`, either case.
 fn opens_a_keyword(byte: u8) -> bool {
     /// Bit `n` is set when the letter `a + n` opens a keyword.
     const OPENING_LETTERS: u32 =
-        (1 << 0) | (1 << 2) | (1 << 10) | (1 << 15) | (1 << 18) | (1 << 19) | (1 << 23);
+        (1 << 0) | (1 << 2) | (1 << 10) | (1 << 15) | (1 << 18) | (1 << 19);
     let letter = (byte | 0x20).wrapping_sub(b'a');
     (letter < 26) & ((OPENING_LETTERS >> (letter & 31)) & 1 == 1)
 }
