@@ -38,6 +38,13 @@ pub(super) const CREDENTIAL_WORDS: [&str; 11] = [
 /// be one inside another word (`passenger`, `author`, `monkey`).
 pub(super) const CREDENTIAL_NAMES: [&str; 3] = ["pass", "auth", "sig"];
 
+/// The longest string read as JSON: a larger one is a log, not a field, and the parse is the only
+/// work here that is not a pass over the text. 256 KiB is a few thousand headers or variables.
+const MAX_EMBEDDED_BYTES: usize = 256 * 1024;
+
+/// How many strings deep a JSON text is read, one inside the next.
+const MAX_EMBEDDED_DEPTH: usize = 4;
+
 /// A name with its separators and case taken out.
 fn squashed(name: &str) -> String {
     name.chars()
@@ -120,6 +127,9 @@ fn only_digits(text: &str) -> bool {
 ///   "value": "sk-..."}`, in any case;
 /// - the second entry of a two-entry array whose first is a credential's name:
 ///   `["Authorization", "Bearer ..."]`;
+/// - a string that is itself a JSON object or array (up to 256 KiB, four strings deep) is walked
+///   as structure, and written again, compactly, when the walk changed it; any other string is
+///   returned as it came, `"123"` and `"null"` included;
 /// - credential-shaped text in every other string, by the rules of [`stderr_text`](super::stderr_text)
 ///   and the well-known tokens with no name beside them (`ghp_...`, `AKIA...`), done before the value
 ///   is written out because writing escapes a line break into two characters the text rules do not
@@ -149,7 +159,7 @@ fn only_digits(text: &str) -> bool {
 /// ```
 #[must_use]
 pub fn structured(value: &Value) -> Value {
-    walk(value, Under::Nothing)
+    walk(value, Under::Nothing, 0)
 }
 
 /// What the walk is below.
@@ -170,7 +180,9 @@ impl Under {
     }
 }
 
-fn walk(value: &Value, under: Under) -> Value {
+/// The walk below `value`, which is `embedded` strings deep inside JSON texts that were themselves
+/// a string of the value.
+fn walk(value: &Value, under: Under, embedded: usize) -> Value {
     match (value, under) {
         // A container under a credential name is one marker, so that redacting never makes the
         // value larger: a megabyte of `1,` under `"token"` would otherwise come back as six.
@@ -181,15 +193,15 @@ fn walk(value: &Value, under: Under) -> Value {
             value.clone()
         }
         (Value::Array(_), Under::Credential { .. }) => Value::String(String::from(REDACTED)),
-        _ => walk_leaf_or_free(value, under),
+        _ => walk_leaf_or_free(value, under, embedded),
     }
 }
 
-fn walk_leaf_or_free(value: &Value, under: Under) -> Value {
+fn walk_leaf_or_free(value: &Value, under: Under, embedded: usize) -> Value {
     match value {
-        Value::Object(members) => Value::Object(object(members)),
-        Value::Array(items) => Value::Array(array(items, under)),
-        Value::String(text) => Value::String(string(text, under)),
+        Value::Object(members) => Value::Object(object(members, embedded)),
+        Value::Array(items) => Value::Array(array(items, under, embedded)),
+        Value::String(text) => Value::String(string(text, under, embedded)),
         Value::Number(_) => match under {
             Under::Credential { counts: false } => Value::String(String::from(REDACTED)),
             _ => value.clone(),
@@ -198,12 +210,50 @@ fn walk_leaf_or_free(value: &Value, under: Under) -> Value {
     }
 }
 
-fn string(text: &str, under: Under) -> String {
+fn string(text: &str, under: Under, embedded: usize) -> String {
     match under {
         Under::Credential { counts: true } if only_digits(text) => text.to_owned(),
         Under::Credential { .. } => String::from(REDACTED),
-        Under::Nothing => message_text(text),
+        Under::Nothing => text_or_structure(text, embedded),
     }
+}
+
+/// A string that is not under a credential's name: read as the text it is, and, when it is a JSON
+/// object or array, as the structure it holds.
+///
+/// A vendor that serialises a request into a field sends JSON as a string, and the structure in it
+/// (a `{"name": ..., "value": ...}` pair, an `["Authorization", ...]` entry) is a credential the
+/// text rules cannot see. Only a text that parses as a container is walked, so `"123"`, `"null"`
+/// and a prose sentence stay what they are; it is written again only when the walk changed
+/// something, so every other string comes back byte for byte. The text is read to
+/// [`MAX_EMBEDDED_BYTES`] and [`MAX_EMBEDDED_DEPTH`] strings deep; past either it is the text rules'
+/// alone, which read a quoted pair at any escaping level.
+fn text_or_structure(text: &str, embedded: usize) -> String {
+    let redacted = message_text(text);
+    let Some(parsed) = embedded_container(text, embedded) else {
+        return redacted;
+    };
+    let walked = walk(&parsed, Under::Nothing, embedded + 1);
+    if walked == parsed {
+        return redacted;
+    }
+    // The member names were copied as they came: the text rules read them once more, on the
+    // written form, where a name is a quoted string like any other.
+    message_text(&walked.to_string())
+}
+
+/// `text` as a JSON object or array, when it is one within the bounds.
+fn embedded_container(text: &str, embedded: usize) -> Option<Value> {
+    if embedded >= MAX_EMBEDDED_DEPTH || text.len() > MAX_EMBEDDED_BYTES {
+        return None;
+    }
+    let trimmed = text.trim();
+    let wrapped = (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'));
+    if !wrapped {
+        return None;
+    }
+    serde_json::from_str(trimmed).ok()
 }
 
 /// The member of `members` whose key, in any case, is one of `names`.
@@ -213,7 +263,7 @@ fn member<'a>(members: &'a Map<String, Value>, names: &[&str]) -> Option<(&'a St
         .find(|(key, _)| names.iter().any(|name| key.eq_ignore_ascii_case(name)))
 }
 
-fn object(members: &Map<String, Value>) -> Map<String, Value> {
+fn object(members: &Map<String, Value>, embedded: usize) -> Map<String, Value> {
     // `{"name": "Authorization", "value": "Bearer ..."}`: the value is the credential.
     let pair_value = member(members, &["name", "key", "header", "field"])
         .and_then(|(_, name)| name.as_str())
@@ -228,12 +278,12 @@ fn object(members: &Map<String, Value>) -> Map<String, Value> {
             } else {
                 Under::credential(key).unwrap_or(Under::Nothing)
             };
-            (key.clone(), walk(member, below))
+            (key.clone(), walk(member, below, embedded))
         })
         .collect()
 }
 
-fn array(items: &[Value], under: Under) -> Vec<Value> {
+fn array(items: &[Value], under: Under, embedded: usize) -> Vec<Value> {
     // `["Authorization", "Bearer ..."]`: the second entry is the credential.
     let pair = matches!(items, [Value::String(name), Value::String(_)] if Under::credential(name).is_some())
         && matches!(under, Under::Nothing);
@@ -241,8 +291,8 @@ fn array(items: &[Value], under: Under) -> Vec<Value> {
         .iter()
         .enumerate()
         .map(|(index, item)| match (pair, index) {
-            (true, 1) => walk(item, Under::Credential { counts: false }),
-            _ => walk(item, under),
+            (true, 1) => walk(item, Under::Credential { counts: false }, embedded),
+            _ => walk(item, under, embedded),
         })
         .collect()
 }
@@ -451,6 +501,119 @@ mod tests {
             shown, expected,
             "expected the value beside a credential name replaced: {expected} | received: {shown}"
         );
+    }
+
+    /// The string a value holds, or an empty one that fails the comparison next to it.
+    fn text_of(value: &serde_json::Value) -> &str {
+        value.as_str().unwrap_or_default()
+    }
+
+    /// A vendor that serialises its request into a field sends JSON as a string. The structure
+    /// in it (a pair of members, a pair of entries) is as much a credential as one outside it.
+    #[test]
+    fn a_json_text_inside_a_string_is_read_as_structure() {
+        let env = r#"[{"name":"OPENAI_API_KEY","value":"sk-live-1"},{"name":"HOME","value":"/h"}]"#;
+        let headers =
+            r#"{"headers":[["Authorization","Bearer sk-live-2"],["Accept","text/plain"]]}"#;
+        let shown = structured(&json!({ "env": env, "request": headers, "retry_after": 30 }));
+        let env_shown: serde_json::Value =
+            serde_json::from_str(text_of(&shown["env"])).unwrap_or_default();
+        assert_eq!(
+            env_shown,
+            json!([{ "name": "OPENAI_API_KEY", "value": "[REDACTED]" }, { "name": "HOME", "value": "/h" }]),
+            "expected the value beside a credential name in an embedded array redacted | received: {shown}"
+        );
+        let request_shown: serde_json::Value =
+            serde_json::from_str(text_of(&shown["request"])).unwrap_or_default();
+        assert_eq!(
+            request_shown,
+            json!({ "headers": [["Authorization", "[REDACTED]"], ["Accept", "text/plain"]] }),
+            "expected the entry beside a credential name in an embedded object redacted | received: {shown}"
+        );
+        assert_eq!(shown["retry_after"], 30);
+    }
+
+    #[test]
+    fn a_json_text_inside_a_json_text_is_read_to_the_depth_the_bound_allows() {
+        let innermost = json!([["Authorization", "Bearer sk-live-3"]]).to_string();
+        let middle = json!({ "inner": innermost }).to_string();
+        let shown = structured(&json!({ "outer": middle }));
+        assert!(
+            !shown.to_string().contains("sk-live-3"),
+            "expected a credential two strings deep redacted | received: {shown}"
+        );
+        // Deeper than the bound is the text rules' alone, and costs no more than they do.
+        let mut deep = json!("x");
+        for _ in 0..8 {
+            deep = json!({ "next": deep.to_string() });
+        }
+        let received = structured(&deep);
+        assert!(
+            received.to_string().len() <= deep.to_string().len(),
+            "expected nesting to be redacted without growing | received: {received}"
+        );
+    }
+
+    /// Only a text that is a container is read, and only when something in it changes is it written
+    /// again: every other string comes back as it went in, spacing and key order included.
+    #[test]
+    fn a_string_that_is_no_json_container_or_holds_nothing_to_redact_is_kept_as_it_was() {
+        for text in [
+            r#"{"b" :  1, "a": [1,  2]}"#,
+            "[ 1, 2 ]",
+            "123",
+            "null",
+            "true",
+            r#""quoted""#,
+            "{not json}",
+            "[1, 2,",
+            "{\"a\": 1} trailing",
+            "1e3",
+        ] {
+            let shown = structured(&json!({ "note": text }));
+            assert_eq!(
+                text_of(&shown["note"]),
+                text,
+                "expected {text:?} kept as it was | received: {shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_embedded_text_over_the_size_bound_is_left_to_the_text_rules() {
+        let pair = r#"{"name":"X_API_KEY","value":"sk-live-4"},"#;
+        let within = format!(
+            "[{}{{}}]",
+            pair.repeat(super::MAX_EMBEDDED_BYTES / pair.len() - 1)
+        );
+        let over = format!(
+            "[{}{{}}]",
+            pair.repeat(super::MAX_EMBEDDED_BYTES / pair.len() + 1)
+        );
+        assert!(
+            within.len() <= super::MAX_EMBEDDED_BYTES && over.len() > super::MAX_EMBEDDED_BYTES
+        );
+        let read = structured(&json!({ "a": within }));
+        assert!(
+            !text_of(&read["a"]).contains("sk-live-4"),
+            "expected a text of {} bytes read as structure | received a value that still holds it",
+            within.len()
+        );
+        let unread = structured(&json!({ "a": over }));
+        assert_eq!(
+            text_of(&unread["a"]),
+            crate::redact::stderr_text(&over),
+            "expected a text of {} bytes left to the text rules",
+            over.len()
+        );
+    }
+
+    #[test]
+    fn structure_read_inside_a_string_is_a_fixed_point() {
+        let env = r#"[{"name":"OPENAI_API_KEY","value":"sk-live-5"},["Cookie","sid=1"]]"#;
+        let once = structured(&json!({ "env": env, "b": [env] }));
+        let twice = structured(&once);
+        assert_eq!(once, twice, "expected a second walk to change nothing");
     }
 
     #[test]
