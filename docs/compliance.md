@@ -172,6 +172,13 @@ own deployment.
   sum where a span would otherwise cut a JSON string in two. Nothing is kept on purpose that the
   release before hid.
 
+  One property of the release before is inherited and not repaired: `stderr_text` is a fixed point
+  wherever the release before is, and not elsewhere. A `?` that puts a later `&passwd=&` in a
+  query string, where an empty value is kept, is redacted away by the first pass (`apikey:?;&passwd=&`
+  gives `apikey=[REDACTED];&passwd=&`), and a second pass reads the rest as a plain assignment and
+  redacts it. Settling that would read every tail that redacted something twice; a host that wants
+  a fixed point reads a message with `redact::bounded`, which is one.
+
   `redact::search` holds that with generated text and no exemption: the canaries a reviewer's
   generators (statements, JSON structures, random fragments, a soup of bytes) and the findings of
   the reviews put in a text are hidden by every entry point if the release before hid them,

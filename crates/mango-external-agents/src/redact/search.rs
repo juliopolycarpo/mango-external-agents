@@ -272,7 +272,12 @@ fn assert_every_entry_point_is_a_fixed_point(raw: &str) {
         }
         let once = pass(&text);
         let twice = pass(&once);
-        if once != twice {
+        // `stderr_text` is the release before's answer, and where that is no fixed point (a `?`
+        // that made a later `&passwd=` part of a query is redacted away) neither is it.
+        let inherited = name == "stderr_text"
+            && once == floor::stderr_text(&text)
+            && twice == floor::stderr_text(&once);
+        if once != twice && !inherited {
             fail(
                 &format!("expected {name} to be a fixed point"),
                 &text,
@@ -605,4 +610,32 @@ fn probe_timing() {
         out.push('\n');
     }
     std::fs::write(&output, out).unwrap_or_default();
+}
+
+#[test]
+fn stderr_text_is_the_release_befores_answer_where_that_answer_is_not_a_fixed_point() {
+    // Found by the long search (seed 4), shrunk. The `?` after `apikey:` puts `&passwd=&` in a
+    // query string, where an empty value is kept; the first pass redacts the `?` away, and in the
+    // second the same text is a plain assignment whose value is redacted. The release before does
+    // exactly that, and `stderr_text` is that release's answer byte for byte (compliance.md): it
+    // does not settle what the release before left to a second pass, while `message_text`,
+    // `bounded` and `structured` do.
+    let text = "apikey:?;&passwd=&";
+    let main = floor::stderr_text(text);
+    assert!(
+        stderr_text(text) == main,
+        "expected stderr_text to return the release before's answer {main:?} | received {:?}",
+        stderr_text(text)
+    );
+    assert!(
+        floor::stderr_text(&main) != main,
+        "expected the release before to be no fixed point on this text | input {text:?}"
+    );
+    for entry in [message_text, bounded_text] {
+        let once = entry(text);
+        assert!(
+            entry(&once) == once,
+            "expected the message path to be a fixed point | input {text:?} first {once:?}"
+        );
+    }
 }
