@@ -1904,6 +1904,14 @@ impl Shared {
         if !self.stop_new_work() {
             return;
         }
+        self.fail_stopped(failure).await;
+    }
+
+    /// The rest of a poison, for the caller that won [`Shared::stop_new_work`].
+    ///
+    /// Whoever stopped new work first owns the turn's ending and the reaper's wake, so a caller
+    /// checks that before it comes here and a loser never does.
+    async fn fail_stopped(&self, failure: VendorError) {
         let _reaper = WakeReaper(&self.terminated);
         if let Some(client) = self.client.get() {
             let _ = tokio::time::timeout(
@@ -1934,6 +1942,51 @@ impl Shared {
         #[cfg(test)]
         drop(self.poison_released.lock().await);
         // The reaper is woken as `_reaper` drops.
+    }
+
+    /// Poisons the session from the task answering one of the app-server's own questions, and
+    /// returns once the poison is done.
+    ///
+    /// The client owns that task, one per request, and drops it at the await it is parked at once
+    /// an end of the connection raises its shutdown flag. [`Shared::poison`] claims the turn's
+    /// terminal and releases the turn in two steps; cut between them, the turn keeps its slot with
+    /// nobody left to release it, and the teardown waits `shutdown_timeout` for a committer that
+    /// is gone before it releases the turn itself. So the poison runs on a task of the harness's
+    /// own, which no end of the connection stops, and the request task only waits for it. A
+    /// request task that is dropped meanwhile detaches the poison, which finishes alone and wakes
+    /// the teardown as it ends. The client answers the dropped request itself, with its closed
+    /// error, if the link still takes the write; that is what it did before.
+    ///
+    /// The notification handler asks the client for a cancellation hold instead
+    /// ([`Shared::hold_terminal_commit`]), because its call is the one the client tracks. A
+    /// request is not that call, and a hold asked for there holds nothing.
+    ///
+    /// ```ignore
+    /// let emitted = shared.emit_for(&route, event).await;
+    /// if matches!(emitted, Err(Error::LimitExceeded { .. })) {
+    ///     shared.poison_apart(failure).await;
+    /// }
+    /// ```
+    async fn poison_apart(self: &Arc<Self>, failure: VendorError) {
+        // Decided here, on the request's task, before anything can cut it: whoever stopped new
+        // work first owns the turn's ending and the reaper's wake, as in
+        // `connection_terminated`. A loser leaves both to the winner and spawns nothing, so the
+        // wake below is only ever the winner's.
+        if !self.stop_new_work() {
+            return;
+        }
+        let shared = Arc::clone(self);
+        // Woken only if this call is cut. A request task dropped while it waits would otherwise
+        // leave the teardown waiting for a poison that may still be on its way to the
+        // interrupt's answer; woken, the teardown starts at once and gives a stretch already
+        // claimed the `shutdown_timeout` it gives any committer. A call that is not cut leaves
+        // the wake to the poison, which owns it.
+        let wake = WakeReaper(&self.terminated);
+        // A poison that panics is a join error here, and its guards have already woken the
+        // teardown as they unwound. The request is then answered with its refusal, as after any
+        // poison.
+        let _ = tokio::spawn(async move { shared.fail_stopped(failure).await }).await;
+        std::mem::forget(wake);
     }
 
     /// Settles every question the server is still waiting on.
@@ -2715,7 +2768,7 @@ impl CodexHandler {
             .await;
         if matches!(emitted, Err(Error::LimitExceeded { .. })) {
             self.shared
-                .poison(VendorError::new(
+                .poison_apart(VendorError::new(
                     CALL_FAILED,
                     "expected room for a bounded Codex approval, received transcript overflow",
                 ))
@@ -3185,7 +3238,7 @@ impl CodexHandler {
         };
         if matches!(emitted, Err(Error::LimitExceeded { .. })) {
             self.shared
-                .poison(VendorError::new(
+                .poison_apart(VendorError::new(
                     CALL_FAILED,
                     "expected room for a bounded Codex question, received transcript overflow",
                 ))
@@ -9154,7 +9207,7 @@ mod tests {
 
                 /// How the connection ends while the commit is parked.
                 #[derive(Clone, Copy, Debug)]
-                enum End {
+                pub(super) enum End {
                     /// The app-server sends a frame past the inbound byte budget.
                     Overflow,
                     /// The app-server exits.
@@ -9197,8 +9250,8 @@ mod tests {
                     (shared, Arc::new(session), link, launcher, stream, parked)
                 }
 
-                /// Ends the connection under the parked replay.
-                async fn end_under(
+                /// Ends the connection under the parked committer.
+                pub(super) async fn end_under(
                     end: End,
                     shared: &Arc<Shared>,
                     session: &Arc<CodexSession>,
@@ -9429,6 +9482,381 @@ mod tests {
                         matches!(closed, Ok(Ok(()))) && live == 0,
                         "expected the close: Ok(()), live children 0 | received: {closed:?}, live children {live}"
                     );
+                }
+            }
+
+            /// A session poisoned while it answers one of the app-server's own questions.
+            ///
+            /// The question's answer is composed on a task the client owns, one per request, and
+            /// the client drops that task at the await it is parked at once an end of the
+            /// connection raises its shutdown flag. The poison's claim of the turn is the one
+            /// stretch of that task that must not be cut: a turn left claimed with no one to
+            /// release it holds the stream open until the teardown gives up on it.
+            ///
+            /// Every poison here is the approval's own `ApprovalRequested` finding no room, and by
+            /// then the sink has committed its `stream-overflow` failure: that is the terminal
+            /// the host reads, cut or not, and what a cut changes is when the turn is released
+            /// and the stream ends. Each test fills the stream, parks the poison between its
+            /// claim and its commit, ends the connection, lets the poison go inside the
+            /// teardown's wait, and reads what the host is left with.
+            mod request_poison {
+                use super::off_the_handlers_task::{End, end_under};
+                use super::*;
+
+                /// How many approval and question events the stream the tests install holds: twice
+                /// the default `max_pending_requests`, the stream's interaction reserve.
+                const INTERACTION_EVENTS: usize = 128;
+
+                /// An approval for the running turn, as the app-server asks for one.
+                fn approval_request(id: u64) -> String {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "method": "item/commandExecution/requestApproval",
+                        "params": {
+                            "threadId": "thread-1", "turnId": "vendor-turn-1",
+                            "itemId": format!("item-{id}"), "command": "pwd"
+                        }
+                    })
+                    .to_string()
+                }
+
+                /// A question for the running turn, as the app-server asks for one.
+                fn question_request(id: u64) -> String {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "method": "item/tool/requestUserInput",
+                        "params": {
+                            "threadId": "thread-1", "turnId": "vendor-turn-1",
+                            "itemId": format!("item-{id}"),
+                            "isBlocking": false,
+                            "questions": [{"id": "note", "header": "Note", "question": "Anything else?"}]
+                        }
+                    })
+                    .to_string()
+                }
+
+                /// Leaves the stream with no room for the next approval or question: the reserve for them
+                /// is spent, and nothing has been read.
+                async fn fill_the_interaction_reserve(shared: &Shared) {
+                    let route = shared
+                        .active_turn_route()
+                        .await
+                        .expect("expected a running turn to fill");
+                    for filled in 0..INTERACTION_EVENTS {
+                        let emitted = shared
+                            .emit_for(
+                                &route,
+                                EventKind::QuestionResolved {
+                                    interaction_id: mango_external_agents::InteractionId::new(
+                                        format!("filler-{filled}"),
+                                    ),
+                                    outcome: mango_external_agents::QuestionOutcome::Cancelled,
+                                },
+                            )
+                            .await;
+                        assert!(
+                            emitted.is_ok(),
+                            "expected room for interaction event {filled} | received: {emitted:?}"
+                        );
+                    }
+                }
+
+                fn is_stream_overflow(events: &[EventKind]) -> bool {
+                    matches!(events.last(), Some(EventKind::Error { error })
+                        if error.code.as_str() == "stream-overflow")
+                }
+
+                /// Sends `question` into a stream with no room for it, and returns once the request's poison has
+                /// claimed the turn and is parked before committing, for as long as the guard is
+                /// kept.
+                async fn poison_parked_after_its_claim(
+                    shared: Arc<Shared>,
+                    options: ClientOptions,
+                    question: fn(u64) -> String,
+                ) -> (
+                    Arc<Shared>,
+                    Arc<super::super::super::super::CodexSession>,
+                    ScriptedLink,
+                    FakeLauncher,
+                    TurnStream,
+                    OwnedMutexGuard<()>,
+                ) {
+                    let (shared, session, link, launcher, stream) =
+                        running_session_with(shared, options, |control| control).await;
+                    fill_the_interaction_reserve(&shared).await;
+                    let parked = Arc::clone(&shared.handler_commit_parked).lock_owned().await;
+                    link.push_line(question(1));
+                    // The poison interrupts the turn before it fails it, and waits for the answer.
+                    link.wait_for_sent(1).await;
+                    let sent: serde_json::Value = serde_json::from_str(&link.sent()[0])
+                        .expect("expected the poisoned request to write a JSON frame");
+                    assert_eq!(
+                        sent["method"], "turn/interrupt",
+                        "expected the first frame written: turn/interrupt | received: {sent}"
+                    );
+                    link.push_line(serde_json::json!({"id": sent["id"], "result": {}}).to_string());
+                    until("the request: holding the turn's claimed terminal", || {
+                        terminal_is_claimed(&shared)
+                    })
+                    .await;
+                    (shared, Arc::new(session), link, launcher, stream, parked)
+                }
+
+                fn options_for(end: End, shared: &Shared) -> ClientOptions {
+                    match end {
+                        End::Overflow => Overflow::Bytes.options(shared),
+                        End::PeerExit | End::HostClose => as_the_harness_connects(shared),
+                    }
+                }
+
+                /// The poison is let go within the teardown's wait, whichever way the connection
+                /// ends under it: the host reads the failure the sink committed, and the teardown
+                /// reaps the child within `shutdown_timeout`. A teardown that had to give up on
+                /// the poison would take that long and more, so the bound is what tells the two
+                /// apart.
+                async fn a_poison_let_go_in_time_releases_the_turn(
+                    end: End,
+                    question: fn(u64) -> String,
+                ) {
+                    let shared = shared();
+                    let grace = shared.host.limits().shutdown_timeout;
+                    let options = options_for(end, &shared);
+                    let (shared, session, link, launcher, mut stream, parked) =
+                        poison_parked_after_its_claim(shared, options, question).await;
+
+                    let began = Instant::now();
+                    end_under(end, &shared, &session, &link).await;
+                    tokio::time::sleep(grace / 2).await;
+                    drop(parked);
+
+                    let (events, ended_after) = ending(&mut stream, began).await;
+                    let (teardown, reaped_after) = torn_down(&shared, began).await;
+                    let released = turn_is_released(&shared);
+                    let live = launcher.live_children();
+                    assert!(
+                        is_stream_overflow(&events) && ended_after < grace,
+                        "expected after {end:?} under a request's poison: the stream ends with stream-overflow within {grace:?} | received: {:?} after {ended_after:?}",
+                        events.last()
+                    );
+                    assert!(
+                        matches!(teardown, Some(Ok(()))) && live == 0 && reaped_after < grace,
+                        "expected after {end:?} under a request's poison: teardown Ok(()) within {grace:?}, live children 0 | received: {teardown:?} after {reaped_after:?}, live children {live}"
+                    );
+                    assert!(
+                        released,
+                        "expected the turn slot after the poison's commit: released | received: still claimed"
+                    );
+                }
+
+                /// A poison that is not let go for a whole `shutdown_timeout` costs the host time and
+                /// nothing else: the teardown releases the turn and reaps the child once it has
+                /// waited, the terminal is still the sink's `stream-overflow`, and the poison that
+                /// lands afterwards finds nothing left to claim.
+                #[tokio::test(start_paused = true)]
+                async fn a_poison_that_outlasts_the_teardowns_wait_costs_time_and_nothing_else() {
+                    let shared = shared();
+                    let grace = shared.host.limits().shutdown_timeout;
+                    let options = options_for(End::Overflow, &shared);
+                    let (shared, session, link, launcher, mut stream, parked) =
+                        poison_parked_after_its_claim(shared, options, approval_request).await;
+
+                    let began = Instant::now();
+                    end_under(End::Overflow, &shared, &session, &link).await;
+                    let (teardown, reaped_after) = torn_down(&shared, began).await;
+                    let released = turn_is_released(&shared);
+                    drop(parked);
+                    let (events, _) = ending(&mut stream, began).await;
+                    tokio::time::sleep(grace).await;
+                    let live = launcher.live_children();
+                    assert!(
+                        matches!(teardown, Some(Ok(())))
+                            && reaped_after >= grace
+                            && reaped_after < grace + std::time::Duration::from_secs(1),
+                        "expected a poison parked past the teardown's wait: teardown Ok(()) after {grace:?} | received: {teardown:?} after {reaped_after:?}"
+                    );
+                    assert!(
+                        released && is_stream_overflow(&events) && live == 0,
+                        "expected after the late poison: turn released, terminal stream-overflow, live children 0 | received: turn released {released}, {:?}, live children {live}",
+                        events.last()
+                    );
+                }
+
+                /// A request cut while its poison is parked before the claim: nothing is claimed,
+                /// so nothing but the request task's own wake can start the teardown. It starts
+                /// at once and ends the turn, the host reads the sink's failure, and the poison
+                /// that is let go afterwards finds nothing to claim.
+                #[tokio::test(start_paused = true)]
+                async fn a_request_cut_before_its_poison_claims_wakes_the_teardown_at_once() {
+                    let shared = shared();
+                    let grace = shared.host.limits().shutdown_timeout;
+                    let options = options_for(End::Overflow, &shared);
+                    let (shared, session, link, launcher, mut stream) =
+                        running_session_with(shared, options, |control| control).await;
+                    // Kept: a dropped session starts the teardown itself.
+                    let session = Arc::new(session);
+                    fill_the_interaction_reserve(&shared).await;
+                    let before_the_claim = Arc::clone(&shared.before_hold).lock_owned().await;
+                    link.push_line(approval_request(1));
+                    link.wait_for_sent(1).await;
+                    let sent: serde_json::Value = serde_json::from_str(&link.sent()[0])
+                        .expect("expected the poisoned request to write a JSON frame");
+                    link.push_line(serde_json::json!({"id": sent["id"], "result": {}}).to_string());
+                    until(
+                        "the poison: asking for its hold, ahead of the claim",
+                        || shared.holds_asked.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                    )
+                    .await;
+
+                    let began = Instant::now();
+                    end_under(End::Overflow, &shared, &session, &link).await;
+                    let (events, ended_after) = ending(&mut stream, began).await;
+                    let (teardown, reaped_after) = torn_down(&shared, began).await;
+                    let live = launcher.live_children();
+                    drop(before_the_claim);
+                    tokio::time::sleep(grace).await;
+                    assert!(
+                        is_stream_overflow(&events) && ended_after < grace,
+                        "expected a request cut ahead of its poison's claim: stream-overflow within {grace:?} | received: {:?} after {ended_after:?}",
+                        events.last()
+                    );
+                    assert!(
+                        matches!(teardown, Some(Ok(()))) && live == 0 && reaped_after < grace,
+                        "expected the teardown woken by the cut request: Ok(()) within {grace:?}, live children 0 | received: {teardown:?} after {reaped_after:?}, live children {live}"
+                    );
+                    assert!(
+                        turn_is_released(&shared),
+                        "expected the turn slot after the late poison: released | received: still claimed"
+                    );
+                }
+
+                /// A poison that finds new work already stopped leaves the turn and the reaper's
+                /// wake to whoever stopped it.
+                #[tokio::test(start_paused = true)]
+                async fn a_poison_that_lost_the_race_leaves_the_turn_and_the_reaper_to_the_winner()
+                {
+                    let shared = shared();
+                    shared.adopt_thread(String::from("thread-1"));
+                    let (_turn_id, _stream) = running(&shared, "vendor-turn-1").await;
+                    assert!(
+                        shared.stop_new_work(),
+                        "expected the first stop of new work to win | received: lost"
+                    );
+
+                    shared
+                        .poison_apart(VendorError::new(
+                            crate::session::CALL_FAILED,
+                            "expected a failure",
+                        ))
+                        .await;
+
+                    assert!(
+                        !shared.terminated.is_cancelled(),
+                        "expected the reaper left to whoever stopped new work: not woken | received: woken"
+                    );
+                    assert!(
+                        !terminal_is_claimed(&shared) && !turn_is_released(&shared),
+                        "expected the turn left to whoever stopped new work: unclaimed and held | received: claimed {}, released {}",
+                        terminal_is_claimed(&shared),
+                        turn_is_released(&shared)
+                    );
+                }
+
+                /// A poison nothing cuts still answers the question it was raised in, after the
+                /// poison is done, with the refusal the question was owed.
+                #[tokio::test(start_paused = true)]
+                async fn a_request_that_poisons_the_session_is_still_refused() {
+                    let shared = shared();
+                    let options = as_the_harness_connects(&shared);
+                    let (_shared, _session, link, _launcher, _stream, parked) =
+                        poison_parked_after_its_claim(shared, options, approval_request).await;
+                    assert_eq!(
+                        link.sent().len(),
+                        1,
+                        "expected the interrupt alone while the poison is parked | received: {:?}",
+                        link.sent()
+                    );
+                    drop(parked);
+
+                    link.wait_for_sent(2).await;
+                    let answer: serde_json::Value = serde_json::from_str(&link.sent()[1])
+                        .expect("expected the second frame to be JSON");
+                    assert_eq!(
+                        answer,
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": 1, "result": {"decision": "decline"}
+                        }),
+                        "expected the question refused once the poison is done | received: {answer}"
+                    );
+                }
+
+                /// The overflow on four workers and the real clock. The poison is let go as soon as
+                /// the connection has ended, with the client on its way to dropping the request.
+                #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+                async fn on_four_workers_an_approvals_poison_survives_an_overflow() {
+                    let shared = shared_with(
+                        held_real_clock_limits(),
+                        mango_external_agents::CancelToken::new(),
+                    );
+                    let options = Overflow::Bytes.options(&shared);
+                    let (shared, session, link, _launcher, mut stream, parked) =
+                        poison_parked_after_its_claim(shared, options, approval_request).await;
+                    let client = client_of(&shared);
+
+                    end_under(End::Overflow, &shared, &session, &link).await;
+                    until("the connection: ended by the overflow", || {
+                        client.is_closed()
+                    })
+                    .await;
+                    drop(parked);
+                    until("the poison: released the turn", || {
+                        turn_is_released(&shared)
+                    })
+                    .await;
+
+                    let events = kinds(&mut stream).await;
+                    assert!(
+                        is_stream_overflow(&events),
+                        "expected the stream to end with: stream-overflow | received: {:?}",
+                        events.last()
+                    );
+                }
+
+                #[tokio::test(start_paused = true)]
+                async fn an_approvals_poison_survives_an_inbound_overflow() {
+                    a_poison_let_go_in_time_releases_the_turn(End::Overflow, approval_request)
+                        .await;
+                }
+
+                #[tokio::test(start_paused = true)]
+                async fn an_approvals_poison_survives_the_peers_exit() {
+                    a_poison_let_go_in_time_releases_the_turn(End::PeerExit, approval_request)
+                        .await;
+                }
+
+                #[tokio::test(start_paused = true)]
+                async fn an_approvals_poison_survives_the_hosts_close() {
+                    a_poison_let_go_in_time_releases_the_turn(End::HostClose, approval_request)
+                        .await;
+                }
+
+                #[tokio::test(start_paused = true)]
+                async fn a_questions_poison_survives_an_inbound_overflow() {
+                    a_poison_let_go_in_time_releases_the_turn(End::Overflow, question_request)
+                        .await;
+                }
+
+                #[tokio::test(start_paused = true)]
+                async fn a_questions_poison_survives_the_peers_exit() {
+                    a_poison_let_go_in_time_releases_the_turn(End::PeerExit, question_request)
+                        .await;
+                }
+
+                #[tokio::test(start_paused = true)]
+                async fn a_questions_poison_survives_the_hosts_close() {
+                    a_poison_let_go_in_time_releases_the_turn(End::HostClose, question_request)
+                        .await;
                 }
             }
 
