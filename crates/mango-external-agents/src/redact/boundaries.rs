@@ -228,6 +228,34 @@ fn the_url_rule_flags_only_a_password_under_a_credential_name() {
     }
 }
 
+/// The keyword check over a range asks the keyword rule alone, anywhere in the range and nowhere
+/// outside it.
+#[test]
+fn a_keyword_is_found_inside_the_range_and_not_outside_it() {
+    use super::rules::holds_a_keyword;
+    let text = b"https://user:hunter2@host/?token=x";
+    for (from, to, expected) in [
+        (0, 13, false),
+        (0, text.len(), true),
+        (24, text.len(), true),
+        (0, 24, false),
+        (8, 8, false),
+    ] {
+        let received = holds_a_keyword(text, from, to);
+        assert_eq!(
+            received,
+            expected,
+            "expected a keyword in {:?} to be {expected} | received: {received}",
+            String::from_utf8_lossy(&text[from..to])
+        );
+    }
+    let user = b"x://my_api_key:p@h";
+    assert!(
+        holds_a_keyword(user, 0, 16),
+        "expected `api_key` found inside a userinfo | received: none"
+    );
+}
+
 /// A value that is itself a credential name, followed by whitespace and a separator, is the value
 /// of the name before it, as it always was in text with no removed byte: the rules read across the
 /// line break, take `password` as the value and stop at the space, so `hunter2` is left. 0.4.1 read
