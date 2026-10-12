@@ -62,7 +62,7 @@ own deployment.
   token used as a URL's user, and the header names `x-functions-key` and
   `Ocp-Apim-Subscription-Key`. Text glued to the closing quote of a quoted value goes with the value
   (`password="pa"ss"word"`). A `&` ends a value only in a query string, one with a `?` before it in
-  the same run of non-blank text. Words that begin with a keyword and are not credentials
+  the same run of non-blank text, within 2048 bytes. Words that begin with a keyword and are not credentials
   (`tokenizer`, `secretary`, `passwordless`) are left alone.
 
   A status after a name (`OPENAI_API_KEY: not set`), a number under a name that counts tokens

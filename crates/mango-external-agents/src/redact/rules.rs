@@ -204,8 +204,11 @@ fn match_header_key(bytes: &[u8], at: usize) -> Option<usize> {
         .then_some(end)
 }
 
-/// How far back a `?` is looked for before a `&` is taken for the join of two parameters.
-const QUERY_LOOKBACK: usize = 64;
+/// How far back a `?` is looked for before a `&` is taken for the join of two parameters. A query
+/// can carry a redirect URI, a state value or a JWT ahead of the key, so the reach is a URL's
+/// usual limit; text with no `?` in reach pays at most this much for each `&name=` start, which
+/// is a constant a byte (`work.rs` pins it).
+pub(super) const QUERY_LOOKBACK: usize = 2048;
 
 /// Whether the parameter that starts at `at` is in a query string: right after a `?`, or after a
 /// `&` with a `?` earlier in the same run of non-blank bytes. `cmd &password=pa&ss` is a shell's
@@ -214,19 +217,41 @@ fn in_a_query(bytes: &[u8], at: usize) -> bool {
     match at.checked_sub(1).and_then(|before| bytes.get(before)) {
         Some(b'?') => true,
         Some(b'&') => {
-            let from = at.saturating_sub(QUERY_LOOKBACK);
-            for byte in bytes[from..at].iter().rev() {
-                count_steps(1);
-                match *byte {
-                    b'?' => return true,
-                    byte if is_space_byte(byte) => return false,
-                    _ => {}
-                }
-            }
-            false
+            let window = &bytes[at.saturating_sub(QUERY_LOOKBACK)..at];
+            // A step is a block of 32 bytes, and the blank check reads at most as many again.
+            count_steps(2 * window.len().div_ceil(32));
+            // The nearest `?`, then whether a blank stands between it and the parameter.
+            last_question_mark(window).is_some_and(|mark| !holds_a_blank(&window[mark..]))
         }
         _ => false,
     }
+}
+
+/// The place of the last `?` in `window`, read a block at a time so that a look back over text with
+/// none costs a vector compare for each block and not a branch for each byte.
+pub(super) fn last_question_mark(window: &[u8]) -> Option<usize> {
+    const BLOCK: usize = 32;
+    let mut end = window.len();
+    for block in window.rchunks(BLOCK) {
+        let start = end - block.len();
+        if block.iter().fold(false, |any, byte| any | (*byte == b'?')) {
+            return block
+                .iter()
+                .rposition(|byte| *byte == b'?')
+                .map(|at| start + at);
+        }
+        end = start;
+    }
+    None
+}
+
+/// Whether `window` holds a blank, with the same block-at-a-time read as [`last_question_mark`].
+pub(super) fn holds_a_blank(window: &[u8]) -> bool {
+    window.chunks(32).any(|block| {
+        block
+            .iter()
+            .fold(false, |any, byte| any | is_space_byte(*byte))
+    })
 }
 
 /// A query parameter that is a credential's only when it is the whole name (`key`, `auth`,

@@ -600,3 +600,51 @@ fn a_credential_word_beside_the_matched_one_vetoes_a_keep() {
         ("token_token: expired", "token_token: expired"),
     ]);
 }
+
+/// The `?` that makes a `&` a query's join can be far behind it: a redirect URI, a state value or
+/// a JWT in the query ahead of the key is hundreds of bytes. `key`, `auth` and `sig` are
+/// credentials only as query parameters, so one lost here is a credential in the clear.
+#[test]
+fn a_query_credential_is_found_however_long_the_query_before_it_is() {
+    for filler in [80, 700, 1500] {
+        let state = "s".repeat(filler);
+        let text = format!("GET /v1?state={state}&key=AIzaSyA1&page=2");
+        let expected = format!("GET /v1?state={state}&key=[REDACTED]&page=2");
+        let shown = stderr_text(&text);
+        assert!(
+            shown == expected,
+            "expected a query key after {filler} bytes of query to be redacted | received: {}",
+            shown.replace(&state, "<state>")
+        );
+    }
+}
+
+#[test]
+fn the_block_reads_find_the_last_question_mark_and_any_blank_at_every_offset() {
+    use super::rules::{holds_a_blank, last_question_mark};
+    for len in [0, 1, 31, 32, 33, 64, 65, 100] {
+        for mark in 0..len {
+            let mut text = vec![b'a'; len];
+            text[mark] = b'?';
+            assert_eq!(
+                last_question_mark(&text),
+                Some(mark),
+                "expected the only `?` of {len} bytes at {mark} to be found | received a different place"
+            );
+            text[len - 1] = b'?';
+            assert_eq!(
+                last_question_mark(&text),
+                Some(len - 1),
+                "expected the last of two `?` in {len} bytes to be found | received a different place"
+            );
+            let mut blank = vec![b'a'; len];
+            blank[mark] = b'\t';
+            assert!(
+                holds_a_blank(&blank),
+                "expected a tab at {mark} of {len} bytes to be found | received: no blank"
+            );
+        }
+        assert_eq!(last_question_mark(&vec![b'a'; len]), None);
+        assert!(!holds_a_blank(&vec![b'a'; len]));
+    }
+}

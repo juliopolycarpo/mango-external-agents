@@ -25,12 +25,14 @@ const SMALL: usize = 16 * 1024;
 /// steps a byte at this size.
 const STEPS_PER_BYTE: usize = 24;
 
-/// [`ends_awaiting_value`] runs two rules over the text four times and sweeps it once more.
-const AWAITING_STEPS_PER_BYTE: usize = 40;
+/// [`ends_awaiting_value`] runs two rules over the text four times and sweeps it once more; a
+/// query string pays the look back for a `?` at each `&name=` on each of them.
+const AWAITING_STEPS_PER_BYTE: usize = 80;
 
 /// Doubling the text may add a little more than double the work: block searches round up to a
-/// whole block and each shape has a constant tail.
-const DOUBLING_SLACK: usize = 256;
+/// whole block, each shape has a constant tail, and the first reach of a look back (2048 bytes of a
+/// query string) looks back less than the rest. A quadratic still fails: it quadruples.
+const DOUBLING_SLACK: usize = 64 * 1024;
 
 /// One shape of text that has cost a rule more than its length, and the length it is built to.
 struct Shape {
@@ -306,8 +308,18 @@ fn extension_steps(text: &str) -> usize {
 /// Fails, naming every shape that broke and both lengths, unless `measure` is within the budget
 /// at each length and at most about doubles when the text does.
 fn assert_work_is_linear(caller: &str, measure: fn(&str) -> usize, per_byte: usize) {
+    assert_shapes_are_linear(caller, measure, per_byte, DOUBLING_SLACK, SHAPES);
+}
+
+fn assert_shapes_are_linear(
+    caller: &str,
+    measure: fn(&str) -> usize,
+    per_byte: usize,
+    slack: usize,
+    shapes: &[Shape],
+) {
     let mut failures = Vec::new();
-    for shape in SHAPES {
+    for shape in shapes {
         let small = (shape.build)(SMALL);
         let large = (shape.build)(2 * SMALL);
         let (small_steps, large_steps) = (measure(&small), measure(&large));
@@ -321,7 +333,7 @@ fn assert_work_is_linear(caller: &str, measure: fn(&str) -> usize, per_byte: usi
                 ));
             }
         }
-        let allowed = 2 * small_steps + DOUBLING_SLACK;
+        let allowed = 2 * small_steps + slack;
         if large_steps > allowed {
             failures.push(format!(
                 "expected scan steps <= {allowed} (twice {small_steps} plus slack) for {} when {} \
@@ -364,6 +376,37 @@ fn ends_awaiting_value_work_is_proportional_to_the_text_for_every_shape() {
         "redact::ends_awaiting_value",
         awaiting_steps,
         AWAITING_STEPS_PER_BYTE,
+    );
+}
+
+/// Shapes that make every start look back the whole reach for a `?` that is not there. The cost is
+/// a constant for each start, so it is proportional to the text, with a larger constant than the
+/// rest: `&key=x` is six bytes and one look back over up to [`QUERY_LOOKBACK`] bytes, read a
+/// block of 32 at a time.
+const LOOKBACK_SHAPES: &[Shape] = &[
+    Shape {
+        what: "query-only names after ampersands with no query string, repeated",
+        build: |len| repeated("&key=x", "", len),
+    },
+    Shape {
+        what: "a long query ahead of query-only names, repeated",
+        build: |len| repeated("?a=b&key=x&sig=y", "", len),
+    },
+    Shape {
+        what: "query-only names glued with dots, repeated",
+        build: |len| repeated("x.&auth=1", "", len),
+    },
+];
+
+#[test]
+fn a_query_lookback_costs_a_bounded_constant_for_each_start() {
+    assert_shapes_are_linear(
+        "redact::stderr_text",
+        redaction_steps,
+        super::rules::QUERY_LOOKBACK / 64 + STEPS_PER_BYTE,
+        // The first reach's worth of text looks back less than the rest.
+        super::rules::QUERY_LOOKBACK * super::rules::QUERY_LOOKBACK / 64,
+        LOOKBACK_SHAPES,
     );
 }
 
