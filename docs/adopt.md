@@ -7,7 +7,7 @@ Mango Protocol, HTTP server, database or recovery loop is required.
 
 [`tests/standalone-current`](../tests/standalone-current/README.md) is a small consumer with its own
 workspace and lockfile. Its four SDK dependencies are exact registry pins at the current published
-release (`=0.6.0`), with no path override. Copy that directory anywhere and run:
+release (`=0.6.1`), with no path override. Copy that directory anywhere and run:
 
 ```sh
 cargo test --locked
@@ -138,6 +138,12 @@ limits, including custom `turn_buffer_bytes`; other harness transports retain th
 
 There is no credential field, and there never will be. The library reuses whatever the user
 already logged into with the vendor's own CLI.
+
+When an ACP agent refuses a prompt because the user is signed out, the turn ends with the code
+`acp-auth-required` and a message that carries the agent profile's sign-in text; the session stays
+`Ready`, so a host shows that text, lets the user sign in with the vendor's CLI, and prompts
+again. Error text a vendor supplies is redacted for credential-shaped content before the host
+sees it, so match a failure on its `code` and `vendor_code`, never on its message.
 
 ## What the host reads
 
