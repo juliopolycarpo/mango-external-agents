@@ -25,23 +25,23 @@
 //! ones did; an input with one is held to the cases in `redact::shapes` and the corpus in
 //! `testing::redaction`, not to 0.4.1, which is frozen and never edited.
 
-use super::reference::{self, Rewrite, remove_boundaries, strip_every_character};
-use super::rules::{QueryRun, assignment_rule, bearer_rule, url_password_rule};
-use super::strip::strip_control_characters;
-use super::{
-    REDACTED, as_text, ends_awaiting_value, redact_assignments, redact_bearer,
-    redact_url_passwords, single_round, stderr_text,
+use super::floor::rules::{QueryRun, assignment_rule, bearer_rule, url_password_rule};
+use super::floor::{
+    as_text, redact_assignments, redact_bearer, redact_url_passwords, single_round,
 };
+use super::reference::{self, Rewrite, remove_boundaries, strip_every_character};
+use super::strip::strip_control_characters;
+use super::{REDACTED, ends_awaiting_value, stderr_text};
 
 /// A rule under test, described the way the replaced scan wants it: where the match ends and the
 /// text that stands in its place.
 fn described(
-    mut rule: impl FnMut(&[u8], usize) -> Option<super::Outcome>,
+    mut rule: impl FnMut(&[u8], usize) -> Option<super::floor::Outcome>,
 ) -> impl FnMut(&[u8], usize) -> Option<Described> {
     move |bytes, at| {
         Some(match rule(bytes, at)? {
-            super::Outcome::Keep { end } => Described::Keep { end },
-            super::Outcome::Redact(found) => {
+            super::floor::Outcome::Keep { end } => Described::Keep { end },
+            super::floor::Outcome::Redact(found) => {
                 let kept = as_text(bytes, at, found.kept_end);
                 Described::Redact(Rewrite {
                     end: found.end,
@@ -114,14 +114,20 @@ const KEYWORDS: &[&str] = &["secret", "token", "password", "passwd", "credential
 /// colon (its value may run on), an `Authorization` header with a scheme other than bearer and
 /// basic, and a userinfo long enough to be a token each qualify.
 fn carries_a_new_trigger(raw: &str) -> bool {
-    // Either stripper may leave what the other took: an escape introducer that ends in a name's
-    // first letter, for one.
-    [
+    let (old, new) = (
         reference::strip_control_characters(raw),
         strip_control_characters(raw),
-    ]
-    .iter()
-    .any(|plain| triggers_in(plain))
+    );
+    // The stripper keeps the first letter of a name that an escape introducer would have taken
+    // (see `strip::pick`), whatever the name is: a letter one stripper keeps and the other takes
+    // is that rule at work, in a name this list of words cannot tell from its neighbours
+    // (`[&key` then `sk-svcacct-passwd=`).
+    if old.replace('\u{1}', "") != new.replace('\u{1}', "") {
+        return true;
+    }
+    // Either stripper may leave what the other took: an escape introducer that ends in a name's
+    // first letter, for one.
+    [old, new].iter().any(|plain| triggers_in(plain))
 }
 
 /// Whether a status word stands after a `:` or an `=`, which is where a rule keeps it.
@@ -346,7 +352,7 @@ fn assert_one_pass_is_a_fixed_point(raw: &str) {
 ///
 /// Each rule is also run on `raw` itself, not only on what the stage before it left: a rule then
 /// sees the control characters and markers the stripper would have taken out.
-fn assert_matches_the_replaced_scan(raw: &str) {
+pub(super) fn assert_matches_the_replaced_scan(raw: &str) {
     assert_one_pass_is_a_fixed_point(raw);
     let expect = |stage: &str, input: &str, run: fn(&str) -> String, expected: String| {
         // Caught, so a stage that panics is reported with the input that made it.
@@ -399,7 +405,7 @@ fn assert_matches_the_replaced_scan(raw: &str) {
         expect(
             "the URL password rule",
             input,
-            redact_url_passwords,
+            |raw| redact_url_passwords(raw).0,
             rewrite_every_word(input, described(url_password_rule)),
         );
     }
@@ -449,7 +455,7 @@ fn assert_awaiting_agrees_with_0_4_1(raw: &str) {
 /// Every keyword in each case, every byte a rule reads as punctuation or space, the pieces of a
 /// URL, every escape form and stripped class, and characters of two, three and four bytes that
 /// are kept, some of them behind a lead byte that removed characters share.
-const FRAGMENTS: &[&str] = &[
+pub(super) const FRAGMENTS: &[&str] = &[
     // What the rules added after 0.4.1 read: quotes and brackets, cookies, glued names, an
     // access key, a signature, a scheme of another name, a status and a count.
     "\"",
@@ -559,7 +565,7 @@ const FRAGMENTS: &[&str] = &[
 ];
 
 /// A credential, or a control character, in each shape a rule or the stripper acts on.
-const SHAPES: &[&str] = &[
+pub(super) const SHAPES: &[&str] = &[
     r#"{"Authorization":"Bearer sk-live-1","Accept":"a"}"#,
     "{'Authorization': 'Bearer sk-live-1'}",
     r#"{\"api_key\":\"sk-live-1\",\"m\":1}"#,
@@ -657,6 +663,18 @@ fn empty_text_and_the_documented_fixture_match_the_replaced_scan() {
     ] {
         assert_matches_the_replaced_scan(raw);
     }
+}
+
+#[test]
+fn a_letter_the_stripper_keeps_of_a_hyphenated_name_is_a_rule_at_work_and_not_a_regression() {
+    // Found by the long search: `[&k` is an escape introducer 0.4.1 removes whole, and the
+    // stripper keeps the `k` when a name follows, however the name is spelled.
+    let raw = "A\u{1b}[31m\u{1b}[&key\rsk-svcacct-passwd=vxy\u{7f}";
+    assert!(
+        carries_a_new_trigger(raw),
+        "expected a new trigger for a kept escape letter before a name | input {raw:?}"
+    );
+    assert_matches_the_replaced_scan(raw);
 }
 
 #[test]

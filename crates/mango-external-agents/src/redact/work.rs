@@ -12,7 +12,7 @@
 //! that is linear only up to some size still fails.
 
 use super::scan::steps;
-use super::{ends_awaiting_value, stderr_text};
+use super::{ends_awaiting_value, message_text, stderr_text};
 use crate::ExtensionValue;
 
 /// A short text and one twice its size, both far past what a quadratic rule survives in a test.
@@ -25,12 +25,24 @@ const SMALL: usize = 16 * 1024;
 /// steps a byte at this size.
 const STEPS_PER_BYTE: usize = 24;
 
+/// What a byte of a message may cost: the rules of the release before, the reads added since, the
+/// tokens, each over the whole text, and a second reading of a text the first one changed. 8 to 40
+/// on the shapes below; 96 leaves room as 24 does for [`stderr_text`], and hides no more.
+const MESSAGE_STEPS_PER_BYTE: usize = 96;
+
 /// [`ends_awaiting_value`] runs two rules over the text four times and sweeps it once more.
 const AWAITING_STEPS_PER_BYTE: usize = 40;
 
 /// Doubling the text may add a little more than double the work: block searches round up to a
-/// whole block and each shape has a constant tail.
-const DOUBLING_SLACK: usize = 256;
+/// whole block, each shape has a constant tail, and a read bounded by a count of lines or items
+/// (a container, a sequence, the body of a private key) costs less than a byte for each byte until
+/// its bound is reached.
+///
+/// It is 8192, a tenth of the steps of the shape that needs it (88,250 at [`SMALL`]). A shape built of a 9 KB unit (a key
+/// with more body lines than are read) is cut in the middle of a unit at 16 KB and at 32 KB, 1.8 and
+/// 3.6 units, and the cut costs a few thousand steps more or less than its length says. The work
+/// of whole units is checked separately and tightly, in `key_block_work_is_linear_in_whole_units`.
+const DOUBLING_SLACK: usize = 8192;
 
 /// One shape of text that has cost a rule more than its length, and the length it is built to.
 struct Shape {
@@ -40,6 +52,15 @@ struct Shape {
 
 fn repeated(unit: &str, tail: &str, len: usize) -> String {
     format!("{}{tail}", unit.repeat(len / unit.len()))
+}
+
+/// `text` cut or padded with spaces to `len` bytes, for a shape whose size is not a multiple of
+/// its unit and would otherwise double to a little more or less than twice.
+fn exactly(mut text: String, len: usize) -> String {
+    text.truncate(len);
+    let padding = len.saturating_sub(text.len());
+    text.push_str(&" ".repeat(padding));
+    text
 }
 
 const SHAPES: &[Shape] = &[
@@ -307,11 +328,149 @@ const SHAPES: &[Shape] = &[
         what: "token-length userinfo with no password, repeated",
         build: |len| repeated("a://aaaaaaaaaaaaaaaaaaa1@", "", len),
     },
+    Shape {
+        what: "a run of backslashes as long as the text, then a quoted name",
+        build: |len| format!("{}\"token\":x", "\\".repeat(len)),
+    },
+    Shape {
+        what: "a run of backslashes before every quote of a name, repeated",
+        build: |len| repeated(&format!("{}\"token_", "\\".repeat(31)), "\":", len),
+    },
+    Shape {
+        what: "a run of backslashes one past the bound before a quote, repeated",
+        build: |len| repeated(&format!("api_key={}\"a", "\\".repeat(32)), "", len),
+    },
+    Shape {
+        what: "a value opened with three backslashes that is never closed, repeated",
+        build: |len| repeated("api_key=\\\\\\\"a\\\"", "", len),
+    },
+    Shape {
+        what: "a value of backslashes and quotes of every count but its own",
+        build: |len| repeated("api_key=\\\\\\\"a\\\"b\\\\\\\\\\\"", "", len),
+    },
+    Shape {
+        what: "a bracket opening a string with 31 backslashes that never closes, repeated",
+        build: |len| {
+            repeated(
+                &format!("token=[{}\"a{}", "\\".repeat(31), " ".repeat(24)),
+                "",
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "a long run of backslashes inside an array under a credential",
+        build: |len| format!("token=[\\\"a{}\\\"]", "\\".repeat(len)),
+    },
+    Shape {
+        what: "a long run of backslashes inside an array outside any string",
+        build: |len| format!("token=[{}]", "\\".repeat(len)),
+    },
+    Shape {
+        what: "an array opened at the end of every line that never closes",
+        build: |len| repeated("token: [\n", "", len),
+    },
+    Shape {
+        what: "an array with entries on every line that never closes, repeated",
+        build: |len| repeated("\"token\": [\n  \"a\",\n", "", len),
+    },
+    Shape {
+        what: "a quoted name and an object opened at the end of every line",
+        build: |len| repeated("{\"password\":{\n", "", len),
+    },
+    Shape {
+        what: "arrays that close one line past the line bound, repeated",
+        build: |len| {
+            repeated(
+                &format!("token: [\n{}]\n{}", "a,\n".repeat(65), " ".repeat(50)),
+                "",
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "arrays that close on the last line the bound allows, repeated",
+        build: |len| {
+            repeated(
+                &format!("token: [\n{}]\n{}", "a,\n".repeat(61), " ".repeat(62)),
+                "",
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "one array as long as the text, one entry to a line",
+        build: |len| exactly(format!("token: [\n{}]", "a,\n".repeat(len / 3)), len),
+    },
+    Shape {
+        what: "strings that never close inside arrays that span lines, repeated",
+        build: |len| repeated("token: [\n\"a\n'b\n", "", len),
+    },
+    Shape {
+        what: "closing brackets and braces only, after a name",
+        build: |len| format!("token: [{}", "]}".repeat(len / 2)),
+    },
+    Shape {
+        what: "a sequence item under a name, repeated",
+        build: |len| repeated("tokens:\n  - a\n", "", len),
+    },
+    Shape {
+        what: "one sequence as long as the text",
+        build: |len| exactly(format!("tokens:\n{}", "  - a\n".repeat(len / 6)), len),
+    },
+    Shape {
+        what: "sequence markers with nothing after them, repeated",
+        build: |len| repeated("tokens:\n  -\n", "", len),
+    },
+    Shape {
+        what: "sequence markers in every column, repeated",
+        build: |len| repeated("tokens:\n - a\n  - b\n   - c\n", "", len),
+    },
+    Shape {
+        what: "blank lines between sequence items",
+        build: |len| repeated("tokens:\n  - a\n\n\n\n\n", "", len),
+    },
+    Shape {
+        what: "a block scalar under a name, repeated",
+        build: |len| repeated("password: |\n  abc def ghi jkl\n", "", len),
+    },
+    Shape {
+        what: "a block scalar that holds a name with its value on the next line, repeated",
+        build: |len| repeated("token: |\n  abc secret:\n  ghi\n", "", len),
+    },
+    Shape {
+        what: "a block scalar that holds a quoted name, repeated",
+        build: |len| repeated("token: |\n  abc \"token\":\n  ghi\n", "", len),
+    },
+    Shape {
+        what: "a block scalar as long as the text",
+        build: |len| exactly(format!("password: |\n{}", "  a\n".repeat(len / 4)), len),
+    },
+    Shape {
+        what: "escaped JSON quotes, three deep, one after another",
+        build: |len| repeated("\\\\\\\"api_key\\\\\\\":\\\\\\\"v\\\\\\\" ", "", len),
+    },
 ];
 
 fn redaction_steps(text: &str) -> usize {
     steps::counted(|| {
         std::hint::black_box(stderr_text(std::hint::black_box(text)));
+    })
+}
+
+/// The walk over a string that holds JSON, the entry point a structured vendor message takes.
+fn embedded_steps(text: &str) -> usize {
+    steps::counted(|| {
+        let value = serde_json::Value::String(text.to_owned());
+        std::hint::black_box(crate::redact::structured(std::hint::black_box(&value)));
+    })
+}
+
+/// The entry point a vendor's messages take: the rules of `stderr_text`, the reads added since and
+/// the token pass.
+fn message_steps(text: &str) -> usize {
+    steps::counted(|| {
+        std::hint::black_box(message_text(std::hint::black_box(text)));
     })
 }
 
@@ -329,9 +488,14 @@ fn extension_steps(text: &str) -> usize {
 
 /// Fails, naming every shape that broke and both lengths, unless `measure` is within the budget
 /// at each length and at most about doubles when the text does.
-fn assert_work_is_linear(caller: &str, measure: fn(&str) -> usize, per_byte: usize) {
+fn assert_work_is_linear(
+    caller: &str,
+    shapes: &[&[Shape]],
+    measure: fn(&str) -> usize,
+    per_byte: usize,
+) {
     let mut failures = Vec::new();
-    for shape in SHAPES {
+    for shape in shapes.iter().copied().flatten() {
         let small = (shape.build)(SMALL);
         let large = (shape.build)(2 * SMALL);
         let (small_steps, large_steps) = (measure(&small), measure(&large));
@@ -365,7 +529,12 @@ fn assert_work_is_linear(caller: &str, measure: fn(&str) -> usize, per_byte: usi
 
 #[test]
 fn redaction_work_is_proportional_to_the_text_for_every_shape() {
-    assert_work_is_linear("redact::stderr_text", redaction_steps, STEPS_PER_BYTE);
+    assert_work_is_linear(
+        "redact::stderr_text",
+        &[SHAPES],
+        redaction_steps,
+        STEPS_PER_BYTE,
+    );
 }
 
 /// Extension normalization redacts the whole value before it keeps 128 code points, so the bound
@@ -374,8 +543,108 @@ fn redaction_work_is_proportional_to_the_text_for_every_shape() {
 fn extension_normalization_work_is_proportional_to_the_value_for_every_shape() {
     assert_work_is_linear(
         "ExtensionValue::normalized",
+        &[SHAPES],
         extension_steps,
-        STEPS_PER_BYTE,
+        MESSAGE_STEPS_PER_BYTE,
+    );
+}
+
+/// JSON texts inside a string: many members, many strings that hold a credential, nesting.
+const EMBEDDED_SHAPES: &[Shape] = &[
+    Shape {
+        what: "an object of many members, each a credential",
+        build: |len| {
+            exactly(
+                format!(
+                    "{{{}\"z\":1}}",
+                    "\"password\":\"x\",".repeat((len - 8) / 16)
+                ),
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "an array of many strings that each hold an assignment",
+        build: |len| {
+            exactly(
+                format!("[{}\"z\"]", "\"token=abc d\",".repeat((len - 8) / 14)),
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "an array of many strings that each hold a sequence item",
+        build: |len| {
+            exactly(
+                format!("[{}\"z\"]", "\"token=- a\\n- b\",".repeat((len - 8) / 18)),
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "an array of many strings that each cross a closing quote",
+        build: |len| {
+            exactly(
+                format!("[{}\"z\"]", "\"password: a\",".repeat((len - 8) / 16)),
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "an object of many keys that are tokens",
+        build: |len| {
+            exactly(
+                format!("{{{}\"z\":1}}", "\"ghp_a\":1,".repeat((len - 8) / 10)),
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "arrays nested to the depth the parser allows",
+        build: |len| {
+            exactly(
+                format!("{}\"token=a\"{}", "[".repeat(100), "]".repeat(100)),
+                len.min(300),
+            )
+        },
+    },
+    Shape {
+        what: "one string as long as the text that holds many escapes and assignments",
+        build: |len| {
+            exactly(
+                format!(
+                    "{{\"m\":\"{}\"}}",
+                    "token=a\\n b\\\"".repeat((len - 8) / 14)
+                ),
+                len,
+            )
+        },
+    },
+];
+
+/// A shape that is not JSON is read by the text rules alone and measures nothing here.
+#[test]
+fn every_embedded_shape_is_a_json_text_at_both_sizes() {
+    for shape in EMBEDDED_SHAPES {
+        for len in [SMALL, 2 * SMALL] {
+            let text = (shape.build)(len);
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&text).is_ok(),
+                "expected {} to be a JSON text at {len} bytes | received the start: {:?}",
+                shape.what,
+                text.chars().take(60).collect::<String>()
+            );
+        }
+    }
+}
+
+#[test]
+fn embedded_json_work_is_proportional_to_the_text_for_every_shape() {
+    assert_work_is_linear(
+        "redact::structured",
+        &[EMBEDDED_SHAPES],
+        embedded_steps,
+        MESSAGE_STEPS_PER_BYTE,
     );
 }
 
@@ -386,9 +655,200 @@ fn extension_normalization_work_is_proportional_to_the_value_for_every_shape() {
 fn ends_awaiting_value_work_is_proportional_to_the_text_for_every_shape() {
     assert_work_is_linear(
         "redact::ends_awaiting_value",
+        &[SHAPES],
         awaiting_steps,
         AWAITING_STEPS_PER_BYTE,
     );
+}
+
+/// Shapes built against the token pass: runs that nearly are tokens, tokens that run on, and
+/// private-key blocks that never end. A scan that reads a run again for each prefix it might begin,
+/// or an end marker again for each begin marker, fails here.
+const TOKEN_SHAPES: &[Shape] = &[
+    Shape {
+        what: "one run of name characters with no token in it",
+        build: |len| "a".repeat(len),
+    },
+    Shape {
+        what: "a token prefix and a body that runs the whole text",
+        build: |len| format!("{}{}", concat!("gh", "p_"), "a".repeat(len)),
+    },
+    Shape {
+        what: "a token prefix repeated inside one run",
+        build: |len| repeated(concat!("gh", "p_"), "", len),
+    },
+    Shape {
+        what: "a hyphenated prefix repeated inside one run",
+        build: |len| repeated(concat!("s", "k-live-"), "", len),
+    },
+    Shape {
+        what: "token prefixes one after another with a body too short",
+        build: |len| repeated(concat!("gh", "p_abc "), "", len),
+    },
+    Shape {
+        what: "access key ids one after another",
+        build: |len| repeated(concat!("AK", "IA0123456789ABCDEF "), "", len),
+    },
+    Shape {
+        what: "access key ids a character too long, one after another",
+        build: |len| repeated(concat!("AK", "IA0123456789ABCDEFG "), "", len),
+    },
+    Shape {
+        what: "web tokens run together on dots",
+        build: |len| repeated(concat!("ey", "Jaaaaaaaaaaaa."), "", len),
+    },
+    Shape {
+        what: "web token headers with a claims part and no signature dot",
+        build: |len| {
+            repeated(
+                concat!("ey", "Jaaaaaaaaaaaa.", "ey", "Jaaaaaaaaaaaa "),
+                "",
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "web token headers with a second part that is no JSON",
+        build: |len| repeated(concat!("ey", "Jaaaaaaaaaaaa.xx "), "", len),
+    },
+    Shape {
+        what: "a web token whose parts run the whole text",
+        build: |len| {
+            format!(
+                "{}{}.{}.{}",
+                concat!("ey", "J"),
+                "a".repeat(len / 3),
+                concat!("ey", "Jb"),
+                "c".repeat(len / 3)
+            )
+        },
+    },
+    Shape {
+        what: "an OAuth prefix repeated with a body too short",
+        build: |len| repeated(concat!("ya", "29.abc "), "", len),
+    },
+    Shape {
+        what: "an OAuth prefix and a body that runs the whole text",
+        build: |len| format!("{}{}", concat!("ya", "29."), "a".repeat(len)),
+    },
+    Shape {
+        what: "private-key begin markers with no end marker",
+        build: |len| repeated(concat!("-----BEGIN PRIV", "ATE KEY-----\n"), "", len),
+    },
+    Shape {
+        what: "private-key begin markers, each with a long line of base64 under it and no end marker",
+        build: |len| {
+            repeated(
+                &format!(
+                    concat!("-----BEGIN PRIV", "ATE KEY-----\n{}\n"),
+                    "Ab+/".repeat(16)
+                ),
+                "",
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "a begin marker and more lines of base64 than the body bound takes, repeated",
+        build: |len| {
+            let unit = format!(
+                concat!("-----BEGIN PRIV", "ATE KEY-----\n{}"),
+                format!("{}\n", "Ab+/".repeat(16)).repeat(140)
+            );
+            exactly(unit.repeat(len / unit.len() + 1), len)
+        },
+    },
+    Shape {
+        what: "private-key begin markers escaped as a JSON string writes them, no end marker",
+        build: |len| {
+            repeated(
+                &format!(
+                    concat!("-----BEGIN PRIV", "ATE KEY-----\\n{}\\n"),
+                    "Ab+/".repeat(16)
+                ),
+                "",
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "certificate begin markers, which are not secrets",
+        build: |len| repeated("-----BEGIN CERTIFICATE-----\n", "", len),
+    },
+    Shape {
+        what: "begin markers with a label that never closes",
+        build: |len| repeated(&format!("-----BEGIN {} ", "A".repeat(52)), "", len),
+    },
+    Shape {
+        what: "end markers with no begin marker",
+        build: |len| repeated(concat!("-----END PRIV", "ATE KEY-----\n"), "", len),
+    },
+    Shape {
+        what: "private-key blocks one after another",
+        build: |len| {
+            repeated(
+                concat!(
+                    "-----BEGIN PRIV",
+                    "ATE KEY-----\nQQ==\n-----END PRIV",
+                    "ATE KEY-----\n"
+                ),
+                "",
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "hyphens only",
+        build: |len| "-".repeat(len),
+    },
+    Shape {
+        what: "JSON line breaks before a run, repeated",
+        build: |len| repeated(concat!("\\ngh", "p_abc "), "", len),
+    },
+    Shape {
+        what: "a backslash and a letter before every run",
+        build: |len| repeated("\\nnnnnnnnnn ", "", len),
+    },
+];
+
+/// The token pass is read for every message a vendor sends, so it is held to the same budget as
+/// the rules, over the shapes above and over every shape of the rules.
+#[test]
+fn message_redaction_work_is_proportional_to_the_text_for_every_shape() {
+    assert_work_is_linear(
+        "redact::bounded",
+        &[SHAPES, TOKEN_SHAPES],
+        message_steps,
+        MESSAGE_STEPS_PER_BYTE,
+    );
+}
+
+/// The scan reads a byte of the text and a byte of each run it is in, and a begin marker with no
+/// end marker takes the rest of the text, so each of these has to record at least its length.
+#[test]
+fn the_token_pass_counts_its_steps() {
+    let len = 4096;
+    for (what, text, at_least) in [
+        ("plain text", "x ".repeat(len / 2), len),
+        ("one long run", "x".repeat(len), len),
+        (
+            "a begin marker with no end marker",
+            format!(
+                "{}{}",
+                concat!("-----BEGIN PRIV", "ATE KEY-----\n"),
+                "x ".repeat(len / 2)
+            ),
+            len,
+        ),
+    ] {
+        let received = message_steps(&text);
+        assert!(
+            received >= at_least,
+            "expected {what} of {} bytes to record >= {at_least} scan steps through the token pass \
+             | received: {received}",
+            text.len()
+        );
+    }
 }
 
 #[test]
@@ -514,4 +974,50 @@ fn a_normalized_extension_value_is_still_bounded_after_redaction() {
         kept, 128,
         "expected 128 code points of redacted text kept | received {normalized:?}"
     );
+}
+
+/// The end marker of a block that is past the window is searched for once, not once for each
+/// begin marker, so a text of many such blocks costs a constant number of steps for each byte.
+#[test]
+fn begin_markers_whose_end_marker_is_past_the_window_cost_a_constant_for_each_byte() {
+    let unit = format!(
+        concat!(
+            "-----BEGIN PRIV",
+            "ATE KEY-----{}-----BEGIN PRIV",
+            "ATE KEY-----{}-----END PRIV",
+            "ATE KEY-----\n"
+        ),
+        " x".repeat(8200),
+        " x".repeat(100)
+    );
+    let mut per_byte = Vec::new();
+    for copies in [1, 4, 16] {
+        let text = unit.repeat(copies);
+        per_byte.push(message_steps(&text) as f64 / text.len() as f64);
+    }
+    let (first, last) = (per_byte[0], per_byte[2]);
+    assert!(
+        last <= first * 1.5 + 1.0 && last <= 24.0,
+        "expected steps for each byte to stay flat from 1 to 16 copies | received: {per_byte:?}"
+    );
+}
+
+/// A key block with more body lines than are read costs the same for every unit of it, so the
+/// work is linear in whole units even where [`DOUBLING_SLACK`] has to absorb a unit cut in two.
+#[test]
+fn key_block_work_is_linear_in_whole_units() {
+    let unit = format!(
+        concat!("-----BEGIN PRIV", "ATE KEY-----\n{}"),
+        format!("{}\n", "Ab+/".repeat(16)).repeat(140)
+    );
+    let one = message_steps(&unit);
+    for units in [2usize, 4, 8, 16] {
+        let steps = message_steps(&unit.repeat(units));
+        let allowed = units * one + units * one / 20;
+        assert!(
+            steps <= allowed,
+            "expected message_text work for {units} key blocks <= {allowed} (about {units} times \
+             {one}) | received: {steps}"
+        );
+    }
 }

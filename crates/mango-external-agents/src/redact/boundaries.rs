@@ -157,15 +157,15 @@ fn a_removed_byte_in_a_name_does_not_change_whether_a_cut_awaits_a_value() {
     }
 }
 
-/// A second pass over a URL whose password starts with a separator byte, `;` or `,`, and whose user
-/// is a credential name, rewrites the redacted userinfo as an assignment. The password rule takes
-/// the whole password, but the assignment rule reads `;` as the end of a value, so the first pass
-/// leaves `NAME:[REDACTED]@` and the second reads `NAME` and its `:` as a name and a separator. It
-/// reveals nothing: the value was already gone. 0.4.1 does the same, and this pins that it stays a
-/// change of shape.
+/// A URL whose password starts with a separator byte, `;` or `,`, and whose user is a credential
+/// name. The assignment rule reads `;` as the end of a value and leaves the userinfo to the
+/// password rule, which redacts it as `NAME:[REDACTED]@`; that text is itself `NAME` and a `:`
+/// with a value, which a second pass rewrote as an assignment. The rules now read the text the
+/// password rule wrote once more, so one pass gives what two did, and 0.4.1, which stopped at
+/// `NAME:[REDACTED]@`, is the only reader that differs.
 #[test]
-fn a_url_whose_user_is_a_credential_name_changes_shape_on_a_second_pass_and_reveals_nothing() {
-    for (raw, once, twice) in [
+fn a_url_whose_user_is_a_credential_name_reaches_its_final_shape_in_one_pass() {
+    for (raw, old, settled) in [
         (
             "i://PASSWORD:;@",
             "i://PASSWORD:[REDACTED]@",
@@ -185,23 +185,75 @@ fn a_url_whose_user_is_a_credential_name_changes_shape_on_a_second_pass_and_reve
         let first = stderr_text(raw);
         let second = stderr_text(&first);
         assert_eq!(
-            first, once,
-            "expected one pass over {raw:?} to give {once:?} | received: {first:?}"
+            first, settled,
+            "expected one pass over {raw:?} to give {settled:?} | received: {first:?}"
         );
         assert_eq!(
-            second, twice,
-            "expected a second pass to give {twice:?} | received: {second:?}"
+            second, first,
+            "expected a second pass over {first:?} to change nothing | received: {second:?}"
         );
         assert!(
-            !first.contains("hunter2") && !second.contains("hunter2"),
-            "expected no password after either pass over {raw:?} | received: {first:?} then {second:?}"
+            !first.contains("hunter2"),
+            "expected no password after the pass over {raw:?} | received: {first:?}"
         );
         let shipped = reference::stderr_text(raw);
         assert_eq!(
-            shipped, once,
-            "expected 0.4.1 to give {once:?} for {raw:?} as well | received: {shipped:?}"
+            shipped, old,
+            "expected 0.4.1 to give {old:?} for {raw:?} | received: {shipped:?}"
         );
     }
+}
+
+/// The URL rule says whether it redacted a password under a user or a scheme with a keyword in it,
+/// which is the only text the assignment rule reads once more. An ordinary user is not charged.
+#[test]
+fn the_url_rule_flags_only_a_password_under_a_credential_name() {
+    use super::floor::redact_url_passwords;
+    for (raw, flagged) in [
+        ("x://token:;hunter2@host", true),
+        ("x://PASSWORD:,@h", true),
+        ("x://my_api_key:p@h", true),
+        ("x://ann:hunter2@host", false),
+        ("redis://:hunter2@db/main", false),
+        ("x://token@host", false),
+        ("token://ann:hunter2@host", true),
+        ("see https://ann:p@h and tokens=1", false),
+        ("no url here token=1", false),
+    ] {
+        let (text, received) = redact_url_passwords(raw);
+        assert_eq!(
+            received, flagged,
+            "expected the flag for {raw:?} to be {flagged} | received: {received} (text {text:?})"
+        );
+    }
+}
+
+/// The keyword check over a range asks the keyword rule alone, anywhere in the range and nowhere
+/// outside it.
+#[test]
+fn a_keyword_is_found_inside_the_range_and_not_outside_it() {
+    use super::floor::holds_a_keyword;
+    let text = b"https://user:hunter2@host/?token=x";
+    for (from, to, expected) in [
+        (0, 13, false),
+        (0, text.len(), true),
+        (24, text.len(), true),
+        (0, 24, false),
+        (8, 8, false),
+    ] {
+        let received = holds_a_keyword(text, from, to);
+        assert_eq!(
+            received,
+            expected,
+            "expected a keyword in {:?} to be {expected} | received: {received}",
+            String::from_utf8_lossy(&text[from..to])
+        );
+    }
+    let user = b"x://my_api_key:p@h";
+    assert!(
+        holds_a_keyword(user, 0, 16),
+        "expected `api_key` found inside a userinfo | received: none"
+    );
 }
 
 /// A value that is itself a credential name, followed by whitespace and a separator, is the value

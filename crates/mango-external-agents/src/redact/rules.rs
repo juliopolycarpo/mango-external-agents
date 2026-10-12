@@ -1,4 +1,11 @@
-//! The three credential rules: a header, a name with a value, and a URL's userinfo.
+//! The newer reads of two credential rules: a header, and a name with a value. (The URL's userinfo
+//! rule is not read twice; it is the release before's.)
+//!
+//! `stderr_text` does not run these: it runs the rules of the release before, kept as they were in
+//! `redact::floor`. These are read beside them by the entry points for a vendor's messages, over
+//! the same text, and what either hides is hidden (`redact::union`). That is why a rule here may
+//! read more (escape depth, containers and sequences across lines, block scalars, counts of twelve
+//! digits) and never has to account for what the release before did with the same place.
 //!
 //! Each is a rule (tried at a place a match can start) and a locator (finds the punctuation a
 //! rule cannot match without, and the starts that reach it; see [`Candidates`]). The scan in
@@ -10,10 +17,8 @@
 //! whatever it holds, and a few values are left alone because they say a credential is missing
 //! and not what it is (see [`status_phrase_end`]).
 
-use std::ops::Range;
-
 use super::scan::{Anchor, count_steps, first_match, run_start};
-use super::structured::{CREDENTIAL_NAMES, CREDENTIAL_WORDS};
+use super::structured::{CREDENTIAL_NAMES, CREDENTIAL_WORDS, SECRET_DIGITS};
 use super::{
     Outcome, Rewrite, is_name_byte, is_space_byte, is_value_byte, match_byte, match_word,
     skip_spaces, strip, take_while,
@@ -21,19 +26,6 @@ use super::{
 
 /// The header name the bearer rule starts at.
 pub(super) const AUTHORIZATION: &[u8] = b"authorization";
-
-/// What a URL's scheme is made of after its first letter, and the marker a removed byte left in
-/// it, which parts nothing: see [`is_name_byte`].
-pub(super) fn is_scheme_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric()
-        | (byte == b'+')
-        | (byte == b'.')
-        | (byte == b'-')
-        | (byte == strip::BOUNDARY_BYTE)
-}
-
-/// What ends a scheme and opens the authority of a URL.
-const SCHEME_SEPARATOR: &[u8] = b"://";
 
 /// The `\b` the rules open with: a match may not start inside a word.
 ///
@@ -52,32 +44,78 @@ fn is_quote(byte: u8) -> bool {
     (byte == b'"') | (byte == b'\'')
 }
 
-/// Where a closing quote that ends at `end` begins, with the backslash that escapes it, or `end`
+/// The most backslashes read in front of a quote: a JSON text serialised into a string, that string
+/// into another, and so on, writes each quote with `2^n - 1` of them for the `n`th string. Five
+/// strings deep is 31. More is a run of backslashes and not a quote, and costs the same bounded read.
+const MAX_SLASHES: usize = 31;
+
+/// How many backslashes stand at `at`, counting no further than one past [`MAX_SLASHES`].
+fn slashes_from(bytes: &[u8], at: usize) -> usize {
+    let mut count = 0;
+    while count <= MAX_SLASHES && bytes.get(at + count) == Some(&b'\\') {
+        count_steps(1);
+        count += 1;
+    }
+    count
+}
+
+/// How many backslashes stand just before `end`, counting no further than one past [`MAX_SLASHES`].
+fn slashes_before(bytes: &[u8], end: usize) -> usize {
+    let mut count = 0;
+    while count <= MAX_SLASHES
+        && end
+            .checked_sub(count + 1)
+            .and_then(|before| bytes.get(before))
+            == Some(&b'\\')
+    {
+        count_steps(1);
+        count += 1;
+    }
+    count
+}
+
+/// Where a closing quote that ends at `end` begins, with the backslashes that escape it, or `end`
 /// when the byte before it is not a quote.
+///
+/// Inlined, with the backslash count behind a call: nearly every separator is turned away on the
+/// byte before it, and a locator that grows past what the compiler inlines costs the plain path.
+#[inline(always)]
 fn before_quote(bytes: &[u8], end: usize) -> usize {
     count_steps(1);
     match end.checked_sub(1) {
         Some(quote) if bytes.get(quote).is_some_and(|byte| is_quote(*byte)) => {
-            match quote.checked_sub(1) {
-                Some(slash) if bytes.get(slash) == Some(&b'\\') => slash,
-                _ => quote,
+            if quote > 0 && bytes[quote - 1] == b'\\' {
+                quote - escaping_slashes(bytes, quote)
+            } else {
+                quote
             }
         }
         _ => end,
     }
 }
 
-/// The byte after a quote at `at`, or `at` when there is none. A backslash may come first: the
-/// quotes of a JSON text inside a string are escaped.
-fn skip_quote(bytes: &[u8], at: usize) -> usize {
-    let quote = match bytes.get(at) {
-        Some(b'\\') => at + 1,
-        _ => at,
-    };
-    match bytes.get(quote) {
-        Some(byte) if is_quote(*byte) => quote + 1,
-        _ => at,
+/// The backslashes in front of the quote at `quote`, or none when there are more than
+/// [`MAX_SLASHES`].
+#[inline(never)]
+fn escaping_slashes(bytes: &[u8], quote: usize) -> usize {
+    match slashes_before(bytes, quote) {
+        slashes if slashes <= MAX_SLASHES => slashes,
+        _ => 0,
     }
+}
+
+/// The quote at `at`, with the backslashes in front of it: the quote, how many there are, and the
+/// byte after it. A JSON text inside a string has its quotes escaped, once for each string it is
+/// inside.
+fn quote_at(bytes: &[u8], at: usize) -> Option<(u8, usize, usize)> {
+    let slashes = slashes_from(bytes, at);
+    let quote = *bytes.get(at + slashes).filter(|byte| is_quote(**byte))?;
+    (slashes <= MAX_SLASHES).then_some((quote, slashes, at + slashes + 1))
+}
+
+/// The byte after a quote at `at`, or `at` when there is none.
+fn skip_quote(bytes: &[u8], at: usize) -> usize {
+    quote_at(bytes, at).map_or(at, |(_, _, after)| after)
 }
 
 // ---- keywords -------------------------------------------------------------------------------
@@ -221,6 +259,9 @@ pub(super) struct QueryRun {
     read_to: usize,
     /// Whether the last `?` or blank read was a `?`.
     question_mark: bool,
+    /// The bytes that containers spanning lines have been read for, past their first line: the
+    /// budget of [`closing_bracket`]. It belongs to the pass and is not reset with the query run.
+    container_bytes: usize,
 }
 
 impl QueryRun {
@@ -237,7 +278,8 @@ impl QueryRun {
 
     fn has_a_question_mark_before(&mut self, bytes: &[u8], at: usize) -> bool {
         if at < self.read_to {
-            *self = Self::default();
+            self.read_to = 0;
+            self.question_mark = false;
         }
         let unread = &bytes[self.read_to..at];
         count_steps(unread.len());
@@ -563,6 +605,12 @@ fn status_phrase_end(bytes: &[u8], start: usize) -> Option<usize> {
     (delimited && marks < 3).then_some(end)
 }
 
+/// Whether the digits in `text` are few enough for a count: twelve or more are a secret, as in the
+/// JSON walk (see [`SECRET_DIGITS`]).
+fn is_a_count(text: &[u8]) -> bool {
+    text.iter().filter(|byte| byte.is_ascii_digit()).count() < SECRET_DIGITS
+}
+
 /// Whether `text` is only digits, with the separators a number is written with.
 fn only_digits(text: &[u8]) -> bool {
     !text.is_empty()
@@ -689,10 +737,11 @@ fn read_header(bytes: &[u8], at: usize, separator: u8) -> Option<Outcome> {
 /// The quote that opens the value whose text starts at `inner`.
 fn opened_before(bytes: &[u8], inner: usize) -> Option<Opened> {
     let quote = *bytes.get(inner.checked_sub(1)?)?;
-    is_quote(quote).then_some(Opened {
+    let slashes = slashes_before(bytes, inner - 1);
+    (is_quote(quote) && slashes <= MAX_SLASHES).then_some(Opened {
         inner,
         quote,
-        escaped: inner >= 2 && bytes[inner - 2] == b'\\',
+        slashes,
     })
 }
 
@@ -731,6 +780,8 @@ fn is_known_scheme(scheme: &[u8]) -> bool {
     is_single_token_scheme(scheme) || is_multi_part_scheme(scheme)
 }
 
+// ---- the assignment rule --------------------------------------------------------------------
+
 /// The next `:` and the one place [`bearer_rule`] can start to reach it.
 ///
 /// The rule wants `authorization`, an optional quote, any spaces, then the colon. (With an equals
@@ -754,8 +805,6 @@ pub(super) fn header_colon(bytes: &[u8], from: usize) -> Option<Anchor> {
     Some(Anchor { at: colon, starts })
 }
 
-// ---- the assignment rule --------------------------------------------------------------------
-
 /// `api_key=`, `secret:`, `"token": `, … and whatever value follows.
 ///
 /// Every start in a name reaches the same separator and the same value, so a rule that decides
@@ -766,13 +815,20 @@ pub(super) fn header_colon(bytes: &[u8], from: usize) -> Option<Anchor> {
 /// A name that holds more than one keyword is answered for by the leftmost that may start there,
 /// so a keep for it (`session_token_cookie: ;a=b`, a name that holds both a token and a cookie)
 /// also skips the later ones. Such names are not ones a vendor writes.
-#[inline]
+#[inline(always)]
 pub(super) fn assignment_rule(bytes: &[u8], at: usize, query: &mut QueryRun) -> Option<Outcome> {
     // Every byte of a name is a start now, since a keyword may end a name or follow a capital.
-    // Most are not the first letter of anything, and are turned away on that alone.
+    // Most are not the first letter of anything, and are turned away on that alone, before the
+    // frame the rest of the rule needs is set up.
     if !(starts_a_keyword(bytes, at) || starts_a_parameter(bytes, at)) {
         return None;
     }
+    read_assignment(bytes, at, query)
+}
+
+/// [`assignment_rule`] for a place that may open a name.
+#[inline(never)]
+fn read_assignment(bytes: &[u8], at: usize, query: &mut QueryRun) -> Option<Outcome> {
     // `Authorization=Bearer x`: the bearer rule's header, written with an equals sign.
     if bytes[at] | 0x20 == b'a'
         && let Some(after_name) = match_word(bytes, at, AUTHORIZATION)
@@ -817,7 +873,11 @@ pub(super) fn assignment_rule(bytes: &[u8], at: usize, query: &mut QueryRun) -> 
     let colon = bytes.get(separator) == Some(&b':');
     let after_separator =
         match_byte(bytes, separator, b'=').or_else(|| match_byte(bytes, separator, b':'))?;
-    let value_start = skip_spaces(bytes, after_separator);
+    let (mut value_start, mut list) = list_item(bytes, skip_spaces(bytes, after_separator));
+    // A cookie header's value is its line, marker and all.
+    if keyword.kind == Kind::Line && list.is_some() {
+        (value_start, list) = (skip_spaces(bytes, after_separator), None);
+    }
     let mut context = Context {
         query,
         start: run_start(bytes, at, is_name_byte),
@@ -826,7 +886,22 @@ pub(super) fn assignment_rule(bytes: &[u8], at: usize, query: &mut QueryRun) -> 
         quoted_name,
         in_query: None,
     };
-    if let Some(opened) = open_quote(bytes, value_start) {
+    // `password: |` and the lines indented under it are one value.
+    let block = if list.is_none() && keyword.kind != Kind::Line {
+        block_scalar_end(bytes, value_start, context.start)
+    } else {
+        None
+    };
+    // A sequence item reads as the sequence whatever it opens with. A cookie header's line, and a
+    // password's phrase after a colon, are read to the end of the line however deep the quote that
+    // opens them is escaped: the reading of an escape deeper than one belongs to this redactor,
+    // and the line is what the release before it redacted.
+    let takes_the_line = keyword.kind == Kind::Line || (keyword.kind == Kind::Phrase && colon);
+    if list.is_none()
+        && block.is_none()
+        && let Some(opened) = open_quote(bytes, value_start)
+        && !(takes_the_line && opened.slashes > 1)
+    {
         return quoted_value(bytes, &keyword, at, opened, after_separator, &mut context);
     }
     // A `&` ends a value only in a query string, and a query string separates with `=`.
@@ -848,6 +923,7 @@ pub(super) fn assignment_rule(bytes: &[u8], at: usize, query: &mut QueryRun) -> 
     if keyword.token
         && digits_end > value_start
         && bytes.get(digits_end).is_none_or(|byte| ends_value(*byte))
+        && is_a_count(&bytes[value_start..digits_end])
         && counts_tokens(bytes, keyword.end)
         && !vetoed()
     {
@@ -872,14 +948,28 @@ pub(super) fn assignment_rule(bytes: &[u8], at: usize, query: &mut QueryRun) -> 
         None => false,
     };
     let value_end = match (keyword.kind, bytes.get(value_start)) {
+        _ if block.is_some() => block.unwrap_or(value_start),
+        _ if list.is_some() => list_end(bytes, value_start, list.flatten()),
         _ if with_a_token => line_end(bytes, value_start),
         (Kind::Line, _) => line_end(bytes, value_start),
         // The brackets close the value, and whatever is glued after them goes with it.
-        (_, Some(b'[' | b'{')) => take_while(bytes, closing_bracket(bytes, value_start), |byte| {
-            !ends_value(byte)
-        }),
+        (_, Some(b'[' | b'{')) => take_while(
+            bytes,
+            closing_bracket(bytes, value_start, &mut context.query.container_bytes),
+            |byte| !ends_value(byte),
+        ),
         (Kind::Phrase, _) if phrase => phrase_end(bytes, value_start),
         _ => take_while(bytes, value_start, |byte| !ends_value(byte)),
+    };
+    let value_end = {
+        let mut end = value_end;
+        loop {
+            let past = whole_marker(bytes, value_start, end);
+            if past == end {
+                break end;
+            }
+            end = take_while(bytes, past, |byte| !ends_value(byte));
+        }
     };
     if value_end == value_start {
         return Some(Outcome::Keep {
@@ -899,6 +989,128 @@ pub(super) fn assignment_rule(bytes: &[u8], at: usize, query: &mut QueryRun) -> 
         joiner,
         tail: "",
     }))
+}
+
+/// `end`, moved past the `]` of a `[REDACTED]` that it falls inside: a value that ends at a bracket
+/// (a quoted member's does) must not end in the middle of a marker an earlier rule wrote, which
+/// would leave `[REDACTED]]` and a text that the next reading redacts differently.
+fn whole_marker(bytes: &[u8], start: usize, end: usize) -> usize {
+    const OPEN: &[u8] = b"[REDACTED";
+    let inside = bytes.get(end) == Some(&b']')
+        && end >= start + OPEN.len()
+        && &bytes[end - OPEN.len()..end] == OPEN;
+    if inside { end + 1 } else { end }
+}
+
+/// Where the YAML block scalar that opens at `at` ends: `|` or `>`, a chomping or indentation
+/// indicator and a comment, then the lines under it that are indented deeper than the line of
+/// the name at `name`. Blank lines between them belong to it, and those after the last do not.
+///
+/// Read across no more than [`MAX_CONTAINER_LINES`] lines and [`MAX_CONTAINER_BYTES`] bytes, as a
+/// container is. A longer scalar is redacted as far as that, and nothing past it. `None` when
+/// `at` is no header (`password: |abc` is a value), or nothing is indented under it.
+fn block_scalar_end(bytes: &[u8], at: usize, name: usize) -> Option<usize> {
+    if !matches!(bytes.get(at), Some(b'|' | b'>')) {
+        return None;
+    }
+    let mut header = at + 1;
+    while header < at + 3 && matches!(bytes.get(header), Some(b'+' | b'-' | b'0'..=b'9')) {
+        header += 1;
+    }
+    let blanks = take_while(bytes, header, is_blank_byte);
+    let comment = blanks > header && bytes.get(blanks) == Some(&b'#');
+    let header_end = if comment {
+        raw_line_end(bytes, blanks)
+    } else {
+        blanks
+    };
+    if !matches!(bytes.get(header_end), Some(b'\n' | b'\r')) {
+        return None;
+    }
+    // The key's own indentation: what is under it must be deeper.
+    let line_start = run_start(bytes, name, |byte| (byte != b'\n') & (byte != b'\r'));
+    let indent = take_while(bytes, line_start, is_blank_byte) - line_start;
+    let mut end = None;
+    let mut line = next_line(bytes, header_end);
+    for _ in 0..MAX_CONTAINER_LINES {
+        if line > bytes.len() || line - at > MAX_CONTAINER_BYTES {
+            break;
+        }
+        let content = take_while(bytes, line, is_blank_byte);
+        let stop = raw_line_end(bytes, content);
+        if content < stop {
+            if content - line <= indent {
+                break;
+            }
+            end = Some(trim_end(bytes, content, stop));
+        }
+        if stop >= bytes.len() {
+            break;
+        }
+        line = next_line(bytes, stop);
+    }
+    end
+}
+
+/// The end of the line that `start` is on, before its break and with its trailing blanks.
+fn raw_line_end(bytes: &[u8], start: usize) -> usize {
+    take_while(bytes, start, |byte| (byte != b'\n') & (byte != b'\r'))
+}
+
+/// The start of the line after the break at `at`: `\n`, `\r\n` or `\r`.
+fn next_line(bytes: &[u8], at: usize) -> usize {
+    match (bytes.get(at), bytes.get(at + 1)) {
+        (Some(b'\r'), Some(b'\n')) => at + 2,
+        _ => at + 1,
+    }
+}
+
+/// The most items of a YAML sequence that a credential's name takes.
+const MAX_LIST_ITEMS: usize = 64;
+
+/// Where the value of a YAML sequence item starts, when the value at `at` opens with the `- ` that
+/// marks one: the item's text, and, as `Some(Some(indent))`, the column of the marker when it
+/// stands first on its line, so that the items below it can be found.
+///
+/// A hyphen glued to its word (`-sk-live-x`) is part of a value, as it always was.
+fn list_item(bytes: &[u8], at: usize) -> (usize, Option<Option<usize>>) {
+    // Nearly every value opens with something else, so this is a byte and a return.
+    if bytes.get(at) != Some(&b'-') || !bytes.get(at + 1).is_some_and(|b| is_blank_byte(*b)) {
+        return (at, None);
+    }
+    let item = take_while(bytes, at + 1, is_blank_byte);
+    if bytes
+        .get(item)
+        .is_none_or(|byte| matches!(byte, b'\n' | b'\r'))
+    {
+        return (at, None);
+    }
+    let blanks = run_start(bytes, at, is_blank_byte);
+    let first_on_line = blanks == 0 || matches!(bytes[blanks - 1], b'\n' | b'\r');
+    (item, Some(first_on_line.then_some(at - blanks)))
+}
+
+/// Where the sequence whose first item starts at `item` ends: the end of that line, and of every
+/// line below it that opens with a marker in the same column (up to [`MAX_LIST_ITEMS`]). A marker
+/// in any other column belongs to another sequence.
+fn list_end(bytes: &[u8], item: usize, indent: Option<usize>) -> usize {
+    let mut end = line_end(bytes, item);
+    let Some(indent) = indent else {
+        return end;
+    };
+    for _ in 0..MAX_LIST_ITEMS {
+        let marker = skip_spaces(bytes, end);
+        let blanks = run_start(bytes, marker, is_blank_byte);
+        let in_column =
+            blanks > 0 && matches!(bytes[blanks - 1], b'\n' | b'\r') && marker - blanks == indent;
+        let marked = bytes.get(marker) == Some(&b'-')
+            && bytes.get(marker + 1).is_some_and(|b| is_blank_byte(*b));
+        if !(in_column && marked) {
+            break;
+        }
+        end = line_end(bytes, take_while(bytes, marker + 1, is_blank_byte));
+    }
+    end
 }
 
 /// Whether nothing is left of a phrase after the status that ends at `end`: the text ends, or a
@@ -955,77 +1167,136 @@ fn token_type_scheme(bytes: &[u8], keyword: &Keyword, value_start: usize) -> Opt
     (scheme && bytes.get(value_end).is_none_or(|byte| !is_name_byte(*byte))).then_some(value_end)
 }
 
+/// The most lines a container under a credential name is read across.
+const MAX_CONTAINER_LINES: usize = 64;
+
+/// The most bytes a container is read across.
+const MAX_CONTAINER_BYTES: usize = 16 * 1024;
+
+/// What a pass may read for containers past their first line, over and above one byte for each
+/// byte of the text it has passed: a text of containers that never close must not read
+/// [`MAX_CONTAINER_BYTES`] for each of them.
+const CONTAINER_ALLOWANCE: usize = 8 * 1024;
+
 /// Where the bracket that opens at `start` closes, counting the brackets and the strings inside:
-/// a JSON array or object that is one credential's value. A string opens with a quote, or with a
-/// backslash and a quote when the JSON is itself inside a string (`{\\"a\\":1}`). An unclosed one
-/// ends with its line.
-fn closing_bracket(bytes: &[u8], start: usize) -> usize {
+/// a JSON array or object that is one credential's value. A string opens with a quote, or with
+/// backslashes and a quote when the JSON is itself inside a string (`{\\"a\\":1}`, and
+/// `{\\\\\\"a\\\\\\":1}` one string deeper), and a string opened with `n` backslashes ends at
+/// a quote with exactly `n`.
+///
+/// A pretty-printed container takes many lines, so the bracket is looked for across line breaks, up
+/// to [`MAX_CONTAINER_LINES`] lines and [`MAX_CONTAINER_BYTES`] bytes, and a string ends with its
+/// line. One that does not close within that, or when the pass has used its allowance (`spent`,
+/// see [`CONTAINER_ALLOWANCE`]), ends with its first line: an array that never closes must not
+/// take the rest of the text with it. Everything read past the first line is added to `spent`.
+fn closing_bracket(bytes: &[u8], start: usize, spent: &mut usize) -> usize {
+    let across_lines = *spent < CONTAINER_ALLOWANCE.saturating_add(start);
     let mut depth = 0usize;
-    // The quote that opened the string we are in, and whether it was written with a backslash.
-    let mut string: Option<(u8, bool)> = None;
+    // The quote that opened the string we are in, and the backslashes written in front of it.
+    let mut string: Option<(u8, usize)> = None;
+    // Where the first line ends, and how many lines have been read.
+    let mut first_break: Option<usize> = None;
+    let mut lines = 1;
     let mut at = start;
+    let charge = |spent: &mut usize, first: Option<usize>, end: usize| {
+        *spent = spent.saturating_add(first.map_or(0, |first| end.saturating_sub(first)));
+    };
     while let Some(&byte) = bytes.get(at) {
         count_steps(1);
         at += 1;
         if matches!(byte, b'\n' | b'\r') {
-            return at - 1;
+            let first = *first_break.get_or_insert(at - 1);
+            if byte == b'\r' && bytes.get(at) == Some(&b'\n') {
+                at += 1;
+            }
+            if !across_lines || lines >= MAX_CONTAINER_LINES || at - start > MAX_CONTAINER_BYTES {
+                charge(spent, first_break, at);
+                return first;
+            }
+            lines += 1;
+            string = None;
+            continue;
         }
         match (string, byte) {
-            (Some((quote, true)), b'\\') if bytes.get(at) == Some(&quote) => {
-                string = None;
-                at += 1;
+            (Some((_, 0)), b'\\') if !matches!(bytes.get(at), Some(b'\n' | b'\r')) => at += 1,
+            (Some((quote, 0)), byte) if byte == quote => string = None,
+            (Some((quote, slashes)), b'\\') => {
+                let run = 1 + take_while(bytes, at, |byte| byte == b'\\') - at;
+                at += run - 1;
+                if run == slashes && bytes.get(at) == Some(&quote) {
+                    string = None;
+                    at += 1;
+                }
             }
-            (Some((_, false)), b'\\') if !matches!(bytes.get(at), Some(b'\n' | b'\r')) => at += 1,
-            (Some((quote, false)), byte) if byte == quote => string = None,
             (Some(_), _) => {}
-            (None, b'\\') if bytes.get(at).is_some_and(|byte| is_quote(*byte)) => {
-                string = Some((bytes[at], true));
-                at += 1;
+            (None, b'\\') => {
+                let run = 1 + take_while(bytes, at, |byte| byte == b'\\') - at;
+                at += run - 1;
+                let quoted = bytes.get(at).is_some_and(|byte| is_quote(*byte));
+                if run <= MAX_SLASHES && quoted {
+                    string = Some((bytes[at], run));
+                    at += 1;
+                } else if quoted {
+                    // Deeper than a string is read, and not a string: the line is the value, as it
+                    // is for a container that never closes.
+                    let first = *first_break.get_or_insert_with(|| {
+                        take_while(bytes, at, |byte| (byte != b'\n') & (byte != b'\r'))
+                    });
+                    charge(spent, first_break, at);
+                    return first;
+                }
             }
-            (None, b'"' | b'\'') => string = Some((byte, false)),
+            (None, b'"' | b'\'') => string = Some((byte, 0)),
             (None, b'[' | b'{') => depth += 1,
             (None, b']' | b'}') => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
+                    charge(spent, first_break, at);
                     return at;
                 }
             }
             (None, _) => {}
         }
     }
-    bytes.len()
+    charge(spent, first_break, at);
+    first_break.unwrap_or(bytes.len())
 }
 
-/// A quote that opens a value at `at`: where its text starts, the quote and whether it is escaped.
+/// A quote that opens a value at `at`: where its text starts, the quote and the backslashes that
+/// escape it (none for a plain string, one for JSON inside a string, `2^n - 1` for the `n`th).
 struct Opened {
     inner: usize,
     quote: u8,
-    escaped: bool,
+    slashes: usize,
 }
 
 fn open_quote(bytes: &[u8], at: usize) -> Option<Opened> {
-    let escaped = bytes.get(at) == Some(&b'\\');
-    let quote_at = if escaped { at + 1 } else { at };
-    let quote = *bytes.get(quote_at).filter(|byte| is_quote(**byte))?;
+    let (quote, slashes, inner) = quote_at(bytes, at)?;
     Some(Opened {
-        inner: quote_at + 1,
+        inner,
         quote,
-        escaped,
+        slashes,
     })
 }
 
 /// Where the text inside a quote ends: at its closing quote, or at the end of the line when it is
 /// never closed.
+///
+/// A plain string ends at its quote, and a backslash escapes the byte after it. One written with
+/// `n` backslashes in front of its quote ends at a quote with exactly `n`: more are the quotes of
+/// a JSON text inside it, written one level deeper. The count is kept as the text is read, so the
+/// work is the length of the string however long a run of backslashes is.
 fn close_quote(bytes: &[u8], opened: &Opened) -> usize {
     let mut at = opened.inner;
+    let mut run = 0;
     while let Some(byte) = bytes.get(at) {
         count_steps(1);
         match *byte {
             b'\n' | b'\r' => return at,
-            b'\\' if opened.escaped && bytes.get(at + 1) == Some(&opened.quote) => return at,
-            b'\\' if !opened.escaped => at += 1,
-            byte if byte == opened.quote && !opened.escaped => return at,
-            _ => {}
+            b'\\' if opened.slashes == 0 => at += 1,
+            b'\\' => run += 1,
+            byte if byte == opened.quote && run == opened.slashes => return at - run,
+            _ => run = 0,
         }
         at += 1;
     }
@@ -1073,12 +1344,7 @@ fn quoted_value(
     if let Some(tail_end) = glued_tail(bytes, &opened, end, context) {
         // The closing quote goes back after the marker, so that the text still reads as a quoted
         // value and a second pass over it leaves it as it is.
-        let tail = match (opened.quote, opened.escaped) {
-            (b'"', false) => "\"",
-            (b'"', true) => "\\\"",
-            (_, false) => "'",
-            (_, true) => "\\'",
-        };
+        let tail = closing_quote_text(&opened);
         return Some(Outcome::Redact(Rewrite {
             end: tail_end,
             kept_end: opened.inner,
@@ -1102,6 +1368,7 @@ fn quoted_value(
     if keyword.token
         && counts_tokens(bytes, keyword.end)
         && only_digits(&bytes[opened.inner..end])
+        && is_a_count(&bytes[opened.inner..end])
         && !vetoed()
     {
         return Some(Outcome::Keep { end });
@@ -1112,6 +1379,15 @@ fn quoted_value(
         joiner: "",
         tail: "",
     }))
+}
+
+/// The backslashes and the quote that close `opened`, as text that outlives the match: a suffix of
+/// [`MAX_SLASHES`] backslashes and a quote.
+fn closing_quote_text(opened: &Opened) -> &'static str {
+    const DOUBLE: &str = "\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\"";
+    const SINGLE: &str = "\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\'";
+    let all = if opened.quote == b'"' { DOUBLE } else { SINGLE };
+    &all[MAX_SLASHES - opened.slashes.min(MAX_SLASHES)..]
 }
 
 /// Where the value ends when text is glued to the quote that closes it: the closing quote at `end`
@@ -1130,7 +1406,7 @@ fn glued_tail(bytes: &[u8], opened: &Opened, end: usize, context: &mut Context) 
     {
         return None;
     }
-    let after = end + if opened.escaped { 2 } else { 1 };
+    let after = end + opened.slashes + 1;
     let first = *bytes.get(after)?;
     let glued = is_word_or_quote(first)
         || is_glue_operator(first)
@@ -1312,91 +1588,3 @@ pub(super) fn has_value(bytes: &[u8], from: usize) -> bool {
 }
 
 // ---- the URL rule ---------------------------------------------------------------------------
-
-/// The password half of `scheme://user:password@host`, or the whole userinfo when it has no
-/// password but is itself a token (`https://ghp_0123456789abcdefghij@host`).
-#[inline]
-pub(super) fn url_password_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
-    if !starts_a_word(bytes, at) || !bytes.get(at)?.is_ascii_alphabetic() {
-        return None;
-    }
-    let scheme_end = take_while(bytes, at + 1, is_scheme_byte);
-    let after_scheme = match_word(bytes, scheme_end, SCHEME_SEPARATOR)?;
-    let password = url_password(bytes, after_scheme)?;
-    Some(Outcome::Redact(Rewrite {
-        end: password.end,
-        kept_end: password.start,
-        joiner: "",
-        tail: "",
-    }))
-}
-
-/// Where the password of the URL whose `://` ends at `after_scheme` starts and ends.
-///
-/// `None` unless the authority is `user:password@`, the user optional and the password not: a
-/// URL that has no password, or whose userinfo is never closed by an `@`, is left as it is. The
-/// exception is a userinfo with no colon that is itself a token, which is long, has a digit and is
-/// made of the characters a token is made of: `git@github.com` is a name, `ghp_0123...@host` is not.
-pub(super) fn url_password(bytes: &[u8], after_scheme: usize) -> Option<Range<usize>> {
-    let user_end = take_while(bytes, after_scheme, |byte| {
-        !matches!(
-            byte,
-            b' ' | b'\t' | b'\n' | b'\r' | b':' | b'/' | b'?' | b'#'
-        )
-    });
-    // The user half is optional: `redis://:hunter2@db/main` is what a URL looks like when
-    // only a password was configured.
-    let Some(password_start) = match_byte(bytes, user_end, b':') else {
-        return token_userinfo(bytes, after_scheme);
-    };
-    let password_end = take_while(bytes, password_start, |byte| {
-        !matches!(
-            byte,
-            b' ' | b'\t' | b'\n' | b'\r' | b'@' | b'/' | b'?' | b'#'
-        )
-    });
-    if password_end == password_start || bytes.get(password_end) != Some(&b'@') {
-        return None;
-    }
-    Some(password_start..password_end)
-}
-
-/// A userinfo with no colon, of 20 or more token characters with a digit among them, closed by `@`.
-fn token_userinfo(bytes: &[u8], start: usize) -> Option<Range<usize>> {
-    let end = take_while(bytes, start, |byte| {
-        byte.is_ascii_alphanumeric() | matches!(byte, b'_' | b'-' | b'.' | b'~' | b'%')
-    });
-    let user = &bytes[start..end];
-    // A name such as `jenkins-deploy-agent-01` is long and has a digit; a token also has a capital
-    // or an underscore, is long enough to be random, or opens like one.
-    let looks_random = user.iter().any(u8::is_ascii_uppercase)
-        || user.contains(&b'_')
-        || user.len() >= 32
-        || [&b"xox"[..], b"sk-", b"pat-"].iter().any(|prefix| {
-            user.len() >= prefix.len() && user[..prefix.len()].eq_ignore_ascii_case(prefix)
-        });
-    let token_like = user.len() >= 20 && user.iter().any(u8::is_ascii_digit) && looks_random;
-    (token_like && bytes.get(end) == Some(&b'@')).then_some(start..end)
-}
-
-/// The next `:` and the places [`url_password_rule`] can start to reach it.
-///
-/// The rule wants a letter, the rest of a scheme, then `://`, then a userinfo with a password in
-/// it. A colon that does not open `://`, or opens a URL with no password to redact, allows no
-/// start; one that does allows any start in the run of scheme bytes that ends at it.
-///
-/// Every start in that run reaches the same authority, so the answer is found here, once, and
-/// not by each start of a scheme like `a.a.a.…` reading the rest of the text again. The
-/// check stops at a `/`, and the next `://` has one right after its colon, so no byte is read
-/// for two separators.
-#[inline]
-pub(super) fn scheme_separator(bytes: &[u8], from: usize) -> Option<Anchor> {
-    let colon = first_match(bytes, from, |byte| byte == b':')?;
-    let starts = match match_word(bytes, colon, SCHEME_SEPARATOR) {
-        Some(after_scheme) if url_password(bytes, after_scheme).is_some() => {
-            run_start(bytes, colon, is_scheme_byte)..colon
-        }
-        _ => 0..0,
-    };
-    Some(Anchor { at: colon, starts })
-}

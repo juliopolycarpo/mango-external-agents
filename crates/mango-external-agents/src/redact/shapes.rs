@@ -6,7 +6,7 @@
 //! Where the text is ambiguous the case is on the redacted side, and says so.
 //! `redact::differential` holds every input without one of these shapes to the 0.4.1 answer.
 
-use super::stderr_text;
+use super::{message_text, stderr_text};
 
 /// Fails, naming `text`, unless redacting it gives `expected`.
 fn assert_shown(cases: &[(&str, &str)]) {
@@ -15,6 +15,43 @@ fn assert_shown(cases: &[(&str, &str)]) {
         assert_eq!(
             &received, expected,
             "expected {text:?} to be shown as {expected:?} | received: {received:?}"
+        );
+    }
+}
+
+/// [`assert_shown`] for the text a vendor's message is shown as: the reads added since the release
+/// before, beside its rules.
+fn assert_message_shown(cases: &[(&str, &str)]) {
+    for (text, expected) in cases {
+        let received = message_text(text);
+        assert_eq!(
+            &received, expected,
+            "expected {text:?} to be shown as {expected:?} in a message | received: {received:?}"
+        );
+    }
+}
+
+/// Fails, naming the text, unless a message made of `text` hides every one of `hidden`, keeps every
+/// one of `kept`, and is a text another reading leaves alone.
+fn assert_hidden(cases: &[(&str, &[&str], &[&str])]) {
+    for (text, hidden, kept) in cases {
+        let received = message_text(text);
+        for secret in *hidden {
+            assert!(
+                !received.contains(secret),
+                "expected {text:?} to hide {secret:?} | received: {received:?}"
+            );
+        }
+        for word in *kept {
+            assert!(
+                received.contains(word),
+                "expected {text:?} to keep {word:?} | received: {received:?}"
+            );
+        }
+        assert_eq!(
+            message_text(&received),
+            received,
+            "expected {text:?} to be shown as a text a second reading leaves alone"
         );
     }
 }
@@ -754,4 +791,408 @@ fn a_header_name_that_only_starts_like_a_vendors_key_header_is_not_one() {
             "Ocp-Apim-Subscription-Key=[REDACTED]",
         ),
     ]);
+}
+
+/// `text` as the content of a JSON string: the backslashes and the double quotes escaped.
+fn escaped(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// `text` escaped once for each string it is inside.
+fn escaped_levels(text: &str, levels: usize) -> String {
+    (0..levels).fold(text.to_owned(), |inner, _| escaped(&inner))
+}
+
+/// How many strings deep a JSON text is read: `{\\\"api_key\\\":...}` is two, five is the most.
+const MOST_LEVELS: usize = 5;
+
+/// A JSON text that was serialised into a string, and that string into another, has a quote
+/// written with a backslash for every level (`\"`, `\\\"`, `\\\\\\\"`). The credential is as much
+/// a credential at the fifth level as at the first, and the words around it stay readable.
+#[test]
+fn json_inside_json_strings_is_read_at_every_level_of_escaping() {
+    for (plain, redacted, own_levels) in [
+        (
+            r#"{"api_key":"sk-live-x1","model":"m"}"#,
+            r#"{"api_key":"[REDACTED]","model":"m"}"#,
+            0,
+        ),
+        // Already one string deep before it is escaped further.
+        (
+            r#"{"data":"{\"api_key\":\"sk-live-x2\"}","id":1}"#,
+            r#"{"data":"{\"api_key\":\"[REDACTED]\"}","id":1}"#,
+            1,
+        ),
+        (
+            r#"{"Authorization":"Bearer sk-live-x3","Accept":"a"}"#,
+            r#"{"Authorization":"Bearer [REDACTED]","Accept":"a"}"#,
+            0,
+        ),
+        (
+            r#"{"password":"two words, here","user":"ann"}"#,
+            r#"{"password":"[REDACTED]","user":"ann"}"#,
+            0,
+        ),
+        (
+            r#"{"token": 12345, "n": 1}"#,
+            r#"{"token": [REDACTED], "n": 1}"#,
+            0,
+        ),
+        (
+            r#"{"tokens":["sk-18a","sk-18b"],"retry_after":30}"#,
+            r#"{"tokens":[REDACTED],"retry_after":30}"#,
+            0,
+        ),
+        (
+            r#"{"headers":{"cookie":"sid=1; b=2"},"ok":true}"#,
+            r#"{"headers":{"cookie":"[REDACTED]"},"ok":true}"#,
+            0,
+        ),
+        (
+            r#"{"password":"pa"ss"word","user":"ann"}"#,
+            r#"{"password":"[REDACTED]","user":"ann"}"#,
+            0,
+        ),
+    ] {
+        for level in 0..=MOST_LEVELS - own_levels {
+            let (text, expected) = (
+                format!("upstream said {}", escaped_levels(plain, level)),
+                format!("upstream said {}", escaped_levels(redacted, level)),
+            );
+            let received = message_text(&text);
+            assert_eq!(
+                received, expected,
+                "expected the credential {level} strings deep redacted | input {text:?} received: {received:?}"
+            );
+        }
+    }
+}
+
+/// The reading stops at the bound and does not run on: text nested past it is a value of
+/// backslashes and quotes, as it was before the bound existed, and it costs a bounded read.
+#[test]
+fn escaping_deeper_than_the_bound_is_not_read_as_a_quote() {
+    let deeper = escaped_levels(r#"{"api_key":"sk-live-x4","m":1}"#, MOST_LEVELS + 1);
+    let received = stderr_text(&deeper);
+    assert!(
+        received.len() <= deeper.len() + "[REDACTED]".len(),
+        "expected the text no larger than the bound allows | received {} bytes from {}",
+        received.len(),
+        deeper.len()
+    );
+}
+
+/// A value in single quotes that were escaped, once or three times. Once, the closing quote goes
+/// back the way it stood. Three times, the floor starts hiding at the name's separator and the
+/// quoted read starts inside the quotes: the union starts where the first does.
+#[test]
+fn escaped_single_quotes_close_a_value_with_the_backslashes_that_opened_it() {
+    assert_message_shown(&[
+        (
+            r"x=1 password=\'pa\'ss-word\' tail",
+            r"x=1 password=\'[REDACTED]\' tail",
+        ),
+        (
+            r"x=1 password=\\\'pa\\\'ss-word\\\' tail",
+            "x=1 password=[REDACTED] tail",
+        ),
+    ]);
+}
+
+/// A pretty-printed array or object under a credential's name is one value, however many lines it
+/// takes, and a YAML sequence under one is a value of its items. The text rules used to read a
+/// line at a time, so only the line with the name was redacted and the entries below it stayed.
+#[test]
+fn a_container_that_spans_lines_is_one_value() {
+    assert_message_shown(&[
+        (
+            "{\"tokens\":\n[\n\"sk-aaa\",\n\"sk-bbb\"\n]}",
+            "{\"tokens\":\n[REDACTED]}",
+        ),
+        (
+            "{\n  \"password\": [\n    \"sk-aaa\",\n    \"sk-bbb\"\n  ],\n  \"user\": \"ann\"\n}",
+            "{\n  \"password\": [REDACTED],\n  \"user\": \"ann\"\n}",
+        ),
+        (
+            "{\n  \"credentials\": {\n    \"user\": \"u\",\n    \"pass\": \"p\"\n  },\n  \"ok\": true\n}",
+            "{\n  \"credentials\": [REDACTED],\n  \"ok\": true\n}",
+        ),
+        (
+            "{\"tokens\": [\"sk-aaa\",\n \"sk-bbb\"], \"retry_after\": 30}",
+            "{\"tokens\": [REDACTED], \"retry_after\": 30}",
+        ),
+        // A bracket inside a string and a nested array do not close the value early.
+        (
+            "{\"secret\": [\n  \"a]b\",\n  [\"c\"],\n  \"d\"\n], \"n\": 1}",
+            "{\"secret\": [REDACTED], \"n\": 1}",
+        ),
+        (
+            "tokens: [\n  sk-aaa,\n  sk-bbb\n]\nnext: ok",
+            "tokens=[REDACTED]\nnext: ok",
+        ),
+        // The carriage returns go with the rest of what the redactor strips.
+        (
+            "{\r\n  \"password\": [\r\n    \"sk-aaa\"\r\n  ]\r\n}",
+            "{\n  \"password\": [REDACTED]\n}",
+        ),
+        // One that never closes ends with its first line, as it always did.
+        (
+            "{\"token\": [\n\"sk-aaa\",\n\"sk-bbb\"",
+            "{\"token\": [REDACTED]\n\"sk-aaa\",\n\"sk-bbb\"",
+        ),
+    ]);
+}
+
+/// The container is read to the line that closes it, and no further than 64 lines on: a longer one
+/// is read as its first line, as an array that never closes is.
+#[test]
+fn a_container_past_the_line_bound_is_read_as_its_first_line() {
+    let body = |lines: usize| format!("{{\"token\": [\n{}\"z\"\n]}}", "\"a\",\n".repeat(lines));
+    let received = message_text(&body(60));
+    assert_eq!(
+        received, "{\"token\": [REDACTED]}",
+        "expected a 62 line array redacted whole | received: {received:?}"
+    );
+    let text = body(100);
+    let received = message_text(&text);
+    assert!(
+        received.starts_with("{\"token\": [REDACTED]\n\"a\","),
+        "expected a 102 line array read as its first line | received: {received:?}"
+    );
+}
+
+#[test]
+fn a_yaml_sequence_under_a_credential_name_is_redacted_item_by_item() {
+    assert_message_shown(&[
+        (
+            "api_key:\n  - sk-live-aaa\n  - sk-live-bbb\nnext: ok",
+            "api_key=[REDACTED]\nnext: ok",
+        ),
+        (
+            "env:\n  tokens:\n    - sk-aaa\n    - sk-bbb\n  other: 1\n",
+            "env:\n  tokens=[REDACTED]\n  other: 1\n",
+        ),
+        // A sequence at another indentation, or under another name, is not this one's.
+        (
+            "tokens:\n  - a\nother:\n  - b",
+            "tokens=[REDACTED]\nother:\n  - b",
+        ),
+        ("tokens:\n  - a\n  - b\n - c", "tokens=[REDACTED]\n - c"),
+        ("api_key: - sk-live-aaa\nnext", "api_key=[REDACTED]\nnext"),
+        // A hyphen that starts a word is a value, as it was.
+        ("api_key:\n  -sk-live-aaa\nnext", "api_key=[REDACTED]\nnext"),
+        // A status stays; the dash in front of it is the floor's, which reads it as the value.
+        (
+            "token:\n  - expired\nnext",
+            "token=[REDACTED] expired\nnext",
+        ),
+    ]);
+}
+
+/// A number under a name that counts tokens is a count: `max_tokens: 100000`. A count has at most
+/// ten digits (4,294,967,295 is the largest a 32-bit counter holds, and no model has a window
+/// near it), so a run of twelve or more is a secret that happens to be digits, and is redacted.
+#[test]
+fn a_count_of_twelve_digits_or_more_is_a_credential_and_a_shorter_one_is_a_count() {
+    assert_message_shown(&[
+        ("tokens: 4294967295", "tokens: 4294967295"),
+        ("tokens: 99999999999", "tokens: 99999999999"),
+        (
+            "max_tokens=4,294,967,295 next",
+            "max_tokens=4,294,967,295 next",
+        ),
+        ("tokens: 100000000000", "tokens=[REDACTED]"),
+        ("tokens: 123456789012", "tokens=[REDACTED]"),
+        ("token_limit=999_999_999_999", "token_limit=[REDACTED]"),
+        // A comma ends a value under every name, so only the digits before it are the value.
+        (
+            "tokens_used: 1,234,567,890,123 left",
+            "tokens_used=[REDACTED],234,567,890,123 left",
+        ),
+        (
+            r#"{"max_tokens": 123456789012, "n": 1}"#,
+            r#"{"max_tokens": [REDACTED], "n": 1}"#,
+        ),
+        (
+            r#"{"max_tokens": 4294967295, "n": 1}"#,
+            r#"{"max_tokens": 4294967295, "n": 1}"#,
+        ),
+        (
+            r#"{"total_tokens":"123456789012","n":1}"#,
+            r#"{"total_tokens":"[REDACTED]","n":1}"#,
+        ),
+        (
+            r#"{"total_tokens":"4294967295","n":1}"#,
+            r#"{"total_tokens":"4294967295","n":1}"#,
+        ),
+        // A name that does not count tokens never kept a number, and the status words stay kept.
+        ("api_token: 12345", "api_token=[REDACTED]"),
+        ("secret: 503", "secret: 503"),
+    ]);
+}
+
+/// A hyphen and a line break is not a sequence marker: the item must start on the same line, so a
+/// dash left as a value does not take the line after it.
+#[test]
+fn a_hyphen_at_the_end_of_a_line_is_a_value_and_not_a_sequence_marker() {
+    assert_shown(&[
+        (
+            "password: -\nuser: bob\nhost: example.com",
+            "password=[REDACTED]\nuser: bob\nhost: example.com",
+        ),
+        ("tokens:\n  -\nother: x", "tokens=[REDACTED]\nother: x"),
+    ]);
+}
+
+/// A sequence item or a container under a credential's name that holds the name of another does not
+/// leave that name's value behind: the floor reads the name and its value on the next line, the item
+/// reads the item, and what the two hide together is everything.
+#[test]
+fn a_sequence_item_never_leaves_the_value_of_a_name_it_holds() {
+    assert_hidden(&[
+        (
+            "tokens: - abc password:\nhunter2",
+            &["abc", "hunter2"],
+            &["tokens"],
+        ),
+        (
+            "tokens: - abc password:\nhunter2\nnext: ok",
+            &["abc", "hunter2"],
+            &["next: ok"],
+        ),
+        (
+            "api_key:\n  - sk-aaa\n  - bbb secret=\nccc\nnext: ok",
+            &["sk-aaa", "bbb", "ccc"],
+            &["next: ok"],
+        ),
+        ("password: - abc secret=\nnext: ok", &["abc"], &["next: ok"]),
+        ("tokens: - password:\nhunter2", &["hunter2"], &["tokens"]),
+        (
+            "tokens: - abc;password:\nhunter2",
+            &["abc", "hunter2"],
+            &["tokens"],
+        ),
+        (
+            "secrets:\n  - token:\n      QXZ1J",
+            &["QXZ1J"],
+            &["secrets"],
+        ),
+        (
+            "env:\n  secrets:\n    - api_key:\n        QXZ2J",
+            &["QXZ2J"],
+            &["env"],
+        ),
+        (
+            "credentials:\n  - password:\n      QXZ3J\n    user: bob",
+            &["QXZ3J"],
+            &["credentials"],
+        ),
+        ("\"token\": - J token:\nQXZ4J", &["QXZ4J"], &["token"]),
+        ("token=- token: QXZ5Jtoken:", &["QXZ5J"], &["token"]),
+    ]);
+}
+
+/// More backslashes than a JSON text can write in front of a quote (31, five strings deep) are not
+/// a string. A container that meets them is read to the end of its line, as an array that never
+/// closes is, and nothing past the line is left behind a bracket that closes in a string.
+#[test]
+fn a_run_of_backslashes_deeper_than_a_string_is_read_to_the_end_of_the_line() {
+    let slashes = |count: usize| "\\".repeat(count);
+    for count in [31, 32, 33, 64] {
+        let text = format!(
+            "api_key: [{}\"x\"] CNRY {}\" tail",
+            slashes(count),
+            slashes(1)
+        );
+        let received = stderr_text(&text);
+        assert_eq!(
+            received, "api_key=[REDACTED]",
+            "expected the line of {count} backslashes in a container redacted whole | input {text:?} received: {received:?}"
+        );
+    }
+}
+
+/// A cookie header takes its line behind any escape deeper than a quote's own, and an ordinary name takes the text
+/// glued to the quote that closes its value at every depth, as it does at the first.
+#[test]
+fn a_value_is_read_the_same_at_every_depth_of_escape() {
+    let slashes = |count: usize| "\\".repeat(count);
+    for count in [0, 1, 3, 7, 15, 31, 32] {
+        let quote = format!("{}'", slashes(count));
+        let cookie = format!("Cookie = {quote}c1{quote}see c2");
+        let received = stderr_text(&cookie);
+        // One quote and its escape are a string of their own; a deeper escape is the line.
+        let expected = if count > 1 {
+            "Cookie = [REDACTED]".to_owned()
+        } else {
+            format!("Cookie = {quote}[REDACTED]{quote} c2")
+        };
+        assert_eq!(
+            received, expected,
+            "expected a cookie's value read behind {count} backslashes as it is at the first depth | input {cookie:?} received: {received:?}"
+        );
+        let password = format!("password = {quote}c1{quote}see c2");
+        let received = stderr_text(&password);
+        assert!(
+            !received.contains("c1") && !received.contains("see"),
+            "expected the value and the text glued to its closing quote gone behind {count} backslashes | input {password:?} received: {received:?}"
+        );
+    }
+}
+
+/// A YAML block scalar under a credential's name is the lines indented under it, as a sequence is
+/// its items: `password: |` has nothing on its own line, and its value used to stay.
+#[test]
+fn a_yaml_block_scalar_under_a_credential_name_is_the_lines_under_it() {
+    assert_message_shown(&[
+        (
+            "password: |\n  hunter2\n  second\nnext: ok",
+            "password=[REDACTED]\nnext: ok",
+        ),
+        ("password: >\n  hunter2\n", "password=[REDACTED]\n"),
+        (
+            "api_key: |-\n  sk-aaa\nnext: ok",
+            "api_key=[REDACTED]\nnext: ok",
+        ),
+        ("secret: |+2\n    sk-aaa\n\n", "secret=[REDACTED]\n\n"),
+        // A comment on the header line, blank lines between the lines, and CRLF line ends.
+        (
+            "token: | # keep\n  a\n\n  b\nnext: ok",
+            "token=[REDACTED]\nnext: ok",
+        ),
+        (
+            "token: |\r\n  a\r\n  b\r\nnext: ok",
+            "token=[REDACTED]\nnext: ok",
+        ),
+        // Only the lines indented deeper than the name's own are its.
+        (
+            "  key:\n    password: |\n      a\n    user: bob",
+            "  key:\n    password=[REDACTED]\n    user: bob",
+        ),
+        ("password: |\nuser: bob", "password=[REDACTED]\nuser: bob"),
+        // A quoted name keeps its quote and its separator.
+        ("{\"password\": |\n  a\n}", "{\"password\": [REDACTED]\n}"),
+        // `|abc` is a value on the line, and a header with nothing under it has nothing to read.
+        (
+            "password: |abc\nuser: bob",
+            "password=[REDACTED]\nuser: bob",
+        ),
+        ("password: |", "password=[REDACTED]"),
+    ]);
+}
+
+/// A block scalar is read across the lines a container is, and no further.
+#[test]
+fn a_block_scalar_is_read_across_no_more_lines_than_a_container() {
+    let lines = |count: usize| format!("password: |\n{}after: ok", "  a\n".repeat(count));
+    let received = message_text(&lines(60));
+    assert_eq!(
+        received, "password=[REDACTED]\nafter: ok",
+        "expected a 60 line scalar redacted whole | received: {received:?}"
+    );
+    let received = message_text(&lines(200));
+    assert!(
+        received.starts_with("password=[REDACTED]\n  a\n") && received.ends_with("after: ok"),
+        "expected a scalar of 200 lines redacted as far as the line bound and no further | received: {received:?}"
+    );
 }

@@ -90,7 +90,7 @@ impl ExtensionValue {
     pub fn normalized(self) -> Option<Self> {
         match self {
             Self::Text(value) => {
-                let redacted = crate::redact::stderr_text(&value);
+                let redacted = crate::redact::message_text(&value);
                 let bounded = normalize::bound_text(&redacted, EXTENSION_VALUE_LIMIT);
                 (!bounded.text.is_empty()).then_some(Self::Text(bounded.text))
             }
@@ -195,6 +195,23 @@ impl FromIterator<(String, ExtensionValue)> for Extensions {
 #[cfg(test)]
 mod tests {
     use super::{EXTENSIONS_MAX_ENTRIES, ExtensionValue, Extensions};
+
+    /// A bare token in an extension's text has no name beside it for the assignment rules, so the
+    /// text is read for the well-known prefixes too, as every vendor message is.
+    #[test]
+    fn a_bare_token_in_an_extension_text_is_redacted() {
+        let token = format!(
+            "{}0123456789abcdefghijklmnopqrstuvwxyz",
+            concat!("gh", "p_")
+        );
+        let value = ExtensionValue::text(format!("retry with {token} later"));
+        let received = value.normalized();
+        assert_eq!(
+            received,
+            Some(ExtensionValue::text("retry with [REDACTED] later")),
+            "expected the token in an extension text redacted | received: {received:?}"
+        );
+    }
 
     #[test]
     fn a_map_past_the_cap_is_cut_rather_than_carried() {

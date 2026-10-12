@@ -1,10 +1,22 @@
 //! Text a vendor prints, for proving a harness redacts what it must and keeps what a host needs.
 //!
-//! Two lists. [`LEAKS`] are credential-shaped messages in the shapes vendors really print: a
+//! Four lists. [`LEAKS`] are credential-shaped messages in the shapes vendors really print: a
 //! header, an assignment, JSON, a URL, a query string, a cookie. Each says which part is the
 //! credential and which words around it must survive. [`BENIGN`] are ordinary vendor errors that
 //! only look like they hold a credential, such as a rate limit with token counts or a variable
 //! that is not set. They come back byte for byte.
+//!
+//! [`BARE_TOKENS`] are credentials with no name beside them, which only a well-known prefix gives
+//! away (`ghp_`, `AKIA`, a JWT, a private-key block), and [`BENIGN_NEAR_TOKENS`] are ordinary text
+//! that comes close to one (`sk-learn`, `npm_config_cache`, a git SHA, a certificate). The prefixes
+//! are read by [`redact::bounded`](crate::redact::bounded) and
+//! [`redact::structured`](crate::redact::structured), the entry points for a vendor's messages, and
+//! not by [`redact::stderr_text`](crate::redact::stderr_text), which stays on the hot path of a
+//! stderr tail. A harness test that runs [`LEAKS`] through `stderr_text` therefore must not run
+//! [`BARE_TOKENS`] through it; [`BENIGN_NEAR_TOKENS`] come back unchanged from every entry point.
+//!
+//! Every token here is synthetic and written in pieces, so that no source line holds a complete
+//! credential shape.
 //!
 //! A harness test scripts one of these as an agent's or a CLI's error and asserts that what the
 //! host receives holds none of [`Leak::secret`], keeps every [`Leak::keeps`], and leaves a
@@ -219,6 +231,9 @@ pub const BENIGN: &[&str] = &[
     "rate limit reached: 429 Too Many Requests, retry after 30s",
     "Rate limit: 90000 tokens per minute exceeded; used 91234 tokens",
     "max_tokens: 100000 > 64000, which is the maximum allowed for this model",
+    // The 13-digit millisecond timestamps the vendors' own streams carry sit under names that say
+    // `At`, not under a name that counts tokens, so the twelve-digit rule does not touch them.
+    r#"{"emittedAtMs":1789334985511,"startedAtMs":1789334985128,"completedAtMs":1789334989478,"input_tokens":120}"#,
     "prompt is too long: 215000 tokens > 200000 maximum",
     "input_tokens=1200 output_tokens=87 total_tokens: 1287",
     "failed to refresh token: 401 Unauthorized",
@@ -258,4 +273,373 @@ pub const BENIGN: &[&str] = &[
     "Unexpected token '<' in JSON at position 0",
     "connection refused (os error 111) while connecting to 127.0.0.1:8080",
     "turn failed: context_length_exceeded (-32000)",
+    "quota check: tokens: 4294967295 allowed, max_tokens=4,294,967,295",
+];
+
+/// Credentials that only the entry points for a vendor's messages hide: ones with no name beside
+/// them, in the messages a vendor prints them in, and a number of twelve digits or more under a
+/// name that counts tokens.
+///
+/// Redacted by [`redact::bounded`](crate::redact::bounded) and
+/// [`redact::structured`](crate::redact::structured); see the module documentation for why
+/// [`redact::stderr_text`](crate::redact::stderr_text) is not asked. The `secret` of each row is the
+/// whole token, prefix included.
+pub const BARE_TOKENS: &[Leak] = &[
+    // A number of twelve digits or more under a name that counts tokens is not a count.
+    leak(
+        "quota check: tokens: 123456789012 exceeded",
+        "123456789012",
+        &["quota check: tokens", "exceeded"],
+    ),
+    leak(
+        r#"usage {"total_tokens":"123456789012","retry_after":30}"#,
+        "123456789012",
+        &["usage", r#""retry_after":30"#],
+    ),
+    leak(
+        concat!(
+            "token: expired (gh",
+            "p_0123456789abcdefghijklmnopqrstuvwxyz)"
+        ),
+        concat!("gh", "p_0123456789abcdefghijklmnopqrstuvwxyz"),
+        &["token: expired ("],
+    ),
+    leak(
+        concat!("api_key: 500 sk-li", "ve-0123456789abcdefghijklmn"),
+        concat!("sk-li", "ve-0123456789abcdefghijklmn"),
+        &["api_key"],
+    ),
+    leak(
+        concat!(
+            "push rejected for gh",
+            "p_0123456789abcdefghijklmnopqrstuvwxyz by the remote"
+        ),
+        concat!("gh", "p_0123456789abcdefghijklmnopqrstuvwxyz"),
+        &["push rejected for ", " by the remote"],
+    ),
+    leak(
+        concat!("oauth gh", "o_0123456789abcdefghijklmnopqrstuvwxyz refused"),
+        concat!("gh", "o_0123456789abcdefghijklmnopqrstuvwxyz"),
+        &["oauth ", " refused"],
+    ),
+    leak(
+        concat!("user gh", "u_0123456789abcdefghijklmnopqrstuvwxyz refused"),
+        concat!("gh", "u_0123456789abcdefghijklmnopqrstuvwxyz"),
+        &["user ", " refused"],
+    ),
+    leak(
+        concat!(
+            "server gh",
+            "s_0123456789abcdefghijklmnopqrstuvwxyz refused"
+        ),
+        concat!("gh", "s_0123456789abcdefghijklmnopqrstuvwxyz"),
+        &["server ", " refused"],
+    ),
+    leak(
+        concat!(
+            "refresh gh",
+            "r_0123456789abcdefghijklmnopqrstuvwxyz refused"
+        ),
+        concat!("gh", "r_0123456789abcdefghijklmnopqrstuvwxyz"),
+        &["refresh ", " refused"],
+    ),
+    leak(
+        concat!(
+            "fine-grained github_p",
+            "at_0123456789abcdefghijkl_0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVW",
+            " refused"
+        ),
+        concat!(
+            "github_p",
+            "at_0123456789abcdefghijkl_0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVW"
+        ),
+        &["fine-grained ", " refused"],
+    ),
+    leak(
+        concat!("gitlab said glp", "at-0123456789abcdefghij is revoked"),
+        concat!("glp", "at-0123456789abcdefghij"),
+        &["gitlab said ", " is revoked"],
+    ),
+    leak(
+        concat!(
+            "slack: xo",
+            "xb-123456789012-1234567890123-abcdefghijklmnopqrstuvwx invalid"
+        ),
+        concat!(
+            "xo",
+            "xb-123456789012-1234567890123-abcdefghijklmnopqrstuvwx"
+        ),
+        &["slack: ", " invalid"],
+    ),
+    leak(
+        concat!(
+            "slack: xo",
+            "xp-123456789012-1234567890123-abcdefghijklmnopqrstuvwx invalid"
+        ),
+        concat!(
+            "xo",
+            "xp-123456789012-1234567890123-abcdefghijklmnopqrstuvwx"
+        ),
+        &["slack: ", " invalid"],
+    ),
+    leak(
+        concat!(
+            "slack: xo",
+            "xa-123456789012-1234567890123-abcdefghijklmnopqrstuvwx invalid"
+        ),
+        concat!(
+            "xo",
+            "xa-123456789012-1234567890123-abcdefghijklmnopqrstuvwx"
+        ),
+        &["slack: ", " invalid"],
+    ),
+    leak(
+        concat!(
+            "anthropic rejected s",
+            "k-ant-api03-0123456789abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789abcdefghijklmnopqrstuvwx today"
+        ),
+        concat!(
+            "s",
+            "k-ant-api03-0123456789abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789abcdefghijklmnopqrstuvwx"
+        ),
+        &["anthropic rejected ", " today"],
+    ),
+    leak(
+        concat!(
+            "openai rejected s",
+            "k-proj-0123456789abcdefghijklmnopqrstuvwxyz-ABCDEF_ghij today"
+        ),
+        concat!(
+            "s",
+            "k-proj-0123456789abcdefghijklmnopqrstuvwxyz-ABCDEF_ghij"
+        ),
+        &["openai rejected ", " today"],
+    ),
+    leak(
+        concat!(
+            "openai svcacct key rejected s",
+            "k-svcacct-0123456789abcdefghijklmnopqrstuvwxyz-ABCDEF_ghij today"
+        ),
+        concat!(
+            "s",
+            "k-svcacct-0123456789abcdefghijklmnopqrstuvwxyz-ABCDEF_ghij"
+        ),
+        &["openai svcacct key rejected ", " today"],
+    ),
+    leak(
+        concat!(
+            "openai admin key rejected s",
+            "k-admin-0123456789abcdefghijklmnopqrstuvwxyz-ABCDEF_ghij today"
+        ),
+        concat!(
+            "s",
+            "k-admin-0123456789abcdefghijklmnopqrstuvwxyz-ABCDEF_ghij"
+        ),
+        &["openai admin key rejected ", " today"],
+    ),
+    leak(
+        concat!(
+            "openai rejected s",
+            "k-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGH today"
+        ),
+        concat!("s", "k-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGH"),
+        &["openai rejected ", " today"],
+    ),
+    leak(
+        concat!("stripe: s", "k_live_0123456789abcdefghijklmn declined"),
+        concat!("s", "k_live_0123456789abcdefghijklmn"),
+        &["stripe: ", " declined"],
+    ),
+    leak(
+        concat!("stripe: r", "k_live_0123456789abcdefghijklmn declined"),
+        concat!("r", "k_live_0123456789abcdefghijklmn"),
+        &["stripe: ", " declined"],
+    ),
+    leak(
+        concat!("aws: AK", "IA0123456789ABCDEF is not authorised"),
+        concat!("AK", "IA0123456789ABCDEF"),
+        &["aws: ", " is not authorised"],
+    ),
+    leak(
+        concat!("aws: AS", "IA0123456789ABCDEF is not authorised"),
+        concat!("AS", "IA0123456789ABCDEF"),
+        &["aws: ", " is not authorised"],
+    ),
+    // The documentation key is redacted like any other: its shape is the shape of a real one, and
+    // a list of documentation keys to allow would be a way past the rule.
+    leak(
+        concat!("aws: AK", "IAIOSFODNN7EXAMPLE is not authorised"),
+        concat!("AK", "IAIOSFODNN7EXAMPLE"),
+        &["aws: ", " is not authorised"],
+    ),
+    leak(
+        concat!("google: AI", "zaSyA0123456789abcdefghijklmnopqrstuv quota"),
+        concat!("AI", "zaSyA0123456789abcdefghijklmnopqrstuv"),
+        &["google: ", " quota"],
+    ),
+    leak(
+        concat!(
+            "google: ya",
+            "29.a0AfB_byC0123456789abcdefghijKLMNOPQRSTUVWXYZ expired"
+        ),
+        concat!("ya", "29.a0AfB_byC0123456789abcdefghijKLMNOPQRSTUVWXYZ"),
+        &["google: ", " expired"],
+    ),
+    leak(
+        concat!(
+            "session ey",
+            "JhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzeW50aGV0aWMifQ.c3ludGhldGljc2lnbmF0dXJl",
+            " rejected"
+        ),
+        concat!(
+            "ey",
+            "JhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzeW50aGV0aWMifQ.c3ludGhldGljc2lnbmF0dXJl"
+        ),
+        &["session ", " rejected"],
+    ),
+    leak(
+        concat!(
+            "unsigned ey",
+            "JhbGciOiJub25lIn0.eyJzdWIiOiJzeW50aGV0aWMifQ. rejected"
+        ),
+        concat!("ey", "JhbGciOiJub25lIn0.eyJzdWIiOiJzeW50aGV0aWMifQ."),
+        &["unsigned ", " rejected"],
+    ),
+    leak(
+        concat!(
+            "loaded -----BEGIN PRIV",
+            "ATE KEY-----\nc3ludGhldGljLWtleS1ib2R5\n-----END PRIV",
+            "ATE KEY-----\n then failed"
+        ),
+        "c3ludGhldGljLWtleS1ib2R5",
+        &["loaded ", " then failed"],
+    ),
+    leak(
+        concat!(
+            "key file:\n-----BEGIN RSA PRIV",
+            "ATE KEY-----\nc3ludGhldGljLWtleS1ib2R5\nbm90LWEtcmVhbC1rZXk=\n-----END RSA PRIV",
+            "ATE KEY-----"
+        ),
+        "bm90LWEtcmVhbC1rZXk=",
+        &["key file:"],
+    ),
+    leak(
+        concat!(
+            "key file:\n-----BEGIN OPENSSH PRIV",
+            "ATE KEY-----\nc3ludGhldGljLWtleS1ib2R5\nbm90LWEtcmVhbC1rZXk=\n"
+        ),
+        "bm90LWEtcmVhbC1rZXk=",
+        &["key file:"],
+    ),
+    leak(
+        concat!(
+            "private key=-----BEGIN PRIV",
+            "ATE KEY-----\nc3ludGhldGljLWtleS1ib2R5\n-----END PRIV",
+            "ATE KEY-----"
+        ),
+        "c3ludGhldGljLWtleS1ib2R5",
+        &["private key"],
+    ),
+    leak(
+        concat!(
+            "npm ERR! 401 np",
+            "m_0123456789abcdefghijklmnopqrstuvwxyz for the registry"
+        ),
+        concat!("np", "m_0123456789abcdefghijklmnopqrstuvwxyz"),
+        &["npm ERR! 401 ", " for the registry"],
+    ),
+    leak(
+        concat!(
+            "hub said h",
+            "f_abcdefghijklmnopqrstuvwxyzABCDEFGH is invalid"
+        ),
+        concat!("h", "f_abcdefghijklmnopqrstuvwxyzABCDEFGH"),
+        &["hub said ", " is invalid"],
+    ),
+    leak(
+        concat!(
+            "digitalocean do",
+            "p_v1_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef is invalid"
+        ),
+        concat!(
+            "do",
+            "p_v1_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ),
+        &["digitalocean ", " is invalid"],
+    ),
+    leak(
+        concat!(
+            "shopify sh",
+            "pat_0123456789abcdef0123456789abcdef is invalid"
+        ),
+        concat!("sh", "pat_0123456789abcdef0123456789abcdef"),
+        &["shopify ", " is invalid"],
+    ),
+    // The same block inside a JSON string, its line breaks written as two characters.
+    leak(
+        concat!(
+            "{\"key\":\"-----BEGIN PRIV",
+            "ATE KEY-----\\nc3ludGhldGljLWtleS1ib2R5\\n-----END PRIV",
+            "ATE KEY-----\\n\",\"id\":7}"
+        ),
+        "c3ludGhldGljLWtleS1ib2R5",
+        &["{\"key\":\"", "\"id\":7}"],
+    ),
+    // After the two characters of a JSON line break, which a run of name characters would swallow.
+    leak(
+        concat!(
+            "{\"note\":\"line one\\ngh",
+            "p_0123456789abcdefghijklmnopqrstuvwxyz\\nline two\"}"
+        ),
+        concat!("gh", "p_0123456789abcdefghijklmnopqrstuvwxyz"),
+        &["line one", "line two"],
+    ),
+];
+
+/// Text that comes close to a well-known token and is not one: hyphenated and underscored
+/// ordinary words, base64 that is not a JWT, hashes and ids, paths, model and package names, cloud
+/// resource names, certificates and the prefixes with nothing after them. Every entry comes back
+/// byte for byte from [`redact::stderr_text`](crate::redact::stderr_text) and from
+/// [`redact::bounded`](crate::redact::bounded).
+pub const BENIGN_NEAR_TOKENS: &[&str] = &[
+    "pip install scikit-learn failed: sk-learn is not a package",
+    "serving sk-live-reload-development-server on port 8080",
+    "see sk-proj-ects-directory-listing for the layout",
+    "sk-ant-colony-optimization-solver finished",
+    "using github_pat_tern_matching_helpers_module_x in the build",
+    "xoxb-is-not-a-real-token-prefix-here was a test name",
+    "task-ant-0123456789abcdefghijklmnop was queued",
+    "risk-live-0123456789abcdefghijklmnop is the dashboard",
+    "disk-proj-0123456789abcdefghijklmnop mounted",
+    "state-of-the-art-model-evaluation-pipeline-version-two ran",
+    "pre-commit-hooks-are-not-installed-in-this-checkout",
+    "npm_config_cache=/home/u/.npm npm_package_name=demo npm_lifecycle_event=build",
+    "HF_HOME=/home/u/.cache/huggingface hf_hub_download retried",
+    "the prefixes ghp_ gho_ ghu_ ghs_ glpat- xoxb- sk-ant- AKIA ya29. are documented",
+    "github_pat_ alone, and github_actions_runner_version_2.300",
+    "ghs_cache_directory_for_the_runner_is_full",
+    "base64 header eyJhbGciOiJIUzI1NiJ9 without a body",
+    "decoded dGhpcyBpcyBub3QgYSB0b2tlbiwganVzdCB0ZXh0IQ== fine",
+    "two parts eyJhbGciOiJIUzI1NiJ9.notapayload is not a jwt",
+    "commit 9fceb02d0ae598e95dc970b74767f19372d61af8 builds",
+    "request 550e8400-e29b-41d4-a716-446655440000 timed out",
+    "file not found: /usr/lib/x86_64-linux-gnu/libssl.so.3",
+    "model gpt-4o-mini and claude-sonnet-5-20260101 and gpt-4.1-nano are available",
+    "package @types/node@22.1.0 and tokio-util-0.7.12 and sk-learn-1.5 resolved",
+    "arn:aws:iam::123456789012:role/deploy in us-east-1 and eu-west-2",
+    "AWS_REGION=eu-west-2 AWS_DEFAULT_OUTPUT=json",
+    "ASIAN_PACIFIC_REGION is not a key and neither is AKIAnotakey",
+    "ASIAPACIFICREGION1 and AKIA0123456789ABCDEFG and XAKIA0123456789ABCDEF",
+    "AIzaSyShort is too short and ya29.x too",
+    "ya29.is-a-prefix-of-google-tokens-in-docs and ya29.abcdefghijklmnopqrstuvwxyzabcdef too",
+    "sk-proj-roadmap-for-2026-quarter-4 and sk-ant-colony-optimization-v2 are page names",
+    "sk-svcacct-roadmap-for-2026-quarter-4 and sk-admin-console-layout-v2 are page names",
+    "serving sk-live-streaming-server-1 on port 8080",
+    "the publishable key pk_live_0123456789abcdefghijklmn is on every page",
+    "short hf_abc and npm_abc and shpat_abc and dop_v1_abc",
+    "-----BEGIN CERTIFICATE-----\nMIIBsynthetic\n-----END CERTIFICATE-----",
+    "-----BEGIN PUBLIC KEY-----\nMFkwsynthetic\n-----END PUBLIC KEY-----",
+    "separator ----- and ----------- and ----- BEGIN -----",
+    "sk- alone and sk-ant- and sk-live-short",
+    "the build tool task-runner-sk-ant-config reads it",
 ];
