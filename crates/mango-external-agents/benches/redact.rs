@@ -7,7 +7,10 @@
 //! stop at without finding anything. Two more shapes are built to repeat a read for each word
 //! start, a credential name made of one keyword over and over and a URL scheme made of dotted
 //! letters, at 16 KiB, 120 KB and 1 MiB: their cost has to grow with the length, not with its
-//! square. The fixtures are synthetic; no vendor wrote them. Run with:
+//! square. Further shapes read what a later rule added: JSON inside a string at three levels of
+//! escaping, a container that spans lines, a YAML sequence and the unnamed-token pass that
+//! `redact::bounded` runs and `stderr_text` does not. The fixtures are synthetic; no vendor wrote
+//! them. Run with:
 //!
 //! ```sh
 //! cargo bench -p mango-external-agents --bench redact
@@ -15,7 +18,8 @@
 
 mod support;
 
-use mango_external_agents::redact::stderr_text;
+use mango_external_agents::normalize::TextLimit;
+use mango_external_agents::redact::{bounded, stderr_text};
 use support::{Bench, Unit};
 
 const KIB: usize = 1024;
@@ -103,6 +107,41 @@ const JSON_SECRET_LINES: &str = concat!(
     "\n",
 );
 
+/// Quoted credentials inside JSON strings, two and three levels deep, as a vendor that serialises
+/// its request into a field writes them.
+const ESCAPED_JSON_LINES: &str = concat!(
+    r#"{"error":"call failed {\"api_key\":\"sk-proj-0123456789\",\"retry\":3}"}"#,
+    "\n",
+    r#"{"msg":"{\"data\":\"{\\\"password\\\":\\\"hunter2\\\",\\\"n\\\":1}\"}"}"#,
+    "\n",
+    r#"{"error":"request {\"model\":\"m\",\"attempt\":3} was refused"}"#,
+    "\n",
+);
+
+/// A pretty-printed object with credentials in containers that span lines, and a YAML sequence.
+const PRETTY_LINES: &str = concat!(
+    "{\n",
+    "  \"model\": \"m\",\n",
+    "  \"tokens\": [\n",
+    "    \"sk-live-0123456789\",\n",
+    "    \"sk-live-9876543210\"\n",
+    "  ],\n",
+    "  \"retry_after\": 30\n",
+    "}\n",
+    "api_key:\n",
+    "  - sk-live-0123456789\n",
+    "  - sk-live-9876543210\n",
+);
+
+/// Lines that carry well-known tokens with no name beside them, and the near misses.
+const BARE_TOKEN_LINES: &str = concat!(
+    "token: expired (gh",
+    "p_0123456789abcdefghijklmnopqrstuvwxyz)\n",
+    "request failed for key AK",
+    "IA0123456789ABCDEF\n",
+    "see sk-learn and task-ant-lines and npm_config_cache for details\n",
+);
+
 /// A keyword repeated in a credential name that never gets a value: every word start in the name
 /// reaches the same separator, and the redactor has to learn once that nothing follows it.
 const NAME_UNIT: &str = "token_";
@@ -143,6 +182,18 @@ fn assert_redacted(label: &str, raw: &str, redacted: &str) {
             "expected every credential in a {} byte tail redacted | received {redacted:?}",
             raw.len()
         ),
+        "escaped-json" | "pretty" | "bounded-tokens" => assert!(
+            redacted.contains("[REDACTED]")
+                && !redacted.contains("hunter2")
+                && !redacted.contains("0123456789"),
+            "expected every credential in a {} byte {label} tail redacted | received {redacted:?}",
+            raw.len()
+        ),
+        "bounded-plain" | "sequence" | "containers" | "slashes" => assert!(
+            !redacted.is_empty(),
+            "expected a {} byte {label} tail to come back",
+            raw.len()
+        ),
         "json-secrets" => assert!(
             !redacted.is_empty(),
             "expected a {} byte tail of quoted credentials to come back",
@@ -170,6 +221,8 @@ fn main() {
             ("late-non-ascii", LATE_NON_ASCII_LINES),
             ("json", JSON_LINES),
             ("json-secrets", JSON_SECRET_LINES),
+            ("escaped-json", ESCAPED_JSON_LINES),
+            ("pretty", PRETTY_LINES),
         ] {
             let raw = tail(lines, len);
             assert_redacted(label, &raw, &stderr_text(&raw));
@@ -187,6 +240,37 @@ fn main() {
         }
     }
     pathological(&bench);
+    messages(&bench);
+}
+
+/// `redact::bounded`, which also reads the unnamed tokens: 16 KiB tails of plain lines and of lines
+/// that carry tokens, 320 KiB per sample, to be read beside `stderr_text` over the same lines.
+fn messages(bench: &Bench) {
+    let len = 16 * KIB;
+    let per_byte = Unit::new(BYTES_PER_SAMPLE as u64, "byte");
+    for (label, lines) in [
+        ("bounded-plain", PLAIN_LINES),
+        ("bounded-tokens", BARE_TOKEN_LINES),
+    ] {
+        let raw = tail(lines, len);
+        let first = bounded(&raw, TextLimit::ErrorMessage);
+        assert_redacted(label, &raw, &first.text);
+        let calls = BYTES_PER_SAMPLE / len;
+        bench.run(
+            &format!("redact/bounded-16KiB/{label}"),
+            per_byte,
+            || (),
+            |()| {
+                (0..calls)
+                    .map(|_| {
+                        bounded(std::hint::black_box(&raw), TextLimit::ErrorMessage)
+                            .text
+                            .len()
+                    })
+                    .sum::<usize>()
+            },
+        );
+    }
 }
 
 /// The same call over text that is built to cost more than its length when a rule reads the same
@@ -200,6 +284,14 @@ fn pathological(bench: &Bench) {
             // not read the rest of the run again for each quote.
             ("quoted-names", repeated("\"token_", "\":", len)),
             ("quotes", repeated("\"", ":", len)),
+            // Escaped quotes three levels deep before names that never get a value.
+            ("slashes", repeated("{\\\\\\\"token_", "\\\\\\\":", len)),
+            // An opener at the end of every line that never closes, and a long sequence.
+            ("containers", repeated("token: [\n", "", len)),
+            (
+                "sequence",
+                format!("tokens:\n{}", "  - a\n".repeat(len / 6)),
+            ),
         ] {
             let name = format!("redact/stderr_text-{size_label}/{label}");
             // Checked only when the case runs: a filtered-out case must not pay for the call.
