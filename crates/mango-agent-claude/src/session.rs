@@ -847,20 +847,25 @@ impl Drop for AbandonedStart {
                     }
                     // This owner may not have a child yet, but a later cancel must wait on the
                     // same teardown once that child arrives.
-                    turn_teardown(active, true);
-                    Some(TakenTurn {
+                    let teardown = turn_teardown(active, true);
+                    let taken = TakenTurn {
                         end: Arc::clone(&active.end),
                         control: active.control.as_ref().map(Arc::clone),
-                    })
+                    };
+                    Some((taken, teardown))
                 })
         };
-        let Some(taken) = taken else {
+        let Some((taken, teardown)) = taken else {
             return;
         };
+        // This worker only installs the stop a later call publishes. Dropped unrun, it would leave
+        // the teardown with no worker and every `cancel` waiting on it, so the guard publishes.
+        let lost = LostWorker::new(&teardown, owned_control.clone().or(taken.control.clone()));
         let shared = Arc::clone(&self.shared);
         let reason = taken.end.get().copied().unwrap_or(CancelReason::Requested);
         let lease = self.mcp_lease.take();
         spawn_owned(&self.shared, async move {
+            let _lost = lost;
             let control = match spawn {
                 Some(task) => match task.await {
                     Ok(Ok(transport)) => Some(transport.control),
@@ -1028,6 +1033,9 @@ fn settle_owner_locked(state: &mut Mutable, end: &Arc<TurnEnd>) {
 struct LostWorker {
     teardown: Arc<Teardown>,
     control: Option<Arc<dyn mango_external_agents::ProcessControl>>,
+    /// The artifact a close worker was to remove. A worker dropped unrun with a child left behind
+    /// keeps it on disk, as any failed stop does.
+    mcp: Option<crate::mcp::Prepared<Arc<ConfigFile>>>,
 }
 
 impl LostWorker {
@@ -1038,6 +1046,7 @@ impl LostWorker {
         Self {
             teardown: Arc::clone(teardown),
             control,
+            mcp: None,
         }
     }
 }
@@ -1054,7 +1063,12 @@ impl Drop for LostWorker {
             ),
         };
         let lost = match self.control.take() {
-            Some(control) => cleanup_required(control, lost),
+            Some(control) => {
+                if let Some(mcp) = self.mcp.take() {
+                    crate::mcp::preserve_after_failed_native_cleanup(mcp);
+                }
+                cleanup_required(control, lost)
+            }
             None => lost,
         };
         self.teardown.finish(Err(lost));
@@ -1544,9 +1558,12 @@ impl mango_external_agents::Session for ClaudeSession {
         }
         let shared = Arc::clone(&self.shared);
         let close_for_worker = Arc::clone(&close);
-        let lost = LostWorker::new(&close, child);
+        let mut lost = LostWorker::new(&close, child);
+        lost.mcp = Some(mcp_config);
         spawn_owned(&self.shared, async move {
-            let _lost = lost;
+            let Some(mcp_config) = lost.mcp.take() else {
+                return;
+            };
             run_close_teardown(&shared, &close_for_worker, active, mcp_config).await;
         });
         close.wait().await
