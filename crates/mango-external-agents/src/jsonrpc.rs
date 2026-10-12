@@ -12,6 +12,24 @@
 //!
 //! Framing, byte caps and process teardown all belong to the transport underneath; this speaks the
 //! protocol on top of them.
+//!
+//! # The two timeouts of a close
+//!
+//! A [`Client::close`] that runs out of time returns [`Error::Timeout`], and which of its two waits
+//! ran out is told by type, not by the text of the error. Both classifiers read through a
+//! [`Dispatch`] annotation, as [`Error::cause`] does, and both are `false` for every other
+//! timeout, a request left unanswered and a frame left unwritten among them.
+//!
+//! - [`is_link_shutdown_timeout`]: closing the link, behind whatever was still queued for it, did
+//!   not finish within [`ClientOptions::shutdown_timeout`]. The link may still be open and the
+//!   peer still running, which a host that owns the process has to deal with.
+//! - [`is_reader_shutdown_timeout`]: the link was dealt with, and the reader had not let go by
+//!   the close's bound of twice `shutdown_timeout`. Either another close, kept and not polled,
+//!   holds the reader while it waits for the handler to be told that the peer exited, or this
+//!   close took the reader down and a handler that blocks its thread kept it from stopping. The
+//!   link is closed; the handler's call may still be running.
+//!
+//! A close whose link failed to close returns that failure rather than the reader's timeout.
 
 mod outbox;
 
@@ -312,7 +330,8 @@ const READER_ABORT_SETTLE: Duration = Duration::from_millis(50);
 /// Whether `error` is a [`Client::close`] that gave up: closing the link, behind whatever
 /// was still queued for it, did not finish within
 /// [`ClientOptions::shutdown_timeout`]. The link may still be open and the peer still
-/// running, which a host that owns the process has to deal with.
+/// running, which a host that owns the process has to deal with. The other timeout of a close
+/// is [`is_reader_shutdown_timeout`]; the [module documentation](self) says what each means.
 ///
 /// It is `false` for every other timeout, a request left unanswered and a frame left
 /// unwritten among them. It reads through what [`Error::cause`] reads through, a
@@ -333,6 +352,35 @@ const READER_ABORT_SETTLE: Duration = Duration::from_millis(50);
 #[must_use]
 pub fn is_link_shutdown_timeout(error: &Error) -> bool {
     matches!(error.cause(), Error::Timeout { operation, .. } if operation == LINK_SHUTDOWN)
+}
+
+/// Whether `error` is a [`Client::close`] that gave up on the reader: the link was dealt with,
+/// and the reader had not let go within the close's bound of twice
+/// [`ClientOptions::shutdown_timeout`]. Another close that was kept and not polled again can hold
+/// the reader while it waits for the handler to be told the peer exited, and a handler that blocks
+/// its thread keeps a reader that was taken down from stopping. The link is closed by then, which
+/// is what tells this from [`is_link_shutdown_timeout`], and the handler's call may still be
+/// running. The [module documentation](self) says what each timeout means.
+///
+/// It is `false` for every other timeout, and for the link's own. It reads through what
+/// [`Error::cause`] reads through, a [`Dispatch`] annotation among it. A close that gave up is
+/// known by the operation text this client names it by, so another layer's `Timeout` that carries
+/// that very text reads as one.
+///
+/// ```no_run
+/// # async fn example(client: &mango_external_agents::jsonrpc::Client) {
+/// use mango_external_agents::jsonrpc::is_reader_shutdown_timeout;
+///
+/// if let Err(error) = client.close().await {
+///     if is_reader_shutdown_timeout(&error) {
+///         eprintln!("the link is closed; the handler's call has not returned");
+///     }
+/// }
+/// # }
+/// ```
+#[must_use]
+pub fn is_reader_shutdown_timeout(error: &Error) -> bool {
+    matches!(error.cause(), Error::Timeout { operation, .. } if operation == READER_SHUTDOWN)
 }
 
 impl PeerTermination {

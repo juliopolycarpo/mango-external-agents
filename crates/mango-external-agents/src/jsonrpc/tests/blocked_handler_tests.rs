@@ -8,7 +8,9 @@
 
 use super::outbox_tests::{options, until, within};
 use super::*;
-use crate::jsonrpc::{ConnectionEnd, READER_ABORT_SETTLE, READER_SHUTDOWN};
+use crate::jsonrpc::{
+    ConnectionEnd, READER_ABORT_SETTLE, READER_SHUTDOWN, is_reader_shutdown_timeout,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex as StdMutex, PoisonError};
 use std::time::Instant;
@@ -123,8 +125,8 @@ async fn a_close_returns_within_its_bound_when_the_handler_blocks_its_thread() {
             "expected close to return within {bound:?} | received: still waiting after {waited:?}"
         );
     };
-    let timed_out_on_the_reader =
-        matches!(&closed, Err(Error::Timeout { operation, .. }) if operation == READER_SHUTDOWN);
+    let timed_out_on_the_reader = matches!(&closed, Err(error) if is_reader_shutdown_timeout(error))
+        && matches!(&closed, Err(Error::Timeout { operation, .. }) if operation == READER_SHUTDOWN);
     assert!(
         timed_out_on_the_reader,
         "expected close to give up with a Timeout for {READER_SHUTDOWN:?} | received {closed:?} after {waited:?}"
