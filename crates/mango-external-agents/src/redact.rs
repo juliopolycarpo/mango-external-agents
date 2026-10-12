@@ -51,6 +51,8 @@ mod reference;
 mod rules;
 mod scan;
 #[cfg(test)]
+mod search;
+#[cfg(test)]
 mod shapes;
 mod strip;
 mod structured;

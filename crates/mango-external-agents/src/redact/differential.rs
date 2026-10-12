@@ -379,7 +379,7 @@ fn assert_one_pass_is_a_fixed_point(raw: &str) {
 ///
 /// Each rule is also run on `raw` itself, not only on what the stage before it left: a rule then
 /// sees the control characters and markers the stripper would have taken out.
-fn assert_matches_the_replaced_scan(raw: &str) {
+pub(super) fn assert_matches_the_replaced_scan(raw: &str) {
     assert_one_pass_is_a_fixed_point(raw);
     let expect = |stage: &str, input: &str, run: fn(&str) -> String, expected: String| {
         // Caught, so a stage that panics is reported with the input that made it.
@@ -436,11 +436,17 @@ fn assert_matches_the_replaced_scan(raw: &str) {
             rewrite_every_word(input, described(url_password_rule)),
         );
     }
+    // A URL password the last rule redacted is read by the assignment rule once more.
+    let settled = if urls == assignments {
+        urls
+    } else {
+        rewrite_every_word(&urls, described_assignments())
+    };
     expect(
         "the whole redactor",
         raw,
         single_round,
-        remove_boundaries(urls),
+        remove_boundaries(settled),
     );
     if let Err(why) = agreement_with_0_4_1(raw) {
         panic!("{why}");
@@ -482,7 +488,7 @@ fn assert_awaiting_agrees_with_0_4_1(raw: &str) {
 /// Every keyword in each case, every byte a rule reads as punctuation or space, the pieces of a
 /// URL, every escape form and stripped class, and characters of two, three and four bytes that
 /// are kept, some of them behind a lead byte that removed characters share.
-const FRAGMENTS: &[&str] = &[
+pub(super) const FRAGMENTS: &[&str] = &[
     // What the rules added after 0.4.1 read: quotes and brackets, cookies, glued names, an
     // access key, a signature, a scheme of another name, a status and a count.
     "\"",
@@ -599,7 +605,7 @@ const FRAGMENTS: &[&str] = &[
 ];
 
 /// A credential, or a control character, in each shape a rule or the stripper acts on.
-const SHAPES: &[&str] = &[
+pub(super) const SHAPES: &[&str] = &[
     r#"{"Authorization":"Bearer sk-live-1","Accept":"a"}"#,
     "{'Authorization': 'Bearer sk-live-1'}",
     r#"{\"api_key\":\"sk-live-1\",\"m\":1}"#,
