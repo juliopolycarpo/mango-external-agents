@@ -45,7 +45,7 @@ fn distinct() -> Limits {
 }
 
 /// Every figure of one `Deadlines`, named, in the order the guide lists them.
-fn figures(deadlines: &Deadlines) -> [(&'static str, Duration); 14] {
+fn figures(deadlines: &Deadlines) -> [(&'static str, Duration); 15] {
     [
         ("process_stop", deadlines.process_stop()),
         ("teardown", deadlines.teardown()),
@@ -54,6 +54,10 @@ fn figures(deadlines: &Deadlines) -> [(&'static str, Duration); 14] {
         ("close_no_turn", deadlines.close_no_turn()),
         ("close_with_turn", deadlines.close_with_turn()),
         ("close_pending_launch", deadlines.close_pending_launch()),
+        (
+            "close_after_pending_launch",
+            deadlines.close_after_pending_launch(),
+        ),
         ("close", deadlines.close()),
         ("close_worst_case", deadlines.close_worst_case()),
         ("exit_to_terminal", deadlines.exit_to_terminal()),
@@ -73,7 +77,7 @@ fn figures(deadlines: &Deadlines) -> [(&'static str, Duration); 14] {
     ]
 }
 
-fn assert_figures(label: &str, received: [(&'static str, Duration); 14], expected: [u64; 14]) {
+fn assert_figures(label: &str, received: [(&'static str, Duration); 15], expected: [u64; 15]) {
     for ((name, got), expected) in received.into_iter().zip(expected) {
         assert_eq!(
             got,
@@ -90,7 +94,7 @@ fn every_figure_at_the_defaults_is_the_one_the_guide_prints() {
     assert_figures(
         "at the defaults",
         figures(&Deadlines::from_limits(&Limits::default())),
-        [14, 14, 0, 14, 5, 19, 24, 24, 24, 2, 16, 602, 14, 14],
+        [14, 14, 0, 14, 5, 19, 24, 14, 24, 24, 2, 16, 602, 14, 14],
     );
 }
 
@@ -100,7 +104,7 @@ fn every_figure_follows_its_own_limit_when_the_limits_are_all_different() {
     assert_figures(
         "for kill_grace 3 s, shutdown_timeout 7 s, idle_timeout 900 s",
         figures(&Deadlines::from_limits(&distinct())),
-        [20, 20, 0, 20, 7, 27, 34, 34, 34, 3, 23, 903, 20, 20],
+        [20, 20, 0, 20, 7, 27, 34, 20, 34, 34, 3, 23, 903, 20, 20],
     );
 }
 

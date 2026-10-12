@@ -256,9 +256,9 @@ impl Deadlines {
     /// The other branch, a launcher that returns nothing within `shutdown_timeout`, ends the close
     /// at [`close_no_turn`](Self::close_no_turn)'s figure with `Error::Timeout` naming the pending
     /// launch and leaves the session `Closing`.
-    /// A later `close` that finds that timeout kept waits for the stop of a child that arrived since,
-    /// if one has begun, for at most [`process_stop`](Self::process_stop), and returns its
-    /// `Error::CleanupRequired` if it failed; that call is not part of this figure.
+    /// A later `close` that finds that timeout kept is bounded by
+    /// [`close_after_pending_launch`](Self::close_after_pending_launch); it is not part of this
+    /// figure.
     ///
     /// The 24 s branch needs the stop to have started by the end of the first wait, and the stop
     /// starts when the `start_turn` call that owns the launch runs again after the launcher
@@ -285,6 +285,30 @@ impl Deadlines {
         launch_wait(&self.limits)
             .saturating_add(self.process_stop())
             .saturating_add(removal_bound(&self.limits))
+    }
+
+    /// From the call to a later `Session::close` that finds a close which gave up on a pending
+    /// launch, until it returns, when the child that arrived since has a stop still running.
+    ///
+    /// That close waits for the stop and returns its `Error::CleanupRequired` if it failed. The
+    /// wait is the rest of one stop, so at most [`process_stop`](Self::process_stop). A later
+    /// close that finds the launch still in the launcher, or the stop already finished, returns
+    /// at once, so this is the bound, not the usual cost. Formula: `process_stop`. At
+    /// `Limits::default()` it is 14 s.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use mango_agent_claude::deadlines::Deadlines;
+    /// use mango_external_agents::Limits;
+    ///
+    /// let deadlines = Deadlines::from_limits(&Limits::default());
+    /// assert_eq!(deadlines.close_after_pending_launch(), Duration::from_secs(14));
+    /// ```
+    #[must_use]
+    pub fn close_after_pending_launch(&self) -> Duration {
+        self.process_stop()
     }
 
     /// How long any `Session::close` can take, counted from the call to `close`.
