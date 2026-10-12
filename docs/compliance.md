@@ -94,7 +94,11 @@ own deployment.
     a secret, in the text rules and in `redact::structured`; ten digits is the largest 32-bit
     counter, and the corpus holds none above eleven. A comma still ends a value under every name,
     so `tokens_used: 1,234,567,890,123` is redacted up to the first comma. A millisecond epoch under a
-    count name (`input_tokens=1700000000000`) has twelve digits and is redacted.
+    count name (`input_tokens=1700000000000`) has thirteen digits and is redacted. None of the repo's
+    fixtures carries one: the 13-digit timestamps in them (`emittedAtMs`, `startedAtMs`,
+    `completedAtMs`) sit under names that are not credential names, and the benign corpus holds one
+    to keep it so. A name that says a time is not exempted: nothing in the Claude, Codex or ACP
+    shapes needs it, and a secret of digits under such a name would be kept by the exemption.
   - **Well-known tokens with no name beside them**, by `redact::bounded` and `redact::structured`
     (the paths that carry a vendor's messages, errors, notices, `data` and discovery text) and not
     by `stderr_text`: `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` and `github_pat_` GitHub tokens
@@ -105,7 +109,7 @@ own deployment.
     OpenAI `sk-ant-`, `sk-proj-`, `sk-live-` and the older 40-character `sk-` as their consoles and
     error messages print them; signed web tokens, two `eyJ` parts and a signature
     ([RFC 7519][rfc-7519]); private-key blocks from `-----BEGIN ... PRIVATE KEY-----` to the end
-    marker or the end of the text ([RFC 7468][rfc-7468]); and npm, Hugging Face, DigitalOcean and
+    marker, within 16 KiB ([RFC 7468][rfc-7468]); and npm, Hugging Face, DigitalOcean and
     Shopify tokens. A token starts where a run of letters, digits, `_` and `-` starts and is
     redacted with the run it is in, so `sk-learn`, `task-ant-lines` and `npm_config_cache` are
     words. Each prefix has a minimum length and an alphabet (`redact/token_shapes.rs` is the
@@ -121,22 +125,27 @@ own deployment.
   instructions (10.39 M to 22.5 M per 320 KiB), and a byte-class gate does not help because plain
   tails are full of `_` and `-`. Stderr tails are read line after line on the hot path, so
   `stderr_text` does not run it (its cost against the previous release is within 1% on every
-  plain case, and 3.7% on text that is a credential on every line); `redact::bounded` and `redact::structured` do, at 2.2 times the instructions on
+  plain case, and 3.9% on text that carries a credential on every line); `redact::bounded` and `redact::structured` do, at 2.2 times the instructions on
   plain text of 16 KiB. The measurements are in `docs/benchmarks.md`.
 
   What the rules do not read, and a host should not rely on them for:
 
-  - a bare token in the text of a stderr tail: `stderr_text` reads names and values, not prefixes,
-    so `token: expired (ghp_...)` passes through it when it is a line of stderr. The same holds for
-    the other text that crosses a boundary through `stderr_text` alone: the version banners the
-    harnesses print, an `ExtensionValue`'s text and the WebSocket URL text;
+  - a bare token in a line of stderr: `stderr_text` reads names and values, not prefixes, so
+    `token: expired (ghp_...)` passes through the stderr tails of the three harnesses and
+    `StderrTail::read`. Every other path reads prefixes too: vendor messages, errors, notices and
+    discovery text (`bounded`, `structured`), an `ExtensionValue`'s text, the WebSocket peer label
+    and the probe failures `mea` prints. A version banner is parsed from the raw line and only the
+    token it yields is stored, and `Discovery::normalized` reads that with `bounded`;
   - a bare token outside the closed list, and any credential with no prefix: an AWS secret access
     key (40 characters of base64) or an Azure key has nothing to recognise it by;
   - a token glued to other name characters (`_ghp_..._`, `ghp_...-`), behind an encoding (`%20ghp_...`,
     `\u003cghp_...`), or with a prefix the list does not hold; a pagination cursor made of two base64
     JSON parts and a word is a web token to the rule;
-  - a private-key header quoted in prose (`expected -----BEGIN ... PRIVATE KEY----- header`) takes
-    the rest of the message, since the block has no end;
+  - a private-key block with no end marker within 16 KiB: only the marker and the lines of base64
+    directly under it go (up to 128 lines of 16 characters or more, and one shorter last line, with
+    real line breaks or the escaped `\\n` of a JSON string), so a sentence that mentions a header
+    keeps the rest of its message, and a key cut mid-body loses its header and the lines under it
+    but not the shorter lines a cut can leave after them;
   - escaping deeper than five strings, a JSON text inside a string deeper than four, or one over
     256 KiB: the walk leaves those to the text rules, which read a quoted pair at any level up to
     five;
