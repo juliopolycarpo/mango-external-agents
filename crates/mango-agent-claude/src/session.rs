@@ -881,6 +881,9 @@ async fn end_turn(
     }
 }
 
+/// Names the host's `ProcessControl` as the peer of an error about a stop it never answered.
+const HOST_CONTROL: &str = "the host's process control";
+
 /// What a stop task that never answered says about itself.
 fn stop_task_lost(joined: &tokio::task::JoinError) -> Error {
     let shape = if joined.is_panic() {
@@ -889,7 +892,7 @@ fn stop_task_lost(joined: &tokio::task::JoinError) -> Error {
         "was cancelled"
     };
     Error::Link {
-        peer: String::from(PROGRAM),
+        peer: String::from(HOST_CONTROL),
         message: format!("expected the host's process stop to return | received: it {shape}"),
     }
 }
@@ -897,8 +900,9 @@ fn stop_task_lost(joined: &tokio::task::JoinError) -> Error {
 /// Wraps a failed stop with the control the host reconciles the child through.
 ///
 /// Always the control the host's launcher returned for this child, so `cleanup_control()` names
-/// it even when the host's own control answered with a `CleanupRequired` of its own; that one stays
-/// readable through `cause()`.
+/// it even when the host's own control answered with a `CleanupRequired` of its own. That answer
+/// is kept whole as `source`, reachable by walking `std::error::Error::source`; `cause()` reads
+/// through it to the innermost error, and the control it named is not offered by any accessor.
 fn cleanup_required(
     control: Arc<dyn mango_external_agents::ProcessControl>,
     source: Error,

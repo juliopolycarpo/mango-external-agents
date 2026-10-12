@@ -123,8 +123,10 @@ async fn a_stop_task_that_never_answered_names_how_it_was_lost() {
     for (joined, shape) in [(panic_error, "panicked"), (abort_error, "was cancelled")] {
         let lost = super::stop_task_lost(&joined);
         assert!(
-            matches!(&lost, Error::Link { message, .. } if message.ends_with(&format!("received: it {shape}"))),
-            "expected a Link error ending in `received: it {shape}` | received {lost:?}"
+            matches!(&lost, Error::Link { peer, message }
+                if peer == "the host's process control"
+                    && message.ends_with(&format!("received: it {shape}"))),
+            "expected a Link error from the host's process control ending in `received: it {shape}` | received {lost:?}"
         );
     }
 }

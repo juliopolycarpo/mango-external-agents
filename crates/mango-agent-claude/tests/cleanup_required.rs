@@ -255,8 +255,9 @@ mod cancel {
 
         assert_cleanup_required("cancel over a panicking kill", &error, &held);
         assert!(
-            matches!(error.cause(), Error::Link { message, .. } if message.contains("panicked")),
-            "expected the cause to say the host's stop panicked | received {error:?}"
+            matches!(error.cause(), Error::Link { peer, message }
+                if peer == "the host's process control" && message.contains("panicked")),
+            "expected the cause to name the host's process control and say its stop panicked | received {error:?}"
         );
         held.reconcile();
     }
@@ -287,6 +288,20 @@ mod cancel {
             "expected the launcher's control, not the one named inside the host's answer | received the inner one"
         );
         assert_refused_kill("cancel over a control with its own cleanup", &error);
+        // The host's answer is kept whole as the source, and its own control is reachable only by
+        // walking the error chain: no accessor offers it.
+        let named = std::iter::successors(std::error::Error::source(&error), |source| {
+            source.source()
+        })
+        .filter_map(|source| source.downcast_ref::<Error>())
+        .find_map(Error::cleanup_control)
+        .expect(
+            "expected the host's own CleanupRequired to stay in the error chain | received none",
+        );
+        assert!(
+            Arc::ptr_eq(&named, &foreign),
+            "expected the control the host's answer named in the error chain | received a different one"
+        );
         held.reconcile();
     }
 
