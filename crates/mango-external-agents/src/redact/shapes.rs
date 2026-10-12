@@ -408,6 +408,21 @@ fn ordinary_text_that_looks_like_a_name_is_kept() {
             r#"{"token_type":"Bearer","expires_in":3600}"#,
         ),
         (r#"{"token_type":"abc"}"#, r#"{"token_type":"[REDACTED]"}"#),
+        (r#"{"token_type":"Bearer"}"#, r#"{"token_type":"Bearer"}"#),
+        ("token_type: Bearer", "token_type: Bearer"),
+        (
+            "token_type=Bearer, expires_in=60",
+            "token_type=Bearer, expires_in=60",
+        ),
+        // A scheme with a credential after it is a credential.
+        (
+            r#"{"token_type":"Bearer eyJhbGciOi.payload.sig"}"#,
+            r#"{"token_type":"[REDACTED]"}"#,
+        ),
+        (
+            "token_type: Bearer eyJhbGciOi.payload.sig\nnext",
+            "token_type=[REDACTED]\nnext",
+        ),
     ]);
 }
 

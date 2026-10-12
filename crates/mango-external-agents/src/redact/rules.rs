@@ -631,12 +631,26 @@ pub(super) fn assignment_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
     {
         return Some(Outcome::Keep { end: digits_end });
     }
-    if is_a_path_for_pwd(bytes, at, &keyword, value_start)
-        || is_a_token_type(bytes, &keyword, value_start)
-    {
+    if is_a_path_for_pwd(bytes, at, &keyword, value_start) {
         return Some(Outcome::Keep { end: value_start });
     }
+    // `token_type: Bearer` names a scheme; `token_type: Bearer eyJ...` has the credential after it,
+    // and the credential is the whole line.
+    let with_a_token = match token_type_scheme(bytes, &keyword, value_start) {
+        Some(scheme_end) => {
+            let after = take_while(bytes, scheme_end, is_blank_byte);
+            let alone = bytes
+                .get(after)
+                .is_none_or(|byte| matches!(byte, b'\n' | b'\r') || ends_value(*byte));
+            if alone {
+                return Some(Outcome::Keep { end: scheme_end });
+            }
+            true
+        }
+        None => false,
+    };
     let value_end = match (keyword.kind, bytes.get(value_start)) {
+        _ if with_a_token => line_end(bytes, value_start),
         (Kind::Line, _) => line_end(bytes, value_start),
         // The brackets close the value, and whatever is glued after them goes with it.
         (_, Some(b'[' | b'{')) => take_while(bytes, closing_bracket(bytes, value_start), |byte| {
@@ -693,10 +707,11 @@ fn is_a_path_for_pwd(bytes: &[u8], at: usize, keyword: &Keyword, value_start: us
     matches!(&bytes[name_start..name_end], b"PWD" | b"OLDPWD")
 }
 
-/// `"token_type": "Bearer"` names a scheme and not a credential.
-fn is_a_token_type(bytes: &[u8], keyword: &Keyword, value_start: usize) -> bool {
+/// Where the scheme ends, when the name is `token_type` and the value starts with `Bearer`, `Basic`
+/// or `MAC`: that names a scheme and not a credential, unless something follows it.
+fn token_type_scheme(bytes: &[u8], keyword: &Keyword, value_start: usize) -> Option<usize> {
     if !keyword.token {
-        return false;
+        return None;
     }
     let rest = &bytes[keyword.end..];
     let kind = rest
@@ -704,17 +719,17 @@ fn is_a_token_type(bytes: &[u8], keyword: &Keyword, value_start: usize) -> bool 
         .or(rest.strip_prefix(b"-"))
         .unwrap_or(rest);
     if kind.len() < 4 || !kind[..4].eq_ignore_ascii_case(b"type") {
-        return false;
+        return None;
     }
     if kind.get(4).is_some_and(|byte| is_name_byte(*byte)) {
-        return false;
+        return None;
     }
     let value_end = take_while(bytes, value_start, |byte| byte.is_ascii_alphabetic());
     let value = &bytes[value_start..value_end];
-    ["bearer", "basic", "mac"]
+    let scheme = ["bearer", "basic", "mac"]
         .iter()
-        .any(|scheme| value.eq_ignore_ascii_case(scheme.as_bytes()))
-        && bytes.get(value_end).is_none_or(|byte| !is_name_byte(*byte))
+        .any(|scheme| value.eq_ignore_ascii_case(scheme.as_bytes()));
+    (scheme && bytes.get(value_end).is_none_or(|byte| !is_name_byte(*byte))).then_some(value_end)
 }
 
 /// Where the bracket that opens at `start` closes, counting the brackets and the strings inside:
@@ -810,7 +825,8 @@ fn quoted_value(
     if status_phrase_end(bytes, opened.inner).is_some_and(|status| status == end) {
         return Some(Outcome::Keep { end });
     }
-    if is_a_token_type(bytes, keyword, opened.inner) {
+    // `"token_type": "Bearer"`; `"Bearer eyJ..."` is a credential and is redacted whole.
+    if token_type_scheme(bytes, keyword, opened.inner) == Some(end) {
         return Some(Outcome::Keep { end });
     }
     if keyword.token && counts_tokens(bytes, keyword.end) && only_digits(&bytes[opened.inner..end])
