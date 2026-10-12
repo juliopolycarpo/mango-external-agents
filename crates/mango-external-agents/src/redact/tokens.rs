@@ -5,8 +5,10 @@
 //! a prefix, a length and an alphabet. This pass reads those, and nothing else: a closed list, each
 //! entry case-sensitive, with a minimum length and a body made of the characters that vendor's
 //! tokens are made of, so that `sk-learn`, `task-ant-...` and `npm_config_cache` are words. A short
-//! body of a prefix that allows `-` or `_` also has a digit, so a hyphenated name that opens like a
-//! prefix (`sk-live-reload-development-server`) is a word too.
+//! body of a prefix that allows `-` or `_` also has a digit and is not made of words, so a
+//! hyphenated name that opens like a prefix (`sk-live-reload-development-server`,
+//! `sk-live-streaming-server-1`) is a word too. Anthropic's, OpenAI's project and Google's OAuth
+//! keys are held to the length and the alphabet their issuers use.
 //!
 //! A token has to start where a run of name characters (`A-Za-z0-9_-`) starts, so a prefix inside a
 //! longer word never matches, and it takes the whole run it is in. The two letters of a JSON line
@@ -206,7 +208,33 @@ fn is_lower_hex(byte: u8) -> bool {
 /// digit in it is a hyphenated name (`sk-live-reload-development-server`) one time in a thousand
 /// tokens lost against many identifiers kept.
 fn looks_random(body: &[u8]) -> bool {
-    body.len() >= 40 || body.iter().any(u8::is_ascii_digit)
+    !is_made_of_words(body) && (body.len() >= 40 || body.iter().any(u8::is_ascii_digit))
+}
+
+/// Whether a body is hyphenated or underscored words and nothing else: two segments or more, none
+/// with both cases in it or two digits or more. A random body has such a segment between any two
+/// of its separators, and a name (`streaming-server-1`, `is-a-prefix-of-google-tokens`) does not.
+fn is_made_of_words(body: &[u8]) -> bool {
+    let mut segments = 0;
+    for segment in body
+        .split(|byte| matches!(byte, b'-' | b'_'))
+        .filter(|segment| !segment.is_empty())
+    {
+        segments += 1;
+        let mixed = segment.iter().any(u8::is_ascii_lowercase)
+            && segment.iter().any(u8::is_ascii_uppercase);
+        let digits = segment.iter().filter(|byte| byte.is_ascii_digit()).count();
+        if mixed || digits >= 2 {
+            return false;
+        }
+    }
+    segments >= 2
+}
+
+/// Whether `body` is made of the letters, digits, `_` and `-` a base64url body is.
+fn is_base64url(body: &[u8]) -> bool {
+    body.iter()
+        .all(|byte| byte.is_ascii_alphanumeric() | matches!(byte, b'-' | b'_'))
 }
 
 /// Whether `run` is `prefix` and then at least `min` bytes that `body` accepts, and nothing else.
@@ -246,14 +274,26 @@ fn slack(run: &[u8]) -> bool {
     false
 }
 
-/// `sk-ant-`, `sk-proj-` and `sk-live-` and 16 or more, Stripe's `sk_live_` and `sk_test_` and 16
-/// or more letters and digits, Shopify's `shpat_` family and 32 hex digits, and OpenAI's older
-/// `sk-` and 40 or more letters and digits with a digit and a letter among them.
+/// `sk-ant-` and a type and two digits (`api03-`) and 80 or more base64url characters, as Anthropic's
+/// console issues them; `sk-proj-` and 40 or more base64url characters with both cases and three
+/// digits among them; `sk-live-` and 16 or more that look random; Stripe's `sk_live_` and `sk_test_`
+/// and 16 or more letters and digits (a `pk_` key is published and no secret); Shopify's `shpat_`
+/// family and 32 hex digits; and OpenAI's older `sk-` and 40 or more letters and digits with a
+/// digit and a letter among them.
 fn s_token(run: &[u8]) -> bool {
-    for prefix in [&b"sk-ant-"[..], b"sk-proj-", b"sk-live-"] {
-        if let Some(body) = run.strip_prefix(prefix) {
-            return body.len() >= 16 && looks_random(body);
-        }
+    if let Some(body) = run.strip_prefix(b"sk-ant-") {
+        return anthropic(body);
+    }
+    if let Some(body) = run.strip_prefix(b"sk-proj-") {
+        return body.len() >= 40
+            && is_base64url(body)
+            && body.iter().filter(|byte| byte.is_ascii_digit()).count() >= 3
+            && body.iter().any(u8::is_ascii_lowercase)
+            && body.iter().any(u8::is_ascii_uppercase)
+            && !is_made_of_words(body);
+    }
+    if let Some(body) = run.strip_prefix(b"sk-live-") {
+        return body.len() >= 16 && looks_random(body);
     }
     if stripe(run) {
         return true;
@@ -271,12 +311,30 @@ fn s_token(run: &[u8]) -> bool {
     })
 }
 
-/// `sk_`, `rk_` and `pk_` with `live_` or `test_` and 16 or more letters and digits.
+/// The body of an Anthropic key after `sk-ant-`: a type of letters and two digits (`api03`, `admin01`),
+/// a hyphen, and 80 or more base64url characters.
+fn anthropic(body: &[u8]) -> bool {
+    let kind = body
+        .iter()
+        .take_while(|byte| byte.is_ascii_lowercase())
+        .count();
+    let digits = body[kind..]
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if kind == 0 || digits != 2 || body.get(kind + digits) != Some(&b'-') {
+        return false;
+    }
+    let rest = &body[kind + digits + 1..];
+    rest.len() >= 80 && is_base64url(rest)
+}
+
+/// `sk_` and `rk_` with `live_` or `test_` and 16 or more letters and digits. A `pk_` key is the
+/// publishable half of the pair, which a page carries by design, and is no secret.
 fn stripe(run: &[u8]) -> bool {
     let Some(rest) = run
         .strip_prefix(b"sk_")
         .or_else(|| run.strip_prefix(b"rk_"))
-        .or_else(|| run.strip_prefix(b"pk_"))
     else {
         return false;
     };
@@ -303,14 +361,21 @@ fn aws_or_google(run: &[u8]) -> bool {
         .is_some_and(|body| body.len() >= 35 && looks_random(body))
 }
 
-/// `ya29.` and 20 or more letters, digits, `_` and `-`: the run is `ya29`, a dot ends it, and the
-/// body is the run after the dot.
+/// `ya29.` and 30 or more letters, digits, `_` and `-` with both cases and a digit among them: the
+/// run is `ya29`, a dot ends it, and the body is the run after the dot.
 fn google_oauth(bytes: &[u8], run: &[u8], run_end: usize) -> Option<usize> {
     if run != b"ya29" || bytes.get(run_end) != Some(&b'.') {
         return None;
     }
     let end = take_while(bytes, run_end + 1, is_run_byte);
-    (end - (run_end + 1) >= 20).then_some(end)
+    let body = &bytes[run_end + 1..end];
+    let random = body.len() >= 30
+        && is_base64url(body)
+        && body.iter().any(u8::is_ascii_digit)
+        && body.iter().any(u8::is_ascii_lowercase)
+        && body.iter().any(u8::is_ascii_uppercase)
+        && !is_made_of_words(body);
+    random.then_some(end)
 }
 
 /// DigitalOcean's `dop_v1_`, `doo_v1_` and `dor_v1_` and 40 or more hex digits.

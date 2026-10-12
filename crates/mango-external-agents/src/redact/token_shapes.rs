@@ -61,20 +61,19 @@ fn rows() -> Vec<Row> {
         row(concat!("xo", "xa-"), SLACK, 20, AtLeast),
         row(concat!("xo", "xs-"), SLACK, 20, AtLeast),
         row(concat!("xo", "xr-"), SLACK, 20, AtLeast),
-        row(concat!("s", "k-ant-"), URL_SAFE, 16, AtLeast),
-        row(concat!("s", "k-proj-"), URL_SAFE, 16, AtLeast),
+        row(concat!("s", "k-ant-api03-"), URL_SAFE, 80, AtLeast),
+        row(concat!("s", "k-ant-admin01-"), URL_SAFE, 80, AtLeast),
+        row(concat!("s", "k-proj-"), URL_SAFE, 40, AtLeast),
         row(concat!("s", "k-live-"), URL_SAFE, 16, AtLeast),
         row(concat!("s", "k-"), ALNUM, 40, AtLeast),
         row(concat!("s", "k_live_"), ALNUM, 16, AtLeast),
         row(concat!("s", "k_test_"), ALNUM, 16, AtLeast),
         row(concat!("r", "k_live_"), ALNUM, 16, AtLeast),
         row(concat!("r", "k_test_"), ALNUM, 16, AtLeast),
-        row(concat!("p", "k_live_"), ALNUM, 16, AtLeast),
-        row(concat!("p", "k_test_"), ALNUM, 16, AtLeast),
         row(concat!("AK", "IA"), UPPER, 16, Exactly),
         row(concat!("AS", "IA"), UPPER, 16, Exactly),
         row(concat!("AI", "za"), URL_SAFE, 35, AtLeast),
-        row(concat!("ya", "29."), URL_SAFE, 20, AtLeast),
+        row(concat!("ya", "29."), URL_SAFE, 30, AtLeast),
         row(concat!("np", "m_"), ALNUM, 30, AtLeast),
         row(concat!("h", "f_"), ALNUM, 30, AtLeast),
         row(concat!("do", "p_v1_"), HEX, 40, AtLeast),
@@ -555,4 +554,76 @@ fn an_end_marker_with_another_label_does_not_close_the_block() {
         shown(&text),
         "[REDACTED]\n-----END CERTIFICATE-----\nkept: words\n"
     );
+}
+
+/// A `pk_` key is the publishable half of Stripe's pair, which every page that takes a card carries.
+#[test]
+fn a_publishable_stripe_key_is_no_secret() {
+    for mode in ["live", "test"] {
+        let key = format!("{}k_{mode}_{}", "p", body(ALNUM, 24));
+        assert_kept(
+            &format!("a publishable {mode} key"),
+            &format!("checkout page uses {key} today"),
+        );
+    }
+}
+
+/// A body of hyphenated words is a name, however many digits one of its words ends in; a random
+/// body has a segment with both cases or two digits between any two of its hyphens.
+#[test]
+fn a_hyphenated_body_of_words_is_a_name_and_a_random_one_is_a_token() {
+    let live = concat!("s", "k-live-");
+    for name in [
+        "streaming-server-1",
+        "streaming-server-2-main",
+        "reload-development-server-v2",
+    ] {
+        assert_kept(
+            "a hyphenated name",
+            &format!("serving {live}{name} on port 8080"),
+        );
+    }
+    for random in [
+        "a1b2c3d4-e5f6g7h8-i9j0k1l2",
+        "Ab3dEf6hIj9lMn2pQr5t",
+        "streamingServer1",
+    ] {
+        let token = format!("{live}{random}");
+        assert_redacted(
+            "a random body",
+            &format!("serving {token} on port 8080"),
+            &token,
+        );
+    }
+}
+
+/// An Anthropic key is `sk-ant-`, a type and two digits, a hyphen, and a long base64url body.
+#[test]
+fn an_anthropic_key_has_its_type_two_digits_and_a_long_body() {
+    let prefix = concat!("s", "k-ant-");
+    let long = body(URL_SAFE, 90);
+    for (what, key, expected_redacted) in [
+        ("the console's shape", format!("{prefix}api03-{long}"), true),
+        ("an admin key", format!("{prefix}admin01-{long}"), true),
+        ("no type", format!("{prefix}03-{long}"), false),
+        ("one digit", format!("{prefix}api3-{long}"), false),
+        ("three digits", format!("{prefix}api003-{long}"), false),
+        (
+            "no hyphen after the digits",
+            format!("{prefix}api03{long}"),
+            false,
+        ),
+        (
+            "a body of 79",
+            format!("{prefix}api03-{}", body(URL_SAFE, 79)),
+            false,
+        ),
+    ] {
+        let text = format!("rejected {key} today");
+        if expected_redacted {
+            assert_redacted(what, &text, &key);
+        } else {
+            assert_kept(what, &text);
+        }
+    }
 }

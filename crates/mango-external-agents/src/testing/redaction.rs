@@ -394,11 +394,11 @@ pub const BARE_TOKENS: &[Leak] = &[
     leak(
         concat!(
             "anthropic rejected s",
-            "k-ant-api03-0123456789abcdefghijklmnopqrstuvwxyz-ABCDEF_ghij today"
+            "k-ant-api03-0123456789abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789abcdefghijklmnopqrstuvwx today"
         ),
         concat!(
             "s",
-            "k-ant-api03-0123456789abcdefghijklmnopqrstuvwxyz-ABCDEF_ghij"
+            "k-ant-api03-0123456789abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789abcdefghijklmnopqrstuvwx"
         ),
         &["anthropic rejected ", " today"],
     ),
@@ -432,11 +432,6 @@ pub const BARE_TOKENS: &[Leak] = &[
         &["stripe: ", " declined"],
     ),
     leak(
-        concat!("stripe: p", "k_live_0123456789abcdefghijklmn declined"),
-        concat!("p", "k_live_0123456789abcdefghijklmn"),
-        &["stripe: ", " declined"],
-    ),
-    leak(
         concat!("aws: AK", "IA0123456789ABCDEF is not authorised"),
         concat!("AK", "IA0123456789ABCDEF"),
         &["aws: ", " is not authorised"],
@@ -459,8 +454,11 @@ pub const BARE_TOKENS: &[Leak] = &[
         &["google: ", " quota"],
     ),
     leak(
-        concat!("google: ya", "29.a0AfB_byC0123456789abcdefghij expired"),
-        concat!("ya", "29.a0AfB_byC0123456789abcdefghij"),
+        concat!(
+            "google: ya",
+            "29.a0AfB_byC0123456789abcdefghijKLMNOPQRSTUVWXYZ expired"
+        ),
+        concat!("ya", "29.a0AfB_byC0123456789abcdefghijKLMNOPQRSTUVWXYZ"),
         &["google: ", " expired"],
     ),
     leak(
@@ -609,6 +607,10 @@ pub const BENIGN_NEAR_TOKENS: &[&str] = &[
     "ASIAN_PACIFIC_REGION is not a key and neither is AKIAnotakey",
     "ASIAPACIFICREGION1 and AKIA0123456789ABCDEFG and XAKIA0123456789ABCDEF",
     "AIzaSyShort is too short and ya29.x too",
+    "ya29.is-a-prefix-of-google-tokens-in-docs and ya29.abcdefghijklmnopqrstuvwxyzabcdef too",
+    "sk-proj-roadmap-for-2026-quarter-4 and sk-ant-colony-optimization-v2 are page names",
+    "serving sk-live-streaming-server-1 on port 8080",
+    "the publishable key pk_live_0123456789abcdefghijklmn is on every page",
     "short hf_abc and npm_abc and shpat_abc and dop_v1_abc",
     "-----BEGIN CERTIFICATE-----\nMIIBsynthetic\n-----END CERTIFICATE-----",
     "-----BEGIN PUBLIC KEY-----\nMFkwsynthetic\n-----END PUBLIC KEY-----",
