@@ -322,7 +322,7 @@ impl Survey {
             Some(version) if version::parse(&shown).as_ref() != Some(version) => {
                 Some(version.to_string())
             }
-            _ => Some(line.to_owned()),
+            _ => Some(shown),
         }
     }
 
@@ -694,11 +694,33 @@ pub fn harness() -> Arc<dyn Harness> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CEILING, ClaudeHarness, probed_capabilities, require_supported};
+    use super::{CEILING, ClaudeHarness, Survey, probed_capabilities, require_supported};
     use mango_external_agents::{
         ApprovalRouting, Capabilities, Configuration, Error, Harness, HarnessId, PermissionLevel,
         TransportKind,
     };
+
+    /// What `reported` returns is already redacted, so nothing that holds a survey holds the banner
+    /// as the CLI printed it.
+    #[test]
+    fn the_reported_line_is_the_redacted_one() {
+        let banner = "2.1.270 (Claude Code) token=sk-live-78";
+        let survey = Survey {
+            banner: Some(String::from(banner)),
+            version: crate::version::parse(banner),
+            ..Survey::default()
+        };
+        let reported = survey.reported().unwrap_or_default();
+        assert!(
+            !reported.contains("sk-live-78"),
+            "expected the reported line to be redacted | received {reported:?}"
+        );
+        assert_eq!(
+            crate::version::parse(&reported).map(|version| version.to_string()),
+            Some(String::from("2.1.270")),
+            "expected the reported line to keep its version | received {reported:?}"
+        );
+    }
 
     #[test]
     fn the_ceiling_covers_everything_a_probe_can_report() {
