@@ -149,64 +149,66 @@ branch, both on the pinned toolchain, release profile.
 
 | Case                               | Base (instructions) | Variant (instructions) |   Delta |
 | ---------------------------------- | ------------------: | ---------------------: | ------: |
-| `stderr_text-1KiB/plain`           |          10,944,352 |             10,587,951 |   -3.3% |
-| `stderr_text-1KiB/secrets`         |          23,925,488 |             23,713,914 |   -0.9% |
-| `stderr_text-1KiB/controls`        |          16,414,354 |             16,288,555 |   -0.8% |
-| `stderr_text-1KiB/separators`      |          18,555,102 |             18,525,391 |   -0.2% |
-| `stderr_text-1KiB/late-non-ascii`  |           8,330,531 |              8,144,507 |   -2.2% |
-| `stderr_text-1KiB/json`            |          39,533,086 |             39,014,358 |   -1.3% |
-| `stderr_text-1KiB/json-secrets`    |          21,122,459 |             20,652,462 |   -2.2% |
-| `stderr_text-1KiB/escaped-json`    |          15,453,094 |             19,629,611 |  +27.0% |
-| `stderr_text-1KiB/pretty`          |          13,261,763 |             16,139,215 |  +21.7% |
-| `stderr_text-16KiB/plain`          |          10,391,808 |             10,026,233 |   -3.5% |
-| `stderr_text-16KiB/secrets`        |          23,790,605 |             23,693,164 |   -0.4% |
-| `stderr_text-16KiB/controls`       |          16,348,711 |             16,237,724 |   -0.7% |
-| `stderr_text-16KiB/separators`     |          18,060,355 |             18,035,193 |   -0.1% |
-| `stderr_text-16KiB/late-non-ascii` |           8,041,984 |              7,863,641 |   -2.2% |
-| `stderr_text-16KiB/json`           |          39,030,094 |             38,501,385 |   -1.4% |
-| `stderr_text-16KiB/json-secrets`   |          20,899,420 |             20,423,433 |   -2.3% |
-| `stderr_text-16KiB/escaped-json`   |          15,097,944 |             19,201,412 |  +27.2% |
-| `stderr_text-16KiB/pretty`         |          11,967,823 |             15,361,770 |  +28.4% |
-| `stderr_text-16KiB/names`          |              76,850 |                 78,423 |   +2.0% |
-| `stderr_text-16KiB/schemes`        |              76,694 |                 78,188 |   +1.9% |
-| `stderr_text-16KiB/quoted-names`   |              77,717 |                 79,131 |   +1.8% |
-| `stderr_text-16KiB/quotes`         |              76,730 |                 78,119 |   +1.8% |
-| `stderr_text-16KiB/slashes`        |              77,343 |                 78,788 |   +1.9% |
-| `stderr_text-16KiB/containers`     |           3,131,281 |              3,743,941 |  +19.6% |
-| `stderr_text-16KiB/sequence`       |              79,175 |                 87,627 |  +10.7% |
-| `stderr_text-120KB/names`          |             523,379 |                534,556 |   +2.1% |
-| `stderr_text-120KB/schemes`        |             524,002 |                535,244 |   +2.1% |
-| `stderr_text-120KB/quoted-names`   |             524,628 |                535,744 |   +2.1% |
-| `stderr_text-120KB/quotes`         |             523,645 |                534,969 |   +2.2% |
-| `stderr_text-120KB/slashes`        |             523,823 |                535,001 |   +2.1% |
-| `stderr_text-120KB/containers`     |          22,896,221 |             26,170,627 |  +14.3% |
-| `stderr_text-120KB/sequence`       |             526,070 |                544,255 |   +3.5% |
-| `stderr_text-1MiB/names`           |           4,529,918 |              4,628,175 |   +2.2% |
-| `stderr_text-1MiB/schemes`         |           4,527,904 |              4,626,075 |   +2.2% |
-| `stderr_text-1MiB/quoted-names`    |           4,528,755 |              4,626,898 |   +2.2% |
-| `stderr_text-1MiB/quotes`          |           4,527,637 |              4,625,984 |   +2.2% |
-| `stderr_text-1MiB/slashes`         |           4,527,814 |              4,626,184 |   +2.2% |
-| `stderr_text-1MiB/containers`      |         200,023,482 |            227,142,713 |  +13.6% |
-| `stderr_text-1MiB/sequence`        |           4,529,864 |              4,635,389 |   +2.3% |
-| `bounded-16KiB/bounded-plain`      |          10,457,034 |             22,506,760 | +115.2% |
-| `bounded-16KiB/bounded-tokens`     |           5,467,762 |             17,563,729 | +221.2% |
+| `stderr_text-1KiB/plain`           |          10,944,352 |             10,926,467 |   -0.2% |
+| `stderr_text-1KiB/secrets`         |          23,925,488 |             24,750,489 |   +3.4% |
+| `stderr_text-1KiB/controls`        |          16,414,354 |             16,312,586 |   -0.6% |
+| `stderr_text-1KiB/separators`      |          18,555,102 |             18,657,252 |   +0.6% |
+| `stderr_text-1KiB/late-non-ascii`  |           8,330,531 |              8,323,819 |   -0.1% |
+| `stderr_text-1KiB/json`            |          39,533,086 |             39,840,554 |   +0.8% |
+| `stderr_text-1KiB/json-secrets`    |          21,122,459 |             21,284,093 |   +0.8% |
+| `stderr_text-1KiB/escaped-json`    |          15,453,094 |             19,926,447 |  +28.9% |
+| `stderr_text-1KiB/pretty`          |          13,261,763 |             16,248,258 |  +22.5% |
+| `stderr_text-16KiB/plain`          |          10,391,808 |             10,357,872 |   -0.3% |
+| `stderr_text-16KiB/secrets`        |          23,790,605 |             24,670,350 |   +3.7% |
+| `stderr_text-16KiB/controls`       |          16,348,711 |             16,234,086 |   -0.7% |
+| `stderr_text-16KiB/separators`     |          18,060,355 |             18,132,951 |   +0.4% |
+| `stderr_text-16KiB/late-non-ascii` |           8,041,984 |              8,015,267 |   -0.3% |
+| `stderr_text-16KiB/json`           |          39,030,094 |             39,300,455 |   +0.7% |
+| `stderr_text-16KiB/json-secrets`   |          20,899,420 |             21,040,484 |   +0.7% |
+| `stderr_text-16KiB/escaped-json`   |          15,097,944 |             19,471,015 |  +29.0% |
+| `stderr_text-16KiB/pretty`         |          11,967,823 |             15,439,275 |  +29.0% |
+| `stderr_text-16KiB/names`          |              76,850 |                 76,878 |   +0.0% |
+| `stderr_text-16KiB/schemes`        |              76,694 |                 76,658 |   -0.0% |
+| `stderr_text-16KiB/quoted-names`   |              77,717 |                 77,838 |   +0.2% |
+| `stderr_text-16KiB/quotes`         |              76,730 |                 76,867 |   +0.2% |
+| `stderr_text-16KiB/slashes`        |              77,343 |                 77,502 |   +0.2% |
+| `stderr_text-16KiB/containers`     |           3,131,281 |              3,810,552 |  +21.7% |
+| `stderr_text-16KiB/sequence`       |              79,175 |                 86,048 |   +8.7% |
+| `stderr_text-120KB/names`          |             523,379 |                523,245 |   -0.0% |
+| `stderr_text-120KB/schemes`        |             524,002 |                524,056 |   +0.0% |
+| `stderr_text-120KB/quoted-names`   |             524,628 |                524,639 |   +0.0% |
+| `stderr_text-120KB/quotes`         |             523,645 |                523,677 |   +0.0% |
+| `stderr_text-120KB/slashes`        |             523,823 |                523,894 |   +0.0% |
+| `stderr_text-120KB/containers`     |          22,896,221 |             26,657,003 |  +16.4% |
+| `stderr_text-120KB/sequence`       |             526,070 |                532,842 |   +1.3% |
+| `stderr_text-1MiB/names`           |           4,529,918 |              4,529,921 |   +0.0% |
+| `stderr_text-1MiB/schemes`         |           4,527,904 |              4,527,888 |   -0.0% |
+| `stderr_text-1MiB/quoted-names`    |           4,528,755 |              4,528,709 |   -0.0% |
+| `stderr_text-1MiB/quotes`          |           4,527,637 |              4,527,751 |   +0.0% |
+| `stderr_text-1MiB/slashes`         |           4,527,814 |              4,527,953 |   +0.0% |
+| `stderr_text-1MiB/containers`      |         200,023,482 |            231,391,877 |  +15.7% |
+| `stderr_text-1MiB/sequence`        |           4,529,864 |              4,537,153 |   +0.2% |
+| `bounded-16KiB/bounded-plain`      |          10,457,034 |             23,056,105 | +120.5% |
+| `bounded-16KiB/bounded-tokens`     |           5,467,762 |             17,675,837 | +223.3% |
 
 Reading it:
 
-- **`stderr_text` on the cases that existed** (`plain`, `secrets`, `controls`, `separators`,
-  `late-non-ascii`, `json`, `json-secrets`): 0.1% to 3.5% fewer instructions than Base, from the
-  quote-state rewrite in `redact::rules` that early-rejects with an inlined check. The change is
-  allowed up to +3% on plain stderr; it is -3.5%.
+- **`stderr_text` on the cases that existed** (`plain`, `controls`, `separators`, `late-non-ascii`,
+  `json`, `json-secrets`): between 0.7% fewer and 0.7% more instructions than Base, 0.3% fewer on
+  plain 16 KiB. `secrets` (every line carries a credential shape) costs 3.4% to 3.7% more. The cause
+  is not isolated: the figure was 0.4% below Base at an earlier commit of this branch, and neither
+  moving the token calls out of the common path nor reverting the sequence reads changed it, which
+  points at inlining in the shared scan code. Plain stderr is inside the 3% this path is held to.
 - **The new shapes for `stderr_text`** cost what their extra reads cost. `escaped-json` and `pretty`
-  do more because Base left them unread (+27% and +28%); the adversarial families (`names`,
-  `schemes`, `quoted-names`, `quotes`, `slashes`, `sequence`) cost +2% over Base, a constant 0.1
-  instruction per byte, and `containers` (an opener at the end of every line that never closes,
-  190 instructions a byte in Base and 217 now) +14%. Instructions per byte are flat from 16 KiB to
-  1 MiB in every family.
+  do more because Base left them unread (+29% each); the adversarial families (`names`, `schemes`,
+  `quoted-names`, `quotes`, `slashes`, `sequence`) cost between 0% and 0.2% over Base at 120 KB and
+  1 MiB, and `containers` (an opener at the end of every line that never closes, 190 instructions a
+  byte in Base and 220 now) +16%. Instructions per byte are flat from 16 KiB to 1 MiB in every
+  family.
 - **`bounded`** (`redact::bounded`, `redact::structured`) runs the token pass. Plain 16 KiB lines
-  cost 2.2 times Base (10.5 M to 22.5 M for 320 KiB); lines with unnamed tokens 3.2 times, since
-  Base leaves them unread. The four 1 MiB token-pass shapes cost 4.6 M to 55 M (a prefix before every
-  run 41 M, web-token headers 34 M, one run opening like a token 55 M, a private-key header with no
+  cost 2.2 times Base (10.5 M to 23.1 M for 320 KiB); lines with unnamed tokens 3.2 times, since
+  Base leaves them unread. The four 1 MiB token-pass shapes cost 4.6 M to 56 M (a prefix before every
+  run 42 M, web-token headers 34 M, one run opening like a token 56 M, a private-key header with no
   end 4.6 M; Base 4.5 M each). They are linear.
 - **Rejected: the token pass inside `stderr_text`.** The same pass over plain stderr cost +120% (10.39 M
   to 22.5 M a sample at 16 KiB, 10.94 M to 23.0 M at 1 KiB). A gate on a byte class (`_`, `-`, `I`,

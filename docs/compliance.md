@@ -78,19 +78,23 @@ own deployment.
     strings deep (`{\\\"api_key\\\":\\\"sk-x\\\"}`): a quote opened with `n` backslashes closes at a
     quote with exactly `n`. `redact::structured` also walks a string that is itself a JSON object or
     array (up to 256 KiB, four strings deep) as structure and writes it again, compactly, when it
-    found something; any other string comes back as it was.
+    found something (keys sorted, whitespace dropped, a number written as `serde_json` writes it,
+    so `1E5` is `100000.0`); any other string comes back as it was.
   - **Containers and sequences.** A value that opens with `[` or `{` is read across line breaks, up
     to 64 lines and 16 KiB, so a pretty-printed array under `"tokens":` goes whole; a container
     that does not close within that, or after the pass has read 8 KiB of them beyond a byte for each
     byte of text, ends with its first line as it did. A YAML `-` after a separator marks a
-    sequence: its first item and every item below it in the same column, up to 64, are the value.
+    sequence of bare items: its first item and every item below it in the same column, up to 64, are
+    the value. A first item that is quoted, a status or a count is read as a single value, and a
+    hyphen at the end of a line is a value, not a marker.
     `ends_awaiting_value` also reports a container a credential's name opened and nothing has closed,
     so a stderr cut that drops its first line goes on dropping lines until the container closes (the
     discard window, 512 bytes, still bounds that).
   - **Counts.** Twelve or more digits (not counting `,` and `_`) under a name that counts tokens are
     a secret, in the text rules and in `redact::structured`; ten digits is the largest 32-bit
     counter, and the corpus holds none above eleven. A comma still ends a value under every name,
-    so `tokens_used: 1,234,567,890,123` is redacted up to the first comma.
+    so `tokens_used: 1,234,567,890,123` is redacted up to the first comma. A millisecond epoch under a
+    count name (`input_tokens=1700000000000`) has twelve digits and is redacted.
   - **Well-known tokens with no name beside them**, by `redact::bounded` and `redact::structured`
     (the paths that carry a vendor's messages, errors, notices, `data` and discovery text) and not
     by `stderr_text`: `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` and `github_pat_` GitHub tokens
@@ -105,7 +109,10 @@ own deployment.
     Shopify tokens. A token starts where a run of letters, digits, `_` and `-` starts and is
     redacted with the run it is in, so `sk-learn`, `task-ant-lines` and `npm_config_cache` are
     words. Each prefix has a minimum length and an alphabet (`redact/token_shapes.rs` is the
-    specification). The AWS documentation key is redacted like any other; an allowlist for it would
+    specification), and a body under 40 characters has a digit, so `sk-live-reload-development-server`
+    is a name. The private-key blocks are read before the name rules, so a name cannot take the
+    first line of a block; every other prefix is read after them, so a name that opens like a prefix
+    (`sk-proj-prod-api-key: x`) still reaches the rules whole. The AWS documentation key is redacted like any other; an allowlist for it would
     be a way past the rule.
   - **A URL whose user is a credential name** (`x://token:;pw@host`) reaches its final shape in one
     call, so a host that redacts a tail twice gets the same string.
@@ -113,8 +120,8 @@ own deployment.
   The token pass reads the whole text a byte at a time, which costs plain stderr lines 120% more
   instructions (10.39 M to 22.5 M per 320 KiB), and a byte-class gate does not help because plain
   tails are full of `_` and `-`. Stderr tails are read line after line on the hot path, so
-  `stderr_text` does not run it (its cost against the previous release is 0 to -3.5% on every
-  plain case); `redact::bounded` and `redact::structured` do, at 2.2 times the instructions on
+  `stderr_text` does not run it (its cost against the previous release is within 1% on every
+  plain case, and 3.7% on text that is a credential on every line); `redact::bounded` and `redact::structured` do, at 2.2 times the instructions on
   plain text of 16 KiB. The measurements are in `docs/benchmarks.md`.
 
   What the rules do not read, and a host should not rely on them for:
@@ -125,13 +132,19 @@ own deployment.
     harnesses print, an `ExtensionValue`'s text and the WebSocket URL text;
   - a bare token outside the closed list, and any credential with no prefix: an AWS secret access
     key (40 characters of base64) or an Azure key has nothing to recognise it by;
+  - a token glued to other name characters (`_ghp_..._`, `ghp_...-`), behind an encoding (`%20ghp_...`,
+    `\u003cghp_...`), or with a prefix the list does not hold; a pagination cursor made of two base64
+    JSON parts and a word is a web token to the rule;
+  - a private-key header quoted in prose (`expected -----BEGIN ... PRIVATE KEY----- header`) takes
+    the rest of the message, since the block has no end;
   - escaping deeper than five strings, a JSON text inside a string deeper than four, or one over
     256 KiB: the walk leaves those to the text rules, which read a quoted pair at any level up to
     five;
-  - a container that spans more than 64 lines or 16 KiB, one that never closes, and one cut by a
-    stderr tail: the rest of the container after the cut is read by the tail's own rules, which see
+  - a container that spans more than 64 lines or 16 KiB, one that never closes, one cut by a stderr
+    tail, and a YAML sequence cut by a tail (`ends_awaiting_value` does not know its column): the rest of the container after the cut is read by the tail's own rules, which see
     no name;
-  - a quoted value with an embedded quote (`'it''s'`), a credential in percent-encoded or base64
+  - a quoted value with an embedded quote (`'it''s'`), and, inside escaped JSON, a string that ends
+    in an escaped backslash, which keeps the value open to the end of its line; a credential in percent-encoded or base64
     form, and a line break written as `%0A`;
   - a credential that is itself a kept word or a short count: `password=404`, `secret=required`,
     `tokens: 12345`. A status word after a credential's name is kept on purpose (a CLI prints
