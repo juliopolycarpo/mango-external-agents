@@ -69,13 +69,16 @@ pub(super) fn redact(text: &str, pass: Pass) -> Option<String> {
 /// container to a rule that is reading a value (`password: [REDACTED] more`).
 const BLOCK_MARK: &str = "\u{e000} \u{e001}PRIVATE_KEY-----";
 
-/// What is left of [`BLOCK_MARK`] when a value in front of it took its first word.
+/// What is left of [`BLOCK_MARK`] when a value in front of it took its first word. It is a
+/// redaction of its own and not nothing: what was glued to the key stays a word apart from the
+/// value, as the space in the key's header kept it.
 const BLOCK_TAIL: &str = " \u{e001}PRIVATE_KEY-----";
 
 /// What the redacted text is left with once the rules are done: a mark that is whole is a
-/// `[REDACTED]`, and what a value left of one is gone.
+/// `[REDACTED]`, and what a value in front of one left of it is a `[REDACTED]` of its own.
 pub(super) fn settle_marks(text: &str) -> String {
-    text.replace(BLOCK_MARK, REDACTED).replace(BLOCK_TAIL, "")
+    text.replace(BLOCK_MARK, REDACTED)
+        .replace(BLOCK_TAIL, concat!(" ", "[REDACTED]"))
 }
 
 /// The private-key blocks of `text`, found by a search for the begin marker and not a read of
@@ -133,8 +136,10 @@ fn redact_prefixes(text: &str) -> Option<String> {
         }
         let run_end = take_while(bytes, at, is_run_byte);
         let escaped = at > 0 && bytes[at - 1] == b'\\' && is_escape_letter(bytes[at]);
-        let found = token_at(text, at, run_end)
-            .map(|end| (at, end))
+        // A token glued to a mark starts a word as it would after the header the mark stands for.
+        let first = at + glued_to_a_mark(bytes, at, run_end);
+        let found = token_at(text, first, run_end)
+            .map(|end| (first, end))
             .or_else(|| {
                 escaped
                     .then(|| token_at(text, at + 1, run_end).map(|end| (at + 1, end)))
@@ -154,6 +159,18 @@ fn redact_prefixes(text: &str) -> Option<String> {
         out.push_str(&text[copied..]);
         out
     })
+}
+
+/// How many bytes of the run at `at` are the name a mark ends in (`PRIVATE_KEY-----`), when it is
+/// one: a token behind it is the start of a word, since the header it stands for ended a word.
+fn glued_to_a_mark(bytes: &[u8], at: usize, run_end: usize) -> usize {
+    const NAME: &[u8] = b"PRIVATE_KEY-----";
+    let after_the_mark = at >= 3 && bytes[..at].ends_with("\u{e001}".as_bytes());
+    if after_the_mark && bytes[at..run_end].starts_with(NAME) {
+        NAME.len()
+    } else {
+        0
+    }
 }
 
 /// Where the token that starts at `start` ends, when one does. The run of name characters that
@@ -491,7 +508,8 @@ fn is_padded_base64(run: &[u8]) -> bool {
 
 /// Whether a credential's name stands at the end of `line` with its value still to come.
 fn waits_on_a_value(line: &str) -> bool {
-    super::ends_awaiting_value(line)
+    // The text is stripped already, and most lines of a key's body name nothing.
+    super::names_a_credential(line) && super::ends_awaiting_value(line)
 }
 
 fn is_base64(byte: u8) -> bool {

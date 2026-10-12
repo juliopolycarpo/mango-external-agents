@@ -98,14 +98,18 @@ fn read(raw: &str, tokens: bool) -> String {
     // ` Bearer sk-live-x` either side of an escape sequence, and a rule that reads the two as
     // neighbours never sees the token at all if the sequence is still sitting between them.
     let (plain, marked) = strip::strip_marking(raw);
-    let mut redacted = rules_round(&plain, tokens);
+    let (mut redacted, blocks) = rules_round(&plain, tokens);
     // A marker the stripper left parts a name from the word before it for the rules, and is gone
     // from what they return, so a second call over that would read the same text differently.
     // Reading it again here, until it stops changing, makes the answer one a second call leaves
     // alone. Text with no removed byte, nearly all of it, pays for one round.
-    if marked {
+    //
+    // A private-key block does the same: the rules read the mark it left as the end of a header,
+    // and the name they made of it and the text glued on is a different name once it is a
+    // `[REDACTED]`.
+    if marked || blocks {
         for _ in 0..EXTRA_ROUNDS {
-            let next = rules_round(&redacted, tokens);
+            let (next, _) = rules_round(&redacted, tokens);
             if next == redacted {
                 break;
             }
@@ -122,8 +126,9 @@ const EXTRA_ROUNDS: usize = 3;
 /// the private-key blocks go first (a name that redacts the first line of a block would leave the
 /// rest of it behind) and the other well-known tokens go last: a name that opens like a prefix
 /// (`sk-live-api-key: x`) must reach the rules whole, and the `[REDACTED]` a token leaves must not
-/// stand where a rule is reading a value.
-fn rules_round(plain: &str, tokens: bool) -> String {
+/// stand where a rule is reading a value. It answers whether a block was replaced, since the text
+/// then wants another round (see [`read`]).
+fn rules_round(plain: &str, tokens: bool) -> (String, bool) {
     let blocks = tokens
         .then(|| tokens::redact(plain, tokens::Pass::Blocks))
         .flatten();
@@ -144,15 +149,15 @@ fn rules_round(plain: &str, tokens: bool) -> String {
         .flatten();
     let text = remove_boundaries(named_last.unwrap_or(settled));
     if blocks.is_some() {
-        return tokens::settle_marks(&text);
+        return (tokens::settle_marks(&text), true);
     }
-    text
+    (text, false)
 }
 
 /// [`stderr_text`] without the rounds that follow a marker: what one reading of the rules gives.
 #[cfg(test)]
 fn single_round(raw: &str) -> String {
-    rules_round(&strip_control_characters(raw), false)
+    rules_round(&strip_control_characters(raw), false).0
 }
 
 /// Redacts `raw` and then bounds it to `limit`: the order every vendor-written diagnostic needs.
@@ -174,6 +179,16 @@ fn single_round(raw: &str) -> String {
 /// ```
 pub fn bounded(raw: &str, limit: crate::normalize::TextLimit) -> crate::normalize::BoundedText {
     crate::normalize::bound_text(&message_text(raw), limit)
+}
+
+/// Whether a keyword or `Authorization` starts anywhere in `text`: without one, nothing in it can
+/// be a credential's name, and a probe would only read it for nothing.
+pub(super) fn names_a_credential(text: &str) -> bool {
+    (0..text.len()).any(|at| {
+        count_steps(1);
+        rules::names_a_keyword(text.as_bytes(), at)
+            || match_word(text.as_bytes(), at, rules::AUTHORIZATION).is_some()
+    })
 }
 
 /// Whether `dropped`, the text a cut removed from the end of what came before, stops where a
@@ -203,12 +218,7 @@ pub(crate) fn ends_awaiting_value(dropped: &str) -> bool {
     // Only the two rules that read across a line break: a URL password cannot span one.
     let plain = strip_control_characters(dropped);
     // Nothing is awaited without a keyword in the text, and most tails have none.
-    let names_a_credential = (0..plain.len()).any(|at| {
-        count_steps(1);
-        rules::names_a_keyword(plain.as_bytes(), at)
-            || match_word(plain.as_bytes(), at, rules::AUTHORIZATION).is_some()
-    });
-    if !names_a_credential {
+    if !names_a_credential(&plain) {
         return false;
     }
     PROBES.iter().any(|(probe, survives)| {

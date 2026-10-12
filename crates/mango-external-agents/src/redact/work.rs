@@ -30,8 +30,14 @@ const AWAITING_STEPS_PER_BYTE: usize = 40;
 
 /// Doubling the text may add a little more than double the work: block searches round up to a
 /// whole block, each shape has a constant tail, and a read bounded by a count of lines or items
-/// (a container, a sequence) costs less than a byte for each byte until its bound is reached.
-const DOUBLING_SLACK: usize = 4096;
+/// (a container, a sequence, the body of a private key) costs less than a byte for each byte until
+/// its bound is reached.
+///
+/// It is 8192, a tenth of the steps of the shape that needs it (88,250 at [`SMALL`]). A shape built of a 9 KB unit (a key
+/// with more body lines than are read) is cut in the middle of a unit at 16 KB and at 32 KB, 1.8 and
+/// 3.6 units, and the cut costs a few thousand steps more or less than its length says. The work
+/// of whole units is checked separately and tightly, in `key_block_work_is_linear_in_whole_units`.
+const DOUBLING_SLACK: usize = 8192;
 
 /// One shape of text that has cost a rule more than its length, and the length it is built to.
 struct Shape {
@@ -863,4 +869,24 @@ fn begin_markers_whose_end_marker_is_past_the_window_cost_a_constant_for_each_by
         last <= first * 1.5 + 1.0 && last <= 24.0,
         "expected steps for each byte to stay flat from 1 to 16 copies | received: {per_byte:?}"
     );
+}
+
+/// A key block with more body lines than are read costs the same for every unit of it, so the
+/// work is linear in whole units even where [`DOUBLING_SLACK`] has to absorb a unit cut in two.
+#[test]
+fn key_block_work_is_linear_in_whole_units() {
+    let unit = format!(
+        concat!("-----BEGIN PRIV", "ATE KEY-----\n{}"),
+        format!("{}\n", "Ab+/".repeat(16)).repeat(140)
+    );
+    let one = message_steps(&unit);
+    for units in [2usize, 4, 8, 16] {
+        let steps = message_steps(&unit.repeat(units));
+        let allowed = units * one + units * one / 20;
+        assert!(
+            steps <= allowed,
+            "expected message_text work for {units} key blocks <= {allowed} (about {units} times \
+             {one}) | received: {steps}"
+        );
+    }
 }
