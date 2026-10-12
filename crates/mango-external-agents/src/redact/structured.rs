@@ -56,6 +56,12 @@ pub(super) fn names_a_credential(name: &str) -> bool {
 
 /// Whether a name counts something that is named like a token: `max_tokens`, `tokens_used`,
 /// `token_limit`. Its number is a count and not a credential.
+///
+/// The text rules' reading (`redact::rules`): the name holds the one credential word `token`, and
+/// either the plural follows it (`tokens`, `tokensUsed`) or a count word does (`token_limit`,
+/// `tokenCount`). A name that only contains a count word elsewhere (`account_token`,
+/// `pin_token_unused`) or holds another credential word (`secret_tokens`, `used_token_secret`)
+/// counts nothing.
 pub(super) fn names_a_count(name: &str) -> bool {
     const COUNTS: [&str; 8] = [
         "count",
@@ -67,8 +73,27 @@ pub(super) fn names_a_count(name: &str) -> bool {
         "total",
         "max",
     ];
-    let name = squashed(name);
-    name.ends_with("tokens") || (name.contains("token") && COUNTS.iter().any(|c| name.contains(c)))
+    let squashed = squashed(name);
+    let credential_words: usize = CREDENTIAL_WORDS
+        .iter()
+        .map(|word| squashed.matches(word).count())
+        .sum();
+    let lower = name.to_ascii_lowercase();
+    let (true, Some(at)) = (credential_words == 1, lower.find("token")) else {
+        return false;
+    };
+    let rest = &name[at + "token".len()..];
+    let plural = rest
+        .strip_prefix(['s', 'S'])
+        .is_some_and(|after| !after.starts_with(|c: char| c.is_ascii_lowercase()));
+    let after_separator = rest
+        .strip_prefix(['_', '-'])
+        .unwrap_or(rest)
+        .to_ascii_lowercase();
+    plural
+        || COUNTS
+            .iter()
+            .any(|count| after_separator.starts_with(count))
 }
 
 /// Whether `text` is only digits, with the separators numbers are written with.
@@ -83,9 +108,13 @@ fn only_digits(text: &str) -> bool {
 ///
 /// What it replaces:
 ///
-/// - every string, number and key under a member whose name is a credential's, at any depth, so
-///   `{"tokens": ["a"]}` and `{"credentials": {"user": "u", "pass": "p"}}` lose their contents;
-///   a number under a name that counts tokens (`max_tokens`, `tokens_used`) is a count and stays;
+/// - every string and number under a member whose name is a credential's, and an array or object
+///   there becomes one `"[REDACTED]"`, so `{"tokens": ["a"]}` and `{"credentials": {"user": "u",
+///   "pass": "p"}}` lose their contents and the result is never larger than the input; a number
+///   under a name that counts tokens (`max_tokens`, `tokens_used`) is a count and stays, as does a
+///   plain list of them. A name counts tokens by the text rules' reading: it holds `token` and no
+///   other credential word, and the plural or a count word follows (`account_token` counts
+///   nothing);
 /// - the `value` of an object whose `name` (or `key`, `header`, `field`) is a credential's, which
 ///   is how an environment variable or an HTTP header is written: `{"name": "OPENAI_API_KEY",
 ///   "value": "sk-..."}`, in any case;
@@ -141,8 +170,23 @@ impl Under {
 }
 
 fn walk(value: &Value, under: Under) -> Value {
+    match (value, under) {
+        // A container under a credential name is one marker, so that redacting never makes the
+        // value larger: a megabyte of `1,` under `"token"` would otherwise come back as six.
+        (Value::Object(_), Under::Credential { .. }) => Value::String(String::from(REDACTED)),
+        (Value::Array(items), Under::Credential { counts: true })
+            if items.iter().all(Value::is_number) =>
+        {
+            value.clone()
+        }
+        (Value::Array(_), Under::Credential { .. }) => Value::String(String::from(REDACTED)),
+        _ => walk_leaf_or_free(value, under),
+    }
+}
+
+fn walk_leaf_or_free(value: &Value, under: Under) -> Value {
     match value {
-        Value::Object(members) => Value::Object(object(members, under)),
+        Value::Object(members) => Value::Object(object(members)),
         Value::Array(items) => Value::Array(array(items, under)),
         Value::String(text) => Value::String(string(text, under)),
         Value::Number(_) => match under {
@@ -168,37 +212,24 @@ fn member<'a>(members: &'a Map<String, Value>, names: &[&str]) -> Option<(&'a St
         .find(|(key, _)| names.iter().any(|name| key.eq_ignore_ascii_case(name)))
 }
 
-fn object(members: &Map<String, Value>, under: Under) -> Map<String, Value> {
+fn object(members: &Map<String, Value>) -> Map<String, Value> {
     // `{"name": "Authorization", "value": "Bearer ..."}`: the value is the credential.
     let pair_value = member(members, &["name", "key", "header", "field"])
         .and_then(|(_, name)| name.as_str())
         .and_then(Under::credential)
         .and_then(|_| member(members, &["value", "val"]))
         .map(|(key, _)| key.as_str());
-    let mut written = Map::with_capacity(members.len());
-    let mut renamed = 0_usize;
-    for (key, member) in members {
-        let below = match under {
-            Under::Credential { .. } => under,
-            Under::Nothing if pair_value == Some(key.as_str()) => {
+    members
+        .iter()
+        .map(|(key, member)| {
+            let below = if pair_value == Some(key.as_str()) {
                 Under::Credential { counts: false }
-            }
-            Under::Nothing => Under::credential(key).unwrap_or(Under::Nothing),
-        };
-        // A key below a credential is itself what a caller may have keyed by: a token, an id.
-        let key = match under {
-            Under::Credential { .. } => {
-                renamed += 1;
-                match renamed {
-                    1 => String::from(REDACTED),
-                    n => format!("{REDACTED} {n}"),
-                }
-            }
-            Under::Nothing => key.clone(),
-        };
-        written.insert(key, walk(member, below));
-    }
-    written
+            } else {
+                Under::credential(key).unwrap_or(Under::Nothing)
+            };
+            (key.clone(), walk(member, below))
+        })
+        .collect()
 }
 
 fn array(items: &[Value], under: Under) -> Vec<Value> {
@@ -291,7 +322,6 @@ mod tests {
     fn everything_under_a_credential_name_is_replaced_at_any_depth() {
         let data = json!({
             "token": "t-1",
-            // A plural name may count tokens, so a plain number below it stays a number.
             "tokens": ["t-2", { "inner": "t-3", "n": 7 }],
             "credentials": { "user": "u-1", "pass": "p-1", "sk-abc": "x" },
             "api_key": 123456789,
@@ -301,12 +331,8 @@ mod tests {
         let shown = structured(&data);
         let expected = json!({
             "token": "[REDACTED]",
-            "tokens": ["[REDACTED]", { "[REDACTED]": "[REDACTED]", "[REDACTED] 2": 7 }],
-            "credentials": {
-                "[REDACTED]": "[REDACTED]",
-                "[REDACTED] 2": "[REDACTED]",
-                "[REDACTED] 3": "[REDACTED]",
-            },
+            "tokens": "[REDACTED]",
+            "credentials": "[REDACTED]",
             "api_key": "[REDACTED]",
             "expires": 30,
             "path": "/repo",
@@ -331,6 +357,71 @@ mod tests {
             secret,
             json!({ "api_token": "[REDACTED]", "token": "[REDACTED]" }),
             "expected a numeric secret under a singular name redacted"
+        );
+    }
+
+    /// A count keeps its number only when the name counts tokens and names no other credential:
+    /// the text rules' reading (`redact::rules`), not a substring of the name.
+    #[test]
+    fn a_number_under_a_name_that_only_contains_a_count_word_is_a_credential() {
+        for name in [
+            "account_token",
+            "accountToken",
+            "secret_tokens",
+            "used_token_secret",
+            "pin_token_unused",
+            "token",
+            "token_secret",
+        ] {
+            assert!(
+                !names_a_count(name),
+                "expected {name:?} not to be a count of tokens"
+            );
+            let shown = structured(&json!({ name: 123456789012_u64, "same": "x" }));
+            assert_eq!(
+                shown,
+                json!({ name: "[REDACTED]", "same": "x" }),
+                "expected the number under {name:?} redacted | received: {shown}"
+            );
+            let as_text = structured(&json!({ name: "123456789012" }));
+            assert_eq!(
+                as_text,
+                json!({ name: "[REDACTED]" }),
+                "expected the digit string under {name:?} redacted | received: {as_text}"
+            );
+        }
+        let nested = structured(&json!({ "max_tokens": { "password": 123456 } }));
+        assert_eq!(
+            nested,
+            json!({ "max_tokens": "[REDACTED]" }),
+            "expected a credential below a count to be redacted | received: {nested}"
+        );
+    }
+
+    /// A redacted array or object is one marker, so the output cannot be larger than the input.
+    #[test]
+    fn a_container_under_a_credential_name_becomes_one_marker() {
+        let items = vec![json!(1); 10_000];
+        let data = json!({ "token": items, "credentials": { "a": 1, "b": [1, 2] }, "ok": 1 });
+        let shown = structured(&data);
+        assert_eq!(
+            shown,
+            json!({ "token": "[REDACTED]", "credentials": "[REDACTED]", "ok": 1 }),
+            "expected one marker per container | received: {}",
+            shown.to_string().len()
+        );
+        let wide = structured(&json!({ "token": vec![1; 100_000] }));
+        assert!(
+            wide.to_string().len() < 64,
+            "expected a 100,000 element array under a credential name to render in under 64 bytes | received: {}",
+            wide.to_string().len()
+        );
+        // A count that is a plain list of numbers stays a list.
+        let counts = structured(&json!({ "tokens": [1, 2, 3] }));
+        assert_eq!(
+            counts,
+            json!({ "tokens": [1, 2, 3] }),
+            "expected a list of counts to stay | received: {counts}"
         );
     }
 

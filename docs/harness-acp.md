@@ -248,10 +248,13 @@ the agent's code as `vendor_code` and its message, with whatever it put in `data
 message is redacted of credential-shaped text and then bounded. So is the message of a refused setup
 request, which is returned as an error and redacted where it is made, and so are the title and
 description of an agent's notice and the `error` of a compaction. In `data`, every string under a
-credential-named key is replaced (a number too, unless the name counts tokens, as `max_tokens` does),
-as are the `value` beside a credential-named `name` or `key` or `header`, the second element of a
-two-entry pair array such as `["Authorization", "Bearer x"]`, and the keys of an object under a
-credential-named key. A string that holds JSON text is read by the redactor, which reads quoted
+credential-named key is replaced (a number too, unless the name counts tokens, as `max_tokens` does:
+the name must hold `token` and no other credential word, and be followed by the plural or a count
+word, so `account_token` and `secret_tokens` count nothing), as are the `value` beside a
+credential-named `name` or `key` or `header` and the second element of a two-entry pair array such
+as `["Authorization", "Bearer x"]`. An array or object under a credential-named key becomes one
+`"[REDACTED]"`, so redacting never makes `data` larger; a plain list of counts under a count name
+stays a list. A string that holds JSON text is read by the redactor, which reads quoted
 pairs, so `"{\"api_key\":\"sk-x\"}"` is covered too. The agent's own code is redacted like its
 message, and an ordinary code (`-32000`, `rate_limit_exceeded`) reads as it was sent. The words
 around the credentials stay readable. The session stays usable, as it does after a
