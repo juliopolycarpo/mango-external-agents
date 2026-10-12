@@ -255,13 +255,15 @@ returns `Ok` says nothing of whether the call has returned.
 - `on_notification` and `on_request_handoff` run on the handler's task. On a connection that has not
   ended the close aborts it and waits for it as long as the first grace has left, as for a slow
   call, or 50 ms if that is spent, closes the link, and returns the handler's `Timeout`
-  (`is_handler_shutdown_timeout`), or the link's own error if closing the link failed.
+  (`is_handler_shutdown_timeout`) if the task is still running as it ends, or the link's own
+  error if closing the link failed. A task that ended in the meantime, however late, is not a
+  failure: the close looks at it again after the link is closed.
 - `on_terminated`, and those two on a connection that ended under this side once the reader has
   taken the handler's task to drain it, are waited for by the reader, which the close waits for
   within its bound. A close that gets to the task before the reader does, while the reader has
   recorded the end but not yet reached the task, is in the case above. The close then takes the
-  reader down, allows the abort 50 ms to land when its bound is spent, and returns the reader's `Timeout`
-  (`is_reader_shutdown_timeout`) when the reader is inside a call that blocks, or the link's own
+  reader down, allows the abort 50 ms to land when its bound is spent, and returns the reader's
+  `Timeout` (`is_reader_shutdown_timeout`) when the reader is inside a call that blocks, or the link's own
   error. A reader parked at an await, waiting for a task whose call blocks, is taken down, and the
   close returns `Ok`.
 - `on_request` runs on tasks the close lets write their refusals for up to `shutdown_timeout`,

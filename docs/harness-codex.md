@@ -282,7 +282,8 @@ treats them differently:
   session's client is the teardown's, which first ends the turn or gives a claimed one
   `shutdown_timeout`. That close waits for the report, within twice its own `shutdown_timeout`
   from its start (and 100 ms more behind a handler that blocks its thread, which the teardown's
-  three-grace backstop covers), and a report that lands after the teardown abandoned the turn adds no terminal.
+  three-grace backstop covers), and a report that lands after the teardown abandoned the turn
+  adds no terminal.
 
 The client's wait and the worker's wait run one after the other, and each ends when the commit
 lands. A commit that lands therefore costs only its own duration. A commit still unfinished after
