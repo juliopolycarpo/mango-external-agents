@@ -189,7 +189,8 @@ fn assert_redacted(label: &str, raw: &str, redacted: &str) {
             "expected every credential in a {} byte {label} tail redacted | received {redacted:?}",
             raw.len()
         ),
-        "bounded-plain" | "sequence" | "containers" | "slashes" => assert!(
+        "bounded-plain" | "sequence" | "containers" | "slashes" | "prefixes" | "pem" | "web"
+        | "one-run" => assert!(
             !redacted.is_empty(),
             "expected a {} byte {label} tail to come back",
             raw.len()
@@ -241,6 +242,7 @@ fn main() {
     }
     pathological(&bench);
     messages(&bench);
+    token_shapes(&bench);
 }
 
 /// `redact::bounded`, which also reads the unnamed tokens: 16 KiB tails of plain lines and of lines
@@ -306,5 +308,43 @@ fn pathological(bench: &Bench) {
                 |()| stderr_text(std::hint::black_box(&raw)).len(),
             );
         }
+    }
+}
+
+/// `redact::bounded` over text built to make the token pass read a run again: a prefix too short to
+/// be a token before every run, a private-key header with no end, web-token headers with no
+/// claims, and one run as long as the text that opens like a token. One call per sample, 1 MiB.
+fn token_shapes(bench: &Bench) {
+    let len = KIB * KIB;
+    for (label, raw) in [
+        ("prefixes", repeated(concat!("gh", "p_abc "), "", len)),
+        (
+            "pem",
+            repeated(concat!("-----BEGIN ", "PRIVATE KEY-----\n"), "", len),
+        ),
+        (
+            "web",
+            repeated(concat!("ey", "Jhbgcioijiuzi1nir. "), "", len),
+        ),
+        (
+            "one-run",
+            format!("{}{}", concat!("sk", "-"), "a".repeat(len)),
+        ),
+    ] {
+        let name = format!("redact/bounded-1MiB/{label}");
+        if !bench.selected(&name) {
+            continue;
+        }
+        assert_redacted(label, &raw, &bounded(&raw, TextLimit::ErrorMessage).text);
+        bench.run(
+            &name,
+            Unit::new(raw.len() as u64, "byte"),
+            || (),
+            |()| {
+                bounded(std::hint::black_box(&raw), TextLimit::ErrorMessage)
+                    .text
+                    .len()
+            },
+        );
     }
 }
