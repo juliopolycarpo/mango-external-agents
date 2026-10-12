@@ -1827,4 +1827,15 @@ mod tests {
             );
         }
     }
+    /// A session's title and preview are the conversation's own content, the words the user and the
+    /// agent used, and not a diagnostic: they are bounded and left otherwise as written.
+    #[test]
+    fn a_session_title_is_content_and_is_not_redacted() {
+        let title = "Rotate the token: it is API_KEY=abc in CI";
+        assert_eq!(
+            super::bounded_label(Some(title.to_owned())).as_deref(),
+            Some(title),
+            "expected a title to reach the host as the conversation wrote it"
+        );
+    }
 }

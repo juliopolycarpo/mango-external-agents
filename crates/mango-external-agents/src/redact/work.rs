@@ -19,10 +19,11 @@ use crate::ExtensionValue;
 const SMALL: usize = 16 * 1024;
 
 /// What a byte of text may cost across the passes (the stripper and the three rules, with the
-/// keyword look-ups behind them): 1 to 9 on the shapes below, so 16 leaves room for a compiler or
+/// keyword look-ups behind them): 1 to 9 on the shapes below, and up to twice that where a removed
+/// byte makes the rules read the text a second time, so 24 leaves room for a compiler or
 /// a pass more without hiding a rule that reads a suffix per candidate, which costs thousands of
 /// steps a byte at this size.
-const STEPS_PER_BYTE: usize = 16;
+const STEPS_PER_BYTE: usize = 24;
 
 /// [`ends_awaiting_value`] runs two rules over the text four times and sweeps it once more.
 const AWAITING_STEPS_PER_BYTE: usize = 40;
@@ -142,6 +143,170 @@ const SHAPES: &[Shape] = &[
         what: "scheme separators one after another with one-letter schemes",
         build: |len| repeated("a://", "", len),
     },
+    Shape {
+        what: "a quoted keyword repeated in a name with no value",
+        build: |len| repeated("\"token_", "\":", len),
+    },
+    Shape {
+        what: "nothing but quotes and a colon",
+        build: |len| repeated("\"", ":x", len),
+    },
+    Shape {
+        what: "a keyword glued to letters, repeated, before one assignment",
+        build: |len| repeated("atoken", "=v", len),
+    },
+    Shape {
+        what: "a keyword repeated in a name whose value says it is missing",
+        build: |len| repeated("token_", ": expired", len),
+    },
+    Shape {
+        what: "a plural keyword repeated in a name whose value is a count",
+        build: |len| repeated("tokens_", ": 100000", len),
+    },
+    Shape {
+        what: "a quote that is never closed after a name",
+        build: |len| repeated("token=\"", "a", len),
+    },
+    Shape {
+        what: "a quoted value of backslashes",
+        build: |len| repeated("api_key='", &"\\".repeat(len), len),
+    },
+    Shape {
+        what: "a password colon repeated on one long line",
+        build: |len| repeated("password: ", "", len),
+    },
+    Shape {
+        what: "a cookie colon repeated on one long line",
+        build: |len| repeated("cookie: ", "", len),
+    },
+    Shape {
+        what: "query parameters one after another",
+        build: |len| repeated("?key=a&token=b", "", len),
+    },
+    Shape {
+        what: "status words one after another after a name",
+        build: |len| repeated("token: ", &"not ".repeat(len / 4), len),
+    },
+    Shape {
+        what: "authorization headers one after another with unusual schemes",
+        build: |len| repeated("authorization: x y ", "", len),
+    },
+    Shape {
+        what: "a status after a name with no space, repeated on one line",
+        build: |len| repeated("token:set.", "", len),
+    },
+    Shape {
+        what: "a cookie status repeated on one line",
+        build: |len| repeated("Cookie: set.", "", len),
+    },
+    Shape {
+        what: "a password and a status repeated on one line",
+        build: |len| repeated("password: not set.", "", len),
+    },
+    Shape {
+        what: "an authorization status repeated on one line",
+        build: |len| repeated("Authorization: 401 Unauthorized.", "", len),
+    },
+    Shape {
+        what: "an authorization reason that is no status, repeated on one line",
+        build: |len| repeated("Authorization: bad bad.", "", len),
+    },
+    Shape {
+        what: "a keyword repeated in a name before an empty quoted value",
+        build: |len| repeated("token_", "=\"\"", len),
+    },
+    Shape {
+        what: "a quoted keyword repeated in a name before a bare closing brace",
+        build: |len| format!("{{\"{}\":}}", "token_".repeat(len / 6)),
+    },
+    Shape {
+        what: "a keyword repeated in a query name before an ampersand",
+        build: |len| format!("?{}=&", "token_".repeat(len / 6)),
+    },
+    Shape {
+        what: "a capitalised keyword repeated before a blank and `key`",
+        build: |len| repeated("token", &"Token".repeat(len / 5), len / 5) + " key=v",
+    },
+    Shape {
+        what: "a brace and a string that never close, repeated",
+        build: |len| repeated("token=[\"", "{[", len),
+    },
+    Shape {
+        what: "a known scheme glued to a colon, repeated on one line",
+        build: |len| repeated("Authorization:Bearer:", "", len),
+    },
+    Shape {
+        what: "a multi-part scheme glued to a comma, repeated on one line",
+        build: |len| repeated("Authorization:Digest,", "", len),
+    },
+    Shape {
+        what: "a known scheme glued to an equals sign, repeated",
+        build: |len| repeated("Authorization:Basic=", "", len),
+    },
+    Shape {
+        what: "an authorization header opening a quote that never closes, repeated",
+        build: |len| repeated("Authorization:'x", "", len),
+    },
+    Shape {
+        what: "an array that never closes under a password, repeated",
+        build: |len| repeated("password:[\"", "", len),
+    },
+    Shape {
+        what: "an escaped string that never closes inside an array, repeated",
+        build: |len| repeated("token=[\\\"a", "", len),
+    },
+    Shape {
+        what: "two different keywords alternating in one name before a status",
+        build: |len| repeated("token_secret_", ": expired", len),
+    },
+    Shape {
+        what: "a token and a cookie alternating in one name before an empty value",
+        build: |len| repeated("token_cookie_", "=,", len),
+    },
+    Shape {
+        what: "ampersands with no query string, repeated",
+        build: |len| repeated("&token=x", "", len),
+    },
+    Shape {
+        what: "a quoted value with text glued to its closing quote, repeated",
+        build: |len| repeated("password=\"a\"b", "", len),
+    },
+    Shape {
+        what: "a quoted value with a glued tail that never ends, repeated",
+        build: |len| repeated("token=\"a\"", &"b".repeat(len), len),
+    },
+    Shape {
+        what: "query-only names after ampersands with no query string, repeated",
+        build: |len| repeated("&key=x", "", len),
+    },
+    Shape {
+        what: "ampersand parameters with no query string, repeated",
+        build: |len| repeated("&a=", "", len),
+    },
+    Shape {
+        what: "a question mark ahead of 341 query-only names, repeated",
+        build: |len| repeated(&format!("?{}", "&key=x".repeat(341)), "", len),
+    },
+    Shape {
+        what: "one question mark far ahead of ampersand parameters",
+        build: |len| format!("?{}", "&a=b".repeat(len / 4)),
+    },
+    Shape {
+        what: "one question mark far ahead of query-only names",
+        build: |len| format!("?{}", "&key=x".repeat(len / 6)),
+    },
+    Shape {
+        what: "query-only names glued with dots, repeated",
+        build: |len| repeated("x.&auth=1", "", len),
+    },
+    Shape {
+        what: "plain words that start with a keyword, repeated",
+        build: |len| repeated("tokenizer: ", "", len),
+    },
+    Shape {
+        what: "token-length userinfo with no password, repeated",
+        build: |len| repeated("a://aaaaaaaaaaaaaaaaaaa1@", "", len),
+    },
 ];
 
 fn redaction_steps(text: &str) -> usize {
@@ -260,6 +425,16 @@ fn every_loop_over_the_text_counts_its_steps() {
             len / 8,
         ),
         ("text with nothing to strip", "x".repeat(len), len),
+        (
+            "a quoted value",
+            format!("token=\"{}\"", "a".repeat(len)),
+            4 * len,
+        ),
+        (
+            "a cookie line with trailing blanks",
+            format!("Cookie: x{}\n", " ".repeat(len)),
+            5 * len,
+        ),
     ] {
         let received = redaction_steps(&text);
         assert!(

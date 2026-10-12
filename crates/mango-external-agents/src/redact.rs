@@ -14,12 +14,28 @@
 //! and so no password to the URL rule. A caller that both redacts and bounds redacts the whole
 //! text first, as the core does for an error's message and a notice.
 //!
-//! The rules know the shape of a credential and not its meaning, so a message that merely looks like
-//! an assignment loses its value: `token: expired` reads `token=[REDACTED]` afterwards. The name and
-//! the words around it stay readable, which is what a host needs of a message beside its code. A
-//! count named like a token loses its number the same way: `max_tokens: 100000` reads
-//! `max_tokens=[REDACTED]`. A JSON object's `"api_key":"sk-..."` is not read at all, because a quote
-//! stands between the name and the colon, so a caller holding structure redacts by key first.
+//! The rules (in `redact::rules`) know the shape of a credential and not its meaning, so a message
+//! that merely looks like an assignment loses its value: `session refused, token: abc123` reads
+//! `token=[REDACTED]` afterwards. The name and the words around it stay readable, which is what a
+//! host needs of a message beside its code. What is read:
+//!
+//! - a name or a value in quotes, with the quotes escaped or not: `{"api_key":"sk-x"}`,
+//!   `'Authorization': 'Bearer x'`. A quoted value runs to its closing quote.
+//! - a keyword that starts a word, follows a capital or ends a name: `accessToken`, `PGPASSWORD`,
+//!   `csrftoken`, `OPENAI_API_KEY`, `API key`.
+//! - any authorization scheme, a cookie header, a `password:` phrase, a query parameter named
+//!   `key`, `sig` or `auth`, and a URL userinfo that is itself a token.
+//!
+//! Three kinds of value are kept, because they say why something failed and are never secrets: a
+//! closed set of status words after a name (`OPENAI_API_KEY: not set`, `token: expired`,
+//! `failed to refresh token: 401 Unauthorized`), a number under a name that counts tokens
+//! (`max_tokens: 100000`, `input_tokens=1200`), and the rest of a query string after the one
+//! parameter that is a credential. Anything outside those sets is redacted: when a value could be
+//! either, it is a credential. A caller holding structure redacts by key first
+//! ([`structured`]), and a JSON text inside a string is read here.
+//!
+//! The keyword list is the one the structured walk uses, so `pwd=x` as text and `"pwd":"x"` as
+//! data agree.
 //!
 //! Every pass is linear in the text. A rule is asked at each place a match can start, and the
 //! places that share an end share everything after their start, so what depends on the end is
@@ -32,17 +48,21 @@ mod boundaries;
 mod differential;
 #[cfg(test)]
 mod reference;
+mod rules;
 mod scan;
+#[cfg(test)]
+mod shapes;
 mod strip;
+mod structured;
 #[cfg(test)]
 mod work;
 
 use std::borrow::Cow;
-use std::ops::Range;
 
-use scan::{Anchor, Candidates, count_steps, first_match, run_start};
+use scan::{Anchor, Candidates, count_steps};
 pub(crate) use strip::{MAX_ESCAPE_BYTES, holds_string_terminator};
 use strip::{remove_boundaries, strip_control_characters};
+pub use structured::structured;
 
 /// Redacts a stderr tail and strips terminal-unsafe control characters.
 ///
@@ -58,10 +78,59 @@ pub fn stderr_text(raw: &str) -> String {
     // Stripped first rather than last. A CLI that colours its output writes `Authorization:` and
     // ` Bearer sk-live-x` either side of an escape sequence, and a rule that reads the two as
     // neighbours never sees the token at all if the sequence is still sitting between them.
-    let plain = strip_control_characters(raw);
-    let bearer = redact_bearer(&plain);
+    let (plain, marked) = strip::strip_marking(raw);
+    let mut redacted = rules_round(&plain);
+    // A marker the stripper left parts a name from the word before it for the rules, and is gone
+    // from what they return, so a second call over that would read the same text differently.
+    // Reading it again here, until it stops changing, makes the answer one a second call leaves
+    // alone. Text with no removed byte, nearly all of it, pays for one round.
+    if marked {
+        for _ in 0..EXTRA_ROUNDS {
+            let next = rules_round(&redacted);
+            if next == redacted {
+                break;
+            }
+            redacted = next;
+        }
+    }
+    redacted
+}
+
+/// The most times text that carried a marker is read again.
+const EXTRA_ROUNDS: usize = 3;
+
+/// The three rules over text the stripper has handled, and the markers taken out after.
+fn rules_round(plain: &str) -> String {
+    let bearer = redact_bearer(plain);
     let assignments = redact_assignments(&bearer);
     remove_boundaries(redact_url_passwords(&assignments))
+}
+
+/// [`stderr_text`] without the rounds that follow a marker: what one reading of the rules gives.
+#[cfg(test)]
+fn single_round(raw: &str) -> String {
+    rules_round(&strip_control_characters(raw))
+}
+
+/// Redacts `raw` and then bounds it to `limit`: the order every vendor-written diagnostic needs.
+///
+/// A bound that cuts first can leave the head of a credential where no rule recognises it, so the
+/// whole text is redacted and the result is cut. `truncated` says that the bound removed
+/// characters from the redacted text. Characters redaction itself stripped or replaced are not
+/// counted, since the text no longer holds them.
+///
+/// # Example
+///
+/// ```
+/// use mango_external_agents::normalize::TextLimit;
+/// use mango_external_agents::redact;
+///
+/// let text = redact::bounded("refused: API_KEY=sk-live-42", TextLimit::ErrorMessage);
+/// assert_eq!(text.text, "refused: API_KEY=[REDACTED]");
+/// assert!(!text.truncated);
+/// ```
+pub fn bounded(raw: &str, limit: crate::normalize::TextLimit) -> crate::normalize::BoundedText {
+    crate::normalize::bound_text(&stderr_text(raw), limit)
 }
 
 /// Whether `dropped`, the text a cut removed from the end of what came before, stops where a
@@ -77,14 +146,15 @@ pub(crate) fn ends_awaiting_value(dropped: &str) -> bool {
     // Each probe finishes one waiting state: a name that wants its separator, a separator that
     // wants its value, `Authorization` that wants `:`, `Authorization:` that wants a scheme and a
     // scheme that wants its token. `Z` is the value; it survives only when nothing claimed it.
-    const PROBES: [&str; 4] = ["\n=Z", "\n:bearer Z", "\nbearer Z", "\nZ"];
+    // The last continues the line, as a cut inside a quoted JSON string does.
+    const PROBES: [&str; 5] = ["\n=Z", "\n:bearer Z", "\nbearer Z", "\nZ", " Z"];
     // Only the two rules that read across a line break: a URL password cannot span one.
     let plain = strip_control_characters(dropped);
     // Nothing is awaited without a keyword in the text, and most tails have none.
     let names_a_credential = (0..plain.len()).any(|at| {
         count_steps(1);
-        match_credential_keyword(plain.as_bytes(), at).is_some()
-            || match_word(plain.as_bytes(), at, AUTHORIZATION).is_some()
+        rules::names_a_keyword(plain.as_bytes(), at)
+            || match_word(plain.as_bytes(), at, rules::AUTHORIZATION).is_some()
     });
     if !names_a_credential {
         return false;
@@ -154,202 +224,25 @@ fn is_known_program(name: &str) -> bool {
     KNOWN_PROGRAMS.contains(&bare)
 }
 
-/// The keyword that makes a variable name a credential's: `api_key` or one of a short list.
-fn match_credential_keyword(bytes: &[u8], at: usize) -> Option<usize> {
-    const KEYWORDS: &[&[u8]] = &[b"secret", b"token", b"password", b"passwd", b"credential"];
-    match_api_key(bytes, at)
-        .or_else(|| KEYWORDS.iter().find_map(|word| match_word(bytes, at, word)))
-}
-
-/// `authorization : bearer <token>`, however it was spaced and cased.
+/// `authorization : <scheme> <token>`, however it was spaced, cased and quoted.
 ///
-/// `basic` counts as well as `bearer`: it is the same header carrying the same credential, and a
-/// base64 user:password is no less a secret for being the older spelling.
+/// Any scheme counts, `bearer` and `basic` among them: it is the same header carrying the same
+/// credential, and a base64 user:password is no less a secret for being the older spelling.
 fn redact_bearer(raw: &str) -> String {
-    rewrite(raw, header_colon, bearer_rule)
+    rewrite(raw, rules::header_colon, rules::bearer_rule)
 }
 
-/// The header name the bearer rule starts at.
-const AUTHORIZATION: &[u8] = b"authorization";
-
-fn bearer_rule(bytes: &[u8], at: usize) -> Option<Rewrite> {
-    let after_keyword = match_word(bytes, at, AUTHORIZATION)?;
-    let after_colon = match_byte(bytes, skip_spaces(bytes, after_keyword), b':')?;
-    let scheme_start = skip_spaces(bytes, after_colon);
-    let after_scheme = match_word(bytes, scheme_start, b"bearer")
-        .or_else(|| match_word(bytes, scheme_start, b"basic"))?;
-    // A boundary marker stands where a byte was removed between the scheme and its token.
-    let token_start = take_while(bytes, after_scheme, |byte| {
-        is_space_byte(byte) || byte == strip::BOUNDARY_BYTE
-    });
-    if token_start == after_scheme {
-        return None;
-    }
-    let token_end = take_while(bytes, token_start, is_value_byte);
-    if token_end == token_start {
-        return None;
-    }
-    Some(Rewrite {
-        end: token_end,
-        kept_end: after_scheme,
-        joiner: " ",
-    })
-}
-
-/// The next `:` and the one place [`bearer_rule`] can start to reach it.
-///
-/// The rule wants `authorization`, any spaces, then the colon. The name ends in a letter, so it
-/// ends where the spaces before the colon begin and starts its own length before that.
-fn header_colon(bytes: &[u8], from: usize) -> Option<Anchor> {
-    let colon = first_match(bytes, from, |byte| byte == b':')?;
-    let name_end = run_start(bytes, colon, is_space_byte);
-    let starts = match name_end.checked_sub(AUTHORIZATION.len()) {
-        Some(start) => start..start + 1,
-        None => 0..0,
-    };
-    Some(Anchor { at: colon, starts })
-}
-
-/// `api_key=`, `secret:`, `token = `, … and whatever value follows.
+/// `api_key=`, `secret:`, `"token": "..."`, … and whatever value follows.
 fn redact_assignments(raw: &str) -> String {
-    rewrite(raw, assignment_separator, assignment_rule)
-}
-
-fn assignment_rule(bytes: &[u8], at: usize) -> Option<Rewrite> {
-    let after_keyword = match_credential_keyword(bytes, at)?;
-    // `AWS_SECRET_ACCESS_KEY=` is a keyword with the rest of a name after it. Requiring the
-    // separator to follow the keyword itself would redact only the spellings that happen to
-    // end on one, which is a minority of the names credentials actually have.
-    let name_end = take_while(bytes, after_keyword, is_name_byte);
-    let separator = skip_spaces(bytes, name_end);
-    let after_separator =
-        match_byte(bytes, separator, b'=').or_else(|| match_byte(bytes, separator, b':'))?;
-    let value_start = skip_spaces(bytes, after_separator);
-    let value_end = take_while(bytes, value_start, is_value_byte);
-    if value_end == value_start {
-        return None;
-    }
-    Some(Rewrite {
-        end: value_end,
-        kept_end: name_end,
-        joiner: "=",
+    let mut query = rules::QueryRun::default();
+    rewrite(raw, rules::assignment_separator, |bytes, at| {
+        rules::assignment_rule(bytes, at, &mut query)
     })
-}
-
-/// The next `=` or `:` and the places [`assignment_rule`] can start to reach it.
-///
-/// The rule wants a keyword, the rest of the name, any spaces, then the separator. A keyword is
-/// made of name bytes, so the whole match up to the spaces lies in the run of name bytes that
-/// ends where those spaces begin, and it can start anywhere in that run.
-///
-/// Every start in that run reaches the same separator and the same value: the rule reads on from
-/// the keyword to the end of the run whichever start it came from. So whether a value follows is
-/// decided here, once, and a separator with none allows no start. Left to the rule, each start
-/// of a name like `token_token_token_…` read the rest of it again before finding that out. Only
-/// the first byte of the value is read: a value that is there is read by the rule that claims it,
-/// and the text is then consumed.
-fn assignment_separator(bytes: &[u8], from: usize) -> Option<Anchor> {
-    let separator = first_match(bytes, from, |byte| (byte == b'=') | (byte == b':'))?;
-    let name_end = run_start(bytes, separator, is_space_byte);
-    let name_start = run_start(bytes, name_end, is_name_byte);
-    if name_start == name_end || !has_value(bytes, separator + 1) {
-        return Some(Anchor {
-            at: separator,
-            starts: 0..0,
-        });
-    }
-    Some(Anchor {
-        at: separator,
-        starts: name_start..name_end,
-    })
-}
-
-/// Whether a value starts after `from`, past any spaces: the check [`assignment_rule`] makes
-/// before it redacts anything.
-fn has_value(bytes: &[u8], from: usize) -> bool {
-    let value_start = skip_spaces(bytes, from);
-    bytes
-        .get(value_start)
-        .is_some_and(|byte| is_value_byte(*byte))
 }
 
 /// The password half of `scheme://user:password@host`.
 fn redact_url_passwords(raw: &str) -> String {
-    rewrite(raw, scheme_separator, url_password_rule)
-}
-
-/// What ends a scheme and opens the authority of a URL.
-const SCHEME_SEPARATOR: &[u8] = b"://";
-
-fn url_password_rule(bytes: &[u8], at: usize) -> Option<Rewrite> {
-    if !bytes.get(at)?.is_ascii_alphabetic() {
-        return None;
-    }
-    let scheme_end = take_while(bytes, at + 1, is_scheme_byte);
-    let after_scheme = match_word(bytes, scheme_end, SCHEME_SEPARATOR)?;
-    let password = url_password(bytes, after_scheme)?;
-    Some(Rewrite {
-        end: password.end,
-        kept_end: password.start,
-        joiner: "",
-    })
-}
-
-/// Where the password of the URL whose `://` ends at `after_scheme` starts and ends.
-///
-/// `None` unless the authority is `user:password@`, the user optional and the password not: a
-/// URL that has no password, or whose userinfo is never closed by an `@`, is left as it is.
-fn url_password(bytes: &[u8], after_scheme: usize) -> Option<Range<usize>> {
-    let user_end = take_while(bytes, after_scheme, |byte| {
-        !matches!(
-            byte,
-            b' ' | b'\t' | b'\n' | b'\r' | b':' | b'/' | b'?' | b'#'
-        )
-    });
-    // The user half is optional: `redis://:hunter2@db/main` is what a URL looks like when
-    // only a password was configured.
-    let password_start = match_byte(bytes, user_end, b':')?;
-    let password_end = take_while(bytes, password_start, |byte| {
-        !matches!(
-            byte,
-            b' ' | b'\t' | b'\n' | b'\r' | b'@' | b'/' | b'?' | b'#'
-        )
-    });
-    if password_end == password_start || bytes.get(password_end) != Some(&b'@') {
-        return None;
-    }
-    Some(password_start..password_end)
-}
-
-/// What a URL's scheme is made of after its first letter, and the marker a removed byte left in
-/// it, which parts nothing: see [`is_name_byte`].
-fn is_scheme_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric()
-        | (byte == b'+')
-        | (byte == b'.')
-        | (byte == b'-')
-        | (byte == strip::BOUNDARY_BYTE)
-}
-
-/// The next `:` and the places [`url_password_rule`] can start to reach it.
-///
-/// The rule wants a letter, the rest of a scheme, then `://`, then a userinfo with a password in
-/// it. A colon that does not open `://`, or opens a URL with no password to redact, allows no
-/// start; one that does allows any start in the run of scheme bytes that ends at it.
-///
-/// Every start in that run reaches the same authority, so the answer is found here, once, and
-/// not by each start of a scheme like `a.a.a.…` reading the rest of the text again. The
-/// check stops at a `/`, and the next `://` has one right after its colon, so no byte is read
-/// for two separators.
-fn scheme_separator(bytes: &[u8], from: usize) -> Option<Anchor> {
-    let colon = first_match(bytes, from, |byte| byte == b':')?;
-    let starts = match match_word(bytes, colon, SCHEME_SEPARATOR) {
-        Some(after_scheme) if url_password(bytes, after_scheme).is_some() => {
-            run_start(bytes, colon, is_scheme_byte)..colon
-        }
-        _ => 0..0,
-    };
-    Some(Anchor { at: colon, starts })
+    rewrite(raw, rules::scheme_separator, rules::url_password_rule)
 }
 
 /// What one rule matched: where the match ends, and what stands in its place.
@@ -360,6 +253,18 @@ struct Rewrite {
     end: usize,
     kept_end: usize,
     joiner: &'static str,
+    /// What follows the marker: the closing quote of a value whose glued tail was redacted with it.
+    tail: &'static str,
+}
+
+/// What a rule makes of a place it was asked about.
+enum Outcome {
+    /// Redact this span.
+    Redact(Rewrite),
+    /// A match that is not a credential, such as `token: expired` or `max_tokens: 100000`. The scan
+    /// steps over it to `end` and leaves it, so the value is read once however many starts the
+    /// name had.
+    Keep { end: usize },
 }
 
 /// Scans left to right, letting `rule` claim a span starting at a word boundary.
@@ -373,7 +278,7 @@ struct Rewrite {
 fn rewrite(
     raw: &str,
     locate: impl Fn(&[u8], usize) -> Option<Anchor>,
-    rule: impl Fn(&[u8], usize) -> Option<Rewrite>,
+    mut rule: impl FnMut(&[u8], usize) -> Option<Outcome>,
 ) -> String {
     let bytes = raw.as_bytes();
     let mut out = String::with_capacity(raw.len());
@@ -382,33 +287,24 @@ fn rewrite(
     let mut from = 0;
     while let Some(at) = candidates.next_from(bytes, from) {
         from = at + 1;
-        if !starts_a_word(bytes, at) {
-            continue;
-        }
-        let Some(found) = rule(bytes, at) else {
-            continue;
+        let found = match rule(bytes, at) {
+            None => continue,
+            Some(Outcome::Keep { end }) => {
+                from = end;
+                continue;
+            }
+            Some(Outcome::Redact(found)) => found,
         };
         out.push_str(&span(raw, copied, at));
         out.push_str(&as_text(bytes, at, found.kept_end));
         out.push_str(found.joiner);
         out.push_str(REDACTED);
+        out.push_str(found.tail);
         copied = found.end;
         from = found.end;
     }
     out.push_str(&span(raw, copied, raw.len()));
     out
-}
-
-/// The `\b` the patterns open with: a match may not start inside a word.
-///
-/// An underscore counts as a boundary here even though `\w` counts it as a word character. The
-/// spelling that matters is `OPENAI_API_KEY`, and treating `_` as part of the preceding word is
-/// what let every screaming-snake-case credential walk past the scanner untouched.
-fn starts_a_word(bytes: &[u8], at: usize) -> bool {
-    match at.checked_sub(1).and_then(|before| bytes.get(before)) {
-        Some(byte) => !byte.is_ascii_alphanumeric(),
-        None => true,
-    }
 }
 
 fn match_word(bytes: &[u8], at: usize, word: &[u8]) -> Option<usize> {
@@ -417,16 +313,6 @@ fn match_word(bytes: &[u8], at: usize, word: &[u8]) -> Option<usize> {
         .get(at..end)?
         .eq_ignore_ascii_case(word)
         .then_some(end)
-}
-
-/// `api[_-]?key`, the one keyword with a shape rather than a spelling.
-fn match_api_key(bytes: &[u8], at: usize) -> Option<usize> {
-    let after_api = match_word(bytes, at, b"api")?;
-    let after_separator = match bytes.get(after_api) {
-        Some(b'_' | b'-') => after_api + 1,
-        _ => after_api,
-    };
-    match_word(bytes, after_separator, b"key")
 }
 
 fn match_byte(bytes: &[u8], at: usize, expected: u8) -> Option<usize> {
@@ -525,9 +411,10 @@ fn is_unsafe_to_render(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::rules::{has_value, url_password};
     use super::{
-        Anchor, Rewrite, ends_awaiting_value, has_value, is_stripped_byte, program_name, rewrite,
-        span, stderr_text, url_password,
+        Anchor, Outcome, Rewrite, ends_awaiting_value, is_stripped_byte, program_name, rewrite,
+        span, stderr_text,
     };
 
     /// The fixture a vendor child writes in the port's own process test.
@@ -538,7 +425,7 @@ mod tests {
     /// the words around the credential stay readable.
     #[test]
     fn an_assignment_shaped_message_keeps_its_name_and_the_words_around_it() {
-        let received = stderr_text("session refused, token: expired, sign in again");
+        let received = stderr_text("session refused, token: abc123, sign in again");
         let expected = "session refused, token=[REDACTED], sign in again";
         assert_eq!(
             received, expected,
@@ -561,11 +448,12 @@ mod tests {
                     })
                 },
                 |_, at| {
-                    (at == 1).then_some(Rewrite {
+                    (at == 1).then_some(Outcome::Redact(Rewrite {
                         end: 3,
                         kept_end: 1,
                         joiner: "=",
-                    })
+                        tail: "",
+                    }))
                 },
             )
         });
@@ -666,11 +554,11 @@ mod tests {
 
     #[test]
     fn leaves_a_keyword_inside_a_longer_word_alone() {
-        assert_eq!(stderr_text("mytoken=v"), "mytoken=v");
-        assert_eq!(
-            stderr_text("a_token_count_of=3"),
-            "a_token_count_of=[REDACTED]"
-        );
+        // The last part of a name is a credential's: `mytoken` is a name, `mytokenizer` is a word.
+        assert_eq!(stderr_text("mytoken=v"), "mytoken=[REDACTED]");
+        assert_eq!(stderr_text("mytokenizer=v"), "mytokenizer=v");
+        // A number under a name that counts tokens is a count.
+        assert_eq!(stderr_text("a_token_count_of=3"), "a_token_count_of=3");
     }
 
     /// The spellings credentials actually have. Each of these walked past the scanner while an
@@ -808,6 +696,10 @@ mod tests {
             "noise Authorization:",
             "noise authorization: Bearer",
             "noise Authorization: basic ",
+            "noise {\"api_key\":",
+            "noise {\"Authorization\": \"Bearer",
+            "noise accessToken",
+            "noise Cookie:",
         ] {
             assert!(
                 ends_awaiting_value(dropped),
@@ -862,8 +754,9 @@ mod tests {
             ("=:", true),
             ("", false),
             ("   ", false),
-            (",", false),
-            ("  ;x", false),
+            // Whether it is a value is the rule's to say; the locator only asks if anything stands.
+            (",", true),
+            ("  ;x", true),
         ] {
             assert_eq!(
                 has_value(text.as_bytes(), 0),
@@ -895,6 +788,90 @@ mod tests {
                 url_password(text.as_bytes(), 0),
                 expected,
                 "expected the password of {text:?} to span {expected:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::bounded;
+    use crate::normalize::TextLimit;
+
+    /// Text the redactor removes or replaces is not a cut: a host learns that a message was
+    /// shortened only when the bound shortened it.
+    #[test]
+    fn only_the_bound_marks_a_message_as_cut() {
+        let limit = TextLimit::ErrorMessage.max_code_points();
+        let replaced = bounded(
+            "\u{1b}[31mrefused\u{1b}[0m: API_KEY=sk-live-1234567890",
+            TextLimit::ErrorMessage,
+        );
+        assert_eq!(
+            (replaced.text.as_str(), replaced.truncated),
+            ("refused: API_KEY=[REDACTED]", false),
+            "expected stripped and replaced text not to count as cut"
+        );
+
+        let long = bounded(&"x".repeat(limit + 10), TextLimit::ErrorMessage);
+        assert!(
+            long.truncated && long.text.chars().count() <= limit,
+            "expected the bound to cut {} code points to at most {limit} and say so | received truncated {} with {}",
+            limit + 10,
+            long.truncated,
+            long.text.chars().count()
+        );
+    }
+}
+
+#[cfg(test)]
+mod corpus_tests {
+    use super::stderr_text;
+    use crate::testing::redaction::{BENIGN, LEAKS};
+
+    #[test]
+    fn every_leak_loses_its_credential_and_keeps_its_words() {
+        for leak in LEAKS {
+            let shown = stderr_text(leak.text);
+            assert!(
+                !shown.contains(leak.secret),
+                "expected {:?} without {:?} | received: {shown:?}",
+                leak.text,
+                leak.secret
+            );
+            for kept in leak.keeps {
+                assert!(
+                    shown.contains(kept),
+                    "expected {:?} to keep {kept:?} | received: {shown:?}",
+                    leak.text
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_benign_message_comes_back_byte_for_byte() {
+        for message in BENIGN {
+            let shown = stderr_text(message);
+            assert_eq!(
+                &shown, message,
+                "expected an ordinary message unchanged | received: {shown:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn redacting_what_was_redacted_changes_nothing() {
+        for text in LEAKS
+            .iter()
+            .map(|leak| leak.text)
+            .chain(BENIGN.iter().copied())
+        {
+            let once = stderr_text(text);
+            let twice = stderr_text(&once);
+            assert_eq!(
+                once, twice,
+                "expected one pass to be a fixed point for {text:?}"
             );
         }
     }

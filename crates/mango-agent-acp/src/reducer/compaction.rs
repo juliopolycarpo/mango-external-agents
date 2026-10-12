@@ -109,6 +109,9 @@ impl Compactions {
 struct Compaction {
     summary: Summary,
     error: Option<String>,
+    /// Whether the bound removed text from the redacted error. Text redaction itself stripped or
+    /// replaced is not counted: the error was redacted first, so what the bound cut is what is
+    /// missing from what a host receives, not from what the agent sent.
     error_cut: bool,
 }
 
@@ -242,10 +245,7 @@ impl Reducer {
             }
             MaybeUndefined::Value(error) => {
                 // Redacted before it is cut, like every other agent error text.
-                let bounded = normalize::bound_text(
-                    &mango_external_agents::redact::stderr_text(&error),
-                    TextLimit::Detail,
-                );
+                let bounded = mango_external_agents::redact::bounded(&error, TextLimit::Detail);
                 compaction.error_cut = bounded.truncated;
                 compaction.error = Some(bounded.text);
                 true

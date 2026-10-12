@@ -238,3 +238,33 @@ fn a_value_that_is_a_credential_name_is_consumed_as_the_value_across_a_removed_b
         reference::stderr_text(marked)
     );
 }
+
+/// A removed byte leaves a marker in the text the rules read, and the marker is gone from what
+/// they return, so a name that the marker parted from the word before it (`Passwd<ESC>Cookie`) was
+/// read as two names the first time and one the second, and a second call took more out. The
+/// redactor reads again while the text still changes, when it carried a marker, so a second call
+/// finds nothing more. Each input here changed on a second call before that.
+#[test]
+fn text_that_carried_a_removed_byte_is_left_alone_by_a_second_call() {
+    for raw in [
+        "PasswdCookie:\u{61c},\u{1b}(B{\u{85}  \u{9d}x]\u{1}:",
+        "Cookie=\"TokenPasswd\u{7f}\0\"cookieexpiredredis\u{1b}]0;'\"",
+        "Bearer\u{1b}[tokensCookie://Basicnot setAccesspwdaccess",
+        "BEARER\u{200e}Passwdcookie:\u{1b}]0;-@?API-KEY\u{1f34b}api",
+        "\u{1b}(BZ\u{9b}:PasswdCookie=\u{1b}[ qPASSWORD  \u{2028}",
+        "Signaturepasswordsecret\u{1b}[31m\\\"\\\u{1b}apiauthorizationSECRETCookie:,credential",
+        "@\r401Basic\u{1}tokensCookie:\rSECRETkeynot set",
+        "\u{1b}(B\u{9b}secret\u{1b}[ qcookie=:,+xDigest",
+        // A name that ends in `cookie` is a cookie header from whichever of its starts is asked.
+        "TokenZZZZZZxSet-Cookie: ;sid=1 ",
+        "session_token_cookie: ;a=b",
+    ] {
+        let once = stderr_text(raw);
+        let twice = stderr_text(&once);
+        assert_eq!(
+            once, twice,
+            "expected a second call over {once:?} (from {raw:?}) to change nothing | received: \
+             {twice:?}"
+        );
+    }
+}

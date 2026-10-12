@@ -119,11 +119,14 @@ impl JsonRpcError {
     /// The failure this represents, with the peer's structure kept.
     ///
     /// The message is redacted of credential-shaped text, as a stderr tail is: a peer that fails
-    /// while describing the request it was making may print the header it sent.
+    /// while describing the request it was making may print the header it sent. It is then bounded
+    /// like the message of a terminal, since a frame may be a megabyte and redaction can grow it.
     pub fn into_vendor_error(self, code: ErrorCode, request_id: Option<String>) -> VendorError {
         let retryable = jsonrpc_code_is_retryable(self.code);
-        let mut error = VendorError::new(code, crate::redact::stderr_text(&self.message))
-            .with_vendor_code(self.code.to_string(), retryable);
+        let message =
+            crate::redact::bounded(&self.message, crate::normalize::TextLimit::ErrorMessage).text;
+        let mut error =
+            VendorError::new(code, message).with_vendor_code(self.code.to_string(), retryable);
         error.request_id = request_id;
         error
     }
@@ -405,6 +408,19 @@ impl std::fmt::Display for PeerTermination {
             ),
         }
     }
+}
+
+/// What this side says of an `error` member it could not read as an error object.
+///
+/// A fixed description of its JSON type and nothing the peer wrote: the member can hold anything,
+/// under keys a redactor reading `name=value` cannot see, and a stand-in that quoted it would carry
+/// that text to the host. For example, a member that is a string reads as `an error member that
+/// is a JSON string, not an error object`.
+fn unreadable_error_message(error: &Value) -> String {
+    format!(
+        "an error member that is a JSON {}, not an error object",
+        json_value_type(error)
+    )
 }
 
 fn json_value_type(value: &Value) -> &'static str {
@@ -1265,8 +1281,8 @@ pub enum CallFailureCause {
     /// `-0`. Nothing this side says about itself ever appears in this variant, with one
     /// exception: an `error` member that is anything else (`null`, a string, an object with
     /// a `code` of `"x"` or `1.0`) could not be read as one, and what is here is then this
-    /// side's stand-in for it, the code `-32603` and, for a message, the member written
-    /// again as JSON. The stand-in cannot be told from a peer's own `-32603` by what it
+    /// side's stand-in for it, the code `-32603` and, for a message, a fixed
+    /// description of the member's JSON type, quoting nothing the peer wrote. The stand-in cannot be told from a peer's own `-32603` by what it
     /// holds; [`CallFailure::peer_error_was_unreadable`] tells them apart.
     ///
     /// An array is not an error object either. One of exactly such a code and a message, with
@@ -1329,8 +1345,8 @@ impl CallFailure {
     /// `{"code":1.0,"message":"m"}` are such members.
     ///
     /// The cause of such a failure is still [`CallFailureCause::Peer`], and the error in it
-    /// is this side's stand-in: the code `-32603` and, for a message, the member written
-    /// again as JSON. The one exception is an array of exactly such a code and a message,
+    /// is this side's stand-in: the code `-32603` and, for a message, a fixed
+    /// description of the member's JSON type. The one exception is an array of exactly such a code and a message,
     /// with or without data after them: what it holds is in the cause, as it always was, and
     /// this is `true` for it all the same.
     /// A peer that answers with its own `-32603` gives the same code and `false` here. It is
@@ -4830,7 +4846,7 @@ async fn dispatch_frame(
                 Err(Failed {
                     body: read.unwrap_or_else(|_| JsonRpcError {
                         code: -32603,
-                        message: error.to_string(),
+                        message: unreadable_error_message(&error),
                         data: None,
                     }),
                     cause,
@@ -5711,11 +5727,17 @@ mod tests {
     #[tokio::test]
     async fn a_null_or_malformed_error_member_still_takes_the_error_path() {
         let cases = [
-            (r#"{"id":"1","error":null}"#, "null"),
-            (r#"{"id":"1","error":"boom"}"#, r#""boom""#),
+            (
+                r#"{"id":"1","error":null}"#,
+                "an error member that is a JSON null, not an error object",
+            ),
+            (
+                r#"{"id":"1","error":"boom"}"#,
+                "an error member that is a JSON string, not an error object",
+            ),
             (
                 r#"{"id":"1","error":{"code":"x"},"result":1}"#,
-                r#"{"code":"x"}"#,
+                "an error member that is a JSON object, not an error object",
             ),
         ];
         for (frame, message) in cases {
@@ -5730,6 +5752,47 @@ mod tests {
                 vendor.vendor_code.as_deref(),
                 Some("-32603"),
                 "expected the internal-error code for {frame}"
+            );
+        }
+    }
+
+    /// A frame can be a megabyte and redaction can grow what it keeps, so the message of an
+    /// error the peer sent is bounded like the message of a terminal.
+    #[test]
+    fn a_peers_error_message_is_bounded_after_it_is_redacted() {
+        let bound = crate::normalize::TextLimit::ErrorMessage.max_code_points();
+        let big = JsonRpcError {
+            code: -32603,
+            message: "token=abc ".repeat(100_000),
+            data: None,
+        };
+        let vendor = big.into_vendor_error(crate::ErrorCode::from_static("peer-call-failed"), None);
+        assert!(
+            vendor.message.chars().count() <= bound && !vendor.message.contains("abc"),
+            "expected a redacted message within {bound} code points | received {} code points",
+            vendor.message.chars().count()
+        );
+    }
+
+    /// A malformed `error` member is stood in for by a description of its type, because quoting
+    /// it would carry whatever it holds, under keys no redactor reads, across to the host.
+    #[tokio::test]
+    async fn a_malformed_error_member_is_not_quoted_in_the_stand_in() {
+        let frames = [
+            r#"{"id":"1","error":{"message":"x","api_key":"sk-live-0123456789"}}"#,
+            r#"{"id":"1","error":{"code":"x","message":"Authorization: Bearer top-secret-token"}}"#,
+            r#"{"id":"1","error":["sk-live-0123456789"]}"#,
+            r#"{"id":"1","error":"sk-live-0123456789"}"#,
+        ];
+        for frame in frames {
+            let error = outcome_of(frame).await.expect_err("expected a failure");
+            let Error::Vendor(vendor) = error else {
+                panic!("expected a vendor failure for {frame}, received {error:?}");
+            };
+            assert!(
+                !vendor.message.contains("sk-live") && !vendor.message.contains("top-secret"),
+                "expected a stand-in that quotes nothing the peer wrote for {frame} | received: {:?}",
+                vendor.message
             );
         }
     }

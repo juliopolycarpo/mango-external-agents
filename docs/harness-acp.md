@@ -248,9 +248,16 @@ the agent's code as `vendor_code` and its message, with whatever it put in `data
 message is redacted of credential-shaped text and then bounded. So is the message of a refused setup
 request, which is returned as an error and redacted where it is made, and so are the title and
 description of an agent's notice and the `error` of a compaction. In `data`, every string under a
-credential-named key is replaced, as is the `value` beside a credential-named `name`, because the
-redactor does not read `"api_key":"..."`. The code and the words around the credentials stay
-readable. The session stays usable, as it does after a
+credential-named key is replaced (a number too, unless the name counts tokens, as `max_tokens` does:
+the name must hold `token` and no other credential word, and be followed by the plural or a count
+word, so `account_token` and `secret_tokens` count nothing), as are the `value` beside a
+credential-named `name` or `key` or `header` and the second element of a two-entry pair array such
+as `["Authorization", "Bearer x"]`. An array or object under a credential-named key becomes one
+`"[REDACTED]"`, so redacting never makes `data` larger; a plain list of counts under a count name
+stays a list. A string that holds JSON text is read by the redactor, which reads quoted
+pairs, so `"{\"api_key\":\"sk-x\"}"` is covered too. The agent's own code is redacted like its
+message, and an ordinary code (`-32000`, `rate_limit_exceeded`) reads as it was sent. The words
+around the credentials stay readable. The session stays usable, as it does after a
 `refusal` or `max_tokens` stop: the agent answered, so the connection is as healthy as after
 any answer. The failed turn's parked questions are withdrawn with ACP's `cancelled` outcome, the
 calls it left running are closed as failed, and the next turn begins clean. A host `cancel`
@@ -416,7 +423,7 @@ A `notice` becomes `EventKind::Notice { severity, title, description }`:
 
 - `severity` is `"info"`, `"warning"` or `"error"`. Any other string the agent sent is kept as
   `{"other": "<its spelling>"}`, to be shown generically; a spelling with nothing left once
-  sanitised is read as `"info"`. It is a presentation hint: an `error` notice does not fail the
+  sanitised is read as `"info"` (the spelling is redacted before it is kept). It is a presentation hint: an `error` notice does not fail the
   turn, and only the prompt's own answer ends one.
 - `title` is cut to a title's length and `description` to a detail's, both sanitised and redacted of
   credential-shaped text before they are cut. `_meta` is not carried.
@@ -456,10 +463,11 @@ A compaction becomes one activity, the same shape the Codex harness gives its ow
   or resource block is dropped, as in an agent message. A chunk appends; a `summary` on an update
   replaces everything so far; `null`, `[]` and a replacement with no text block clear it
   (`ActivityContent::Empty`); an omitted `summary` changes nothing. Every update carries the whole
-  summary so far, sanitised and cut to a detail's length as it accumulates (`truncated` says when),
+  summary so far, sanitised and cut to a detail's length as it accumulates (`truncated` says when
+  the cut removed text, not when redaction replaced some),
   and updates are coalesced on the tool calls' own five-second interval, with whatever is held
   delivered ahead of the completion.
-- **Error.** Patched the same way and carried as the activity's `detail`, on an update while the
+- **Error.** Patched the same way, redacted of credential-shaped text before it is cut, and carried as the activity's `detail`, on an update while the
   compaction runs and on the result when it ends, which is where a failed tool call's words go. A
   cleared error is an empty `detail`.
 - **Left open.** A compaction the agent never ends is closed with the turn like a tool call left

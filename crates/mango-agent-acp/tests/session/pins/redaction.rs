@@ -186,12 +186,22 @@ async fn a_credential_in_data_is_redacted_and_its_siblings_are_kept() {
             "credentials": { "user": "u-0123456789", "pass": "pw-0123456789" },
             "env": [{ "name": "OPENAI_API_KEY", "value": "ev-0123456789" }],
             "note": "line one\nAuthorization:\nBearer nl-0123456789",
+            "headers": [["Authorization", "Bearer pa-0123456789"]],
+            "pairs": [{ "Name": "X_AUTH_TOKEN", "Value": "pn-0123456789" }],
+            "cookie": "sid=ck-0123456789",
+            "privateKey": "pk-0123456789",
+            "pin": { "auth": 1234567890 },
             "retry_after": 30,
         },
     }))
     .await;
 
     for secret in [
+        "pa-0123456789",
+        "pn-0123456789",
+        "ck-0123456789",
+        "pk-0123456789",
+        "1234567890",
         "sk-live-0123456789",
         "abc.def.ghi",
         "rt-0123456789",
@@ -212,6 +222,53 @@ async fn a_credential_in_data_is_redacted_and_its_siblings_are_kept() {
             failure.message.contains(kept),
             "expected data to keep {kept:?} | received: {:?}",
             failure.message
+        );
+    }
+}
+
+/// A message that puts a URL's password just before the bound, then its closing `@`: cut first,
+/// the bound leaves `redis://app:hunter2`, which no rule reads as a credential.
+fn password_at_the_bound(limit: mango_external_agents::normalize::TextLimit) -> String {
+    let url = " redis://app:hunter2";
+    format!(
+        "{}{url}@db",
+        "x".repeat(limit.max_code_points() - url.len())
+    )
+}
+
+/// A refused setup request is returned as an error and never passes the sink, so the agent's
+/// message is redacted and bounded where it is made, in that order, however large the frame was.
+#[tokio::test]
+async fn a_setup_error_is_redacted_before_it_is_bounded_and_then_bounded() {
+    use mango_external_agents::normalize::TextLimit;
+    let cases = [
+        (
+            "a password at the bound",
+            password_at_the_bound(TextLimit::ErrorMessage),
+        ),
+        ("a very large message", "e".repeat(200_000)),
+    ];
+    for (what, message) in cases {
+        let launcher = FakeLauncher::new();
+        launcher.push(
+            FakeAcpAgent::new()
+                .refusing_new_session(-31_004, message)
+                .process(),
+        );
+        let error = refusal(
+            AcpHarness::new(profile())
+                .open_session(&host(&launcher), OpenSession::new("chat-1"))
+                .await,
+        );
+        let Error::Vendor(failure) = error.cause() else {
+            panic!("expected Error::Vendor for {what} | received: {error:?}");
+        };
+        let bound = TextLimit::ErrorMessage.max_code_points();
+        assert!(
+            !failure.message.contains("hunter2") && failure.message.chars().count() <= bound,
+            "expected {what} redacted and within {bound} code points | received {} code points ending {:?}",
+            failure.message.chars().count(),
+            &failure.message[failure.message.len().saturating_sub(40)..]
         );
     }
 }

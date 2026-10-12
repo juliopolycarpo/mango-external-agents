@@ -10,8 +10,9 @@
 //! One pass over the text. Nothing here looks back, and a scan for an OSC terminator stops at the
 //! next escape, so the work is linear in the length of the text.
 
+use super::rules::{AUTHORIZATION, names_a_keyword};
 use super::scan::{count_steps, first_match};
-use super::{AUTHORIZATION, is_unsafe_to_render, match_credential_keyword, match_word};
+use super::{is_unsafe_to_render, match_word};
 
 /// Marks where a removed byte stood in front of a credential name. Every C0 control is stripped
 /// from the input, so it cannot already be in the text; it is not a letter, so a name after it
@@ -85,10 +86,17 @@ const CHARSET_INTRODUCERS: &[u8] = b"()*+";
 /// space: a value the rules are reading goes on through it, and a half-credential after a removed
 /// byte is not left in the clear. [`remove_boundaries`] takes it out of the redacted text.
 pub(super) fn strip_control_characters(raw: &str) -> String {
+    strip_marking(raw).0
+}
+
+/// [`strip_control_characters`], and whether it left a [`BOUNDARY`] in the text it returns. The
+/// marker is a control character, which the stripper removes, so one in the text is its own.
+pub(super) fn strip_marking(raw: &str) -> (String, bool) {
     let bytes = raw.as_bytes();
     let mut out = String::with_capacity(raw.len());
     let mut at = 0;
     let mut removed = false;
+    let mut marked = false;
     loop {
         count_steps(1);
         // Nothing is removed from, or marked in, text that follows a kept character and holds
@@ -118,12 +126,13 @@ pub(super) fn strip_control_characters(raw: &str) -> String {
             && (starts_credential_name(bytes, at) || ends_with_scheme(&out))
         {
             out.push(BOUNDARY);
+            marked = true;
         }
         removed = false;
         out.push(character);
         at = after;
     }
-    out
+    (out, marked)
 }
 
 /// Where the text from `at` first holds a byte a removed character can start with: the end of
@@ -157,7 +166,7 @@ fn starts_a_removed_character(byte: u8) -> bool {
 /// `Authorization` header.
 fn starts_credential_name(bytes: &[u8], at: usize) -> bool {
     count_steps(1);
-    match_credential_keyword(bytes, at).is_some() || match_word(bytes, at, AUTHORIZATION).is_some()
+    names_a_keyword(bytes, at) || match_word(bytes, at, AUTHORIZATION).is_some()
 }
 
 /// Whether `text` ends in an authorization scheme, `Bearer` or `Basic`, whose token the bearer

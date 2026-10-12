@@ -17,6 +17,7 @@ use crate::error::{Error, Result};
 use crate::event::ActivityKind;
 use crate::interaction::{Interaction, InteractionId, InteractionKind};
 use crate::normalize::{self, APPROVAL_MAX_OPTIONS, TextLimit};
+use crate::redact;
 
 /// What the agent is allowed to do. One of the two axes.
 #[derive(
@@ -361,9 +362,7 @@ impl UnsupportedReason {
     /// This reason with its vendor-written explanation bounded.
     fn normalized(self) -> Self {
         match self {
-            Self::Other(reason) => {
-                Self::Other(normalize::bound_text(&reason, TextLimit::Detail).text)
-            }
+            Self::Other(reason) => Self::Other(redact::bounded(&reason, TextLimit::Detail).text),
             reason => reason,
         }
     }
@@ -1742,5 +1741,25 @@ mod tests {
         )]);
 
         assert_eq!(broker_response(Some(&allow), &unanswerable).await, None);
+    }
+    /// A vendor's explanation of why an option is unavailable is its diagnostic text.
+    #[test]
+    fn an_unsupported_reasons_explanation_is_redacted() {
+        let UnsupportedReason::Other(text) =
+            UnsupportedReason::Other(String::from("sandbox off: set API_KEY=sk-live-79 first"))
+                .normalized()
+        else {
+            panic!("expected an explanation back");
+        };
+        assert!(
+            !text.contains("sk-live-79") && text.starts_with("sandbox off: set "),
+            "expected the words kept and the credential redacted | received: {text:?}"
+        );
+        let plain = "not available on this plan";
+        assert_eq!(
+            UnsupportedReason::Other(plain.to_owned()).normalized(),
+            UnsupportedReason::Other(plain.to_owned()),
+            "expected an ordinary explanation unchanged"
+        );
     }
 }

@@ -113,6 +113,25 @@ pub fn parse(output: &str) -> Option<String> {
 mod tests {
     use super::{Comparison, compare, parse};
 
+    /// The probe parses the raw line and stores the token, so a banner the redactor rewrites
+    /// (`token: 1.2.3` reads as an assignment) keeps a version that survives redaction.
+    #[test]
+    fn a_banner_the_redactor_rewrites_still_yields_a_version_that_survives_redaction() {
+        let banner = "tool token: 1.2.3";
+        let redacted = mango_external_agents::redact::stderr_text(banner);
+        assert_eq!(
+            parse(&redacted),
+            None,
+            "expected the redacted banner {redacted:?} to have lost its version | received one"
+        );
+        let version = parse(banner).expect("expected a version off the raw banner");
+        assert_eq!(
+            mango_external_agents::redact::stderr_text(&version),
+            version,
+            "expected the version token to survive redaction | received a different text"
+        );
+    }
+
     #[test]
     fn a_longer_version_compares_against_a_shorter_floor_without_padding_lies() {
         assert_eq!(compare("1.2.3", "1.2"), Comparison::AtLeast);

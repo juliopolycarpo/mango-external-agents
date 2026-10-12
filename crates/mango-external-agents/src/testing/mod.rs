@@ -14,6 +14,7 @@ pub mod conformance;
 mod harness;
 mod launcher;
 mod link;
+pub mod redaction;
 
 pub use broker::{FrozenClock, RecordingBroker};
 pub use harness::FakeHarness;

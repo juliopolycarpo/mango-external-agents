@@ -542,7 +542,21 @@ fn require_supported_handshake_version(handshake: &InitializeResponse) -> Result
 fn missing_rollout(error: &Error, native_session_id: &str) -> bool {
     matches!(error.cause(), Error::Vendor(vendor)
         if vendor.vendor_code.as_deref() == Some("-32600")
-            && vendor.message == format!("no rollout found for thread id {native_session_id}"))
+            && vendor.message
+                == as_shown(&format!("no rollout found for thread id {native_session_id}")))
+}
+
+/// `message` as a host is shown a peer's error message: redacted of credential-shaped text.
+///
+/// The JSON-RPC client redacts the messages it returns, so the text the vendor is expected to send
+/// is compared in the form that arrives. An id that is itself credential-shaped, such as
+/// `token=abc`, would otherwise be redacted out of the answer and never equal the expected text.
+fn as_shown(message: &str) -> String {
+    mango_external_agents::redact::bounded(
+        message,
+        mango_external_agents::normalize::TextLimit::ErrorMessage,
+    )
+    .text
 }
 
 /// Proves a native thread's original workspace before loading it for a resumed conversation.
@@ -575,7 +589,7 @@ async fn preflight_resume_workspace(
 fn thread_not_loaded(error: &Error, native_session_id: &str) -> bool {
     matches!(error.cause(), Error::Vendor(vendor)
         if vendor.vendor_code.as_deref() == Some("-32600")
-            && vendor.message == format!("thread not loaded: {native_session_id}"))
+            && vendor.message == as_shown(&format!("thread not loaded: {native_session_id}")))
 }
 
 /// Rejects a different identity or workspace before a handle can be exposed to the host.

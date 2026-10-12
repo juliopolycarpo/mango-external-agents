@@ -22,6 +22,7 @@
 
 use agent_client_protocol_schema::v1::ErrorCode as AcpErrorCode;
 use mango_external_agents::error::jsonrpc_code_is_retryable;
+use mango_external_agents::normalize::TextLimit;
 use mango_external_agents::{Error, ErrorCode, VendorError};
 
 /// The code a turn's terminal carries when the agent answered `session/prompt` with ACP's
@@ -128,7 +129,9 @@ pub(crate) fn prompt_failure(
 /// any other vendor text; a refusal of a setup request is returned as an error and never passes it.
 ///
 /// Redacted here, whole, with the data appended and before anything cuts it, so both reach the
-/// host redacted. The core's sink redacts a terminal again, which changes nothing a second time.
+/// host redacted. The core's sink redacts a terminal again. A second pass is not promised to be a
+/// no-op for every text (`redact::boundaries` pins inputs where it differs, and each one reveals
+/// nothing), but it is one over the corpus in `testing::redaction`, which is what is held.
 ///
 /// An explicit `"data": null` says nothing, so it reads as no data. The connection already
 /// drops it while parsing; this arm holds the rule for an error built any other way, where the
@@ -136,87 +139,20 @@ pub(crate) fn prompt_failure(
 fn message(error: &agent_client_protocol_schema::v1::Error) -> String {
     let text = match &error.data {
         Some(data) if !data.is_null() => {
-            format!("{} ({})", error.message, redact_credential_keys(data))
+            format!(
+                "{} ({})",
+                error.message,
+                mango_external_agents::redact::structured(data)
+            )
         }
         _ => error.message.clone(),
     };
-    mango_external_agents::redact::stderr_text(&text)
-}
-
-/// `data` with every string under a credential-named key replaced, at any depth, and every other
-/// string redacted on its own.
-///
-/// The redactor reads `api_key=value`, and a JSON object writes the same thing as
-/// `"api_key":"value"`, with a quote between the name and the colon, which it does not read. So the
-/// structure is used while it is still structure. A string anywhere under a key that names a
-/// secret, a token, a password, a credential, an API key or an authorization header becomes
-/// `[REDACTED]`, and so does the `value` of an object whose `name` is such a name, which is how an
-/// environment variable or an HTTP header is written. Every other string is redacted as text before
-/// it is rendered, because rendering escapes a line break into two characters the redactor does not
-/// skip. Numbers and booleans are kept, so `"retry_after":30` and a sibling `"path"` stay readable.
-fn redact_credential_keys(value: &serde_json::Value) -> serde_json::Value {
-    redact_under(value, false)
-}
-
-/// [`redact_credential_keys`] below a point that may already be a credential's.
-fn redact_under(value: &serde_json::Value, credential: bool) -> serde_json::Value {
-    use serde_json::Value;
-    match value {
-        Value::Object(members) => {
-            let named = members
-                .get("name")
-                .and_then(Value::as_str)
-                .is_some_and(names_a_credential);
-            Value::Object(
-                members
-                    .iter()
-                    .map(|(key, member)| {
-                        let secret =
-                            credential || names_a_credential(key) || (named && key == "value");
-                        (key.clone(), redact_under(member, secret))
-                    })
-                    .collect(),
-            )
-        }
-        Value::Array(items) => Value::Array(
-            items
-                .iter()
-                .map(|item| redact_under(item, credential))
-                .collect(),
-        ),
-        Value::String(_) if credential => Value::String(String::from("[REDACTED]")),
-        Value::String(text) => Value::String(mango_external_agents::redact::stderr_text(text)),
-        other => other.clone(),
-    }
-}
-
-/// Whether a JSON key names a credential, however it is cased or separated: `api_key`, `apiKey`,
-/// `refresh-token`, `Authorization`, `client_secret`, `pass`.
-fn names_a_credential(key: &str) -> bool {
-    const NAMES: [&str; 8] = [
-        "secret",
-        "token",
-        "password",
-        "passwd",
-        "pwd",
-        "credential",
-        "apikey",
-        "authorization",
-    ];
-    let squashed: String = key
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .map(|character| character.to_ascii_lowercase())
-        .collect();
-    squashed == "pass" || NAMES.iter().any(|name| squashed.contains(name))
+    mango_external_agents::redact::bounded(&text, TextLimit::ErrorMessage).text
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AUTH_REQUIRED_CODE, names_a_credential, prompt_failure, redact_credential_keys,
-        request_error, vendor_error,
-    };
+    use super::{AUTH_REQUIRED_CODE, prompt_failure, request_error, vendor_error};
     use agent_client_protocol_schema::v1::Error as AcpError;
     use mango_external_agents::Error;
 
@@ -344,56 +280,44 @@ mod tests {
         );
     }
 
+    /// The corpus as an agent sends it: in the message, and as a string inside `data`, where an
+    /// agent that forwards an upstream's JSON body puts it.
     #[test]
-    fn a_key_names_a_credential_however_it_is_cased_or_separated() {
-        let received: Vec<bool> = [
-            "api_key",
-            "apiKey",
-            "API-KEY",
-            "refresh_token",
-            "clientSecret",
-            "Authorization",
-            "password",
-            "pass",
-            "pwd",
-            "path",
-            "retry_after",
-            "key",
-        ]
-        .map(names_a_credential)
-        .to_vec();
-        let expected = vec![
-            true, true, true, true, true, true, true, true, true, false, false, false,
-        ];
-        assert_eq!(
-            received, expected,
-            "expected which keys name a credential: {expected:?} | received: {received:?}"
-        );
-    }
-
-    #[test]
-    fn only_text_under_a_credential_key_is_replaced_at_any_depth() {
-        let data = serde_json::json!({
-            "token": "t-1",
-            "expires": 30,
-            "nested": [{ "password": "p-1", "path": "/repo" }],
-            "tokens": ["t-2", { "inner": "t-3" }],
-            "env": [{ "name": "OPENAI_API_KEY", "value": "v-1" }, { "name": "HOME", "value": "/h" }],
-            "tokens_used": { "count": 4 },
-        });
-        let received = redact_credential_keys(&data);
-        let expected = serde_json::json!({
-            "token": "[REDACTED]",
-            "expires": 30,
-            "nested": [{ "password": "[REDACTED]", "path": "/repo" }],
-            "tokens": ["[REDACTED]", { "inner": "[REDACTED]" }],
-            "env": [{ "name": "OPENAI_API_KEY", "value": "[REDACTED]" }, { "name": "HOME", "value": "/h" }],
-            "tokens_used": { "count": 4 },
-        });
-        assert_eq!(
-            received, expected,
-            "expected text under credential keys replaced: {expected} | received: {received}"
-        );
+    fn every_shape_in_the_corpus_is_redacted_in_the_message_and_in_a_data_string() {
+        use mango_external_agents::testing::redaction::{BENIGN, LEAKS};
+        for leak in LEAKS {
+            let in_message = vendor_error("session/new", &AcpError::new(-31_004, leak.text));
+            let in_data = vendor_error(
+                "session/new",
+                &AcpError::new(-31_004, "refused").data(serde_json::json!(leak.text)),
+            );
+            for failure in [&in_message, &in_data] {
+                assert!(
+                    !failure.message.contains(leak.secret),
+                    "expected {:?} without {:?} | received: {:?}",
+                    leak.text,
+                    leak.secret,
+                    failure.message
+                );
+            }
+            // A data string is shown as JSON, with its quotes escaped, so only the message keeps
+            // its words verbatim.
+            for kept in leak.keeps {
+                assert!(
+                    in_message.message.contains(kept),
+                    "expected {:?} to keep {kept:?} | received: {:?}",
+                    leak.text,
+                    in_message.message
+                );
+            }
+        }
+        for text in BENIGN {
+            let failure = vendor_error("session/new", &AcpError::new(-31_004, *text));
+            assert_eq!(
+                &failure.message, text,
+                "expected an ordinary agent message to reach the host unchanged"
+            );
+        }
     }
 
     #[test]

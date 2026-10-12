@@ -393,16 +393,12 @@ impl EventKind {
     ) -> Option<Self> {
         // Redacted before it is cut, like an error's message: a cut inside a credential leaves its
         // head where no rule recognises it.
-        let title =
-            normalize::bound_text(&crate::redact::stderr_text(title), TextLimit::Title).text;
+        let title = crate::redact::bounded(title, TextLimit::Title).text;
         if title.trim().is_empty() {
             return None;
         }
         let description = description
-            .map(|description| {
-                normalize::bound_text(&crate::redact::stderr_text(description), TextLimit::Detail)
-                    .text
-            })
+            .map(|description| crate::redact::bounded(description, TextLimit::Detail).text)
             .filter(|description| !description.trim().is_empty());
         Some(Self::Notice {
             severity: severity.normalized(),
@@ -421,9 +417,10 @@ impl EventKind {
     ///
     /// [`Error::InvalidVendorValue`](crate::Error::InvalidVendorValue) when an opaque id does not
     /// survive bounding. Such an id is refused rather than shortened: a truncated id echoed back
-    /// to the vendor would name a different object. A [`EventKind::Notice`] whose title has
-    /// nothing to show once sanitised is refused the same way; [`Self::notice`] is how a harness
-    /// finds that out first.
+    /// to the vendor would name a different object. A [`EventKind::Notice`] built by hand whose
+    /// title is blank, or has nothing left once control characters are stripped, is refused the
+    /// same way, with the title as received in the error; [`Self::notice`] returns `None` for
+    /// such a title instead, which is how a harness finds that out first.
     pub fn normalized(self) -> Result<Self> {
         Ok(match self {
             Self::TurnStarted { native_turn_id } => Self::TurnStarted {
@@ -482,7 +479,7 @@ impl EventKind {
                 None => {
                     return Err(crate::Error::InvalidVendorValue {
                         field: "notice title",
-                        received: normalize::bound_text(&title, TextLimit::Title).text,
+                        received: crate::redact::bounded(&title, TextLimit::Title).text,
                     });
                 }
             },
@@ -551,14 +548,15 @@ impl fmt::Debug for NoticeSeverity {
 }
 
 impl NoticeSeverity {
-    /// This severity with a vendor's own spelling bounded like a label.
+    /// This severity with a vendor's own spelling redacted of credential-shaped text and bounded
+    /// like a label.
     ///
     /// A spelling with nothing left once sanitised names no severity, so it becomes
     /// [`NoticeSeverity::Info`], the least a host can make of it.
     fn normalized(self) -> Self {
         match self {
             Self::Other(name) => {
-                let name = normalize::bound_text(&name, TextLimit::ActivityName).text;
+                let name = crate::redact::bounded(&name, TextLimit::ActivityName).text;
                 match name.trim().is_empty() {
                     true => Self::Info,
                     false => Self::Other(name),
@@ -1627,17 +1625,15 @@ fn normalize_error(error: VendorError) -> VendorError {
         code: crate::ErrorCode::new(
             normalize::bound_text(error.code.as_str(), TextLimit::VendorId).text,
         ),
-        message: normalize::bound_text(
-            &crate::redact::stderr_text(&error.message),
-            TextLimit::ErrorMessage,
-        )
-        .text,
+        message: crate::redact::bounded(&error.message, TextLimit::ErrorMessage).text,
         request_id: error
             .request_id
             .map(|id| normalize::bound_text(&id, TextLimit::VendorId).text),
+        // An identifier, but one the vendor chose: a string enum or the first key of an object,
+        // so redacted like the message beside it. An ordinary code reads as it was written.
         vendor_code: error
             .vendor_code
-            .map(|code| normalize::bound_text(&code, TextLimit::VendorId).text),
+            .map(|code| crate::redact::bounded(&code, TextLimit::VendorId).text),
         retryable: error.retryable,
     }
 }
@@ -2428,6 +2424,62 @@ mod tests {
         assert_eq!(error.vendor_code.as_deref(), Some("-32000"));
     }
 
+    /// The three shapes above are the ones the redactor always read. Every shape a vendor prints
+    /// goes through the same two doors, an error's message and a notice's description, and comes
+    /// out without its credential and with the words that tell a host what happened; an ordinary
+    /// message goes through as it was.
+    #[test]
+    fn the_redaction_corpus_holds_through_an_error_and_a_notice() {
+        use crate::testing::redaction::{BENIGN, LEAKS};
+        let through_error = |text: &str| {
+            let kind = EventKind::Error {
+                error: VendorError::new(ErrorCode::from_static("codex-failed"), text),
+            };
+            let EventKind::Error { error } = kind.normalized().expect("expected an error event")
+            else {
+                panic!("expected an error event");
+            };
+            error.message
+        };
+        let through_notice =
+            |text: &str| match EventKind::notice(NoticeSeverity::Warning, "title", Some(text)) {
+                Some(EventKind::Notice { description, .. }) => description.unwrap_or_default(),
+                other => panic!("expected a notice, received {other:?}"),
+            };
+        for leak in LEAKS {
+            for (door, shown) in [
+                ("an error message", through_error(leak.text)),
+                ("a notice description", through_notice(leak.text)),
+            ] {
+                assert!(
+                    !shown.contains(leak.secret),
+                    "expected {door} for {:?} without {:?} | received: {shown:?}",
+                    leak.text,
+                    leak.secret
+                );
+                for kept in leak.keeps {
+                    assert!(
+                        shown.contains(kept),
+                        "expected {door} for {:?} to keep {kept:?} | received: {shown:?}",
+                        leak.text
+                    );
+                }
+            }
+        }
+        for text in BENIGN {
+            assert_eq!(
+                &through_error(text),
+                text,
+                "expected an ordinary message to reach a host unchanged"
+            );
+            assert_eq!(
+                &through_notice(text),
+                text,
+                "expected an ordinary description to reach a host unchanged"
+            );
+        }
+    }
+
     /// A cut before the `@` that closes a URL's password leaves `redis://app:hunter2`, which no rule
     /// recognises, so the text is redacted whole and bounded after.
     #[test]
@@ -2451,6 +2503,128 @@ mod tests {
             "expected the message within {limit} code points | received: {}",
             error.message.chars().count()
         );
+    }
+
+    /// The vendor's own code is an identifier the vendor chose, so it is redacted too, and the
+    /// codes vendors actually send read exactly as they were written.
+    #[test]
+    fn a_vendor_code_is_redacted_and_ordinary_codes_are_unchanged() {
+        let ordinary = [
+            "-32000",
+            "-32603",
+            "429",
+            "rate_limit_exceeded",
+            "max_tokens",
+            "invalid_request_error",
+            "context_length_exceeded",
+            "insufficient_quota",
+            "usageLimitExceeded",
+            "connection-terminated",
+            "error_max_turns",
+            "authentication_failed",
+        ];
+        for code in ordinary {
+            let kind = EventKind::Error {
+                error: VendorError::new(ErrorCode::from_static("codex-failed"), "m")
+                    .with_vendor_code(code, false),
+            };
+            let EventKind::Error { error } = kind.normalized().expect("an error event") else {
+                panic!("expected an error event");
+            };
+            assert_eq!(
+                error.vendor_code.as_deref(),
+                Some(code),
+                "expected the ordinary code {code:?} unchanged"
+            );
+        }
+        let kind = EventKind::Error {
+            error: VendorError::new(ErrorCode::from_static("codex-failed"), "m")
+                .with_vendor_code("api_key=sk-live-0123456789", false),
+        };
+        let EventKind::Error { error } = kind.normalized().expect("an error event") else {
+            panic!("expected an error event");
+        };
+        assert_eq!(
+            error.vendor_code.as_deref(),
+            Some("api_key=[REDACTED]"),
+            "expected a credential-shaped vendor code redacted"
+        );
+    }
+
+    /// A severity the crate has no arm for keeps the vendor's spelling, redacted.
+    #[test]
+    fn a_notice_severity_the_vendor_spelled_is_redacted_and_ordinary_spellings_are_unchanged() {
+        for spelling in ["critical", "debug", "_debug", "fatal-error"] {
+            let kind =
+                EventKind::notice(NoticeSeverity::Other(spelling.to_owned()), "Heads up", None)
+                    .expect("a usable notice")
+                    .normalized()
+                    .expect("a usable notice");
+            assert!(
+                matches!(&kind, EventKind::Notice { severity: NoticeSeverity::Other(name), .. } if name == spelling),
+                "expected the ordinary spelling {spelling:?} unchanged | received: {kind:?}"
+            );
+        }
+        let kind = EventKind::notice(
+            NoticeSeverity::Other(String::from("token=sk-live-0123456789")),
+            "Heads up",
+            None,
+        )
+        .expect("a usable notice")
+        .normalized()
+        .expect("a usable notice");
+        assert!(
+            matches!(&kind, EventKind::Notice { severity: NoticeSeverity::Other(name), .. } if name == "token=[REDACTED]"),
+            "expected a credential-shaped severity redacted | received: {kind:?}"
+        );
+    }
+
+    /// `filler` characters, then a URL whose password the bound would cut off from its closing `@`
+    /// if it ran first, then the `@`.
+    fn cut_inside_a_url_password(limit: TextLimit) -> String {
+        let url = " redis://app:hunter2";
+        format!(
+            "{}{url}@db",
+            "x".repeat(limit.max_code_points() - url.len())
+        )
+    }
+
+    /// A notice's title and description, and the spelling of an unknown severity, are redacted
+    /// before they are cut, as an error's message is: a swap would leave `redis://app:hunter2`.
+    #[test]
+    fn a_notice_is_redacted_before_it_is_cut() {
+        let title = cut_inside_a_url_password(TextLimit::Title);
+        let description = cut_inside_a_url_password(TextLimit::Detail);
+        let severity = cut_inside_a_url_password(TextLimit::ActivityName);
+        let notice = EventKind::notice(NoticeSeverity::Other(severity), &title, Some(&description))
+            .expect("a usable notice");
+        for notice in [
+            notice.clone(),
+            notice.normalized().expect("a usable notice"),
+        ] {
+            let EventKind::Notice {
+                severity,
+                title,
+                description,
+            } = notice
+            else {
+                panic!("expected a notice");
+            };
+            let NoticeSeverity::Other(severity) = severity else {
+                panic!("expected a vendor spelling kept");
+            };
+            for (what, text) in [
+                ("title", title),
+                ("description", description.unwrap_or_default()),
+                ("severity", severity),
+            ] {
+                assert!(
+                    !text.contains("hunter2"),
+                    "expected the {what} redacted before it is cut | received a tail of: {:?}",
+                    &text[text.len().saturating_sub(40)..]
+                );
+            }
+        }
     }
 
     /// A notice is display-only vendor text, but it reaches the same screen as an error.

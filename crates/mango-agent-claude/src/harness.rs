@@ -306,10 +306,24 @@ impl Survey {
                 .map(str::trim)
                 .filter(|line| !line.is_empty())
         };
-        lines()
+        let line = lines()
             .find(|line| self.version.is_some() && version::parse(line) == self.version)
-            .or_else(|| lines().next())
-            .map(str::to_owned)
+            .or_else(|| lines().next())?;
+        // The version was read from the raw line. What a host is shown is that line redacted and
+        // bounded, and opening parses the receipt's copy again: a line the redactor rewrites
+        // (`tool token: 2.1.270` reads as an assignment) would lose its version there and fail
+        // closed. Such a line is shown as the version alone.
+        let shown = mango_external_agents::redact::bounded(
+            line,
+            mango_external_agents::normalize::TextLimit::AccountLabel,
+        )
+        .text;
+        match &self.version {
+            Some(version) if version::parse(&shown).as_ref() != Some(version) => {
+                Some(version.to_string())
+            }
+            _ => Some(shown),
+        }
     }
 
     /// The version as a host should read it: what the CLI reported, bounded by the core.
@@ -680,11 +694,33 @@ pub fn harness() -> Arc<dyn Harness> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CEILING, ClaudeHarness, probed_capabilities, require_supported};
+    use super::{CEILING, ClaudeHarness, Survey, probed_capabilities, require_supported};
     use mango_external_agents::{
         ApprovalRouting, Capabilities, Configuration, Error, Harness, HarnessId, PermissionLevel,
         TransportKind,
     };
+
+    /// What `reported` returns is already redacted, so nothing that holds a survey holds the banner
+    /// as the CLI printed it.
+    #[test]
+    fn the_reported_line_is_the_redacted_one() {
+        let banner = "2.1.270 (Claude Code) token=sk-live-78";
+        let survey = Survey {
+            banner: Some(String::from(banner)),
+            version: crate::version::parse(banner),
+            ..Survey::default()
+        };
+        let reported = survey.reported().unwrap_or_default();
+        assert!(
+            !reported.contains("sk-live-78"),
+            "expected the reported line to be redacted | received {reported:?}"
+        );
+        assert_eq!(
+            crate::version::parse(&reported).map(|version| version.to_string()),
+            Some(String::from("2.1.270")),
+            "expected the reported line to keep its version | received {reported:?}"
+        );
+    }
 
     #[test]
     fn the_ceiling_covers_everything_a_probe_can_report() {
