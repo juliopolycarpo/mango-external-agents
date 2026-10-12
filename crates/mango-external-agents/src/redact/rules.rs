@@ -648,8 +648,16 @@ fn trim_end(bytes: &[u8], start: usize, mut end: usize) -> usize {
 pub(super) fn assignment_separator(bytes: &[u8], from: usize) -> Option<Anchor> {
     let separator = first_match(bytes, from, |byte| (byte == b'=') | (byte == b':'))?;
     let name_end = before_quote(bytes, run_start(bytes, separator, is_space_byte));
+    // The value is looked at first: a separator with none allows no start, and a long name before
+    // one is then not read at all.
+    if !has_value(bytes, separator + 1) {
+        return Some(Anchor {
+            at: separator,
+            starts: 0..0,
+        });
+    }
     let (mut name_start, mut first) = name_run(bytes, name_end);
-    if name_start == name_end || !has_value(bytes, separator + 1) {
+    if name_start == name_end {
         return Some(Anchor {
             at: separator,
             starts: 0..0,
