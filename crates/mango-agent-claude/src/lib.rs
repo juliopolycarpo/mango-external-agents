@@ -4,6 +4,7 @@ pub mod argv;
 pub mod auth;
 pub mod cli_surface;
 pub mod commands;
+pub mod deadlines;
 pub mod harness;
 pub mod help;
 pub mod mcp;

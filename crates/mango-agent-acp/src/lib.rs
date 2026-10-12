@@ -3,6 +3,7 @@
 mod approval_events;
 mod client;
 pub mod content;
+pub mod deadlines;
 pub mod error;
 pub mod harness;
 pub mod permission;

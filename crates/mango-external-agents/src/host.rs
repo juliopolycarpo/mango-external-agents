@@ -153,6 +153,15 @@ impl CancelToken {
 /// Every one of them exists because the vendor is a third-party process whose output is not the
 /// host's to trust: a stalled reader must trigger bounded pressure handling, a long line must
 /// be refused, and a stalled call must end rather than hold a turn open forever.
+///
+/// The timeouts add up along the path of a `close`, a `cancel` or a teardown, and each harness
+/// guide tabulates the sums. A host that wraps its own timeout around one of those operations
+/// does not copy a formula: each harness crate computes the worst case from a `Limits`.
+/// `mango_agent_acp::deadlines::Deadlines`, `mango_agent_claude::deadlines::Deadlines` and
+/// `mango_agent_codex::deadlines::Deadlines` all build with `Deadlines::from_limits(&limits)`
+/// and answer `close_worst_case()`, how long any `close` can take from the call, with one method
+/// per row of that harness's Deadlines table beside it. This crate does not depend on the
+/// harness crates, so those names are not links.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// How many payload events one turn holds before reporting overflow and stopping native work.
@@ -233,21 +242,25 @@ pub struct Limits {
     /// `close` skips the protocol stop and this deadline. In the Codex harness it goes straight
     /// to the teardown. Each stage of that teardown is bounded by [`Self::kill_grace`] or
     /// [`Self::shutdown_timeout`], and together they add up to the teardown row of the same
-    /// table: 36 seconds at the defaults.
+    /// table: 36 seconds at the defaults. `mango_agent_codex::deadlines::Deadlines` computes
+    /// that and the cancel rows from a `Limits`.
     ///
     /// In the ACP harness `close` is at most 29 seconds at the defaults: one
     /// [`Self::shutdown_timeout`] for `session/close` when the agent advertised it, one for the
     /// connection, the process stop (two [`Self::kill_grace`] and two
     /// [`Self::shutdown_timeout`]), and one more [`Self::shutdown_timeout`] for a turn another
-    /// task is still settling. `docs/harness-acp.md` has that table.
+    /// task is still settling. `docs/harness-acp.md` has that table, and
+    /// `mango_agent_acp::deadlines::Deadlines` computes its rows from a `Limits`.
     ///
     /// The Claude harness has no protocol stop, so every stop is the process stop: two
     /// [`Self::kill_grace`] and two [`Self::shutdown_timeout`], 14 seconds at the defaults. A
     /// `cancel` writes the turn's terminal at once and returns when that stop does. `close` adds
     /// one [`Self::shutdown_timeout`] for removing the MCP artifact, 19 seconds, and waits one
-    /// [`Self::shutdown_timeout`] for a launch the host's launcher has not returned yet. A stop
+    /// [`Self::shutdown_timeout`] for a launch the host's launcher has not returned yet, so a
+    /// close over a pending launch whose child then has to be stopped takes up to 24 seconds. A stop
     /// that runs out of time returns its own [`Error::Timeout`], not
-    /// [`Error::CleanupRequired`]. `docs/harness-claude.md` has that table.
+    /// [`Error::CleanupRequired`]. `docs/harness-claude.md` has that table, and
+    /// `mango_agent_claude::deadlines::Deadlines` computes its rows from a `Limits`.
     ///
     /// For example, a host whose tools can take minutes to abort raises this without lengthening
     /// every protocol request: `Limits { cancel_settle_timeout: Duration::from_secs(300),

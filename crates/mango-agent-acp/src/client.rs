@@ -2072,7 +2072,11 @@ impl ConnectionHandle {
     /// reports an error is not a failed teardown either: a blocked writer makes it report one
     /// after the child is gone, and process cleanup is the fact that decides.
     pub(crate) async fn shutdown(&self, reason: mango_external_agents::CancelReason) -> Result<()> {
-        let _ = tokio::time::timeout(self.limits.shutdown_timeout, self.client.close()).await;
+        let _ = tokio::time::timeout(
+            crate::deadlines::connection_close_bound(&self.limits),
+            self.client.close(),
+        )
+        .await;
         self.ended.cancel();
         self.child_reaper.reap(reason).await
     }

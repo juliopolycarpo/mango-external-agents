@@ -19,12 +19,22 @@ use std::time::{Duration, Instant};
 
 use mango_external_agents::testing::{Announcer, FakeLauncher, FakeProcess};
 use mango_external_agents::{
-    ActivityStatus, AttemptId, CancelReason, Configuration, EventKind, EventReceiver, EventSink,
-    HarnessIdentity, HostContext, LaunchSpec, Limits, ProcessLauncher, SessionIds, SessionSnapshot,
-    TerminalStatus, TransportKind, TransportSelection, TurnId,
+    ActivityStatus, AttemptId, CancelReason, CancelToken, Configuration, EventKind, EventReceiver,
+    EventSink, HarnessIdentity, HostContext, LaunchSpec, Limits, ProcessLauncher, SessionIds,
+    SessionSnapshot, TerminalStatus, TransportKind, TransportSelection, TurnId,
 };
 
 use super::{ConnectionHandle, SessionId, SessionState, TurnHandle, drive};
+
+#[allow(
+    dead_code,
+    unreachable_pub,
+    reason = "shared by path with tests/session.rs, which uses the parts this module does not"
+)]
+#[path = "../../tests/session/stalling.rs"]
+mod stalling;
+
+use stalling::{Reap, Stalls, assert_reaches};
 
 /// The most notifications the connection under test may hold for its handler.
 const MESSAGE_BUDGET: usize = 4;
@@ -88,18 +98,33 @@ struct Launch {
 
 /// Launches the fake agent and builds the session state its updates are for.
 async fn launch() -> Launch {
+    launch_with(None, None, hold_limits()).await
+}
+
+/// The limits the tests here run under: a small message budget and one request at a time.
+fn hold_limits() -> Limits {
+    Limits {
+        turn_channel_capacity: MESSAGE_BUDGET,
+        max_pending_requests: 1,
+        ..Limits::default()
+    }
+}
+
+/// [`launch`], with the agent's output ending when `gone` is cancelled and its child stalled by
+/// `stalls`, when they are given, under `limits`.
+async fn launch_with(gone: Option<CancelToken>, stalls: Option<&Stalls>, limits: Limits) -> Launch {
     let agent = Announcer::new();
     let launcher = FakeLauncher::new();
-    launcher.push(FakeProcess::responding(|_| Vec::new()).announcing(agent.clone()));
+    let process = FakeProcess::responding(|_| Vec::new()).announcing(agent.clone());
+    launcher.push(match gone {
+        Some(gone) => process.ending_stdout_when(gone),
+        None => process,
+    });
     let host = HostContext::builder()
         .launcher(Arc::new(launcher.clone()))
         .cwd(std::env::temp_dir())
         .client_info("acp-client-tests", "0.1.0")
-        .limits(Limits {
-            turn_channel_capacity: MESSAGE_BUDGET,
-            max_pending_requests: 1,
-            ..Limits::default()
-        })
+        .limits(limits)
         .build()
         .expect("expected a host context");
     let core_state = mango_external_agents::SessionState::new(
@@ -130,6 +155,10 @@ async fn launch() -> Launch {
         })
         .await
         .expect("expected the fake child to launch");
+    let process = match stalls {
+        Some(stalls) => stalls.stall(process),
+        None => process,
+    };
     let framed = crate::transport::frame(process, &host).expect("expected a framed child");
     Launch {
         launcher,
@@ -158,13 +187,23 @@ fn begin_turn(host: &HostContext, state: &SessionState) -> (TurnHandle, EventRec
 
 impl RunningTurn {
     async fn start() -> Self {
+        Self::start_with(None, None, hold_limits()).await
+    }
+
+    /// [`Self::start`] over a child whose output ends when `gone` is cancelled and whose stop
+    /// `stalls` drags out, when they are given.
+    async fn start_with(
+        gone: Option<CancelToken>,
+        stalls: Option<&Stalls>,
+        limits: Limits,
+    ) -> Self {
         let Launch {
             launcher,
             host,
             state,
             agent,
             framed,
-        } = launch().await;
+        } = launch_with(gone, stalls, limits).await;
         let connection = Arc::new(drive(framed, Arc::clone(&state)));
         let (turn, events) = begin_turn(&host, &state);
         Self {
@@ -905,5 +944,121 @@ async fn a_refusal_whose_hold_is_refused_takes_nothing_and_a_close_leaves_the_tu
     assert!(
         closed.is_ok() && told == expected && closed_after < grace,
         "expected after the close: Ok(()), {expected:?} within {grace:?} | received: {closed:?}, {told:?} after {closed_after:?}"
+    );
+}
+
+/// 3 s of grace and 7 s of shutdown, so no term of a sum can be mistaken for another, and every
+/// other limit far above the longest wait.
+fn exit_limits() -> Limits {
+    Limits {
+        kill_grace: Duration::from_secs(3),
+        shutdown_timeout: Duration::from_secs(7),
+        request_timeout: Duration::from_secs(4000),
+        idle_timeout: Duration::from_secs(5000),
+        approval_timeout: Duration::from_secs(5000),
+        cancel_settle_timeout: Duration::from_secs(6000),
+        ..hold_limits()
+    }
+}
+
+/// The slack under a driven sum, wider than the stalled stages' own milliseconds.
+const SLACK: Duration = Duration::from_millis(10);
+
+/// A turn on a child whose input has stopped taking writes and whose stop is stalled at every
+/// stage, with the agent ready to exit.
+struct ExitingAgent {
+    running: RunningTurn,
+    gone: CancelToken,
+    limits: Limits,
+}
+
+impl ExitingAgent {
+    async fn start() -> Self {
+        let limits = exit_limits();
+        let gone = CancelToken::new();
+        let stalls = Stalls::against(&limits, Reap::Never);
+        let running = RunningTurn::start_with(Some(gone.clone()), Some(&stalls), limits).await;
+        stalls.block_writes();
+        Self {
+            running,
+            gone,
+            limits,
+        }
+    }
+}
+
+/// An agent that exits while the handler holds a stretch is told to the handler only after the
+/// peer has waited `shutdown_timeout` for the queue to drain and another for the hold: twice
+/// `shutdown_timeout`, the first two terms of `Deadlines::exit_to_closed`. The watcher then runs
+/// the teardown, and it ends one `teardown` after the handler was told, which is
+/// `exit_to_closed` less the turn wait that follows.
+#[tokio::test(start_paused = true)]
+async fn an_agent_exit_during_a_hold_is_told_to_the_handler_after_two_shutdown_timeouts() {
+    let ExitingAgent {
+        running,
+        gone,
+        limits,
+    } = ExitingAgent::start().await;
+    let deadlines = crate::deadlines::Deadlines::from_limits(&limits);
+    let _delivery = running.park_the_refusal_mid_commit().await;
+
+    let began = tokio::time::Instant::now();
+    gone.cancel();
+    running.connection.ended().cancelled().await;
+    let told_after = began.elapsed();
+    running.connection.begin_shutdown(CancelReason::Shutdown);
+    let cleaned = running.connection.wait_shutdown().await;
+    let cleaned_after = began.elapsed();
+
+    assert_reaches(
+        "the handler to be told of the exit (two shutdown_timeout)",
+        told_after,
+        crate::deadlines::exit_notice_bound(&limits),
+        2 * SLACK,
+    );
+    assert!(
+        cleaned.is_err(),
+        "expected the stalled reap to end the teardown: Err(CleanupRequired) | received: {cleaned:?}"
+    );
+    assert_reaches(
+        "the exit's teardown to end (Deadlines::exit_to_closed less shutdown_timeout)",
+        cleaned_after,
+        deadlines.exit_to_closed() - limits.shutdown_timeout,
+        2 * SLACK,
+    );
+}
+
+/// A `close` called at the moment the agent exits does not wait for the exit to be told: it starts
+/// the teardown itself and ends one `teardown` after its own call, long before the 34 s the exit
+/// path needs. This is why `close_worst_case` is `close`, measured from the call.
+#[tokio::test(start_paused = true)]
+async fn a_close_at_the_moment_of_an_exit_during_a_hold_ends_one_teardown_after_the_call() {
+    let ExitingAgent {
+        running,
+        gone,
+        limits,
+    } = ExitingAgent::start().await;
+    let deadlines = crate::deadlines::Deadlines::from_limits(&limits);
+    let _delivery = running.park_the_refusal_mid_commit().await;
+
+    let began = tokio::time::Instant::now();
+    gone.cancel();
+    let closed = running.connection.shutdown(CancelReason::Shutdown).await;
+    let elapsed = began.elapsed();
+
+    assert!(
+        closed.is_err(),
+        "expected the stalled reap to end the teardown: Err(CleanupRequired) | received: {closed:?}"
+    );
+    assert_reaches(
+        "a close at an exit (Deadlines::teardown)",
+        elapsed,
+        deadlines.teardown(),
+        SLACK,
+    );
+    assert!(
+        elapsed <= deadlines.close_worst_case(),
+        "expected a close at an exit within {:?} (close_worst_case) | received: {elapsed:?}",
+        deadlines.close_worst_case()
     );
 }

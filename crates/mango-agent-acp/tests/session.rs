@@ -10,6 +10,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 
+#[path = "session/deadlines.rs"]
+mod deadlines;
+#[path = "session/stalling.rs"]
+mod stalling;
 #[path = "session/teardown.rs"]
 mod teardown;
 

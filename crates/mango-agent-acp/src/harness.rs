@@ -593,7 +593,7 @@ impl Harness for AcpHarness {
         // Weak for the same reason the connection is: this watcher must not keep alive what it
         // waits to see end.
         let turn_state = Arc::downgrade(&connection_state);
-        let settle_limit = host.limits().shutdown_timeout;
+        let settle_limit = crate::deadlines::turn_release_bound(host.limits());
         let host_cancel = host.cancel().clone();
 
         let catalog = opened

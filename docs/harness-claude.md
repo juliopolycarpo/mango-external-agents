@@ -335,25 +335,58 @@ ignores both signals takes about 2 `kg`, 4 s at the defaults. On
 Windows it reports no graceful interrupt, and its kill gives the Job 2 `kg` to empty. Either kill
 is cut at `st` if that is the smaller.
 
-| Path                                         | Worst case                 | At the defaults | `TokioLauncher`, Unix | `TokioLauncher`, Windows |
-| -------------------------------------------- | -------------------------- | --------------- | --------------------- | ------------------------ |
-| Stop `S`                                     | `kg` + `kg` + `st` + `st`  | 14 s            | 6 s                   | 4 s                      |
-| `cancel`, to the turn's terminal             | none                       | at once         | at once               | at once                  |
-| `cancel`, to its return                      | `S`                        | 14 s            | 6 s                   | 4 s                      |
-| `cancel` while the launch is pending         | none                       | at once         | at once               | at once                  |
-| `close`, no turn                             | `st`                       | 5 s             | 5 s                   | 5 s                      |
-| `close` with a turn active                   | `S` + `st`                 | 19 s            | 11 s                  | 9 s                      |
-| `close` while the launch is pending          | `st`, or `st` + `S` + `st` | 5 s, or 24 s    | 5 s, or 16 s          | 5 s, or 14 s             |
-| Child exit or end of stream, to the terminal | `kg`                       | 2 s             | 2 s                   | 2 s                      |
-| Child exit or end of stream, to reaped       | `kg` + `S`                 | 16 s            | 8 s                   | 6 s                      |
-| Silent stream, to the terminal               | idle floor + `kg`          | 602 s           | 602 s                 | 602 s                    |
-| Host shutdown token, to the terminal         | `S`                        | 14 s            | 6 s                   | 4 s                      |
-| Session dropped mid-turn, to reaped          | `S`                        | 14 s            | 6 s                   | 4 s                      |
+| Path                                         | Worst case                 | At the defaults | `TokioLauncher`, Unix | `TokioLauncher`, Windows | `Deadlines` method          |
+| -------------------------------------------- | -------------------------- | --------------- | --------------------- | ------------------------ | --------------------------- |
+| Stop `S`                                     | `kg` + `kg` + `st` + `st`  | 14 s            | 6 s                   | 4 s                      | `process_stop`, `teardown`  |
+| `cancel`, to the turn's terminal             | none                       | at once         | at once               | at once                  | `cancel_to_terminal`        |
+| `cancel`, to its return                      | `S`                        | 14 s            | 6 s                   | 4 s                      | `cancel_to_return`          |
+| `cancel` while the launch is pending         | none                       | at once         | at once               | at once                  |                             |
+| `close`, no turn                             | `st`                       | 5 s             | 5 s                   | 5 s                      | `close_no_turn`             |
+| `close` with a turn active                   | `S` + `st`                 | 19 s            | 11 s                  | 9 s                      | `close_with_turn`           |
+| `close` while the launch is pending          | `st`, or `st` + `S` + `st` | 5 s, or 24 s    | 5 s, or 16 s          | 5 s, or 14 s             | `close_pending_launch`      |
+| Any `close`, the largest of the three above  | `st` + `S` + `st`          | 24 s            | 16 s                  | 14 s                     | `close_worst_case`, `close` |
+| Child exit or end of stream, to the terminal | `kg`                       | 2 s             | 2 s                   | 2 s                      | `exit_to_terminal`          |
+| Child exit or end of stream, to reaped       | `kg` + `S`                 | 16 s            | 8 s                   | 6 s                      | `exit_to_reaped`            |
+| Silent stream, to the terminal               | idle floor + `kg`          | 602 s           | 602 s                 | 602 s                    | `silent_stream_to_terminal` |
+| Host shutdown token, to the terminal         | `S`                        | 14 s            | 6 s                   | 4 s                      | `host_shutdown_to_terminal` |
+| Session dropped mid-turn, to reaped          | `S`                        | 14 s            | 6 s                   | 4 s                      | `dropped_session_to_reaped` |
 
-Tests on a paused clock against a fake launcher assert the stages these sums are made of: the
-14 s stop, the stop with no graceful interrupt, the `kg` waits around an exit, the 602 s, and the
-`st` a close gives a pending launch and the artifact removal. They run on CI's Linux, macOS and
-Windows lanes. The sums themselves are not asserted. The two `TokioLauncher` columns are pinned by
+The method names are on `mango_agent_claude::deadlines::Deadlines`, built with
+`Deadlines::from_limits(&limits)`. They give the first value column, the one that holds for any
+launcher, as `Duration`s from the same `Limits`; the `TokioLauncher` columns are that launcher's
+own and are not in the API. Every method counts from a stated moment, and the table's rows carry it
+in their names: the call to `cancel` or `close`, the child's exit or the end of its stream, the
+last record read from a silent child, the host's token being cancelled, the last session handle
+being dropped. A host that puts a timeout around `close` uses `Deadlines::close_worst_case()`,
+counted from the call to `close`; it is the largest of the three close rows. The silent-stream
+figure reads the idle floor through the same function the pump does,
+`pinned::stream_idle_timeout`, and the close waits and the exit grace go through
+`deadlines::launch_wait`, `removal_bound` and `exit_grace`, so the figure and the wait cannot drift
+apart. The stop is the core's `stop_process_with_limits`, which this crate cannot edit, so
+`process_stop` repeats its formula and a test runs the core against a control that spends every
+stage to keep the two equal.
+
+Tests on a paused clock against a fake launcher drive these rows to their worst case, with a
+child that answers one millisecond inside each bound, and assert the elapsed time falls between the
+method's value less those milliseconds and the value itself: the stop `S`, both against the core
+directly and through `cancel`, which also returns its terminal at once; `close` with a turn active,
+which is the stop followed by a removal that stalls for `st`, 19 s at the defaults; `close` with
+no turn; `close` while the launch is pending, to the end of the stop it runs for a child that
+arrives one millisecond before the wait ends; the host shutdown token; a dropped session; the `kg`
+after an exit; the end of a stream to reaped; and the silent stream, at the defaults and at an
+`idle_timeout` above the floor. They run on CI's Linux, macOS and Windows lanes. Three things are
+not driven to the figure in the table:
+
+- The last `st` of `close` while the launch is pending. The start that owns the launch holds its
+  own lease on the artifact until its stop returns, so a close that learns of the reap first finds
+  the artifact still held and removes nothing. In the tests the close returns after the wait and
+  the stop alone, `st` + `S`, and 24 s stays as the ceiling.
+- A child that exited, to reaped. The fake child answers the stop's waits at once, so the stop
+  spends fewer stages. The end of a stream under a live child spends all of them and drives the
+  same row.
+- `cancel` while the launch is pending, which returns at once and has no bound to measure.
+
+The two `TokioLauncher` columns are pinned by
 real-process tests on the real clock, at a `kill_grace` of 500 ms on Unix and 1 s or 4 s on
 Windows, in `crates/mango-external-agents/src/launcher/tokio_launcher/tests/stop_bound.rs`. Where a
 stage must have been waited out the test asserts a lower bound for it, which a loaded runner cannot
@@ -381,13 +414,19 @@ What each path does, and what a host sees when a bound runs out:
   host that sees this error ends its runtime with `Runtime::shutdown_timeout` or
   `Runtime::shutdown_background`.
 - **`close` while the launch is pending.** The close waits one `shutdown_timeout` for the launcher.
-  If the child arrives in that time the close waits for its stop and removes the artifact. If it
-  does not, the close fails and the session stays `Closing`, even after the child is later reaped,
-  and a second `close` returns the same error. The start that owns the launch still stops the
-  child when it arrives. It removes the artifact after a reap and leaves it on disk after a stop
-  that failed. That holds whether the `start_turn` caller is still waiting or dropped its call. A
-  `start_turn` future that is kept alive and never polled again stops nothing until it is polled
-  or dropped.
+  If the child arrives in that time and the `start_turn` that owns the launch has begun its stop,
+  the close waits for that stop and then for the artifact removal, `close_pending_launch`, 24 s at
+  the defaults. The start usually still holds its lease on the artifact when the stop returns, so
+  the close has nothing to remove and the figure is a ceiling. If the child does not arrive, or
+  arrives and its start is not run, the close fails after one `shutdown_timeout` and the session
+  stays `Closing`, even after the child is later reaped, and a second `close` returns the same
+  error. The stop runs on a task of its own, but it is begun by the `start_turn` future when that
+  is polled after the launcher returned, or by its drop. A `start_turn` future that is kept alive
+  and never polled again begins no stop and leaves the child running, so the close takes the
+  `shutdown_timeout` branch and the child stays until the future is polled or dropped. The close
+  never waits longer than `close_pending_launch` for that reason. The start that owns the launch
+  removes the artifact after a reap and leaves it on disk after a stop that failed, whether the
+  `start_turn` caller is still waiting or dropped its call.
 - **Child exit or end of stream.** The terminal is an `Error` event with code `claude-no-result`,
   `claude-terminated` for exit 143, or `claude-stream-broken` when the link itself failed. The
   stop runs after it. Nobody is waiting on that stop, so

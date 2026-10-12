@@ -37,6 +37,7 @@ use mango_external_agents::{
 use crate::client::{
     self, ConnectionHandle, PromptFailure, link_failure, overflow_failure, with_stderr,
 };
+use crate::deadlines::{cancel_grace, session_close_bound, turn_release_bound};
 use crate::profile::AcpProfile;
 use crate::{content, prompt_size, reducer};
 
@@ -1252,14 +1253,14 @@ impl Session for AcpSession {
                 outcome = &mut prompt => Some(outcome),
                 () = handle.sink.closed() => {
                     if request_native_cancel(&state, &connection, native_session_id.clone(), CancelReason::Requested) {
-                        tokio::time::timeout(limits.kill_grace, &mut prompt).await.ok()
+                        tokio::time::timeout(cancel_grace(&limits), &mut prompt).await.ok()
                     } else {
                         None
                     }
                 },
                 () = handle.sink.terminated() => {
                     if request_native_cancel(&state, &connection, native_session_id.clone(), CancelReason::Requested) {
-                        tokio::time::timeout(limits.kill_grace, &mut prompt).await.ok()
+                        tokio::time::timeout(cancel_grace(&limits), &mut prompt).await.ok()
                     } else {
                         None
                     }
@@ -1269,14 +1270,14 @@ impl Session for AcpSession {
                     // that synchronous write has settled before deciding the stream's outcome.
                     let _starting = state.lock_turn_start();
                     drop(_starting);
-                    tokio::time::timeout(limits.kill_grace, &mut prompt).await.ok()
+                    tokio::time::timeout(cancel_grace(&limits), &mut prompt).await.ok()
                 },
                 () = state.idle_expired(limits.idle_timeout) => {
                     // The agent went quiet with nothing waiting on the host. Stopped the same way a
                     // host cancel is, so an agent that honours `session/cancel` ends its own turn and
                     // one that does not is reaped after the kill grace.
                     if request_native_cancel(&state, &connection, native_session_id.clone(), CancelReason::Timeout) {
-                        tokio::time::timeout(limits.kill_grace, &mut prompt).await.ok()
+                        tokio::time::timeout(cancel_grace(&limits), &mut prompt).await.ok()
                     } else {
                         None
                     }
@@ -1727,7 +1728,7 @@ async fn finish_close(
         if let Ok(sent) = client::submit(&connection, CloseSessionRequest::new(native_session_id)) {
             let sent = sent.abandoned_for(reason.into());
             let _ = tokio::time::timeout(
-                limits.shutdown_timeout,
+                session_close_bound(&limits),
                 client::await_sent(&connection, profile.as_ref(), sent),
             )
             .await;
@@ -1765,7 +1766,7 @@ async fn finish_close(
             // The prompt task claimed this terminal and releases the slot once it is written.
             // After a failed cleanup it deliberately keeps the slot, so there is nothing to wait
             // for: the cleanup error already says what was left behind.
-            result = wait_for_turn_release(&state, limits.shutdown_timeout).await;
+            result = wait_for_turn_release(&state, turn_release_bound(&limits)).await;
         }
     }
 
