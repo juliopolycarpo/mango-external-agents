@@ -417,9 +417,10 @@ impl EventKind {
     ///
     /// [`Error::InvalidVendorValue`](crate::Error::InvalidVendorValue) when an opaque id does not
     /// survive bounding. Such an id is refused rather than shortened: a truncated id echoed back
-    /// to the vendor would name a different object. A [`EventKind::Notice`] whose title has
-    /// nothing to show once sanitised is refused the same way; [`Self::notice`] is how a harness
-    /// finds that out first.
+    /// to the vendor would name a different object. A [`EventKind::Notice`] built by hand whose
+    /// title is blank, or has nothing left once control characters are stripped, is refused the
+    /// same way, with the title as received in the error; [`Self::notice`] returns `None` for
+    /// such a title instead, which is how a harness finds that out first.
     pub fn normalized(self) -> Result<Self> {
         Ok(match self {
             Self::TurnStarted { native_turn_id } => Self::TurnStarted {
@@ -478,7 +479,7 @@ impl EventKind {
                 None => {
                     return Err(crate::Error::InvalidVendorValue {
                         field: "notice title",
-                        received: normalize::bound_text(&title, TextLimit::Title).text,
+                        received: crate::redact::bounded(&title, TextLimit::Title).text,
                     });
                 }
             },

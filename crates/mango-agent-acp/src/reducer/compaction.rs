@@ -109,6 +109,9 @@ impl Compactions {
 struct Compaction {
     summary: Summary,
     error: Option<String>,
+    /// Whether the bound removed text from the redacted error. Text redaction itself stripped or
+    /// replaced is not counted: the error was redacted first, so what the bound cut is what is
+    /// missing from what a host receives, not from what the agent sent.
     error_cut: bool,
 }
 

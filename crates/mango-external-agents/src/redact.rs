@@ -757,6 +757,37 @@ mod tests {
 }
 
 #[cfg(test)]
+mod bounded_tests {
+    use super::bounded;
+    use crate::normalize::TextLimit;
+
+    /// Text the redactor removes or replaces is not a cut: a host learns that a message was
+    /// shortened only when the bound shortened it.
+    #[test]
+    fn only_the_bound_marks_a_message_as_cut() {
+        let limit = TextLimit::ErrorMessage.max_code_points();
+        let replaced = bounded(
+            "\u{1b}[31mrefused\u{1b}[0m: API_KEY=sk-live-1234567890",
+            TextLimit::ErrorMessage,
+        );
+        assert_eq!(
+            (replaced.text.as_str(), replaced.truncated),
+            ("refused: API_KEY=[REDACTED]", false),
+            "expected stripped and replaced text not to count as cut"
+        );
+
+        let long = bounded(&"x".repeat(limit + 10), TextLimit::ErrorMessage);
+        assert!(
+            long.truncated && long.text.chars().count() <= limit,
+            "expected the bound to cut {} code points to at most {limit} and say so | received truncated {} with {}",
+            limit + 10,
+            long.truncated,
+            long.text.chars().count()
+        );
+    }
+}
+
+#[cfg(test)]
 mod corpus_tests {
     use super::stderr_text;
     use crate::testing::redaction::{BENIGN, LEAKS};
