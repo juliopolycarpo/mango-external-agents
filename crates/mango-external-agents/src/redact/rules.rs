@@ -354,6 +354,13 @@ pub(super) fn names_a_keyword(bytes: &[u8], at: usize) -> bool {
     starts_a_keyword(bytes, at) && match_keyword(bytes, at).is_some()
 }
 
+/// Whether a keyword starts anywhere in `bytes[from..to]`: the userinfo of a URL, say. The query
+/// name rules are left out, since the text is not a query, which makes this a good deal cheaper
+/// than asking [`names_a_keyword`] at every place.
+pub(super) fn holds_a_keyword(bytes: &[u8], from: usize, to: usize) -> bool {
+    (from..to).any(|at| starts_a_keyword(bytes, at) && match_keyword(bytes, at).is_some())
+}
+
 /// Whether the two bytes at `at` open some keyword, of `key` or of `signature`: `se`cret,
 /// `si`g, `to`ken, `pa`ssword, `pw`d, `pr`ivate, `cr`edential, `co`okie, `ap`i, `au`th, `ac`cess,
 /// `ke`y.

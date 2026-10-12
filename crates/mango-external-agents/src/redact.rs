@@ -299,7 +299,7 @@ fn redact_url_passwords(raw: &str) -> (String, bool) {
     let text = rewrite(raw, rules::scheme_separator, |bytes, at| {
         let outcome = rules::url_password_rule(bytes, at);
         if let Some(Outcome::Redact(found)) = &outcome {
-            named = named || (at..found.kept_end).any(|place| rules::names_a_keyword(bytes, place));
+            named = named || rules::holds_a_keyword(bytes, at, found.kept_end);
         }
         outcome
     });
