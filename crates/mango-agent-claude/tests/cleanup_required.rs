@@ -1023,6 +1023,87 @@ mod pending_launch_cancel {
     }
 }
 
+/// Real threads, not a paused clock: the claim that one stop serves every caller rests on the
+/// owner lock and one atomic, and only parallel callers can break either.
+///
+/// The idle timer is not among the racers. Its floor is ten minutes and a real clock cannot be
+/// moved, so its stop is driven on the paused clock in `pump::a_silent_stream_...`.
+mod racing {
+    use super::*;
+
+    const ROUNDS: usize = 40;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancel_close_the_exit_and_the_shutdown_token_share_one_stop_and_one_outcome() {
+        for round in 0..ROUNDS {
+            let held = hold_refusing_kill(FakeClaudeCli::new().with_turn(stalled())).await;
+            let mut turn = held.start().await;
+            held.launcher.turn_reading().await;
+            let go = Arc::new(tokio::sync::Barrier::new(5));
+
+            let cancels: Vec<_> = (0..2)
+                .map(|_| {
+                    let (session, go) = (Arc::clone(&held.session), Arc::clone(&go));
+                    tokio::spawn(async move {
+                        go.wait().await;
+                        session.cancel(CancelReason::Requested).await
+                    })
+                })
+                .collect();
+            let close = tokio::spawn({
+                let (session, go) = (Arc::clone(&held.session), Arc::clone(&go));
+                async move {
+                    go.wait().await;
+                    session.close(CloseReason::Requested).await
+                }
+            });
+            let exit = tokio::spawn({
+                let (launcher, go) = (Arc::clone(&held.launcher), Arc::clone(&go));
+                async move {
+                    go.wait().await;
+                    launcher.exit_turn_holding_its_output(1);
+                }
+            });
+            let shutdown = tokio::spawn({
+                let (token, go) = (held.host.cancel().clone(), Arc::clone(&go));
+                async move {
+                    go.wait().await;
+                    token.cancel();
+                }
+            });
+
+            let mut outcomes = Vec::new();
+            for call in cancels.into_iter().chain([close]) {
+                let outcome = tokio::time::timeout(NEVER, call)
+                    .await
+                    .expect("expected the call to return | received none within an hour")
+                    .expect("expected the call task to finish");
+                outcomes.push(outcome);
+            }
+            exit.await.expect("expected the exit task to finish");
+            shutdown
+                .await
+                .expect("expected the shutdown task to finish");
+            let _ = terminal_of(&mut turn).await;
+
+            for (call, outcome) in ["cancel", "cancel", "close"].iter().zip(&outcomes) {
+                let error = outcome.as_ref().expect_err(&format!(
+                    "expected round {round}: {call} to share the failed stop | received Ok"
+                ));
+                assert_cleanup_required(&format!("round {round}: {call}"), error, &held);
+                assert_refused_kill(&format!("round {round}: {call}"), error);
+            }
+            assert_eq!(
+                held.tap.refused_kills(),
+                1,
+                "expected round {round} to ask the host's control to kill once | received {}",
+                held.tap.refused_kills()
+            );
+            held.reconcile();
+        }
+    }
+}
+
 /// A session is torn down on the runtime that opened it. If that runtime is gone, the worker is
 /// dropped unrun, and the caller on another runtime must still hear that the child was not stopped.
 mod opening_runtime_gone {
