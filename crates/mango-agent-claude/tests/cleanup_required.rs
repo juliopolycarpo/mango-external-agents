@@ -599,6 +599,125 @@ mod close {
         held.reconcile();
     }
 
+    /// A second close that lands while the late child's stop is still running waits for it, rather
+    /// than repeating a timeout that has no control.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_during_the_late_childs_stop_waits_for_it() {
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_turn(stalled())
+                .with_slow_stop(unanswered_kill()),
+        );
+        let gate = launcher.gate_turn_spawns();
+        let held = open_over(launcher, ControlTap::new).await;
+        let _starting = tokio::spawn({
+            let session = Arc::clone(&held.session);
+            async move {
+                session
+                    .start_turn(TurnRequest::new("turn-1", "hold"))
+                    .await
+                    .map(drop)
+            }
+        });
+        gate.wait_for_spawn().await;
+        let _ = tokio::time::timeout(NEVER, held.session.close(CloseReason::Requested)).await;
+        gate.release();
+        while held.launcher.kill_requests() == 0 {
+            tokio::task::yield_now().await;
+        }
+        let began = tokio::time::Instant::now();
+
+        let again = tokio::time::timeout(NEVER, held.session.close(CloseReason::Requested))
+            .await
+            .expect("expected the second close to return | received none within an hour")
+            .expect_err("expected the second close to see the late child's failed stop");
+
+        assert_cleanup_required("the close during the late child's stop", &again, &held);
+        assert_eq!(
+            began.elapsed(),
+            held.limits.shutdown_timeout,
+            "expected the close to wait out the kill the late child's stop was still running | received {:?}",
+            began.elapsed()
+        );
+        held.reconcile();
+    }
+
+    /// While the launch is still pending a later close has nothing new to say: the same timeout,
+    /// at once, with no control.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_while_the_launch_is_still_pending_repeats_the_timeout_at_once() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(stalled()));
+        let gate = launcher.gate_turn_spawns();
+        let held = open_over(launcher, ControlTap::new).await;
+        let _starting = tokio::spawn({
+            let session = Arc::clone(&held.session);
+            async move {
+                session
+                    .start_turn(TurnRequest::new("turn-1", "hold"))
+                    .await
+                    .map(drop)
+            }
+        });
+        gate.wait_for_spawn().await;
+        let _ = tokio::time::timeout(NEVER, held.session.close(CloseReason::Requested)).await;
+        let began = tokio::time::Instant::now();
+
+        let again = tokio::time::timeout(NEVER, held.session.close(CloseReason::Requested))
+            .await
+            .expect("expected the second close to return | received none within an hour")
+            .expect_err("expected the second close to repeat the timeout");
+
+        assert_timeout(
+            "the close over a launch still pending",
+            &again,
+            "a pending Claude launch",
+            held.limits.shutdown_timeout,
+        );
+        assert!(
+            again.cleanup_control().is_none() && began.elapsed().is_zero(),
+            "expected the kept timeout at once and without a control | received {again:?} after {:?}",
+            began.elapsed()
+        );
+        gate.release();
+    }
+
+    /// The late child was stopped, so there is no failure to reconcile: the kept timeout stands.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_after_the_late_child_was_stopped_repeats_the_timeout() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(stalled()));
+        let gate = launcher.gate_turn_spawns();
+        let held = open_over(launcher, ControlTap::new).await;
+        let starting = tokio::spawn({
+            let session = Arc::clone(&held.session);
+            async move {
+                session
+                    .start_turn(TurnRequest::new("turn-1", "hold"))
+                    .await
+                    .map(drop)
+            }
+        });
+        gate.wait_for_spawn().await;
+        let _ = tokio::time::timeout(NEVER, held.session.close(CloseReason::Requested)).await;
+        gate.release();
+        let _ = tokio::time::timeout(NEVER, starting).await;
+
+        let again = tokio::time::timeout(NEVER, held.session.close(CloseReason::Requested))
+            .await
+            .expect("expected the second close to return | received none within an hour")
+            .expect_err("expected the second close to repeat the timeout");
+
+        assert_timeout(
+            "the close after the late child was stopped",
+            &again,
+            "a pending Claude launch",
+            held.limits.shutdown_timeout,
+        );
+        assert!(
+            again.cleanup_control().is_none(),
+            "expected no control for a child that was stopped | received {again:?}"
+        );
+    }
+
     /// A host that timed out its `start_turn` and drops it, then only closes, still gets the
     /// control: nothing else is left to tell it.
     #[tokio::test(start_paused = true)]
