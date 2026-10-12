@@ -996,7 +996,8 @@ bound, in `src/deadlines/tests.rs`: the prompt task frees the slot right after t
 joined, so no fake holds it there. The exit row is therefore driven in two parts, not as one run
 to `Closed`, and the watcher's own settle wait is not driven at all.
 
-The peer bounds its own close at twice `shutdown_timeout`: once for the answers it still owes the
+The peer bounds its own close at twice `shutdown_timeout`, and 100 ms more behind a handler that
+blocks its thread: once for the answers it still owes the
 agent and for a notification call that holds its cancellation off, once to write its queue and
 close the link. The harness gives the close one `shutdown_timeout` and then moves on to the
 process: both waits are over at once on a link that takes its writes, and behind a write the

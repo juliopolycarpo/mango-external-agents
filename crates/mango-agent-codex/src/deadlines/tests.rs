@@ -183,3 +183,18 @@ async fn the_process_stop_is_what_core_spends_on_a_child_that_stalls_every_stage
         "expected the stalled stop to end at its reap: Timeout(process reaping) | received: {stopped:?}"
     );
 }
+
+/// The backstop leaves the JSON-RPC client's close room for everything it may use: twice
+/// `shutdown_timeout`, and 100 ms for the two aborts it waits to land behind a handler that
+/// blocks its thread, so that a close that uses all of it returns its own result and not the
+/// backstop's timeout.
+#[test]
+fn the_close_backstop_leaves_room_for_the_clients_whole_close_at_the_defaults() {
+    let limits = Limits::default();
+    let clients_worst_close = limits.shutdown_timeout * 2 + Duration::from_millis(100);
+    let backstop = close_backstop(&limits);
+    assert!(
+        backstop > clients_worst_close,
+        "expected a backstop past the client's worst close {clients_worst_close:?} | received: {backstop:?}"
+    );
+}
