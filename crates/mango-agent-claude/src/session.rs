@@ -71,6 +71,9 @@ struct Teardown {
     done: tokio::sync::Notify,
     worker_started: AtomicBool,
     taint_continuation: bool,
+    /// Set the instant a stop proved the child gone, before its outcome is published, so a
+    /// worker dropped in between does not report a child that is already reaped as left behind.
+    proven_gone: Arc<AtomicBool>,
 }
 
 impl Teardown {
@@ -80,6 +83,7 @@ impl Teardown {
             done: tokio::sync::Notify::new(),
             worker_started: AtomicBool::new(false),
             taint_continuation,
+            proven_gone: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -586,7 +590,13 @@ async fn run_teardown(
     settled: bool,
     taint_continuation: bool,
 ) {
-    let outcome = end_turn(taken.control, reason, shared.host.limits()).await;
+    let outcome = end_turn(
+        taken.control,
+        reason,
+        shared.host.limits(),
+        Arc::clone(&teardown.proven_gone),
+    )
+    .await;
     if let Ok(outcome) = outcome {
         record_stop(
             shared,
@@ -671,13 +681,15 @@ async fn run_close_teardown(
     };
     let result = match native {
         Ok(()) => {
-            let removal_bound = crate::deadlines::removal_bound(shared.host.limits());
-            let result = crate::mcp::remove_on_close(mcp_config.take(), removal_bound).await;
-            // Close is terminal after native cleanup, even when the host's scratch mount refuses
-            // the final unlink or never answers it. The typed error still tells the caller which
-            // resource remained, and the wait for it is one more shutdown stage.
+            // The child is gone and close is terminal from here, even when the host's scratch
+            // mount refuses the final unlink or never answers it. Recorded before the removal
+            // starts, so a worker dropped inside it reports no child left behind. The typed
+            // error below still tells the caller which resource remained, and the wait for it is
+            // one more shutdown stage.
+            close.proven_gone.store(true, Ordering::Release);
             shared.core_state.set_status(SessionStatus::Closed);
-            result
+            let removal_bound = crate::deadlines::removal_bound(shared.host.limits());
+            crate::mcp::remove_on_close(mcp_config.take(), removal_bound).await
         }
         Err(error) => {
             crate::mcp::preserve_after_failed_native_cleanup(mcp_config);
@@ -792,6 +804,10 @@ impl AbandonedStart {
 
     /// Waits for the owned launcher task, so dropping this future cannot cancel a spawn that may
     /// still hand a live process back later.
+    ///
+    /// A task cancelled with its runtime comes back as an `Error::Launch`, and the library treats
+    /// it as a launch that produced no child: it never saw the launcher complete, so anything the
+    /// launcher had half-created is the launcher's own to clean up.
     async fn spawn(&mut self) -> Result<stdio::StdioTransport> {
         let result = self
             .spawn
@@ -874,6 +890,10 @@ impl Drop for AbandonedStart {
                         crate::mcp::release_after_stop(lease, false).await;
                         return;
                     }
+                    // A launch error without a control, or a launch task that was cancelled, is a
+                    // launch the library never saw complete. A child it half-created is the
+                    // launcher's own to end, as for a host that drops `ProcessLauncher::launch`;
+                    // nothing here holds a control to stop it with.
                     Ok(Err(_)) | Err(_) => None,
                 },
                 None => owned_control.or(taken.control),
@@ -910,6 +930,7 @@ async fn end_turn(
     control: Option<Arc<dyn mango_external_agents::ProcessControl>>,
     reason: CancelReason,
     limits: &mango_external_agents::Limits,
+    proven_gone: Arc<AtomicBool>,
 ) -> Result<Option<StopOutcome>> {
     let Some(control) = control else {
         return Ok(None);
@@ -920,7 +941,13 @@ async fn end_turn(
     let limits = *limits;
     let stop = tokio::spawn({
         let control = Arc::clone(&control);
-        async move { stop_process_with_limits(control.as_ref(), reason, &limits).await }
+        async move {
+            let stopped = stop_process_with_limits(control.as_ref(), reason, &limits).await;
+            if stopped.is_ok() {
+                proven_gone.store(true, Ordering::Release);
+            }
+            stopped
+        }
     });
     match stop.await {
         Ok(Ok(outcome)) => Ok(Some(outcome)),
@@ -1036,6 +1063,8 @@ struct LostWorker {
     /// The artifact a close worker was to remove. A worker dropped unrun with a child left behind
     /// keeps it on disk, as any failed stop does.
     mcp: Option<crate::mcp::Prepared<Arc<ConfigFile>>>,
+    /// The stop a close waits on, whose proof of a reaped child also clears this guard's control.
+    child_stop: Option<Arc<Teardown>>,
 }
 
 impl LostWorker {
@@ -1047,6 +1076,7 @@ impl LostWorker {
             teardown: Arc::clone(teardown),
             control,
             mcp: None,
+            child_stop: None,
         }
     }
 }
@@ -1062,6 +1092,16 @@ impl Drop for LostWorker {
                 "expected the runtime that opened the session to run its teardown | received: it shut down first",
             ),
         };
+        let gone = self.teardown.proven_gone.load(Ordering::Acquire)
+            || self.child_stop.as_ref().is_some_and(|stop| {
+                stop.proven_gone.load(Ordering::Acquire) || matches!(stop.outcome(), Some(Ok(())))
+            });
+        if gone {
+            // The child was reaped before the worker was lost: only the outcome is missing, and
+            // no cleanup is owed, so nothing here asks the host to reconcile.
+            self.control = None;
+            self.mcp = None;
+        }
         let lost = match self.control.take() {
             Some(control) => {
                 if let Some(mcp) = self.mcp.take() {
@@ -1269,8 +1309,11 @@ impl mango_external_agents::Session for ClaudeSession {
         }));
         let transport = match abandoned.spawn().await {
             Ok(transport) => transport,
-            // No child ever launched, so there is nothing to reap here — only the reservation
-            // this call made above, and only if a stop has not already taken it.
+            // No child was handed back, so there is nothing to reap here — only the reservation
+            // this call made above, and only if a stop has not already taken it. That includes a
+            // launch task that was cancelled because the runtime it ran on went away: a launch
+            // the library never saw complete leaves whatever it half-created to the launcher,
+            // as for a host that drops `ProcessLauncher::launch`.
             Err(error) => {
                 abandoned.disarm();
                 if error.cleanup_control().is_some() {
@@ -1559,6 +1602,7 @@ impl mango_external_agents::Session for ClaudeSession {
         let shared = Arc::clone(&self.shared);
         let close_for_worker = Arc::clone(&close);
         let mut lost = LostWorker::new(&close, child);
+        lost.child_stop = active.clone();
         lost.mcp = Some(mcp_config);
         spawn_owned(&self.shared, async move {
             let Some(mcp_config) = lost.mcp.take() else {
