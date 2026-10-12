@@ -204,6 +204,30 @@ fn a_url_whose_user_is_a_credential_name_reaches_its_final_shape_in_one_pass() {
     }
 }
 
+/// The URL rule says whether it redacted a password under a user or a scheme with a keyword in it,
+/// which is the only text the assignment rule reads once more. An ordinary user is not charged.
+#[test]
+fn the_url_rule_flags_only_a_password_under_a_credential_name() {
+    use super::redact_url_passwords;
+    for (raw, flagged) in [
+        ("x://token:;hunter2@host", true),
+        ("x://PASSWORD:,@h", true),
+        ("x://my_api_key:p@h", true),
+        ("x://ann:hunter2@host", false),
+        ("redis://:hunter2@db/main", false),
+        ("x://token@host", false),
+        ("token://ann:hunter2@host", true),
+        ("see https://ann:p@h and tokens=1", false),
+        ("no url here token=1", false),
+    ] {
+        let (text, received) = redact_url_passwords(raw);
+        assert_eq!(
+            received, flagged,
+            "expected the flag for {raw:?} to be {flagged} | received: {received} (text {text:?})"
+        );
+    }
+}
+
 /// A value that is itself a credential name, followed by whitespace and a separator, is the value
 /// of the name before it, as it always was in text with no removed byte: the rules read across the
 /// line break, take `password` as the value and stop at the space, so `hunter2` is left. 0.4.1 read

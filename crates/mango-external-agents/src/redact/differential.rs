@@ -360,6 +360,11 @@ fn next_char_boundary(raw: &str, at: usize) -> usize {
     next.min(raw.len())
 }
 
+/// The URL password rule's text, without the flag it also returns.
+fn url_passwords_only(raw: &str) -> String {
+    redact_url_passwords(raw).0
+}
+
 /// Fails, naming `raw`, unless redacting what one pass returned changes nothing.
 ///
 /// A host that redacts again, as the harnesses do with a tail from a control that may not have
@@ -432,15 +437,15 @@ pub(super) fn assert_matches_the_replaced_scan(raw: &str) {
         expect(
             "the URL password rule",
             input,
-            redact_url_passwords,
+            url_passwords_only,
             rewrite_every_word(input, described(url_password_rule)),
         );
     }
     // A URL password the last rule redacted is read by the assignment rule once more.
-    let settled = if urls == assignments {
-        urls
-    } else {
+    let settled = if redact_url_passwords(&assignments).1 {
         rewrite_every_word(&urls, described_assignments())
+    } else {
+        urls
     };
     expect(
         "the whole redactor",

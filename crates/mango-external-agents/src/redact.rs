@@ -125,15 +125,15 @@ fn rules_round(plain: &str, tokens: bool) -> String {
     let unnamed = tokens.then(|| tokens::redact(plain)).flatten();
     let bearer = redact_bearer(unnamed.as_deref().unwrap_or(plain));
     let assignments = redact_assignments(&bearer);
-    let urls = redact_url_passwords(&assignments);
+    let (urls, named) = redact_url_passwords(&assignments);
     // A URL password the last rule redacted leaves `user:[REDACTED]@`, which reads as an assignment
     // when the user is a credential's name (`token:;x@` gives `token:[REDACTED]@`). Reading it once
     // more gives the text a second call would, so a call leaves its own output alone. Only text
-    // that held a URL password pays for it.
-    let settled = if urls == assignments {
-        urls
-    } else {
+    // with such a URL pays for it: a URL with an ordinary user does not.
+    let settled = if named {
         redact_assignments(&urls)
+    } else {
+        urls
     };
     remove_boundaries(settled)
 }
@@ -281,9 +281,18 @@ fn redact_assignments(raw: &str) -> String {
     })
 }
 
-/// The password half of `scheme://user:password@host`.
-fn redact_url_passwords(raw: &str) -> String {
-    rewrite(raw, rules::scheme_separator, rules::url_password_rule)
+/// The password half of `scheme://user:password@host`, and whether a password was redacted from a
+/// URL whose scheme or user holds a keyword: the text then reads as an assignment.
+fn redact_url_passwords(raw: &str) -> (String, bool) {
+    let mut named = false;
+    let text = rewrite(raw, rules::scheme_separator, |bytes, at| {
+        let outcome = rules::url_password_rule(bytes, at);
+        if let Some(Outcome::Redact(found)) = &outcome {
+            named = named || (at..found.kept_end).any(|place| rules::names_a_keyword(bytes, place));
+        }
+        outcome
+    });
+    (text, named)
 }
 
 /// What one rule matched: where the match ends, and what stands in its place.
