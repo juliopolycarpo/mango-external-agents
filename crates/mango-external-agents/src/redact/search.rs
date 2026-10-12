@@ -13,6 +13,7 @@
 //! printed with a failure and `MEA_REDACT_SEARCH_SEED` replays it.
 
 use super::differential::{FRAGMENTS, SHAPES, assert_matches_the_replaced_scan};
+use super::reference;
 use super::{bounded, message_text, stderr_text, structured};
 use crate::normalize::TextLimit;
 use crate::testing::redaction::{BARE_TOKENS, BENIGN, BENIGN_NEAR_TOKENS, LEAKS};
@@ -105,6 +106,124 @@ const TOKEN_PIECES: &[&str] = &[
     SECRET,
 ];
 
+/// The names a structured input is built from.
+const NAMES: &[&str] = &[
+    "tokens",
+    "token",
+    "password",
+    "passwd",
+    "pwd",
+    "api_key",
+    "apiKey",
+    "secret",
+    "Cookie",
+    "credential",
+    "x-api-key",
+    "private_key",
+    "client_secret",
+    "access_token",
+    "session_cookie",
+    "tokens_used",
+    "max_tokens",
+    "input_tokens",
+];
+const SEPARATORS: &[&str] = &[":", "=", ": ", " = ", ":\n", "=\n", ":\n  ", " :", ": \n"];
+
+/// How a value is written: what opens it, a body, what closes it. A body that ends in `:` or `=`
+/// is a name still waiting for its value.
+const VALUES: &[(&str, &str, &str)] = &[
+    ("", "abc", ""),
+    ("", "abc def", ""),
+    ("", "null", ""),
+    ("", "not set", ""),
+    ("", "12", ""),
+    ("", "token: x", ""),
+    ("", "abc password:", ""),
+    ("", "abc secret=", ""),
+    ("[", "a, b", "]"),
+    ("[", "\"a\", \"b\"", "]"),
+    ("[", "abc, password:", ""),
+    ("[\n  ", "a,\n  b\n", "]"),
+    ("{", "\"a\": 1", "}"),
+    ("{", "abc secret=", ""),
+    ("{", "\"k\": \"v\", \"password\": \"x\"", "}"),
+    ("- ", "abc", ""),
+    ("- ", "abc secret=", ""),
+    ("- ", "\"a\"", ""),
+    ("- ", "expired", ""),
+    ("\n  - ", "abc", "\n  - def"),
+    ("\n  - ", "abc password:", ""),
+    ("\"", "abc def", "\""),
+    ("\"", "abc secret=", ""),
+    ("'", "abc def", "'"),
+    ("'", "abc password:", ""),
+    ("|\n  ", "abc", ""),
+    (">\n  ", "abc def", ""),
+    ("|", "token: x", ""),
+    (">", "token: x", ""),
+    ("(", "abc", ")"),
+];
+
+/// The quotes a name is written in, from none to a JSON text five strings deep.
+const NAME_QUOTES: &[&str] = &[
+    "",
+    "",
+    "",
+    "\"",
+    "'",
+    "\\\"",
+    "\\\\\"",
+    "\\\\\\\"",
+    "\\\\\\\\\"",
+    "\\\\\\\\\\\"",
+];
+const BREAKS: &[&str] = &["\n", "\n", " ", ", ", "; ", "\n  ", "\r\n", " & ", "\n\n"];
+
+/// Whether a statement is one the containers-only-add search leaves out, because the redactor
+/// reads it differently from 0.4.1 on purpose (`docs/compliance.md`, "Intended keeps"):
+///
+/// - a value that ends in a name still waiting for its own value (`- abc password:`): the name
+///   keeps its value, so the item before it is not read through it, and the value the item
+///   would have swallowed is read as what it is;
+/// - a value on the line after its name that is itself a name and its separator
+///   (`passwd:` then `token: x`): the second name is a statement of its own, and so is its value.
+fn is_an_intended_keep(separator: &str, body: &str) -> bool {
+    body.ends_with([':', '=']) || (separator.contains('\n') && body.starts_with("token: "))
+}
+
+/// One input of statements, each a name, a separator and a value written one of the ways above,
+/// with a [`SECRET`] after it: the shapes a vendor's message carries a credential in, minus the
+/// intended keeps ([`is_an_intended_keep`]). A secret stands apart from the words around it, since
+/// one glued to the front of a name is a part of that name.
+fn structured_text(random: &mut Random) -> String {
+    let mut text = String::new();
+    if random.below(6) == 0 {
+        text.push_str(random.pick(TOKEN_PIECES));
+    }
+    for statement in 0..1 + random.below(3) {
+        if statement > 0 {
+            text.push_str(random.pick(BREAKS));
+        }
+        let quote = *random.pick(NAME_QUOTES);
+        let separator = *random.pick(SEPARATORS);
+        let (open, body, close) = loop {
+            let value = *random.pick(VALUES);
+            if !is_an_intended_keep(separator, value.1) {
+                break value;
+            }
+        };
+        text.push_str(&format!("{quote}{}{quote}", random.pick(NAMES)));
+        text.push_str(separator);
+        text.push_str(&format!("{open}{body}{close}"));
+        if random.below(3) > 0 {
+            text.push_str(random.pick(BREAKS));
+            text.push_str(SECRET);
+            text.push(' ');
+        }
+    }
+    text
+}
+
 /// One input: fragments of the differential's lists, token pieces and byte soup, mixed.
 fn generate(random: &mut Random) -> String {
     let length = 1 + random.below(24);
@@ -127,6 +246,11 @@ fn generate(random: &mut Random) -> String {
 
 /// Runs `check` on `count()` generated inputs on several threads, naming the input that fails.
 fn search(check: fn(&str)) {
+    search_in(generate, check);
+}
+
+/// [`search`] over the inputs `generator` makes.
+fn search_in(generator: fn(&mut Random) -> String, check: fn(&str)) {
     let (seed, count) = (seed(), count());
     std::thread::scope(|scope| {
         let workers: Vec<_> = (0..THREADS)
@@ -134,7 +258,7 @@ fn search(check: fn(&str)) {
                 scope.spawn(move || {
                     let mut random = Random::new(seed, thread);
                     for _ in 0..count / THREADS {
-                        let text = generate(&mut random);
+                        let text = generator(&mut random);
                         check(&text);
                     }
                 })
@@ -215,12 +339,35 @@ fn labelled(raw: &str) -> String {
     out
 }
 
+/// Whether a closing bracket stands in the body of a private-key block: between a begin marker and
+/// the end marker after it, or the end of the text.
+///
+/// The one place the token pass does not only add (`docs/compliance.md`, "Intended keeps"). Without
+/// it a container that opened in front of the block closes at that bracket and is redacted to it;
+/// with the block gone the bracket is gone, and the container reads as one that never closes (its
+/// first line). The body of a key is base64, and base64 holds no bracket.
+fn has_a_bracket_in_a_key(text: &str) -> bool {
+    let mut rest = text;
+    while let Some(begin) = rest.find("-----BEGIN ") {
+        let body = &rest[begin..];
+        let end = body.find("-----END ").unwrap_or(body.len());
+        if body[..end].contains([']', '}']) {
+            return true;
+        }
+        rest = &body[end..];
+    }
+    false
+}
+
 /// The token pass only adds: a value the name rules redact (`stderr_text`) is redacted by the
 /// message entry points too, occurrence by occurrence, whatever the text holds, private-key blocks
-/// included. A block or a token that takes a name with it, or ends where a rule would have carried
+/// included, but for a bracket inside a block ([`has_a_bracket_in_a_key`]). A block or a token that takes a name with it, or ends where a rule would have carried
 /// on, shows here as a label that survives the message form and not the stderr form.
 fn assert_the_token_pass_only_adds(raw: &str) {
     let text = labelled(raw);
+    if has_a_bracket_in_a_key(&text) {
+        return;
+    }
     let (rules, message) = (stderr_text(&text), message_text(&text));
     let structured_form = bounded(&text, TextLimit::ErrorMessage).text;
     for index in 0..LABELS {
@@ -257,6 +404,25 @@ fn the_token_pass_only_adds_in_both_corpora_and_their_pieces() {
 }
 
 #[test]
+fn a_bracket_in_a_key_body_is_found_and_one_outside_is_not() {
+    let key =
+        |body: &str| format!("a ] -----BEGIN PRIVATE KEY-----{body}-----END PRIVATE KEY----- }}");
+    for (text, expected) in [
+        (key("AAAA"), false),
+        (key("AA]AA"), true),
+        (key("AA}AA"), true),
+        ("-----BEGIN PRIVATE KEY-----AA]".to_owned(), true),
+        ("no key ] here".to_owned(), false),
+    ] {
+        assert_eq!(
+            has_a_bracket_in_a_key(&text),
+            expected,
+            "expected a bracket in a key body to be {expected} | input {text:?}"
+        );
+    }
+}
+
+#[test]
 fn the_labels_tell_one_occurrence_from_the_next() {
     let text = format!("a {SECRET} b {SECRET} c");
     assert_eq!(labelled(&text), "a SEKRET0 b SEKRET1 c");
@@ -266,6 +432,59 @@ fn the_labels_tell_one_occurrence_from_the_next() {
         "expected the occurrences past {LABELS} left as they are | received: {:?}",
         labelled(&many)
     );
+}
+
+/// The container, sequence and escape-depth reads only add to what 0.4.1 redacted (which read a
+/// value to the end of its line): a value 0.4.1 redacted is redacted now, occurrence by occurrence,
+/// on every shape [`structured_text`] makes. The only text left visible is the text the rules keep
+/// on purpose, and [`is_an_intended_keep`] names it.
+fn assert_the_rules_only_add_to_the_replaced_scan(raw: &str) {
+    let text = labelled(raw);
+    let (replaced, current) = (reference::stderr_text(&text), stderr_text(&text));
+    for index in 0..LABELS {
+        let label = format!("{}{index}", &SECRET[..SECRET.len() - 1]);
+        assert!(
+            !current.contains(&label) || replaced.contains(&label),
+            "expected {label} gone from stderr_text as it is from the replaced scan | input {text:?} (seed {}) replaced: {replaced:?}, current: {current:?}",
+            seed()
+        );
+    }
+}
+
+#[test]
+#[ignore = "a long search; see the module docs"]
+fn the_rules_only_add_to_the_replaced_scan_on_generated_structures() {
+    search_in(
+        structured_text,
+        assert_the_rules_only_add_to_the_replaced_scan,
+    );
+}
+
+#[test]
+fn the_rules_only_add_to_the_replaced_scan_on_a_few_structures() {
+    let mut random = Random::new(2, 0);
+    for _ in 0..2_000 {
+        assert_the_rules_only_add_to_the_replaced_scan(&structured_text(&mut random));
+    }
+}
+
+#[test]
+fn the_structured_generator_makes_every_container_and_escape_depth() {
+    let mut random = Random::new(1, 0);
+    let all: String = (0..4_000).map(|_| structured_text(&mut random)).collect();
+    for (what, found) in [
+        ("a sequence", all.contains("\n  - ") || all.contains(": - ")),
+        ("an array", all.contains("[\"a\"")),
+        ("an object", all.contains("{\"a\": 1}")),
+        ("a block scalar", all.contains("|\n  ")),
+        ("a name five strings deep", all.contains("\\\\\\\\\\\"")),
+        ("a label", all.contains(SECRET)),
+    ] {
+        assert!(
+            found,
+            "expected the structured generator to make {what} | received none in 4,000 inputs"
+        );
+    }
 }
 
 #[test]

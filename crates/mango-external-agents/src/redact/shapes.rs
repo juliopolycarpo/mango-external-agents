@@ -1002,3 +1002,142 @@ fn a_hyphen_at_the_end_of_a_line_is_a_value_and_not_a_sequence_marker() {
         ("tokens:\n  -\nother: x", "tokens=[REDACTED]\nother: x"),
     ]);
 }
+
+/// A sequence item or a container under a name that reads one word ends where a credential's name
+/// ends it, and that name reads the text after it: the item used to take the name along, and the
+/// value on the next line stayed. A name that reads a phrase or a line takes the names in it, as it
+/// always has.
+#[test]
+fn a_sequence_item_stops_at_the_credential_name_that_ends_it() {
+    assert_shown(&[
+        (
+            "tokens: - abc password:\nhunter2",
+            "tokens=[REDACTED] password=[REDACTED]",
+        ),
+        (
+            "tokens: - abc password:\nhunter2\nnext: ok",
+            "tokens=[REDACTED] password=[REDACTED]\nnext: ok",
+        ),
+        (
+            "api_key:\n  - sk-aaa\n  - bbb secret=\nccc\nnext: ok",
+            "api_key=[REDACTED] secret=[REDACTED]\nnext: ok",
+        ),
+        // A name that reads the line takes the one in it.
+        (
+            "password: - abc secret=\nnext: ok",
+            "password=[REDACTED]\nnext: ok",
+        ),
+        // A value that is the name and nothing else is read as it was.
+        ("tokens: - password:\nhunter2", "tokens=[REDACTED]\nhunter2"),
+        // A name glued to the item is a part of it.
+        (
+            "tokens: - abc;password:\nhunter2",
+            "tokens=[REDACTED]\nhunter2",
+        ),
+    ]);
+}
+
+/// More backslashes than a JSON text can write in front of a quote (31, five strings deep) are not
+/// a string. A container that meets them is read to the end of its line, as an array that never
+/// closes is, and nothing past the line is left behind a bracket that closes in a string.
+#[test]
+fn a_run_of_backslashes_deeper_than_a_string_is_read_to_the_end_of_the_line() {
+    let slashes = |count: usize| "\\".repeat(count);
+    for count in [31, 32, 33, 64] {
+        let text = format!(
+            "api_key: [{}\"x\"] CNRY {}\" tail",
+            slashes(count),
+            slashes(1)
+        );
+        let received = stderr_text(&text);
+        assert_eq!(
+            received, "api_key=[REDACTED]",
+            "expected the line of {count} backslashes in a container redacted whole | input {text:?} received: {received:?}"
+        );
+    }
+}
+
+/// A cookie header takes its line behind any escape deeper than a quote's own, and an ordinary name takes the text
+/// glued to the quote that closes its value at every depth, as it does at the first.
+#[test]
+fn a_value_is_read_the_same_at_every_depth_of_escape() {
+    let slashes = |count: usize| "\\".repeat(count);
+    for count in [0, 1, 3, 7, 15, 31, 32] {
+        let quote = format!("{}'", slashes(count));
+        let cookie = format!("Cookie = {quote}c1{quote}see c2");
+        let received = stderr_text(&cookie);
+        // One quote and its escape are a string of their own; a deeper escape is the line.
+        let expected = if count > 1 {
+            "Cookie = [REDACTED]".to_owned()
+        } else {
+            format!("Cookie = {quote}[REDACTED]{quote} c2")
+        };
+        assert_eq!(
+            received, expected,
+            "expected a cookie's value read behind {count} backslashes as it is at the first depth | input {cookie:?} received: {received:?}"
+        );
+        let password = format!("password = {quote}c1{quote}see c2");
+        let received = stderr_text(&password);
+        assert!(
+            !received.contains("c1") && !received.contains("see"),
+            "expected the value and the text glued to its closing quote gone behind {count} backslashes | input {password:?} received: {received:?}"
+        );
+    }
+}
+
+/// A YAML block scalar under a credential's name is the lines indented under it, as a sequence is
+/// its items: `password: |` has nothing on its own line, and its value used to stay.
+#[test]
+fn a_yaml_block_scalar_under_a_credential_name_is_the_lines_under_it() {
+    assert_shown(&[
+        (
+            "password: |\n  hunter2\n  second\nnext: ok",
+            "password=[REDACTED]\nnext: ok",
+        ),
+        ("password: >\n  hunter2\n", "password=[REDACTED]\n"),
+        (
+            "api_key: |-\n  sk-aaa\nnext: ok",
+            "api_key=[REDACTED]\nnext: ok",
+        ),
+        ("secret: |+2\n    sk-aaa\n\n", "secret=[REDACTED]\n\n"),
+        // A comment on the header line, blank lines between the lines, and CRLF line ends.
+        (
+            "token: | # keep\n  a\n\n  b\nnext: ok",
+            "token=[REDACTED]\nnext: ok",
+        ),
+        (
+            "token: |\r\n  a\r\n  b\r\nnext: ok",
+            "token=[REDACTED]\nnext: ok",
+        ),
+        // Only the lines indented deeper than the name's own are its.
+        (
+            "  key:\n    password: |\n      a\n    user: bob",
+            "  key:\n    password=[REDACTED]\n    user: bob",
+        ),
+        ("password: |\nuser: bob", "password=[REDACTED]\nuser: bob"),
+        // A quoted name keeps its quote and its separator.
+        ("{\"password\": |\n  a\n}", "{\"password\": [REDACTED]\n}"),
+        // `|abc` is a value on the line, and a header with nothing under it has nothing to read.
+        (
+            "password: |abc\nuser: bob",
+            "password=[REDACTED]\nuser: bob",
+        ),
+        ("password: |", "password=[REDACTED]"),
+    ]);
+}
+
+/// A block scalar is read across the lines a container is, and no further.
+#[test]
+fn a_block_scalar_is_read_across_no_more_lines_than_a_container() {
+    let lines = |count: usize| format!("password: |\n{}after: ok", "  a\n".repeat(count));
+    let received = stderr_text(&lines(60));
+    assert_eq!(
+        received, "password=[REDACTED]\nafter: ok",
+        "expected a 60 line scalar redacted whole | received: {received:?}"
+    );
+    let received = stderr_text(&lines(200));
+    assert!(
+        received.starts_with("password=[REDACTED]\n  a\n") && received.ends_with("after: ok"),
+        "expected a scalar of 200 lines redacted as far as the line bound and no further | received: {received:?}"
+    );
+}

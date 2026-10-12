@@ -888,7 +888,11 @@ fn read_assignment(bytes: &[u8], at: usize, query: &mut QueryRun) -> Option<Outc
     let colon = bytes.get(separator) == Some(&b':');
     let after_separator =
         match_byte(bytes, separator, b'=').or_else(|| match_byte(bytes, separator, b':'))?;
-    let (value_start, list) = list_item(bytes, skip_spaces(bytes, after_separator));
+    let (mut value_start, mut list) = list_item(bytes, skip_spaces(bytes, after_separator));
+    // A cookie header's value is its line, marker and all.
+    if keyword.kind == Kind::Line && list.is_some() {
+        (value_start, list) = (skip_spaces(bytes, after_separator), None);
+    }
     let mut context = Context {
         query,
         start: run_start(bytes, at, is_name_byte),
@@ -897,7 +901,22 @@ fn read_assignment(bytes: &[u8], at: usize, query: &mut QueryRun) -> Option<Outc
         quoted_name,
         in_query: None,
     };
-    if let Some(opened) = open_quote(bytes, value_start) {
+    // `password: |` and the lines indented under it are one value.
+    let block = if list.is_none() && keyword.kind != Kind::Line {
+        block_scalar_end(bytes, value_start, context.start)
+    } else {
+        None
+    };
+    // A sequence item reads as the sequence whatever it opens with. A cookie header's line, and a
+    // password's phrase after a colon, are read to the end of the line however deep the quote that
+    // opens them is escaped: the reading of an escape deeper than one belongs to this redactor,
+    // and the line is what the release before it redacted.
+    let takes_the_line = keyword.kind == Kind::Line || (keyword.kind == Kind::Phrase && colon);
+    if list.is_none()
+        && block.is_none()
+        && let Some(opened) = open_quote(bytes, value_start)
+        && !(takes_the_line && opened.slashes > 1)
+    {
         return quoted_value(bytes, &keyword, at, opened, after_separator, &mut context);
     }
     // A `&` ends a value only in a query string, and a query string separates with `=`.
@@ -944,6 +963,7 @@ fn read_assignment(bytes: &[u8], at: usize, query: &mut QueryRun) -> Option<Outc
         None => false,
     };
     let value_end = match (keyword.kind, bytes.get(value_start)) {
+        _ if block.is_some() => block.unwrap_or(value_start),
         _ if list.is_some() => list_end(bytes, value_start, list.flatten()),
         _ if with_a_token => line_end(bytes, value_start),
         (Kind::Line, _) => line_end(bytes, value_start),
@@ -955,6 +975,30 @@ fn read_assignment(bytes: &[u8], at: usize, query: &mut QueryRun) -> Option<Outc
         ),
         (Kind::Phrase, _) if phrase => phrase_end(bytes, value_start),
         _ => take_while(bytes, value_start, |byte| !ends_value(byte)),
+    };
+    // A sequence item, a block scalar or a container, under a name that reads one word
+    // (`tokens: - abc password:`),
+    // stops short of a credential's name that ends it: the name's own value is the text after it,
+    // which the rule for that name reads. A name that reads a phrase or a line takes the names in
+    // it along, as it always has, and the text after the redaction is then the same word it was.
+    let past_a_word = keyword.kind == Kind::Token
+        && (list.is_some()
+            || block.is_some()
+            || matches!(bytes.get(value_start), Some(b'[' | b'{')));
+    let value_end = if past_a_word {
+        stop_at_pending_name(bytes, value_start, value_end)
+    } else {
+        value_end
+    };
+    let value_end = {
+        let mut end = value_end;
+        loop {
+            let past = whole_marker(bytes, value_start, end);
+            if past == end {
+                break end;
+            }
+            end = take_while(bytes, past, |byte| !ends_value(byte));
+        }
     };
     if value_end == value_start {
         return Some(Outcome::Keep {
@@ -974,6 +1018,214 @@ fn read_assignment(bytes: &[u8], at: usize, query: &mut QueryRun) -> Option<Outc
         joiner,
         tail: "",
     }))
+}
+
+/// `end`, moved past the `]` of a `[REDACTED]` that it falls inside: a value that ends at a bracket
+/// (a quoted member's does) must not end in the middle of a marker an earlier rule wrote, which
+/// would leave `[REDACTED]]` and a text that the next reading redacts differently.
+fn whole_marker(bytes: &[u8], start: usize, end: usize) -> usize {
+    const OPEN: &[u8] = b"[REDACTED";
+    let inside = bytes.get(end) == Some(&b']')
+        && end >= start + OPEN.len()
+        && &bytes[end - OPEN.len()..end] == OPEN;
+    if inside { end + 1 } else { end }
+}
+
+/// Where the YAML block scalar that opens at `at` ends: `|` or `>`, a chomping or indentation
+/// indicator and a comment, then the lines under it that are indented deeper than the line of
+/// the name at `name`. Blank lines between them belong to it, and those after the last do not.
+///
+/// Read across no more than [`MAX_CONTAINER_LINES`] lines and [`MAX_CONTAINER_BYTES`] bytes, as a
+/// container is. A longer scalar is redacted as far as that, and nothing past it. `None` when
+/// `at` is no header (`password: |abc` is a value), or nothing is indented under it.
+fn block_scalar_end(bytes: &[u8], at: usize, name: usize) -> Option<usize> {
+    if !matches!(bytes.get(at), Some(b'|' | b'>')) {
+        return None;
+    }
+    let mut header = at + 1;
+    while header < at + 3 && matches!(bytes.get(header), Some(b'+' | b'-' | b'0'..=b'9')) {
+        header += 1;
+    }
+    let blanks = take_while(bytes, header, is_blank_byte);
+    let comment = blanks > header && bytes.get(blanks) == Some(&b'#');
+    let header_end = if comment {
+        raw_line_end(bytes, blanks)
+    } else {
+        blanks
+    };
+    if !matches!(bytes.get(header_end), Some(b'\n' | b'\r')) {
+        return None;
+    }
+    // The key's own indentation: what is under it must be deeper.
+    let line_start = run_start(bytes, name, |byte| (byte != b'\n') & (byte != b'\r'));
+    let indent = take_while(bytes, line_start, is_blank_byte) - line_start;
+    let mut end = None;
+    let mut line = next_line(bytes, header_end);
+    for _ in 0..MAX_CONTAINER_LINES {
+        if line > bytes.len() || line - at > MAX_CONTAINER_BYTES {
+            break;
+        }
+        let content = take_while(bytes, line, is_blank_byte);
+        let stop = raw_line_end(bytes, content);
+        if content < stop {
+            if content - line <= indent {
+                break;
+            }
+            end = Some(trim_end(bytes, content, stop));
+        }
+        if stop >= bytes.len() {
+            break;
+        }
+        line = next_line(bytes, stop);
+    }
+    end
+}
+
+/// The end of the line that `start` is on, before its break and with its trailing blanks.
+fn raw_line_end(bytes: &[u8], start: usize) -> usize {
+    take_while(bytes, start, |byte| (byte != b'\n') & (byte != b'\r'))
+}
+
+/// The start of the line after the break at `at`: `\n`, `\r\n` or `\r`.
+fn next_line(bytes: &[u8], at: usize) -> usize {
+    match (bytes.get(at), bytes.get(at + 1)) {
+        (Some(b'\r'), Some(b'\n')) => at + 2,
+        _ => at + 1,
+    }
+}
+
+/// A credential's name that ends a value and has its own value still to come.
+struct PendingName {
+    /// Where the name starts.
+    start: usize,
+    /// How its value is read.
+    kind: Kind,
+    /// Where its separator is.
+    separator: usize,
+}
+
+/// The credential's name that ends `bytes[from..to]` with its separator at the end of the text or
+/// right after it, past blanks: `abc password:` and `abc password` (`:` next).
+fn pending_name(bytes: &[u8], from: usize, to: usize) -> Option<PendingName> {
+    let mut end = to;
+    while end > from && matches!(bytes[end - 1], b' ' | b'\t' | b'\n' | b'\r') {
+        count_steps(1);
+        end -= 1;
+    }
+    if end <= from {
+        return None;
+    }
+    // The separator closes the value, or the value ends with the name and the separator follows.
+    let (separator, name_end) = if matches!(bytes[end - 1], b'=' | b':') {
+        let separator = end - 1;
+        (
+            separator,
+            before_quote(bytes, run_start(bytes, separator, is_space_byte)),
+        )
+    } else {
+        let blanks = take_while(bytes, to, is_blank_byte);
+        let after = skip_spaces(bytes, skip_quote(bytes, blanks));
+        if !matches!(bytes.get(after), Some(b'=' | b':')) {
+            return None;
+        }
+        (after, before_quote(bytes, end))
+    };
+    let (start, first) = name_run(bytes, name_end);
+    let keyword = named_credential(bytes, first, name_end)?;
+    let kind = if ends_in_cookie(bytes, first, name_end) {
+        Kind::Line
+    } else {
+        keyword.kind
+    };
+    Some(PendingName {
+        start,
+        kind,
+        separator,
+    })
+}
+
+/// The keyword that makes a name a credential's, when one starts in `bytes[first..name_end]`.
+fn named_credential(bytes: &[u8], first: usize, name_end: usize) -> Option<Keyword> {
+    (first..name_end).find_map(|place| {
+        if !starts_a_keyword(bytes, place) {
+            // The header's name is no keyword of the assignment rule, and its line is a line.
+            return (bytes[place] | 0x20 == b'a'
+                && starts_a_word(bytes, place)
+                && match_word(bytes, place, AUTHORIZATION) == Some(name_end))
+            .then_some(Keyword {
+                end: name_end,
+                kind: Kind::Line,
+                whole: true,
+                token: false,
+                key_shape: false,
+            });
+        }
+        match_keyword(bytes, place).filter(|keyword| {
+            keyword_may_start(bytes, place, keyword.end)
+                && (keyword.whole || !is_a_plain_word(bytes, place, keyword.end))
+        })
+    })
+}
+
+/// Where a value that runs from `from` to `to` ends when a credential's name ends it: `- abc
+/// password:` ends where `password` starts, since what the name takes is the text after it, and a
+/// value that took the name along would leave that text behind.
+///
+/// `to` when no such name ends it, and `from` when the value is nothing but the name. And `to`
+/// when the name would read the word after it as its value and that word is itself a name with
+/// its separator (`secret=\n\ncredential: x`): the value that took the first name along leaves the
+/// second to its own rule, and a bare value that took the second would leave `x`.
+fn stop_at_pending_name(bytes: &[u8], from: usize, to: usize) -> usize {
+    let Some(pending) = pending_name(bytes, from, to) else {
+        return to;
+    };
+    // A cookie's line takes whatever follows, names included. A password's phrase takes the rest
+    // of its line unless it opens with a quote, which is a value of its own. The others read one
+    // word, and would take a name for it.
+    let takes_the_line = match pending.kind {
+        Kind::Line => true,
+        Kind::Phrase if bytes[pending.separator] == b':' => {
+            // Whole line unless a comma or a semicolon ends the phrase early, or a quote opens a
+            // value of its own that the rules read as one.
+            let value = skip_spaces(bytes, pending.separator + 1);
+            phrase_end(bytes, value) == line_end(bytes, value)
+                && quote_at(bytes, value).is_none_or(|(_, slashes, _)| slashes > 1)
+        }
+        Kind::Phrase | Kind::Token => false,
+    };
+    if !takes_the_line && next_word_is_a_name(bytes, pending.separator + 1) {
+        return to;
+    }
+    let mut stop = pending.start;
+    // A name glued to the end of the value is a part of it: the text left behind would be read
+    // again as one word with the redaction, and the next pass would not be this one.
+    if stop > from && !is_blank_byte(bytes[stop - 1]) {
+        return to;
+    }
+    while stop > from && is_blank_byte(bytes[stop - 1]) {
+        stop -= 1;
+    }
+    // The value is the name and nothing else: the reading that took it along is the one that holds.
+    if stop <= from { to } else { stop }
+}
+
+/// Whether the word that follows `after`, past blanks and line breaks, is a credential's name
+/// with its separator: it ends in one, or a separator follows it.
+fn next_word_is_a_name(bytes: &[u8], after: usize) -> bool {
+    let word = skip_spaces(bytes, after);
+    let end = take_while(bytes, word, |byte| !is_space_byte(byte));
+    pending_name(bytes, word, end).is_some() || starts_a_named_pair(bytes, word)
+}
+
+/// Whether a credential's name and its separator stand at `at`, the name quoted or not.
+fn starts_a_named_pair(bytes: &[u8], at: usize) -> bool {
+    let inner = skip_quote(bytes, at);
+    let name_end = take_while(bytes, inner, is_name_byte);
+    if name_end == inner || named_credential(bytes, inner, name_end).is_none() {
+        return false;
+    }
+    let after = skip_spaces(bytes, skip_quote(bytes, name_end));
+    matches!(bytes.get(after), Some(b'=' | b':'))
 }
 
 /// The most items of a YAML sequence that a credential's name takes.
@@ -1143,9 +1395,18 @@ fn closing_bracket(bytes: &[u8], start: usize, spent: &mut usize) -> usize {
             (None, b'\\') => {
                 let run = 1 + take_while(bytes, at, |byte| byte == b'\\') - at;
                 at += run - 1;
-                if run <= MAX_SLASHES && bytes.get(at).is_some_and(|byte| is_quote(*byte)) {
+                let quoted = bytes.get(at).is_some_and(|byte| is_quote(*byte));
+                if run <= MAX_SLASHES && quoted {
                     string = Some((bytes[at], run));
                     at += 1;
+                } else if quoted {
+                    // Deeper than a string is read, and not a string: the line is the value, as it
+                    // is for a container that never closes.
+                    let first = *first_break.get_or_insert_with(|| {
+                        take_while(bytes, at, |byte| (byte != b'\n') & (byte != b'\r'))
+                    });
+                    charge(spent, first_break, at);
+                    return first;
                 }
             }
             (None, b'"' | b'\'') => string = Some((byte, 0)),

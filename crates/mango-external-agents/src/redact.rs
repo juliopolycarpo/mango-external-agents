@@ -98,7 +98,7 @@ fn read(raw: &str, tokens: bool) -> String {
     // ` Bearer sk-live-x` either side of an escape sequence, and a rule that reads the two as
     // neighbours never sees the token at all if the sequence is still sitting between them.
     let (plain, marked) = strip::strip_marking(raw);
-    let (mut redacted, blocks) = rules_round(&plain, tokens);
+    let (mut redacted, reread) = rules_round(&plain, tokens);
     // A marker the stripper left parts a name from the word before it for the rules, and is gone
     // from what they return, so a second call over that would read the same text differently.
     // Reading it again here, until it stops changing, makes the answer one a second call leaves
@@ -107,7 +107,10 @@ fn read(raw: &str, tokens: bool) -> String {
     // A private-key block does the same: the rules read the mark it left as the end of a header,
     // and the name they made of it and the text glued on is a different name once it is a
     // `[REDACTED]`.
-    if marked || blocks {
+    //
+    // A URL password redacted under a credential's name does the same: the `user:[REDACTED]@` it
+    // leaves is read as an assignment, and what that takes can make another URL of what is left.
+    if marked || reread {
         for _ in 0..EXTRA_ROUNDS {
             let (next, _) = rules_round(&redacted, tokens);
             if next == redacted {
@@ -126,8 +129,8 @@ const EXTRA_ROUNDS: usize = 3;
 /// the private-key blocks go first (a name that redacts the first line of a block would leave the
 /// rest of it behind) and the other well-known tokens go last: a name that opens like a prefix
 /// (`sk-live-api-key: x`) must reach the rules whole, and the `[REDACTED]` a token leaves must not
-/// stand where a rule is reading a value. It answers whether a block was replaced, since the text
-/// then wants another round (see [`read`]).
+/// stand where a rule is reading a value. It answers whether a block was replaced or a URL password
+/// under a credential's name was, since the text then wants another round (see [`read`]).
 fn rules_round(plain: &str, tokens: bool) -> (String, bool) {
     let blocks = tokens
         .then(|| tokens::redact(plain, tokens::Pass::Blocks))
@@ -151,7 +154,7 @@ fn rules_round(plain: &str, tokens: bool) -> (String, bool) {
     if blocks.is_some() {
         return (tokens::settle_marks(&text), true);
     }
-    (text, false)
+    (text, named)
 }
 
 /// [`stderr_text`] without the rounds that follow a marker: what one reading of the rules gives.

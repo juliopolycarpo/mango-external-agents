@@ -172,6 +172,16 @@ fn marker_follows_a_separator(lower: &str) -> bool {
     })
 }
 
+/// Whether `|` or `>` stands right after a `:` or an `=`, where a rule added after 0.4.1 reads the
+/// lines under it as the value of a YAML block scalar.
+fn block_scalar_follows_a_separator(lower: &str) -> bool {
+    lower.match_indices([':', '=']).any(|(at, _)| {
+        let rest =
+            lower[at + 1..].trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '\u{1}');
+        rest.starts_with(['|', '>'])
+    })
+}
+
 /// The words a rule keeps after a name, as the rules spell them.
 const STATUS_WORDS: &[&str] = &[
     "not",
@@ -218,6 +228,7 @@ fn triggers_in(plain: &str) -> bool {
         || NEW_WORDS.iter().any(|word| lower.contains(word))
         || status_follows_a_separator(&lower)
         || marker_follows_a_separator(&lower)
+        || block_scalar_follows_a_separator(&lower)
     {
         return true;
     }
