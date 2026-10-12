@@ -578,6 +578,11 @@ pub const BARE_TOKENS: &[Leak] = &[
 /// [`redact::bounded`](crate::redact::bounded).
 pub const BENIGN_NEAR_TOKENS: &[&str] = &[
     "pip install scikit-learn failed: sk-learn is not a package",
+    "serving sk-live-reload-development-server on port 8080",
+    "see sk-proj-ects-directory-listing for the layout",
+    "sk-ant-colony-optimization-solver finished",
+    "using github_pat_tern_matching_helpers_module_x in the build",
+    "xoxb-is-not-a-real-token-prefix-here was a test name",
     "task-ant-0123456789abcdefghijklmnop was queued",
     "risk-live-0123456789abcdefghijklmnop is the dashboard",
     "disk-proj-0123456789abcdefghijklmnop mounted",

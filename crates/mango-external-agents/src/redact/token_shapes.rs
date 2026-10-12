@@ -375,3 +375,78 @@ fn the_text_around_multibyte_characters_is_kept_whole() {
         "expected the words kept | received: {received:?}"
     );
 }
+
+/// A name that opens like a token prefix is a name: its value is the secret, and the name has to
+/// reach the assignment rules whole, as it does through `stderr_text`.
+#[test]
+fn a_name_that_opens_like_a_token_prefix_keeps_its_value_redacted() {
+    for text in [
+        concat!("github_p", "at_for_actions_runner_token = \"SEKRET1\""),
+        concat!("sk", "-proj-prod-openai-api-key: SEKRET1value"),
+        concat!("sk", "-live-stripe-webhook-secret=SEKRET1value"),
+        concat!("sk", "-ant-api-key-for-claude: SEKRET1"),
+        concat!("glp", "at-renovate-bot-access-token = SEKRET1"),
+        concat!("AI", "zaSy_google_maps_browser_restricted_api_key=SEKRET1"),
+    ] {
+        let received = shown(text);
+        assert!(
+            !received.contains("SEKRET1") && received.contains("[REDACTED]"),
+            "expected the value after a name that opens like a token redacted | input {text:?} received: {received:?}"
+        );
+    }
+}
+
+/// A token after a name that takes the rest of its line is part of that value; the marker it
+/// leaves must not end the value early.
+#[test]
+fn a_token_after_a_name_that_takes_the_rest_of_the_line_leaves_nothing_behind() {
+    for name in [
+        "password:",
+        "passphrase:",
+        "Authorization:",
+        "Proxy-Authorization:",
+    ] {
+        let text = format!(
+            "{name} {}0123456789abcdefghijklmnopqrstuvwxyz SEKRET1 more",
+            concat!("gh", "p_")
+        );
+        let received = shown(&text);
+        assert!(
+            !received.contains("SEKRET1"),
+            "expected the rest of the value after a token under {name:?} redacted | input {text:?} received: {received:?}"
+        );
+    }
+}
+
+/// Whatever `stderr_text` takes out, the message entry points take out too: the token pass adds
+/// to the rules and never gets in their way.
+#[test]
+fn the_message_entry_points_redact_everything_stderr_text_redacts() {
+    for leak in LEAKS.iter().chain(BARE_TOKENS) {
+        if stderr_text(leak.text).contains(leak.secret) {
+            continue;
+        }
+        let received = shown(leak.text);
+        assert!(
+            !received.contains(leak.secret),
+            "expected {:?} gone from the message form as it is from stderr_text | received: {received:?}",
+            leak.secret
+        );
+    }
+}
+
+/// A block that begins where another ends is read as a block, so one pass leaves nothing for a
+/// second: `[REDACTED]-----BEGIN ...` would otherwise be a block behind a bracket.
+#[test]
+fn private_key_blocks_that_adjoin_are_redacted_in_one_pass() {
+    let (begin, end) = (
+        concat!("-----BEGIN ", "PRIVATE KEY-----"),
+        "-----END PRIVATE KEY-----",
+    );
+    let text = format!("{begin}\nAAAA\n{end}{begin}\nBBBB\n{end} after");
+    let once = shown(&text);
+    assert_eq!(
+        once, "[REDACTED][REDACTED] after",
+        "expected two adjoining blocks redacted in one pass | input {text:?} received: {once:?}"
+    );
+}

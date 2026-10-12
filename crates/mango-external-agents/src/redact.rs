@@ -118,12 +118,16 @@ fn read(raw: &str, tokens: bool) -> String {
 /// The most times text that carried a marker is read again.
 const EXTRA_ROUNDS: usize = 3;
 
-/// The three rules over text the stripper has handled, and the markers taken out after. The token
-/// pass goes first when asked: a private-key block that a name redacts the first line of would
-/// otherwise leave the rest of it behind.
+/// The three rules over text the stripper has handled, and the markers taken out after. When asked,
+/// the private-key blocks go first (a name that redacts the first line of a block would leave the
+/// rest of it behind) and the other well-known tokens go last: a name that opens like a prefix
+/// (`sk-live-api-key: x`) must reach the rules whole, and the `[REDACTED]` a token leaves must not
+/// stand where a rule is reading a value.
 fn rules_round(plain: &str, tokens: bool) -> String {
-    let unnamed = tokens.then(|| tokens::redact(plain)).flatten();
-    let bearer = redact_bearer(unnamed.as_deref().unwrap_or(plain));
+    let blocks = tokens
+        .then(|| tokens::redact(plain, tokens::Pass::Blocks))
+        .flatten();
+    let bearer = redact_bearer(blocks.as_deref().unwrap_or(plain));
     let assignments = redact_assignments(&bearer);
     let (urls, named) = redact_url_passwords(&assignments);
     // A URL password the last rule redacted leaves `user:[REDACTED]@`, which reads as an assignment
@@ -135,7 +139,14 @@ fn rules_round(plain: &str, tokens: bool) -> String {
     } else {
         urls
     };
-    remove_boundaries(settled)
+    let named_last = tokens
+        .then(|| tokens::redact(&settled, tokens::Pass::Prefixes))
+        .flatten();
+    let text = remove_boundaries(named_last.unwrap_or(settled));
+    if blocks.is_some() {
+        return text.replace(tokens::BLOCK_MARK, REDACTED);
+    }
+    text
 }
 
 /// [`stderr_text`] without the rounds that follow a marker: what one reading of the rules gives.

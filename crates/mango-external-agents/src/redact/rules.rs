@@ -978,10 +978,15 @@ const MAX_LIST_ITEMS: usize = 64;
 ///
 /// A hyphen glued to its word (`-sk-live-x`) is part of a value, as it always was.
 fn list_item(bytes: &[u8], at: usize) -> (usize, Option<Option<usize>>) {
-    let marked =
-        bytes.get(at) == Some(&b'-') && bytes.get(at + 1).is_some_and(|b| is_space_byte(*b));
-    let item = skip_spaces(bytes, at + 1);
-    if !marked || item >= bytes.len() {
+    // Nearly every value opens with something else, so this is a byte and a return.
+    if bytes.get(at) != Some(&b'-') || !bytes.get(at + 1).is_some_and(|b| is_blank_byte(*b)) {
+        return (at, None);
+    }
+    let item = take_while(bytes, at + 1, is_blank_byte);
+    if bytes
+        .get(item)
+        .is_none_or(|byte| matches!(byte, b'\n' | b'\r'))
+    {
         return (at, None);
     }
     let blanks = run_start(bytes, at, is_blank_byte);
@@ -1003,11 +1008,11 @@ fn list_end(bytes: &[u8], item: usize, indent: Option<usize>) -> usize {
         let in_column =
             blanks > 0 && matches!(bytes[blanks - 1], b'\n' | b'\r') && marker - blanks == indent;
         let marked = bytes.get(marker) == Some(&b'-')
-            && bytes.get(marker + 1).is_some_and(|b| is_space_byte(*b));
+            && bytes.get(marker + 1).is_some_and(|b| is_blank_byte(*b));
         if !(in_column && marked) {
             break;
         }
-        end = line_end(bytes, skip_spaces(bytes, marker + 1));
+        end = line_end(bytes, take_while(bytes, marker + 1, is_blank_byte));
     }
     end
 }

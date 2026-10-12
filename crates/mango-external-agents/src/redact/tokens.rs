@@ -4,7 +4,9 @@
 //! (ghp_...)` or a key quoted in prose, has no name to find, but most vendors give theirs away with
 //! a prefix, a length and an alphabet. This pass reads those, and nothing else: a closed list, each
 //! entry case-sensitive, with a minimum length and a body made of the characters that vendor's
-//! tokens are made of, so that `sk-learn`, `task-ant-...` and `npm_config_cache` are words.
+//! tokens are made of, so that `sk-learn`, `task-ant-...` and `npm_config_cache` are words. A short
+//! body of a prefix that allows `-` or `_` also has a digit, so a hyphenated name that opens like a
+//! prefix (`sk-live-reload-development-server`) is a word too.
 //!
 //! A token has to start where a run of name characters (`A-Za-z0-9_-`) starts, so a prefix inside a
 //! longer word never matches, and it takes the whole run it is in. The two letters of a JSON line
@@ -33,15 +35,77 @@ fn is_escape_letter(byte: u8) -> bool {
     matches!(byte, b'n' | b'r' | b't' | b'b' | b'f')
 }
 
-/// `text` with every well-known token replaced, or `None` when it holds none.
+/// Which tokens a pass reads: the private-key blocks, which have to go before the name rules (a
+/// name that redacts the block's first line would leave the rest of it), or every other prefix,
+/// which has to go after them (a name that opens like a prefix is a name).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Pass {
+    Blocks,
+    Prefixes,
+}
+
+/// `text` with every well-known token of `pass` replaced, or `None` when it holds none.
 ///
 /// # Example
 ///
 /// ```ignore
-/// let found = redact("see ghp_0123456789abcdefghijklmnopqrstuv now");
+/// let found = redact("see ghp_0123456789abcdefghijklmnopqrstuv now", Pass::Prefixes);
 /// assert_eq!(found.as_deref(), Some("see [REDACTED] now"));
 /// ```
-pub(super) fn redact(text: &str) -> Option<String> {
+pub(super) fn redact(text: &str, pass: Pass) -> Option<String> {
+    match pass {
+        Pass::Blocks => redact_blocks(text),
+        Pass::Prefixes => redact_prefixes(text),
+    }
+}
+
+/// What stands for a redacted private-key block while the name rules read the text, and is
+/// replaced by `[REDACTED]` when they are done. The marker itself would read as a closed container
+/// to a rule that is reading a value (`password: [REDACTED] more`), and this reads as a word.
+pub(super) const BLOCK_MARK: &str = "\u{e000}key-block\u{e001}";
+
+/// The private-key blocks of `text`, found by a search for the begin marker and not a read of
+/// every run, each replaced by [`BLOCK_MARK`].
+fn redact_blocks(text: &str) -> Option<String> {
+    const BEGIN: &str = "-----BEGIN ";
+    let bytes = text.as_bytes();
+    let mut out: Option<String> = None;
+    let mut copied = 0;
+    let mut from = 0;
+    while let Some(offset) = text[from..].find(BEGIN) {
+        count_steps(offset + 1);
+        let start = from + offset;
+        from = start + 1;
+        // A block that starts where the one before it ended is another block, not a word.
+        let adjoins = start == copied && copied > 0;
+        if start < copied || !(adjoins || starts_a_run(bytes, start)) {
+            continue;
+        }
+        let Some(end) = private_key_block(text, start) else {
+            continue;
+        };
+        let out = out.get_or_insert_with(|| String::with_capacity(text.len()));
+        out.push_str(&text[copied..start]);
+        out.push_str(BLOCK_MARK);
+        copied = end;
+        from = end;
+    }
+    out.map(|mut out| {
+        out.push_str(&text[copied..]);
+        out
+    })
+}
+
+/// Whether a token may start at `at`: no name character in front, or the letter of a JSON line
+/// break that follows a backslash.
+fn starts_a_run(bytes: &[u8], at: usize) -> bool {
+    let Some(&before) = at.checked_sub(1).and_then(|place| bytes.get(place)) else {
+        return true;
+    };
+    !is_run_byte(before) || (is_escape_letter(before) && at >= 2 && bytes[at - 2] == b'\\')
+}
+
+fn redact_prefixes(text: &str) -> Option<String> {
     let bytes = text.as_bytes();
     let mut out: Option<String> = None;
     let mut copied = 0;
@@ -93,7 +157,6 @@ fn token_at(text: &str, start: usize, run_end: usize) -> Option<usize> {
         b'n' => with_body(run, b"npm_", 30, is_alphanumeric).then_some(run_end),
         b'h' => with_body(run, b"hf_", 30, is_alphanumeric).then_some(run_end),
         b'd' => digitalocean(run).then_some(run_end),
-        b'-' => private_key_block(text, start),
         _ => None,
     }
 }
@@ -104,6 +167,14 @@ fn is_alphanumeric(byte: u8) -> bool {
 
 fn is_lower_hex(byte: u8) -> bool {
     byte.is_ascii_digit() | matches!(byte, b'a'..=b'f')
+}
+
+/// Whether the body of a token is random enough to be one: a body under 40 characters has a digit.
+/// Real tokens of these prefixes are random over 62 or 64 characters, so a short body with no
+/// digit in it is a hyphenated name (`sk-live-reload-development-server`) one time in a thousand
+/// tokens lost against many identifiers kept.
+fn looks_random(body: &[u8]) -> bool {
+    body.len() >= 40 || body.iter().any(u8::is_ascii_digit)
 }
 
 /// Whether `run` is `prefix` and then at least `min` bytes that `body` accepts, and nothing else.
@@ -123,10 +194,10 @@ fn github(run: &[u8]) -> bool {
             && body.iter().all(|byte| byte.is_ascii_alphanumeric());
     }
     if let Some(body) = run.strip_prefix(b"github_pat_") {
-        return body.len() >= 22;
+        return body.len() >= 22 && looks_random(body);
     }
     run.strip_prefix(b"glpat-")
-        .is_some_and(|body| body.len() >= 20)
+        .is_some_and(|body| body.len() >= 20 && looks_random(body))
 }
 
 /// Slack's `xoxb-`, `xoxp-`, `xoxa-`, `xoxs-` and `xoxr-` and 20 or more letters, digits and
@@ -137,7 +208,8 @@ fn slack(run: &[u8]) -> bool {
     {
         return matches!(kind, b'b' | b'p' | b'a' | b's' | b'r')
             && body.len() >= 20
-            && !body.contains(&b'_');
+            && !body.contains(&b'_')
+            && looks_random(body);
     }
     false
 }
@@ -148,7 +220,7 @@ fn slack(run: &[u8]) -> bool {
 fn s_token(run: &[u8]) -> bool {
     for prefix in [&b"sk-ant-"[..], b"sk-proj-", b"sk-live-"] {
         if let Some(body) = run.strip_prefix(prefix) {
-            return body.len() >= 16;
+            return body.len() >= 16 && looks_random(body);
         }
     }
     if stripe(run) {
@@ -196,7 +268,7 @@ fn aws_or_google(run: &[u8]) -> bool {
         return true;
     }
     run.strip_prefix(b"AIza")
-        .is_some_and(|body| body.len() >= 35)
+        .is_some_and(|body| body.len() >= 35 && looks_random(body))
 }
 
 /// `ya29.` and 20 or more letters, digits, `_` and `-`: the run is `ya29`, a dot ends it, and the

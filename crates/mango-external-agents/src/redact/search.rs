@@ -18,6 +18,9 @@ use crate::normalize::TextLimit;
 use crate::testing::redaction::{BARE_TOKENS, BENIGN, BENIGN_NEAR_TOKENS, LEAKS};
 use serde_json::Value;
 
+/// A value no rule keeps and no text holds by chance: the search asks where it survives.
+const SECRET: &str = "SEKRET1";
+
 const DEFAULT_COUNT: u64 = 2_000;
 const THREADS: u64 = 4;
 
@@ -99,6 +102,7 @@ const TOKEN_PIECES: &[&str] = &[
     "\\\\n",
     "\n",
     ".",
+    SECRET,
 ];
 
 /// One input: fragments of the differential's lists, token pieces and byte soup, mixed.
@@ -190,6 +194,29 @@ fn one_pass_over_generated_text_is_a_fixed_point() {
 #[ignore = "a long search; see the module docs"]
 fn no_entry_point_panics_on_generated_text() {
     search(assert_nothing_panics);
+}
+
+/// The message entry points add to the rules and never get in their way: where `stderr_text`
+/// takes [`SECRET`] out, `message_text` does too. Text with a private-key marker is left out: a
+/// block is replaced whole, and the words in it (`password`, `Bearer`) are no longer names for the
+/// text after it, so a secret glued to the end marker is read as the stderr rules read it only by
+/// accident.
+fn assert_messages_redact_what_stderr_redacts(raw: &str) {
+    if stderr_text(raw).contains(SECRET) || raw.contains("PRIVATE KEY") {
+        return;
+    }
+    let received = message_text(raw);
+    assert!(
+        !received.contains(SECRET),
+        "expected {SECRET:?} gone from the message form as it is from stderr_text | input {raw:?} (seed {}) received: {received:?}",
+        seed()
+    );
+}
+
+#[test]
+#[ignore = "a long search; see the module docs"]
+fn the_message_form_redacts_whatever_stderr_text_redacts_in_generated_text() {
+    search(assert_messages_redact_what_stderr_redacts);
 }
 
 #[test]

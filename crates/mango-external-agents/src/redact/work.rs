@@ -31,7 +31,7 @@ const AWAITING_STEPS_PER_BYTE: usize = 40;
 /// Doubling the text may add a little more than double the work: block searches round up to a
 /// whole block, each shape has a constant tail, and a read bounded by a count of lines or items
 /// (a container, a sequence) costs less than a byte for each byte until its bound is reached.
-const DOUBLING_SLACK: usize = 1024;
+const DOUBLING_SLACK: usize = 2048;
 
 /// One shape of text that has cost a rule more than its length, and the length it is built to.
 struct Shape {

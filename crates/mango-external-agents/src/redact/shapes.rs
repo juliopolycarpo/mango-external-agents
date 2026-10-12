@@ -989,3 +989,16 @@ fn a_count_of_twelve_digits_or_more_is_a_credential_and_a_shorter_one_is_a_count
         ("secret: 503", "secret: 503"),
     ]);
 }
+
+/// A hyphen and a line break is not a sequence marker: the item must start on the same line, so a
+/// dash left as a value does not take the line after it.
+#[test]
+fn a_hyphen_at_the_end_of_a_line_is_a_value_and_not_a_sequence_marker() {
+    assert_shown(&[
+        (
+            "password: -\nuser: bob\nhost: example.com",
+            "password=[REDACTED]\nuser: bob\nhost: example.com",
+        ),
+        ("tokens:\n  -\nother: x", "tokens=[REDACTED]\nother: x"),
+    ]);
+}
