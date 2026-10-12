@@ -552,7 +552,11 @@ fn missing_rollout(error: &Error, native_session_id: &str) -> bool {
 /// is compared in the form that arrives. An id that is itself credential-shaped, such as
 /// `token=abc`, would otherwise be redacted out of the answer and never equal the expected text.
 fn as_shown(message: &str) -> String {
-    mango_external_agents::redact::stderr_text(message)
+    mango_external_agents::redact::bounded(
+        message,
+        mango_external_agents::normalize::TextLimit::ErrorMessage,
+    )
+    .text
 }
 
 /// Proves a native thread's original workspace before loading it for a resumed conversation.

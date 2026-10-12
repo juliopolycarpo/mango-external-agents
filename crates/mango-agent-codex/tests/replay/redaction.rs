@@ -228,3 +228,43 @@ async fn every_shape_in_the_corpus_is_redacted_through_both_doors() {
         );
     }
 }
+
+/// The harness compares the peer's message, which the client bounds to an error message's length
+/// after redacting it, so the expected text has to be bounded the same way: an id of any length
+/// still finds its missing rollout.
+#[tokio::test]
+async fn a_very_long_thread_id_still_falls_back_to_a_fresh_thread() {
+    let launcher = Arc::new(FakeLauncher::new());
+    let missing = "t".repeat(3000);
+    launcher.push(
+        ResumeErrorServer {
+            message: format!("no rollout found for thread id {missing}"),
+        }
+        .process(),
+    );
+    let (host, launcher) = with_launcher(launcher, None);
+
+    let session = CodexHarness::new()
+        .open_session(
+            &host,
+            OpenSession::new("chat-1")
+                .resuming(&missing, mango_external_agents::ResumeMode::Fallback),
+        )
+        .await
+        .expect("expected a conclusive missing rollout to start a new thread");
+
+    assert!(
+        !session.snapshot().resumed && session.snapshot().fallback_reason.is_some(),
+        "expected a fresh thread for a 3000 character id | received: resumed {} reason {:?}",
+        session.snapshot().resumed,
+        session.snapshot().fallback_reason
+    );
+    assert!(
+        launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("thread/start")),
+        "expected thread/start after the missing rollout | received: {:?}",
+        launcher.written()
+    );
+}
