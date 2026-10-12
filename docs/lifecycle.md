@@ -236,26 +236,29 @@ where it used to see `Ok`. The first close, polled again after the second gave u
 with `Ok`; dropping it takes the reader down mid-call, so `on_terminated` does not return.
 
 A close future that is kept holds a borrow of the client it was called on, or a share of it when it
-owns one, so a client is not dropped under it: the reader lives no longer than the future, and
-dropping the future takes the reader down. A host that wants a kept close gone drops the future,
-and then the client. A future that is leaked instead (`std::mem::forget`) holds the lock on the
+owns one, so a client is not dropped under it. While the future is parked in its wait for the
+reader, the reader lives no longer than the future: dropping it takes the reader down. A host that
+wants a kept close gone drops the future, and then the client. A future that is leaked instead (`std::mem::forget`) holds the lock on the
 reader's handle for good, and dropping the client stops the reader without that lock.
 
 A handler that blocks its thread, with `std::thread::sleep` or a blocking lock, inside
 `on_terminated` cannot be stopped by the abort that a close gives up on, since an abort lands at an
 await. The close no longer waits for it without a bound: after the reader's wait runs out it takes
-the reader down, allows the abort a few milliseconds to land (50 ms, and no more than
-`shutdown_timeout`) when its bound is already spent, and returns the reader's `Timeout`, or the
-link's own error if closing the link failed. The close thus ends within twice `shutdown_timeout`,
-plus that allowance in this case. The reader's task stays on the blocked thread until the call
+the reader down, allows the abort 50 ms to land when its bound is already spent, and returns the
+reader's `Timeout`, or the link's own error if closing the link failed. The close thus ends within
+twice `shutdown_timeout`, plus that allowance in this case. The bound relies on another worker
+thread of the runtime being free to run its timers. The reader's task stays on the blocked thread until the call
 returns and then ends without a further call: the client stays closed, `Client::ended` keeps the
 end it recorded, `on_terminated` is not made again, and a later close or a drop has nothing left to
 wait for or stop. A handler must not block its thread; this only keeps the close from waiting for
-it. A handler blocked in `on_notification` or `on_request_handoff` is not covered: the close waits
-for that task, after aborting it, for as long as it blocks. The same holds for a caller that wraps `close` in a timeout shorter than twice
-`shutdown_timeout` on a connection that ended under this side: such a caller can cut
-`on_terminated` and should wrap `close` in nothing shorter than that bound if it relies on the
-call finishing.
+it. A handler blocked in `on_notification` or `on_request_handoff` is not covered on a connection
+that has not ended: the close waits for that task, after aborting it, for as long as it blocks. On
+a connection that ended under this side the reader waits for that task instead, and the close's
+bound cuts the reader as above.
+
+A caller that wraps `close` in a timeout shorter than twice `shutdown_timeout` on a connection that
+ended under this side can cut `on_terminated`, and should wrap `close` in nothing shorter than that
+bound if it relies on the call finishing.
 
 Things a client does on the wire only when its `WireOptions` ask for them, each off by
 default. `with_batch_decoding` reads a line that is a JSON array as a batch: its members are

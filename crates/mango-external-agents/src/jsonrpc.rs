@@ -322,9 +322,9 @@ const LINK_SHUTDOWN: &str = "JSON-RPC link shutdown";
 const READER_SHUTDOWN: &str = "JSON-RPC reader shutdown";
 
 /// What a [`Client::close`] that has spent its bound still gives the reader it has just aborted to
-/// notice the abort, capped at `shutdown_timeout`. The abort reaches a task at its next await, a
-/// scheduler turn away, so a bound already spent would otherwise read a reader that was about to
-/// stop as one that cannot.
+/// notice the abort. The abort reaches a task at its next await, a scheduler turn away, so a bound
+/// already spent would otherwise read a reader that was about to stop as one that cannot, whatever
+/// `shutdown_timeout` is.
 const READER_ABORT_SETTLE: Duration = Duration::from_millis(50);
 
 /// Whether `error` is a [`Client::close`] that gave up: closing the link, behind whatever
@@ -497,23 +497,29 @@ fn json_value_type(value: &Value) -> &'static str {
 /// its thread without awaiting, with `std::thread::sleep`, a `std` lock held across a wait or a
 /// blocking read, cannot be stopped that way, and it holds a worker thread of the runtime while
 /// it blocks. Wait on the runtime's own primitives, or hand blocking work to
-/// [`tokio::task::spawn_blocking`].
+/// [`tokio::task::spawn_blocking`]. The bounds below also rely on another worker thread being
+/// free to run the client's timers, which a runtime whose workers are all blocked cannot do.
 ///
 /// What a handler that blocks does to [`Client::close`] depends on the call:
 ///
 /// - [`on_terminated`](Self::on_terminated), on a connection that ended under this side: the
 ///   close waits for the call within its bound, as it does for any handler, and then stops
-///   waiting for it. It takes the reader down, gives the abort a few milliseconds to land, and
-///   returns [`Error::Timeout`] for the operation "JSON-RPC reader shutdown" (or the link's own
-///   error, if closing the link failed), so it ends within its documented bound. The reader's
+///   waiting for it. It takes the reader down, gives the abort 50 ms to land when its bound is
+///   already spent, and returns [`Error::Timeout`] for the operation "JSON-RPC reader shutdown" (or the link's own
+///   error, if closing the link failed), so it ends within its documented bound, twice
+///   `shutdown_timeout`, plus that allowance. The reader's
 ///   task cannot be stopped and stays on the blocked thread until the call returns, then ends
 ///   without any further call. The client stays closed, [`Client::ended`] keeps the end it
 ///   recorded, and a later close or a drop has nothing left to wait for or to stop.
 /// - [`on_notification`](Self::on_notification) and
-///   [`on_request_handoff`](Self::on_request_handoff): these run on the handler's task, which a
-///   close aborts and then waits for without a bound. A close behind a call that blocks waits
-///   for as long as the call blocks. Only the wait for the reader is bounded.
-/// - [`on_request`](Self::on_request) runs on tasks that a close aborts and does not wait for.
+///   [`on_request_handoff`](Self::on_request_handoff): these run on the handler's task. A close
+///   made on a connection that has not ended aborts that task and then waits for it without a
+///   bound, so it waits for as long as the call blocks. Only the wait for the reader is bounded.
+///   On a connection that ended under this side the reader is the one waiting for the task, and
+///   the close's bound cuts the reader as above.
+/// - [`on_request`](Self::on_request) runs on tasks that a close lets write their refusals for up
+///   to `shutdown_timeout`, which a call that blocks uses whole, and then aborts without
+///   waiting for them.
 #[async_trait::async_trait]
 pub trait PeerHandler: Send + Sync {
     /// The peer announced something.
@@ -3173,7 +3179,9 @@ impl Client {
     /// owes the peer to be written, and once for what was queued before the close to be written
     /// and the link closed. Both waits are over at once on a link that takes its writes. The
     /// handler's tasks are cancelled, not waited out, which takes no time unless a handler is
-    /// blocking its thread without yielding; nothing here can bound that. Two things are waited
+    /// blocking its thread without yielding. The wait for the reader is bounded against that, by
+    /// this bound and, when it is spent, 50 ms more for the abort to land; the wait for the
+    /// handler's own task is not, as [`PeerHandler`] says. Two things are waited
     /// for inside the same bound: a notification call or a hand-off that asked for a
     /// [`hold`](Self::hold_cancellation), during the first wait, and, on a connection that had
     /// already ended under this side, the handler's
@@ -3252,9 +3260,9 @@ impl Client {
     /// # A close that is kept
     ///
     /// A close future borrows the client it was called on, or owns a share of it, so a client
-    /// cannot be dropped under a close that is kept: the reader lives no longer than the future,
-    /// and dropping the future takes the reader down. Drop a kept close before the client it
-    /// belongs to. A future that is leaked, with [`std::mem::forget`], holds the lock on the
+    /// cannot be dropped under a close that is kept. While the future is parked in its wait for
+    /// the reader, the reader lives no longer than the future: dropping it takes the reader down.
+    /// Drop a kept close before the client it belongs to. A future that is leaked, with [`std::mem::forget`], holds the lock on the
     /// reader's handle for good; dropping the client stops the reader without that lock.
     ///
     /// # Wrapping a close
@@ -3373,8 +3381,7 @@ impl Client {
                 // wait ends with this close's own bound, or, when that is spent, after the
                 // short allowance a task needs to notice the abort. The reader is left to stop
                 // whenever the handler returns; nothing is left to wait for it.
-                let settle = READER_ABORT_SETTLE.min(self.state.options.shutdown_timeout);
-                let settled = latest.max(deadline_after(settle));
+                let settled = latest.max(deadline_after(READER_ABORT_SETTLE));
                 if tokio::time::timeout_at(settled, &mut *pump).await.is_err() {
                     return closed.and(Err(self.state.reader_shutdown_timeout()));
                 }

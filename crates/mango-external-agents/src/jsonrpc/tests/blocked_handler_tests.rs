@@ -189,3 +189,55 @@ async fn a_close_returns_within_its_bound_when_the_handler_blocks_its_thread() {
     );
     drop(client);
 }
+
+/// A sender whose `close` fails, as a link does that could not be closed.
+struct FailingClose(Box<dyn crate::link::LinkSender>);
+
+#[async_trait::async_trait]
+impl crate::link::LinkSender for FailingClose {
+    async fn send(&mut self, message: String) -> crate::Result<()> {
+        self.0.send(message).await
+    }
+
+    async fn close(&mut self) -> crate::Result<()> {
+        Err(Error::Link {
+            peer: String::from("ACP agent"),
+            message: String::from("close refused"),
+        })
+    }
+}
+
+/// A close that could not close the link and then could not stop the reader behind a blocked
+/// handler returns the link's own error, as the better answer, and not the reader's timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_that_failed_to_close_the_link_returns_that_failure_behind_a_blocked_handler() {
+    let gate = ThreadGate::arc();
+    let _release = ReleaseOnDrop(Arc::clone(&gate));
+    let handler = ThreadBlockedTermination::arc(&gate);
+    let link = ScriptedLink::new();
+    let (sender, receiver) = link.clone().into_link().split();
+    let client = Client::connect(
+        crate::link::Link::new(Box::new(FailingClose(sender)), receiver),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        options(),
+    );
+    link.end();
+    until("the handler to block inside on_terminated", || {
+        handler.entered.load(Ordering::Acquire) == 1
+    })
+    .await;
+
+    let bound = bound();
+    let began = Instant::now();
+    let closed = tokio::time::timeout(bound + LOAD_MARGIN, client.close()).await;
+    let waited = began.elapsed();
+    let Ok(closed) = closed else {
+        panic!(
+            "expected close to return within {bound:?} | received: still waiting after {waited:?}"
+        );
+    };
+    assert!(
+        matches!(&closed, Err(Error::Link { message, .. }) if message == "close refused"),
+        "expected the link's own failure, Error::Link \"close refused\" | received {closed:?} after {waited:?}"
+    );
+}
