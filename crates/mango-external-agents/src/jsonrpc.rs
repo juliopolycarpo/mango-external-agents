@@ -342,8 +342,9 @@ const ABORT_SETTLE: Duration = Duration::from_millis(50);
 /// Whether `error` is a [`Client::close`] that gave up: closing the link, behind whatever
 /// was still queued for it, did not finish within
 /// [`ClientOptions::shutdown_timeout`]. The link may still be open and the peer still
-/// running, which a host that owns the process has to deal with. The other timeout of a close
-/// is [`is_reader_shutdown_timeout`]; the [module documentation](self) says what each means.
+/// running, which a host that owns the process has to deal with. The other timeouts of a
+/// close are [`is_reader_shutdown_timeout`] and [`is_handler_shutdown_timeout`]; the
+/// [module documentation](self) says what each means.
 ///
 /// It is `false` for every other timeout, a request left unanswered and a frame left
 /// unwritten among them. It reads through what [`Error::cause`] reads through, a
