@@ -36,14 +36,14 @@ own deployment.
 
   | Text                                                                                        | Redacted | By                                                              |
   | ------------------------------------------------------------------------------------------- | -------- | --------------------------------------------------------------- |
-  | stderr crossing a diagnostic boundary                                                       | yes      | `redact::stderr_text`                                           |
+  | stderr crossing a diagnostic boundary                                                       | yes      | `redact::stderr_text` (no unnamed tokens, see below)            |
   | an `EventKind::Error` message and its vendor code                                           | yes      | the core, whichever harness produced it                         |
   | the title, description and unknown severity of an `EventKind::Notice`                       | yes      | `EventKind::notice`                                             |
   | a JSON-RPC peer's error message, when it is an error object                                 | yes      | `JsonRpcError::into_vendor_error`                               |
   | a setup `Error::Vendor` message                                                             | yes      | the core, then bounded                                          |
   | the version a probe printed, a `VersionTooOld` `found`, an unsupported option's explanation | yes      | `redact::bounded`, in `Discovery::normalized` and the matrix    |
   | a session's title and preview (the conversation's own words), a login hint, an account plan | no       | content or host text, bounded only                              |
-  | an ACP agent's error message and its `data`, a JSON value read as structure                 | yes      | `redact::structured`, then `stderr_text`                        |
+  | an ACP agent's error message and its `data`, a JSON value read as structure                 | yes      | `redact::structured`, then the text rules and the token pass    |
   | an ACP compaction error                                                                     | yes      | `redact::bounded`                                               |
   | a malformed JSON-RPC `error` member                                                         | n/a      | a fixed description; the member is never quoted                 |
   | `CallFailureCause::Peer`, the peer's message exactly as sent                                | **no**   | exact by design, so a harness may compare it; never show it raw |
@@ -67,27 +67,79 @@ own deployment.
   a cookie is a member; a `Cookie:` or `Set-Cookie:` line is read to its end. Words that begin with a keyword and are not credentials
   (`tokenizer`, `secretary`, `passwordless`) are left alone.
 
-  A status after a name (`OPENAI_API_KEY: not set`), a number under a name that counts tokens
-  (`max_tokens: 100000`) and the rest of a query string are kept; a value that could be a credential
-  is redacted, and a second credential word in the name (`session_token_cookie: expired`) vetoes a
-  keep. `testing::redaction` holds the corpus of both kinds.
+  A status after a name (`OPENAI_API_KEY: not set`), a number of at most eleven digits under a name
+  that counts tokens (`max_tokens: 100000`) and the rest of a query string are kept; a value that
+  could be a credential is redacted, and a second credential word in the name
+  (`session_token_cookie: expired`) vetoes a keep. `testing::redaction` holds the corpus of both kinds.
+
+  What was added after the first release of these rules, and what each costs:
+
+  - **Escaped JSON.** A quoted name and value are read at any level of escaping up to five
+    strings deep (`{\\\"api_key\\\":\\\"sk-x\\\"}`): a quote opened with `n` backslashes closes at a
+    quote with exactly `n`. `redact::structured` also walks a string that is itself a JSON object or
+    array (up to 256 KiB, four strings deep) as structure and writes it again, compactly, when it
+    found something; any other string comes back as it was.
+  - **Containers and sequences.** A value that opens with `[` or `{` is read across line breaks, up
+    to 64 lines and 16 KiB, so a pretty-printed array under `"tokens":` goes whole; a container
+    that does not close within that, or after the pass has read 8 KiB of them beyond a byte for each
+    byte of text, ends with its first line as it did. A YAML `-` after a separator marks a
+    sequence: its first item and every item below it in the same column, up to 64, are the value.
+    `ends_awaiting_value` also reports a container a credential's name opened and nothing has closed,
+    so a stderr cut that drops its first line goes on dropping lines until the container closes (the
+    discard window, 512 bytes, still bounds that).
+  - **Counts.** Twelve or more digits (not counting `,` and `_`) under a name that counts tokens are
+    a secret, in the text rules and in `redact::structured`; ten digits is the largest 32-bit
+    counter, and the corpus holds none above eleven. A comma still ends a value under every name,
+    so `tokens_used: 1,234,567,890,123` is redacted up to the first comma.
+  - **Well-known tokens with no name beside them**, by `redact::bounded` and `redact::structured`
+    (the paths that carry a vendor's messages, errors, notices, `data` and discovery text) and not
+    by `stderr_text`: `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` and `github_pat_` GitHub tokens
+    ([token formats][github-tokens]); GitLab `glpat-` ([token overview][gitlab-tokens]); Slack
+    `xox[bpasr]-` ([token types][slack-tokens]); Stripe `sk_`, `rk_` and `pk_` with `live_` or `test_`
+    ([API keys][stripe-keys]); AWS `AKIA` and `ASIA` access key ids, exactly 20 characters
+    ([identifiers][aws-identifiers]); Google `AIza` API keys and `ya29.` OAuth tokens; Anthropic and
+    OpenAI `sk-ant-`, `sk-proj-`, `sk-live-` and the older 40-character `sk-` as their consoles and
+    error messages print them; signed web tokens, two `eyJ` parts and a signature
+    ([RFC 7519][rfc-7519]); private-key blocks from `-----BEGIN ... PRIVATE KEY-----` to the end
+    marker or the end of the text ([RFC 7468][rfc-7468]); and npm, Hugging Face, DigitalOcean and
+    Shopify tokens. A token starts where a run of letters, digits, `_` and `-` starts and is
+    redacted with the run it is in, so `sk-learn`, `task-ant-lines` and `npm_config_cache` are
+    words. Each prefix has a minimum length and an alphabet (`redact/token_shapes.rs` is the
+    specification). The AWS documentation key is redacted like any other; an allowlist for it would
+    be a way past the rule.
+  - **A URL whose user is a credential name** (`x://token:;pw@host`) reaches its final shape in one
+    call, so a host that redacts a tail twice gets the same string.
+
+  The token pass reads the whole text a byte at a time, which costs plain stderr lines 120% more
+  instructions (10.39 M to 22.5 M per 320 KiB), and a byte-class gate does not help because plain
+  tails are full of `_` and `-`. Stderr tails are read line after line on the hot path, so
+  `stderr_text` does not run it (its cost against the previous release is 0 to -3.5% on every
+  plain case); `redact::bounded` and `redact::structured` do, at 2.2 times the instructions on
+  plain text of 16 KiB. The measurements are in `docs/benchmarks.md`.
 
   What the rules do not read, and a host should not rely on them for:
 
-  - doubly escaped JSON, and a quoted value with an embedded quote
-    (`'it''s'`);
-  - a pretty-printed multi-line array, which is read one line at a time, since an array that never
-    closes must not take the rest of the text with it;
-  - a credential that is itself a kept word or count: `password=404`, `secret=required`,
-    `tokens: 123456789012`;
-  - a bare token with no name on the line: `token: expired (ghp_...)`, `api_key: 500 sk-live-...`.
-    A list of well-known prefixes (`ghp_`, `sk-`, `AKIA`, `eyJ...`) redacted wherever they appear
-    was measured and not added: the cheapest form, one vectorised search for a byte the prefixes
-    share, costs the plain path 6 to 8 percent of its instructions before it checks a single
-    candidate, past the 3 percent this path is held to.
+  - a bare token in the text of a stderr tail: `stderr_text` reads names and values, not prefixes,
+    so `token: expired (ghp_...)` passes through it when it is a line of stderr. The same holds for
+    the other text that crosses a boundary through `stderr_text` alone: the version banners the
+    harnesses print, an `ExtensionValue`'s text and the WebSocket URL text;
+  - a bare token outside the closed list, and any credential with no prefix: an AWS secret access
+    key (40 characters of base64) or an Azure key has nothing to recognise it by;
+  - escaping deeper than five strings, a JSON text inside a string deeper than four, or one over
+    256 KiB: the walk leaves those to the text rules, which read a quoted pair at any level up to
+    five;
+  - a container that spans more than 64 lines or 16 KiB, one that never closes, and one cut by a
+    stderr tail: the rest of the container after the cut is read by the tail's own rules, which see
+    no name;
+  - a quoted value with an embedded quote (`'it''s'`), a credential in percent-encoded or base64
+    form, and a line break written as `%0A`;
+  - a credential that is itself a kept word or a short count: `password=404`, `secret=required`,
+    `tokens: 12345`. A status word after a credential's name is kept on purpose (a CLI prints
+    `OPENAI_API_KEY: not set` constantly), and the number of digits that separates a count from a
+    secret is a threshold: a secret of eleven digits or fewer under a count name passes;
   - a text that carried a removed byte is read again until it stops changing; a text that did not
-    is read once, and a second call can differ only where a URL's user is itself a credential name
-    (`redact/boundaries.rs` pins those).
+    is read once.
+
     `Debug` and `Display` for process, transport, MCP, JSON-RPC, error, session-listing, stream-handle
     and event payload carriers report only safe metadata. The same policy covers discovery and receipts,
     configuration, interactions, identity containers and extension values; callers handle originals through
@@ -401,6 +453,13 @@ about third-party harnesses found either way — "not found" is the finding, not
 [goose-acp]: https://block.github.io/goose/docs/advanced/acp-protocol
 [codex-acp]: https://github.com/agentclientprotocol/codex-acp
 [claude-acp]: https://github.com/agentclientprotocol/claude-agent-acp
+[github-tokens]: https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/about-authentication-to-github#githubs-token-formats
+[gitlab-tokens]: https://docs.gitlab.com/security/tokens/
+[slack-tokens]: https://api.slack.com/authentication/token-types
+[stripe-keys]: https://docs.stripe.com/keys
+[aws-identifiers]: https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_identifiers.html
+[rfc-7519]: https://www.rfc-editor.org/rfc/rfc7519
+[rfc-7468]: https://www.rfc-editor.org/rfc/rfc7468
 
 Some profiles need a note beyond the link:
 
