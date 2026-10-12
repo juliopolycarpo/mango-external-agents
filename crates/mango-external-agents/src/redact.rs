@@ -123,7 +123,17 @@ fn rules_round(plain: &str, tokens: bool) -> String {
     let unnamed = tokens.then(|| tokens::redact(plain)).flatten();
     let bearer = redact_bearer(unnamed.as_deref().unwrap_or(plain));
     let assignments = redact_assignments(&bearer);
-    remove_boundaries(redact_url_passwords(&assignments))
+    let urls = redact_url_passwords(&assignments);
+    // A URL password the last rule redacted leaves `user:[REDACTED]@`, which reads as an assignment
+    // when the user is a credential's name (`token:;x@` gives `token:[REDACTED]@`). Reading it once
+    // more gives the text a second call would, so a call leaves its own output alone. Only text
+    // that held a URL password pays for it.
+    let settled = if urls == assignments {
+        urls
+    } else {
+        redact_assignments(&urls)
+    };
+    remove_boundaries(settled)
 }
 
 /// [`stderr_text`] without the rounds that follow a marker: what one reading of the rules gives.
