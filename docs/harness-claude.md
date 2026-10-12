@@ -345,8 +345,8 @@ is cut at `st` if that is the smaller.
 | `close`, no turn                             | `st`                       | 5 s             | 5 s                   | 5 s                      | `close_no_turn`              |
 | `close` with a turn active                   | `S` + `st`                 | 19 s            | 11 s                  | 9 s                      | `close_with_turn`            |
 | `close` while the launch is pending          | `st`, or `st` + `S` + `st` | 5 s, or 24 s    | 5 s, or 16 s          | 5 s, or 14 s             | `close_pending_launch`       |
-| A later `close` over a late child's stop     | `S`                        | 14 s            | 6 s                   | 4 s                      | `close_after_pending_launch` |
 | Any `close`, the largest of the three above  | `st` + `S` + `st`          | 24 s            | 16 s                  | 14 s                     | `close_worst_case`, `close`  |
+| A later `close` over a late child's stop     | `S`                        | 14 s            | 6 s                   | 4 s                      | `close_after_pending_launch` |
 | Child exit or end of stream, to the terminal | `kg`                       | 2 s             | 2 s                   | 2 s                      | `exit_to_terminal`           |
 | Child exit or end of stream, to reaped       | `kg` + `S`                 | 16 s            | 8 s                   | 6 s                      | `exit_to_reaped`             |
 | Silent stream, to the terminal               | idle floor + `kg`          | 602 s           | 602 s                 | 602 s                    | `silent_stream_to_terminal`  |
@@ -492,13 +492,18 @@ has run. The cause stays typed, as it does in Codex, where ACP carries it as tex
 only queues `session/cancel`, so it has no stop to fail.
 
 A stop runs on the runtime that opened the session. A `cancel` or `close` made from another
-runtime, after that one shut down, cannot get the stop run: it returns `Error::CleanupRequired`
-with the host's control and an `Error::Link` naming the runtime as its cause, and the child is
-still there for the host to reconcile.
+runtime, after that one shut down, cannot get the stop run: with a child installed it returns
+`Error::CleanupRequired` with the host's control and an `Error::Link` naming the runtime as its
+cause, and the child is still there for the host to reconcile. A `close` with no child to stop
+returns that `Error::Link` alone, and the session stays `Closing`.
 
 A host that moved from 0.6 matched `Error::Timeout` on these calls. Read `cleanup_control()` first
 and finish the stop through the control it returns, and read `cause()` for the stage that failed:
 `Error::Timeout` is what `cause()` returns for a stage that ran out.
+
+A launch that fails over a child its launcher could not end (a `CleanupRequired` out of the spawn)
+is kept the same way: the `start_turn` returns it, the reservation stays taken, and every later
+`cancel` and `close` repeats it, with the MCP artifact left on disk.
 
 Not bounded by anything here:
 
