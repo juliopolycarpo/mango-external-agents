@@ -495,11 +495,17 @@ A stop runs on the runtime that opened the session. A `cancel` or `close` made f
 runtime, after that one shut down, cannot get the stop run: with a child installed it returns
 `Error::CleanupRequired` with the host's control and an `Error::Link` naming the runtime as its
 cause, and the child is still there for the host to reconcile. A `close` with no child to stop
-returns that `Error::Link` alone, and the session stays `Closing`.
+returns that `Error::Link` alone, and the session stays `Closing`. A worker lost after the stop
+already proved the child gone, inside the artifact removal for one, owes no cleanup: the waiter
+gets the bare `Error::Link`, with no control, and a `close` leaves the session `Closed`.
 
 A host that moved from 0.6 matched `Error::Timeout` on these calls. Read `cleanup_control()` first
 and finish the stop through the control it returns, and read `cause()` for the stage that failed:
 `Error::Timeout` is what `cause()` returns for a stage that ran out.
+
+A launch future the library never saw complete, because the runtime it ran on went away, is the
+launcher's own to clean up, as for a host that drops `ProcessLauncher::launch`: the session reads
+it as a launch that produced no child, and a later `close` can reach `Closed`.
 
 A launch that fails over a child its launcher could not end (a `CleanupRequired` out of the spawn)
 is kept the same way: the `start_turn` returns it, the reservation stays taken, and every later
