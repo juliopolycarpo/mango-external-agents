@@ -22,16 +22,16 @@ Run benches with `cargo bench` or `scripts/bench.sh`, never `cargo run`: a debug
 warning in its header and its numbers are not comparable. Arguments after `--` that do not start
 with `-` filter cases by substring; flags such as `--bench` are ignored.
 
-| Binary                                | Cases                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `mango-external-agents` / `framing`   | `LineStream`: a 128 KiB line at 16 KiB chunks; a 1 MiB line at 4 KiB, 16 KiB and 1 MiB chunks; 15-byte, 100-byte, 1 KiB and 64 KiB records at 16 KiB chunks; an invalid-UTF-8 line (the lossy repair path); malformed lines of 16 KiB, 64 KiB and 512 KiB with the first invalid byte at the start, middle and end, a multibyte character cut short, one invalid byte in 64 and all invalid, each handing its repaired line back from the routine so that line is freed outside the clock, and a dense-invalid line at the raw cap that repair pushes past the buffered limit (this one frees its repaired string and the stream's buffer inside the clock, as the bench cannot return them); the captured fixture transcripts replayed at 4 KiB and 16 KiB chunks                                                                                                                                               |
-| `mango-external-agents` / `events`    | `EventSink::emit` plus drain for 1 KiB deltas (ASCII, JSON escapes, non-ASCII, characters the sanitiser strips), 16- and 64-byte deltas, approval requests and resolutions, a completed activity and a rich activity; the same events serialized to a counting writer and to a string; `normalize::sanitize_field` alone; `normalize::bound_text` at the detail limit over clean ASCII, a late or early non-ASCII character, an escape at, before and after the bound, and ANSI command output; the emit and drain of an activity whose detail has a late non-ASCII character or escape                                                                                                                                                                                                                                                                                                                          |
-| `mango-external-agents` / `redact`    | `redact::stderr_text` over a 1 KiB and a 16 KiB stderr tail, 320 KiB per sample: plain diagnostic lines, lines that carry each credential shape, coloured output with control characters throughout, and lines dense in separators and box-drawing characters with nothing to redact; plain lines that end in a non-ASCII character; structured log lines with a quote before nearly every `:`, with nothing to redact and with quoted credentials; JSON inside strings at two and three levels of escaping; a pretty-printed object with credentials in multi-line containers and a YAML sequence; `redact::bounded` over plain lines and lines with unnamed tokens, and four 1 MiB token-pass shapes; a credential name made of one keyword repeated, a URL scheme made of dotted letters, quoted names that never get a value and a run of bare quotes, each at 16 KiB, 120 KB and 1 MiB, one call per sample |
-| `mango-external-agents` / `copies`    | `Client` dispatch of prebuilt frames through a scripted link (1 KiB notification, 500 KB diff notification, 500 KB and error responses); `Client` sends of 1 KiB notifications into a discarding sink and 1 KiB requests against a peer that answers each as it is written, the same notifications from eight callers contending for one link, and both queued with `submit_*`; `stdio::open` link sends of 1 KiB and 1 MiB messages into a counting sink, each timed from its call to the end of its write                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `mango-agent-acp` / `reducer`         | `Reducer::update_at` on tool-call frames: ten 100 KiB diffs as a new call, as an update and as a completion; a 1 MiB image ahead of a text block; a 1 MiB text body; the frames most agents send (two 2 KiB diffs, a short text); and a 1000- and 10000-call `session/load` replay, through `update_at` and through `Reducer::session_facts`; held updates of one call (2 KiB to 1 MiB)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `mango-agent-codex` / `pipeline`      | Per stage and end to end: raw line to JSON, `Notification::parse`, `TurnReducer::reduce`, emit, drain, serialize. 1 KiB text deltas; 500 KB patch updates (throttled and emitted); a file change started and completed; command output inside the throttle window (1 KiB, 8 KiB and 64 KiB chunks); every captured Codex transcript                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `hub-host` / `retry`                  | `Supervisor::run` re-sending an 8 MiB, 2 MiB, 1 MiB or attachment-free request after `NotSubmitted` answers (1 or 3 re-sends), on a paused clock so backoff costs nothing; the process's peak resident set is printed after the cases                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `mango-agent-claude` / `tool_results` | `TurnReducer::reduce` closing a call: a `tool_result` record with a string payload (1 MiB, 32 KiB) or an array of text blocks (1 MiB in one block and in 100 blocks, 12 KiB and 32 KiB in one block, 6 KiB and 600 bytes in three); starting a `Write` (16 KiB, 200 KiB) or an `Edit` (two 2 KiB or two 100-byte strings) call; 1000 subagent text blocks of 1 KiB forwarded under one `Task`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| Binary                                | Cases                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mango-external-agents` / `framing`   | `LineStream`: a 128 KiB line at 16 KiB chunks; a 1 MiB line at 4 KiB, 16 KiB and 1 MiB chunks; 15-byte, 100-byte, 1 KiB and 64 KiB records at 16 KiB chunks; an invalid-UTF-8 line (the lossy repair path); malformed lines of 16 KiB, 64 KiB and 512 KiB with the first invalid byte at the start, middle and end, a multibyte character cut short, one invalid byte in 64 and all invalid, each handing its repaired line back from the routine so that line is freed outside the clock, and a dense-invalid line at the raw cap that repair pushes past the buffered limit (this one frees its repaired string and the stream's buffer inside the clock, as the bench cannot return them); the captured fixture transcripts replayed at 4 KiB and 16 KiB chunks                                                                                                                                                                                                                                                                                                          |
+| `mango-external-agents` / `events`    | `EventSink::emit` plus drain for 1 KiB deltas (ASCII, JSON escapes, non-ASCII, characters the sanitiser strips), 16- and 64-byte deltas, approval requests and resolutions, a completed activity and a rich activity; the same events serialized to a counting writer and to a string; `normalize::sanitize_field` alone; `normalize::bound_text` at the detail limit over clean ASCII, a late or early non-ASCII character, an escape at, before and after the bound, and ANSI command output; the emit and drain of an activity whose detail has a late non-ASCII character or escape                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `mango-external-agents` / `redact`    | `redact::stderr_text` over a 1 KiB and a 16 KiB stderr tail, 320 KiB per sample: plain diagnostic lines, lines that carry each credential shape, coloured output with control characters throughout, and lines dense in separators and box-drawing characters with nothing to redact; plain lines that end in a non-ASCII character; structured log lines with a quote before nearly every `:`, with nothing to redact and with quoted credentials; JSON inside strings at two and three levels of escaping; a pretty-printed object with credentials in multi-line containers and a YAML sequence; `redact::bounded` over plain lines, lines with unnamed tokens, credentials, JSON inside strings and containers, and four 1 MiB token-pass shapes; a credential name made of one keyword repeated, a URL scheme made of dotted letters, quoted names that never get a value, a run of bare quotes, escaped quotes, an opener that never closes and one long sequence, each at 16 KiB, 120 KB and 1 MiB, through `stderr_text` and through `bounded`, one call per sample |
+| `mango-external-agents` / `copies`    | `Client` dispatch of prebuilt frames through a scripted link (1 KiB notification, 500 KB diff notification, 500 KB and error responses); `Client` sends of 1 KiB notifications into a discarding sink and 1 KiB requests against a peer that answers each as it is written, the same notifications from eight callers contending for one link, and both queued with `submit_*`; `stdio::open` link sends of 1 KiB and 1 MiB messages into a counting sink, each timed from its call to the end of its write                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `mango-agent-acp` / `reducer`         | `Reducer::update_at` on tool-call frames: ten 100 KiB diffs as a new call, as an update and as a completion; a 1 MiB image ahead of a text block; a 1 MiB text body; the frames most agents send (two 2 KiB diffs, a short text); and a 1000- and 10000-call `session/load` replay, through `update_at` and through `Reducer::session_facts`; held updates of one call (2 KiB to 1 MiB)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `mango-agent-codex` / `pipeline`      | Per stage and end to end: raw line to JSON, `Notification::parse`, `TurnReducer::reduce`, emit, drain, serialize. 1 KiB text deltas; 500 KB patch updates (throttled and emitted); a file change started and completed; command output inside the throttle window (1 KiB, 8 KiB and 64 KiB chunks); every captured Codex transcript                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `hub-host` / `retry`                  | `Supervisor::run` re-sending an 8 MiB, 2 MiB, 1 MiB or attachment-free request after `NotSubmitted` answers (1 or 3 re-sends), on a paused clock so backoff costs nothing; the process's peak resident set is printed after the cases                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `mango-agent-claude` / `tool_results` | `TurnReducer::reduce` closing a call: a `tool_result` record with a string payload (1 MiB, 32 KiB) or an array of text blocks (1 MiB in one block and in 100 blocks, 12 KiB and 32 KiB in one block, 6 KiB and 600 bytes in three); starting a `Write` (16 KiB, 200 KiB) or an `Edit` (two 2 KiB or two 100-byte strings) call; 1000 subagent text blocks of 1 KiB forwarded under one `Task`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 
 The ACP `prompt` binary adds `prompt/4KiB` (100 turns per sample) and `prompt/1MiB`
 (16 turns). It drives the preflight, the connection's own frame queue, the physical writer, and terminal
@@ -107,7 +107,7 @@ search is still vectorized, but the call and the setup around each `:` cost abou
 instructions on plain tails, and the bigger locators in `redact::rules` made the compiler stop
 inlining it. A byte every rule turns away has to be turned away on that byte before a keyword is
 compared, in `starts_a_keyword` and by `name_run`, which looks at the bytes of a name once.
-Check `objdump -d` on `redact_bearer` and `redact_assignments` for `pcmpeqb`.
+Check `objdump -d` on `bearer_stage` and `assignment_stage` (in `redact::floor`) for `pcmpeqb`.
 
 An instruction-count receipt is more stable than wall time for a change to the rules. On Linux
 where `perf_event_open` works for the caller's own children, count user-space instructions of
@@ -136,158 +136,156 @@ workspace forbids. To find allocations, use a profiler on the bench binary
 (`target/release/deps/<name>-<hash>`), for example `valgrind --tool=dhat` or `heaptrack`, outside
 the repository.
 
-## Receipt: the redactor's new reads
+## Receipt: the redactor's newer reads
 
-The redactor change that added the token pass, escaped-JSON reads, multi-line containers, counts
-and the URL settle was measured with user-space instructions, which do not move with the load of a
-shared machine the way wall time does. One sample is the call or calls the case names (320 KiB per
-sample for the 1 KiB and 16 KiB cases, one call for 120 KB and 1 MiB); the figure is
-`(I(11 samples) - I(1 sample)) / 10`, counted with `perf_event_open` around the bench binary, so
+The redactor change that added the token pass, escaped-JSON reads, multi-line containers, sequences,
+block scalars, counts and the URL settle was measured with user-space instructions, which do not move
+with the load of a shared machine the way wall time does. One sample is the call or calls the case
+names (320 KiB per sample for the 1 KiB and 16 KiB cases, one call for 120 KB and 1 MiB); the figure
+is `(I(11 samples) - I(1 sample)) / 10`, counted with `perf_event_open` around the bench binary, so
 process start and setup cancel. Base is `e172b8a` built with the same `benches/redact.rs` as the
 variant (its assertions loosened for the shapes Base cannot redact), Variant is the head of the
 branch, both on the pinned toolchain in the release profile **with
 `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1`**.
 
 That last setting matters. With the default 16 code generation units, the instruction count of an
-unchanged path moves by up to 3% when an unrelated edit (one string in the test corpus) changes
-how the crate is split into units and so which functions can be inlined into which: bisecting this
-branch with the default profile put `stderr_text` on the secrets lines at -0.4% and at +3.7% for two
-commits that differ only in a test constant. One unit has no such partition, and every commit that
-does not touch the path measures the same, to within 150 instructions in 22 million. The table is
-from that build.
+unchanged path moves by up to 3% when an unrelated edit changes how the crate is split into units
+and so which functions can be inlined into which. One unit has no such partition, and every commit
+that does not touch the path measures the same, to within 150 instructions in 22 million.
 
-| Case                               | Base (instructions) | Variant (instructions) |   Delta |
-| ---------------------------------- | ------------------: | ---------------------: | ------: |
-| `stderr_text-1KiB/plain`           |          10,606,270 |             10,865,847 |   +2.4% |
-| `stderr_text-1KiB/secrets`         |          22,597,131 |             24,340,841 |   +7.7% |
-| `stderr_text-1KiB/controls`        |          16,502,368 |             16,634,481 |   +0.8% |
-| `stderr_text-1KiB/separators`      |          18,621,647 |             19,020,060 |   +2.1% |
-| `stderr_text-1KiB/late-non-ascii`  |           8,164,097 |              8,286,348 |   +1.5% |
-| `stderr_text-1KiB/json`            |          38,738,727 |             40,025,391 |   +3.3% |
-| `stderr_text-1KiB/json-secrets`    |          20,455,996 |             21,143,009 |   +3.4% |
-| `stderr_text-1KiB/escaped-json`    |          15,366,941 |             20,195,126 |  +31.4% |
-| `stderr_text-1KiB/pretty`          |          13,008,325 |             17,146,834 |  +31.8% |
-| `stderr_text-16KiB/plain`          |          10,054,717 |             10,291,673 |   +2.4% |
-| `stderr_text-16KiB/secrets`        |          22,503,149 |             24,353,002 |   +8.2% |
-| `stderr_text-16KiB/controls`       |          16,462,735 |             16,586,624 |   +0.8% |
-| `stderr_text-16KiB/separators`     |          18,149,010 |             18,575,013 |   +2.3% |
-| `stderr_text-16KiB/late-non-ascii` |           7,899,935 |              8,006,673 |   +1.4% |
-| `stderr_text-16KiB/json`           |          38,247,800 |             39,516,094 |   +3.3% |
-| `stderr_text-16KiB/json-secrets`   |          20,240,070 |             20,914,200 |   +3.3% |
-| `stderr_text-16KiB/escaped-json`   |          15,036,231 |             19,762,846 |  +31.4% |
-| `stderr_text-16KiB/pretty`         |          11,751,233 |             16,310,104 |  +38.8% |
-| `stderr_text-16KiB/names`          |              78,287 |                 78,291 |   +0.0% |
-| `stderr_text-16KiB/schemes`        |              78,058 |                 78,158 |   +0.1% |
-| `stderr_text-16KiB/quoted-names`   |              79,200 |                 79,256 |   +0.1% |
-| `stderr_text-16KiB/quotes`         |              78,250 |                 78,359 |   +0.1% |
-| `stderr_text-16KiB/slashes`        |              78,806 |                 79,034 |   +0.3% |
-| `stderr_text-16KiB/containers`     |           2,946,487 |              4,209,491 |  +42.9% |
-| `stderr_text-16KiB/sequence`       |              80,622 |                 87,781 |   +8.9% |
-| `stderr_text-120KB/names`          |             534,411 |                534,449 |   +0.0% |
-| `stderr_text-120KB/schemes`        |             535,184 |                535,188 |   +0.0% |
-| `stderr_text-120KB/quoted-names`   |             535,801 |                535,804 |   +0.0% |
-| `stderr_text-120KB/quotes`         |             534,843 |                535,016 |   +0.0% |
-| `stderr_text-120KB/slashes`        |             534,884 |                535,112 |   +0.0% |
-| `stderr_text-120KB/containers`     |          21,543,295 |             29,672,904 |  +37.7% |
-| `stderr_text-120KB/sequence`       |             537,144 |                544,329 |   +1.3% |
-| `stderr_text-1MiB/names`           |           4,628,022 |              4,628,094 |   +0.0% |
-| `stderr_text-1MiB/schemes`         |           4,626,104 |              4,626,197 |   +0.0% |
-| `stderr_text-1MiB/quoted-names`    |           4,626,883 |              4,626,667 |   -0.0% |
-| `stderr_text-1MiB/quotes`          |           4,625,854 |              4,625,772 |   -0.0% |
-| `stderr_text-1MiB/slashes`         |           4,626,046 |              4,626,152 |   +0.0% |
-| `stderr_text-1MiB/containers`      |         188,201,496 |            257,860,453 |  +37.0% |
-| `stderr_text-1MiB/sequence`        |           4,628,180 |              4,635,519 |   +0.2% |
-| `bounded-16KiB/bounded-plain`      |          10,119,734 |             23,621,857 | +133.4% |
-| `bounded-16KiB/bounded-tokens`     |           5,357,419 |             18,231,119 | +240.3% |
+**`stderr_text` is the release before's code.** It runs the rules in `redact::floor`, which are
+Base's `rules.rs` to the letter, so a tail costs what it did: plain lines within 0.3% and every
+other case within 3.0%. The two ways a copy of those rules can cost more are measured and
+removed: a second scan of the same text for the spans the union needs (the three stages are one
+function each, compiled once, and both the text and the spans come from it), and a second set of
+callers for the scan helpers, which made the compiler stop inlining them into the rules (plain
+lines +5.9%). The +3.0% on
+`secrets` is the keyword check that decides whether a redacted URL password needs the assignment
+rule once more (about 540 instructions for each URL, on the one line in nine of this case that
+carries one).
 
-Reading it:
+| Case                               | Base (instructions) | Variant (instructions) | Delta |
+| ---------------------------------- | ------------------: | ---------------------: | ----: |
+| `stderr_text-1KiB/plain`           |          10,606,270 |             10,618,017 | +0.1% |
+| `stderr_text-1KiB/secrets`         |          22,597,131 |             23,250,358 | +2.9% |
+| `stderr_text-1KiB/controls`        |          16,502,368 |             16,031,633 | -2.9% |
+| `stderr_text-1KiB/separators`      |          18,621,647 |             18,628,452 | +0.0% |
+| `stderr_text-1KiB/late-non-ascii`  |           8,164,097 |              8,184,740 | +0.3% |
+| `stderr_text-1KiB/json`            |          38,738,727 |             38,729,427 | -0.0% |
+| `stderr_text-1KiB/json-secrets`    |          20,455,996 |             20,457,628 | +0.0% |
+| `stderr_text-1KiB/escaped-json`    |          15,366,941 |             15,365,326 | -0.0% |
+| `stderr_text-1KiB/pretty`          |          13,008,325 |             13,017,727 | +0.1% |
+| `stderr_text-16KiB/plain`          |          10,054,717 |             10,038,121 | -0.2% |
+| `stderr_text-16KiB/secrets`        |          22,503,149 |             23,185,685 | +3.0% |
+| `stderr_text-16KiB/controls`       |          16,462,735 |             15,961,528 | -3.0% |
+| `stderr_text-16KiB/separators`     |          18,149,010 |             18,123,100 | -0.1% |
+| `stderr_text-16KiB/late-non-ascii` |           7,899,935 |              7,890,576 | -0.1% |
+| `stderr_text-16KiB/json`           |          38,247,800 |             38,181,145 | -0.2% |
+| `stderr_text-16KiB/json-secrets`   |          20,240,070 |             20,212,077 | -0.1% |
+| `stderr_text-16KiB/escaped-json`   |          15,036,231 |             15,004,619 | -0.2% |
+| `stderr_text-16KiB/pretty`         |          11,751,233 |             11,732,681 | -0.2% |
+| `stderr_text-16KiB/names`          |              78,287 |                 78,286 | -0.0% |
+| `stderr_text-16KiB/schemes`        |              78,058 |                 78,074 | +0.0% |
+| `stderr_text-16KiB/quoted-names`   |              79,200 |                 79,258 | +0.1% |
+| `stderr_text-16KiB/quotes`         |              78,250 |                 78,375 | +0.2% |
+| `stderr_text-16KiB/slashes`        |              78,806 |                 78,167 | -0.8% |
+| `stderr_text-16KiB/containers`     |           2,946,487 |              2,944,104 | -0.1% |
+| `stderr_text-16KiB/sequence`       |              80,622 |                 79,948 | -0.8% |
+| `stderr_text-120KB/names`          |             534,411 |                533,670 | -0.1% |
+| `stderr_text-120KB/schemes`        |             535,184 |                534,740 | -0.1% |
+| `stderr_text-120KB/quoted-names`   |             535,801 |                535,169 | -0.1% |
+| `stderr_text-120KB/quotes`         |             534,843 |                535,174 | +0.1% |
+| `stderr_text-120KB/slashes`        |             534,884 |                535,478 | +0.1% |
+| `stderr_text-120KB/containers`     |          21,543,295 |             21,530,431 | -0.1% |
+| `stderr_text-120KB/sequence`       |             537,144 |                537,612 | +0.1% |
+| `stderr_text-1MiB/names`           |           4,628,022 |              4,628,636 | +0.0% |
+| `stderr_text-1MiB/schemes`         |           4,626,104 |              4,626,743 | +0.0% |
+| `stderr_text-1MiB/quoted-names`    |           4,626,883 |              4,627,413 | +0.0% |
+| `stderr_text-1MiB/quotes`          |           4,625,854 |              4,626,483 | +0.0% |
+| `stderr_text-1MiB/slashes`         |           4,626,046 |              4,626,456 | +0.0% |
+| `stderr_text-1MiB/containers`      |         188,201,496 |            188,085,496 | -0.1% |
+| `stderr_text-1MiB/sequence`        |           4,628,180 |              4,628,515 | +0.0% |
 
-- **Where the cost came from**, bisected commit by commit at one code generation unit
-  (`stderr_text-16KiB/secrets`, Base 22,503,064):
+**`bounded`** (`redact::bounded`, `redact::structured`, and the extension text, the peer label and
+`mea`'s probe failures) reads the rules of the release before, the newer reads and the token pass,
+over the same text, joins the spans, and reads the result again when it changed. Base has no
+token pass and none of the newer reads, so its row is the cost of `stderr_text`. Plain 16 KiB
+lines cost 3.2 times Base (10.1 M to 32.1 M for 320 KiB), of which the rules of the release before
+are 10.0 M, the newer reads 8.3 M and the token pass 13.2 M; a text that holds credentials is read
+twice, so a credential-dense text costs several times a tail. The cost is for a vendor's message,
+short and rare, and not for a tail. The four 1 MiB token-pass shapes are linear.
 
-  | Commit                                                        | Instructions | Against Base |
-  | ------------------------------------------------------------- | -----------: | -----------: |
-  | token pass in `bounded` and `structured`                      |   22,481,930 |        -0.1% |
-  | quoted names and values through nested escaping               |   22,813,527 |        +1.4% |
-  | containers across lines, sequences                            |   22,903,708 |        +1.8% |
-  | 12 digits under a count name                                  |   22,915,381 |        +1.8% |
-  | assignment rule re-read after any redacted URL password       |   40,335,089 |         +79% |
-  | the same, only for a URL named like a credential              |   23,635,083 |        +5.0% |
-  | the keyword check of that gate cut to the userinfo's keywords |   23,374,156 |        +3.9% |
+| Case                                 | Base (instructions) | Variant (instructions) |   Delta |
+| ------------------------------------ | ------------------: | ---------------------: | ------: |
+| `bounded-16KiB/bounded-plain`        |          10,119,734 |             32,078,072 | +217.0% |
+| `bounded-16KiB/bounded-tokens`       |           5,357,419 |             44,838,916 | +736.9% |
+| `bounded-16KiB/bounded-secrets`      |                   - |            165,308,214 |         |
+| `bounded-16KiB/bounded-escaped-json` |                   - |             88,848,855 |         |
+| `bounded-16KiB/bounded-pretty`       |                   - |             77,803,356 |         |
+| `bounded-16KiB/names`                |                   - |                534,259 |         |
+| `bounded-16KiB/schemes`              |                   - |              1,225,392 |         |
+| `bounded-16KiB/quoted-names`         |                   - |                733,285 |         |
+| `bounded-16KiB/quotes`               |                   - |                675,985 |         |
+| `bounded-16KiB/slashes`              |                   - |                712,840 |         |
+| `bounded-16KiB/containers`           |                   - |             23,547,668 |         |
+| `bounded-16KiB/sequence`             |                   - |              2,210,265 |         |
+| `bounded-120KB/names`                |                   - |              3,829,753 |         |
+| `bounded-120KB/schemes`              |                   - |              8,891,184 |         |
+| `bounded-120KB/quoted-names`         |                   - |              5,283,661 |         |
+| `bounded-120KB/quotes`               |                   - |              4,871,987 |         |
+| `bounded-120KB/slashes`              |                   - |              5,134,265 |         |
+| `bounded-120KB/containers`           |                   - |            171,130,067 |         |
+| `bounded-120KB/sequence`             |                   - |             16,099,005 |         |
+| `bounded-1MiB/names`                 |                   - |             33,376,472 |         |
+| `bounded-1MiB/schemes`               |                   - |             77,590,850 |         |
+| `bounded-1MiB/quoted-names`          |                   - |             46,059,452 |         |
+| `bounded-1MiB/quotes`                |                   - |             42,463,115 |         |
+| `bounded-1MiB/slashes`               |                   - |             44,751,379 |         |
+| `bounded-1MiB/containers`            |                   - |          1,497,525,490 |         |
+| `bounded-1MiB/sequence`              |                   - |            140,555,644 |         |
+| `bounded-1MiB/prefixes`              |                   - |             48,515,533 |         |
+| `bounded-1MiB/pem`                   |                   - |            118,562,639 |         |
+| `bounded-1MiB/web`                   |                   - |             41,073,524 |         |
+| `bounded-1MiB/one-run`               |                   - |             61,336,362 |         |
 
-  So the secrets lines cost 3.9% more, from three mechanisms: the escape-depth reads on every
-  quoted pair (+1.4%), the container and sequence reads (+0.4%), and the check that decides whether
-  a redacted URL password needs the assignment rule once more (+2.1%, about 540 instructions for
-  each URL on the lines of this case). That check is charged to the one line in nine of this
-  synthetic case that carries a URL password; plain stderr, which has none, pays nothing for it.
+Milliseconds for one 256 KiB text of each shape, release, default profile, the rules of the release
+before (`stderr_text` on `main`), `stderr_text` now, `bounded` on `main` and now, and `structured` on
+a string leaf now (`MEA_PROBE_IN=<file> MEA_PROBE_OUT=<file> cargo nextest run -p
+mango-external-agents --release --lib --run-ignored only -E 'test(redact::search::probe_timing)'`):
 
-  That bisect ends at the first receipt of this branch. The commits after it, fixes from review,
-  moved the same row to 24,353,002 (+8.2%): a bisect of them at one unit puts +2.9% of plain
-  stderr, +4.2% of the secrets lines and +12% of `containers` on the one that added the end of a
-  sequence item at a credential's name, block scalars and the whole-marker rule, and nothing
-  measurable on the others (a key block's mark +0.05%). Taking the new end-of-item check out of
-  `read_assignment` returns plain stderr to 10.00 M, and that check does not execute on plain text
-  (it needs a sequence item, a block scalar or a container under a name): what moved is how the
-  compiler lays out and inlines the name-reading functions that the new reads share
-  (`ends_in_cookie`, `is_a_plain_word`, `name_run` are called from two places now and no longer
-  inlined into `read_assignment`), not work per byte. Forcing the inlining back, moving the
-  check into a function of its own and splitting `read_assignment` after its keyword test each left
-  the figure where it was, so it is recorded and not chased further.
-- **`stderr_text` on the cases that existed** (`plain`, `controls`, `separators`, `late-non-ascii`):
-  between 0.8% and 2.4% more instructions than Base (the 16 KiB `plain` is 10.05 M and 10.29 M;
-  see the paragraph above for where it comes from). `json` and `json-secrets` (a quote before
-  nearly every `:`) cost 3.3% more, the escape-depth reads and the same layout cost.
-- **The new shapes for `stderr_text`** cost what their extra reads cost. `escaped-json` and `pretty`
-  do more because Base left them unread (+31% and +39%); the adversarial families (`names`,
-  `schemes`, `quoted-names`, `quotes`, `slashes`, `sequence`) cost 0.0% to 0.2% over Base at 120 KB
-  and 1 MiB, and `containers` (an opener at the end of every line that never closes, 180
-  instructions a byte in Base and 246 now) +37%. Instructions per byte are flat from 16 KiB to
-  1 MiB in every family.
-- **`bounded`** (`redact::bounded`, `redact::structured`, and now the extension text, the peer
-  label and `mea`'s probe failures) runs the token pass. Plain 16 KiB lines cost 2.3 times Base
-  (10.1 M to 23.6 M for 320 KiB); lines with unnamed tokens 3.4 times, since Base leaves them
-  unread. The four 1 MiB token-pass shapes cost 35 M to 98 M against Base's 4.6 M (a prefix before
-  every run 44 M, web-token headers 35 M, one run opening like a token 55 M, private-key headers
-  with no end marker, each with the line of its body, 98 M: a text that held a block is read up to
-  three more times, so the mark it leaves reads as the header it replaced). They are linear.
+| Text                 | `stderr_text` main | `stderr_text` now | `bounded` main | `bounded` now | `structured` now |
+| -------------------- | -----------------: | ----------------: | -------------: | ------------: | ---------------: |
+| `plain`              |                1.5 |               1.0 |            1.0 |           3.0 |              3.0 |
+| `cred-lines`         |                3.0 |               3.0 |            3.0 |          20.2 |             19.7 |
+| `seq-rep`            |                3.9 |               3.4 |            3.9 |          29.1 |             29.0 |
+| `block-scalar-rep`   |                3.8 |               3.1 |            3.8 |          24.9 |             25.3 |
+| `container-unclosed` |                5.0 |               7.1 |            5.5 |          57.6 |             59.2 |
+| `container-nested`   |                3.6 |               5.1 |            3.7 |          40.0 |             35.9 |
+| `name-chain`         |                4.6 |               5.4 |            4.8 |          41.8 |             43.1 |
+| `url-pass-q`         |                4.4 |               5.9 |            4.6 |          44.5 |             45.3 |
+| `esc-depth2`         |                0.7 |               1.3 |            0.8 |          13.8 |             14.4 |
+| `bare-tokens`        |                0.2 |               0.2 |            0.2 |           2.2 |              2.6 |
+
+The ratio of the message path to Base is the number of readers, and holds from 16 KiB to 1 MiB:
+`redact/work.rs` asserts the linearity of every entry point on every run by counting scan steps
+(and a JSON text inside a string, whose parse is not counted, was timed at 32 KiB to 250 KiB:
+the time doubles when the text does).
+
 - **Rejected: the token pass inside `stderr_text`.** The same pass over plain stderr cost +120% (10.39 M
   to 22.5 M a sample at 16 KiB, 10.94 M to 23.0 M at 1 KiB). A gate on a byte class (`_`, `-`, `I`,
   `J`) is useless because ordinary tails contain `_` and `-` constantly; a first prototype saved
   only 6.8% of the cost. The pass therefore runs where the text is a vendor's message and not a
   tail, and the limit is written down in `docs/compliance.md`.
-- **Wall time** on the shared reference machine is too noisy to carry the claim (the spread of
-  per-run medians exceeds the delta for most plain cases); medians of five interleaved runs of 15
-  samples each agree in direction with the instruction counts for the adversarial families and for
-  `bounded`.
+- **Rejected: the newer reads inside `stderr_text`.** They cost plain tails 2.4% and the lines with
+  credentials 8.2% in a design that put them in the one rewrite, and made `stderr_text` hide less
+  than the release before in places no search had reached (three rounds of review found one after
+  another). They are read beside the rules of the release before, in the paths that carry a
+  message, and `stderr_text` keeps the release before's answer.
 
-Adversarial timings, 1 MiB, one call per sample, release, median of five interleaved runs of 15
-samples, ns per byte, with plain 16 KiB stderr beside them (range of the five medians in
-parentheses):
-
-| Family                                                     |              Base |           Variant |
-| ---------------------------------------------------------- | ----------------: | ----------------: |
-| `stderr_text` plain 16 KiB                                 | 4.2 (3.5 to 24.6) | 6.1 (3.2 to 31.0) |
-| `names` (`token_` repeated, then `=`)                      |               3.7 |               2.4 |
-| `schemes` (`a.` repeated, then `://`)                      |               1.1 |               0.9 |
-| `quoted-names`                                             |               1.2 |               1.0 |
-| `quotes`                                                   |               1.2 |               0.9 |
-| `slashes` (escaped quotes three levels deep)               |               1.2 |               0.9 |
-| `containers` (`token: [` and a line break, repeated)       |              41.5 |              31.6 |
-| `sequence` (one YAML sequence as long as the text)         |               1.1 |               0.9 |
-| `bounded` prefixes (`ghp_abc` repeated)                    |               0.9 |               5.2 |
-| `bounded` private-key header with no end                   |               1.2 |               0.5 |
-| `bounded` web-token headers with no claims                 |               1.1 |               3.7 |
-| `bounded` one run as long as the text opening like a token |               0.9 |               5.5 |
-
-The wall figures have a spread the size of the differences in the plain row; they show that no
-family leaves the linear band (a quadratic family would be hundreds of times plain at 1 MiB), and
-the instruction counts above carry the comparison. `redact/work.rs` asserts the same linearity on
-every run by counting scan steps, with no clock.
-
-The long searches that back the other claims (fixed point, no panic, agreement with 0.4.1) are
-ignored tests in `redact/search.rs`: `MEA_REDACT_SEARCH_COUNT=4000000 cargo nextest run --release
---run-ignored only redact::search`, with `CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS=true` to trap an
-overflow.
+The long searches that back the other claims (nothing the release before hid is shown, fixed point,
+no panic, a JSON text stays JSON) are ignored tests in `redact/search.rs`:
+`MEA_REDACT_SEARCH_COUNT=4000000 cargo nextest run --release --run-ignored only redact::search`,
+with `CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS=true` to trap an overflow.
 
 ## Record a Base / Variant / Delta receipt
 
