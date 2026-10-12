@@ -26,8 +26,10 @@
 //! - [`is_reader_shutdown_timeout`]: the link was dealt with, and the reader had not let go by
 //!   the close's bound of twice `shutdown_timeout`. Either another close, kept and not polled,
 //!   holds the reader while it waits for the handler to be told that the peer exited, or this
-//!   close took the reader down and a handler that blocks its thread kept it from stopping. The
-//!   link is closed; the handler's call may still be running.
+//!   close took the reader down and it had not stopped when its wait ran out: a handler that
+//!   blocks its thread kept it, or, rarely, a reader that is not blocked took longer than the
+//!   50 ms an abort is given to land after `on_terminated` had used the whole bound. The link is
+//!   closed; the handler's call may still be running.
 //! - [`is_handler_shutdown_timeout`]: the link was dealt with, and the task that runs
 //!   [`on_notification`](PeerHandler::on_notification) and
 //!   [`on_request_handoff`](PeerHandler::on_request_handoff) was still running as the close
@@ -373,9 +375,11 @@ pub fn is_link_shutdown_timeout(error: &Error) -> bool {
 /// and the reader had not let go within the close's bound of twice
 /// [`ClientOptions::shutdown_timeout`]. Another close that was kept and not polled again can hold
 /// the reader while it waits for the handler to be told the peer exited, and a handler that blocks
-/// its thread keeps a reader that was taken down from stopping. The link is closed by then, which
-/// is what tells this from [`is_link_shutdown_timeout`], and the handler's call may still be
-/// running. The [module documentation](self) says what each timeout means.
+/// its thread keeps a reader that was taken down from stopping. Rarely it is neither: a reader
+/// that is not blocked, taken down after `on_terminated` had used the whole bound, took longer to
+/// stop than the 50 ms an abort is given to land. The link is closed by then, which is what tells
+/// this from [`is_link_shutdown_timeout`], and the handler's call may still be running. The
+/// [module documentation](self) says what each timeout means.
 ///
 /// It is `false` for every other timeout, and for the link's own. It reads through what
 /// [`Error::cause`] reads through, a [`Dispatch`] annotation among it. A close that gave up is
@@ -388,7 +392,7 @@ pub fn is_link_shutdown_timeout(error: &Error) -> bool {
 ///
 /// if let Err(error) = client.close().await {
 ///     if is_reader_shutdown_timeout(&error) {
-///         eprintln!("the link is closed; the handler's call has not returned");
+///         eprintln!("the link is closed; the handler's call may not have returned");
 ///     }
 /// }
 /// # }
@@ -3245,9 +3249,13 @@ impl Client {
     /// twice `shutdown_timeout`, plus at most 100 ms, and only a handler that blocks its thread
     /// can use that, whatever else a handler does. A call that blocks its thread for longer than
     /// the first grace and then returns is treated as one that never does: the close returns the
-    /// handler's timeout, with the link closed, where it used to wait the call out. A task that
-    /// ended in the meantime, even late, does not fail the close: it is looked at again as the
-    /// close ends. [`PeerHandler`] says what each call leaves behind. The exceptions are not
+    /// handler's timeout, with the link closed, where it used to wait the call out. The handler's
+    /// task is looked at again as the close ends, so one that ended in the meantime, even late,
+    /// does not fail the close. The reader has no later moment to be looked at: it is the last
+    /// thing a close waits for. So on a connection that had already ended, when the handler's
+    /// `on_terminated` used the whole bound, a reader that is not blocked but takes longer than
+    /// those 50 ms to stop still gives the reader's timeout, with the link closed.
+    /// [`PeerHandler`] says what each call leaves behind. The exceptions are not
     /// handlers: a link whose own `send` or `close` blocks its thread, and a runtime whose every
     /// worker thread is blocked, which cannot run the timers that bound the close. Two things
     /// are waited for inside the same bound: a notification call or a hand-off that asked for a
@@ -3349,8 +3357,10 @@ impl Client {
     /// [`is_link_shutdown_timeout`]), [`Error::Timeout`] naming the reader
     /// ([`is_reader_shutdown_timeout`]) when the reader had not let go once this close's bound of
     /// twice `shutdown_timeout` had run out: because another close that holds it was still
-    /// waiting for the handler to be told, or because the reader was taken down and a handler
-    /// that blocks its thread (see [`PeerHandler`]) kept it from stopping; and [`Error::Timeout`]
+    /// waiting for the handler to be told, or because the reader was taken down and had not
+    /// stopped when its wait ran out, kept by a handler that blocks its thread (see
+    /// [`PeerHandler`]) or, rarely, slower than the allowance "How long it takes" describes; and
+    /// [`Error::Timeout`]
     /// naming the handler ([`is_handler_shutdown_timeout`]) when the handler's task was still
     /// inside a call that blocks its thread. The link is closed by then in the last two. Nothing
     /// in any of them waits for good, whether or not the other close is ever polled again. A

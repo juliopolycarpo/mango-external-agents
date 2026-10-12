@@ -264,7 +264,9 @@ returns `Ok` says nothing of whether the call has returned.
   recorded the end but not yet reached the task, is in the case above. The close then takes the
   reader down, allows the abort 50 ms to land when its bound is spent, and returns the reader's
   `Timeout` (`is_reader_shutdown_timeout`) when the reader is inside a call that blocks, or the link's own
-  error. A reader parked at an await, waiting for a task whose call blocks, is taken down, and the
+  error. The reader is the last thing a close waits for, so it is not looked at again: a reader that
+  is not blocked but takes longer than those 50 ms to stop, after `on_terminated` used the whole
+  bound, gives the same `Timeout`. A reader parked at an await, waiting for a task whose call blocks, is taken down, and the
   close returns `Ok`.
 - `on_request` runs on tasks the close lets write their refusals for up to `shutdown_timeout`,
   then aborts without waiting for them. The close returns `Ok`.
