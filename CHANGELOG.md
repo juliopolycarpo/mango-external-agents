@@ -4,6 +4,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.6.1] - 2026-10-12
+
+### 🚀 Features
+
+- **(core)** Give a host each harness's worst-case deadlines (#176)
+
+### 🐛 Bug Fixes
+
+- **(core)** Redact quoted, glued and unusual credential shapes in vendor text (#177)
+- **(core)** Redact credential-shaped text in a vendor's error message (#175)
+- **(core)** Bound a second close behind one that is held (#173)
+- **(acp)** Give a host the login hint when an agent answers a prompt with auth-required (#170)
+
+### 🧪 Testing
+
+- **(core)** Measure the built-in launcher's stop bound (#172)
+- **(codex)** Prove a refused hold claims nothing through the peer seam (#174)
+- **(core)** Pin the registry consumer to the published 0.6.0 (#171)
+
 ## [0.6.0] - 2026-10-11
 
 ### 🚀 Features
