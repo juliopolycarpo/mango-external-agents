@@ -303,6 +303,12 @@ const LINK_SHUTDOWN: &str = "JSON-RPC link shutdown";
 /// not [`LINK_SHUTDOWN`].
 const READER_SHUTDOWN: &str = "JSON-RPC reader shutdown";
 
+/// What a [`Client::close`] that has spent its bound still gives the reader it has just aborted to
+/// notice the abort, capped at `shutdown_timeout`. The abort reaches a task at its next await, a
+/// scheduler turn away, so a bound already spent would otherwise read a reader that was about to
+/// stop as one that cannot.
+const READER_ABORT_SETTLE: Duration = Duration::from_millis(50);
+
 /// Whether `error` is a [`Client::close`] that gave up: closing the link, behind whatever
 /// was still queued for it, did not finish within
 /// [`ClientOptions::shutdown_timeout`]. The link may still be open and the peer still
@@ -435,6 +441,31 @@ fn json_value_type(value: &Value) -> &'static str {
 }
 
 /// What the harness above does with what the peer said.
+///
+/// # A handler must not block its thread
+///
+/// Every method here is `async` and runs on the connection's runtime. This client stops a call
+/// by aborting its task, and an abort takes effect at the call's next await. A call that blocks
+/// its thread without awaiting, with `std::thread::sleep`, a `std` lock held across a wait or a
+/// blocking read, cannot be stopped that way, and it holds a worker thread of the runtime while
+/// it blocks. Wait on the runtime's own primitives, or hand blocking work to
+/// [`tokio::task::spawn_blocking`].
+///
+/// What a handler that blocks does to [`Client::close`] depends on the call:
+///
+/// - [`on_terminated`](Self::on_terminated), on a connection that ended under this side: the
+///   close waits for the call within its bound, as it does for any handler, and then stops
+///   waiting for it. It takes the reader down, gives the abort a few milliseconds to land, and
+///   returns [`Error::Timeout`] for the operation "JSON-RPC reader shutdown" (or the link's own
+///   error, if closing the link failed), so it ends within its documented bound. The reader's
+///   task cannot be stopped and stays on the blocked thread until the call returns, then ends
+///   without any further call. The client stays closed, [`Client::ended`] keeps the end it
+///   recorded, and a later close or a drop has nothing left to wait for or to stop.
+/// - [`on_notification`](Self::on_notification) and
+///   [`on_request_handoff`](Self::on_request_handoff): these run on the handler's task, which a
+///   close aborts and then waits for without a bound. A close behind a call that blocks waits
+///   for as long as the call blocks. Only the wait for the reader is bounded.
+/// - [`on_request`](Self::on_request) runs on tasks that a close aborts and does not wait for.
 #[async_trait::async_trait]
 pub trait PeerHandler: Send + Sync {
     /// The peer announced something.
@@ -3182,7 +3213,11 @@ impl Client {
     /// [`is_link_shutdown_timeout`]), and [`Error::Timeout`] naming the reader when another
     /// close that holds it was still waiting for the handler to be told after this one's bound
     /// of twice `shutdown_timeout` had run out. The link is closed by then. Nothing in the
-    /// second case waits for good, whether or not the other close is ever polled again.
+    /// second case waits for good, whether or not the other close is ever polled again. The same
+    /// [`Error::Timeout`] is what a close returns when it took the reader down and the reader did
+    /// not stop, because a handler blocks its thread; see [`PeerHandler`]. That close ends at
+    /// its bound, twice `shutdown_timeout` and, when it had to take the reader down after the
+    /// bound was spent, a few milliseconds more for the abort to land.
     pub async fn close(&self) -> Result<()> {
         // Stored before the drain rather than inside it, and that order is the contract `call`
         // reads: a caller that finds the map open has, by that fact, arrived before this store,
@@ -3254,10 +3289,7 @@ impl Client {
         // was kept and is never polled again holds it for good, and this close must still end.
         let Ok(mut reader) = tokio::time::timeout_at(latest, self.pump.lock()).await else {
             // The link was dealt with above, and a failure to close it is the better answer.
-            return closed.and(Err(Error::Timeout {
-                operation: String::from(READER_SHUTDOWN),
-                after: self.state.options.shutdown_timeout.saturating_mul(2),
-            }));
+            return closed.and(Err(self.state.reader_shutdown_timeout()));
         };
         if let Some(pump) = reader.take() {
             // The reader of a connection that ended under this side is on its way to telling
@@ -3275,7 +3307,16 @@ impl Client {
             // turn stream parks it — would never reach the flag, and closing would never return.
             if !told {
                 pump.abort();
-                let _ = pump.await;
+                // An abort reaches a task at its next await. A handler that blocks its thread
+                // never gets there, and waiting for it would be waiting for the handler. The
+                // wait ends with this close's own bound, or, when that is spent, after the
+                // short allowance a task needs to notice the abort. The reader is left to stop
+                // whenever the handler returns; nothing is left to wait for it.
+                let settle = READER_ABORT_SETTLE.min(self.state.options.shutdown_timeout);
+                let settled = latest.max(deadline_after(settle));
+                if tokio::time::timeout_at(settled, &mut *pump).await.is_err() {
+                    return closed.and(Err(self.state.reader_shutdown_timeout()));
+                }
             }
         }
         closed
@@ -3507,6 +3548,15 @@ impl ClientState {
             frame.insert(String::from("params"), params);
         }
         Ok(Value::Object(frame).to_string())
+    }
+
+    /// What a close returns when the reader did not let go within its bound of twice
+    /// `shutdown_timeout`.
+    fn reader_shutdown_timeout(&self) -> Error {
+        Error::Timeout {
+            operation: String::from(READER_SHUTDOWN),
+            after: self.options.shutdown_timeout.saturating_mul(2),
+        }
     }
 
     /// What a call still waiting is failed with once this side has stopped speaking.
@@ -5093,6 +5143,7 @@ fn oversized_frame(error: &Error) -> bool {
 #[cfg(test)]
 mod tests {
     mod abandoned_close_tests;
+    mod blocked_handler_tests;
     mod cancellation_hold_tests;
     mod handoff_hold_tests;
     mod handoff_queue_tests;
