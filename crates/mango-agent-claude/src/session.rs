@@ -690,7 +690,8 @@ async fn run_close_teardown(
             // the final unlink or never answers it. The typed error still tells the caller which
             // resource remained, and the wait for it is one more shutdown stage. The session
             // stays `Closing` until that wait is over, so a host watching the status never sees
-            // `Closed` while the artifact's removal is still running.
+            // `Closed` while this worker's removal is still running. A worker lost here is
+            // settled by its guard, which cannot wait for a removal.
             shared.core_state.set_status(SessionStatus::Closed);
             result
         }
@@ -1099,8 +1100,8 @@ impl Drop for LostWorker {
                 "expected the runtime that opened the session to run its teardown | received: it shut down first",
             ),
         };
-        // A close reads the turn under the lifecycle gate that refuses every later start, so a
-        // close that found no turn has no child, now or later.
+        // A close reads the active turn under the lifecycle gate that refuses every later start,
+        // so a close that found none has no child, now or later.
         let never_had_a_child =
             self.closing.is_some() && self.child_stop.is_none() && self.control.is_none();
         let gone = never_had_a_child

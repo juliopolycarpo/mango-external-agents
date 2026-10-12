@@ -495,7 +495,7 @@ A stop runs on the runtime that opened the session. A `cancel` or `close` made f
 runtime, after that one shut down, cannot get the stop run: with a child installed it returns
 `Error::CleanupRequired` with the host's control and an `Error::Link` naming the runtime as its
 cause, and the child is still there for the host to reconcile. A `close` over a session with no
-turn has no child to stop: it returns that `Error::Link` alone and the session is `Closed`. One
+active turn has no child to stop: it returns that `Error::Link` alone and the session is `Closed`. One
 over a launch that is still pending returns the same error and the session stays `Closing`, since
 a child may yet arrive. A worker lost after the stop
 already proved the child gone, inside the artifact removal for one, owes no cleanup: the waiter
