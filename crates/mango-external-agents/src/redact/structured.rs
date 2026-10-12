@@ -45,6 +45,16 @@ const MAX_EMBEDDED_BYTES: usize = 256 * 1024;
 /// How many strings deep a JSON text is read, one inside the next.
 const MAX_EMBEDDED_DEPTH: usize = 4;
 
+/// How many digits make a number under a name that counts tokens a secret and not a count. The
+/// largest count is a 32-bit counter's 4,294,967,295, ten digits, and no window or budget comes
+/// near it; twelve digits is a secret that is made of digits. The text rules read the same number.
+pub(super) const SECRET_DIGITS: usize = 12;
+
+/// Whether `text`, a number written with separators or not, has few enough digits to be a count.
+pub(super) fn digits_make_a_count(text: &str) -> bool {
+    text.bytes().filter(u8::is_ascii_digit).count() < SECRET_DIGITS
+}
+
 /// A name with its separators and case taken out.
 fn squashed(name: &str) -> String {
     name.chars()
@@ -188,7 +198,7 @@ fn walk(value: &Value, under: Under, embedded: usize) -> Value {
         // value larger: a megabyte of `1,` under `"token"` would otherwise come back as six.
         (Value::Object(_), Under::Credential { .. }) => Value::String(String::from(REDACTED)),
         (Value::Array(items), Under::Credential { counts: true })
-            if items.iter().all(Value::is_number) =>
+            if items.iter().all(is_a_count) =>
         {
             value.clone()
         }
@@ -204,15 +214,27 @@ fn walk_leaf_or_free(value: &Value, under: Under, embedded: usize) -> Value {
         Value::String(text) => Value::String(string(text, under, embedded)),
         Value::Number(_) => match under {
             Under::Credential { counts: false } => Value::String(String::from(REDACTED)),
+            Under::Credential { counts: true } if !is_a_count(value) => {
+                Value::String(String::from(REDACTED))
+            }
             _ => value.clone(),
         },
         other => other.clone(),
     }
 }
 
+/// Whether `value` is a number with few enough digits to be a count.
+fn is_a_count(value: &Value) -> bool {
+    value
+        .as_number()
+        .is_some_and(|number| digits_make_a_count(&number.to_string()))
+}
+
 fn string(text: &str, under: Under, embedded: usize) -> String {
     match under {
-        Under::Credential { counts: true } if only_digits(text) => text.to_owned(),
+        Under::Credential { counts: true } if only_digits(text) && digits_make_a_count(text) => {
+            text.to_owned()
+        }
         Under::Credential { .. } => String::from(REDACTED),
         Under::Nothing => text_or_structure(text, embedded),
     }
@@ -446,6 +468,32 @@ mod tests {
             nested,
             json!({ "max_tokens": "[REDACTED]" }),
             "expected a credential below a count to be redacted | received: {nested}"
+        );
+    }
+
+    /// A count has at most ten digits; twelve or more under a name that counts tokens is a secret
+    /// that is made of digits, as the text rules read it.
+    #[test]
+    fn a_number_of_twelve_digits_under_a_count_name_is_redacted() {
+        let shown = structured(&json!({
+            "max_tokens": 4294967295_u64,
+            "tokens_used": 123456789012_u64,
+            "total_tokens": "123456789012",
+            "input_tokens": "4294967295",
+            "tokens": [1, 2, 123456789012_u64],
+            "output_tokens": [1, 2, 3],
+        }));
+        let expected = json!({
+            "max_tokens": 4294967295_u64,
+            "tokens_used": "[REDACTED]",
+            "total_tokens": "[REDACTED]",
+            "input_tokens": "4294967295",
+            "tokens": "[REDACTED]",
+            "output_tokens": [1, 2, 3],
+        });
+        assert_eq!(
+            shown, expected,
+            "expected counts of twelve digits redacted and shorter ones kept | received: {shown}"
         );
     }
 

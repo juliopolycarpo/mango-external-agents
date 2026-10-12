@@ -127,6 +127,23 @@ fn carries_a_new_trigger(raw: &str) -> bool {
     .any(|plain| triggers_in(plain))
 }
 
+/// Whether twelve digits or more, with `,` and `_` between them, are in `lower`: a number that is
+/// no longer a count under a name that counts tokens, which a rule added after 0.4.1 redacts.
+fn twelve_digits(lower: &str) -> bool {
+    let mut digits = 0;
+    for byte in lower.bytes() {
+        match byte {
+            b'0'..=b'9' => digits += 1,
+            b',' | b'_' => {}
+            _ => digits = 0,
+        }
+        if digits >= 12 {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether a status word stands after a `:` or an `=`, which is where a rule keeps it.
 fn status_follows_a_separator(lower: &str) -> bool {
     lower.match_indices([':', '=']).any(|(at, _)| {
@@ -197,6 +214,7 @@ const STATUS_WORDS: &[&str] = &[
 fn triggers_in(plain: &str) -> bool {
     let lower = plain.to_ascii_lowercase();
     if lower.contains(['"', '\'', '\\', '?', '&', '[', '{'])
+        || twelve_digits(&lower)
         || NEW_WORDS.iter().any(|word| lower.contains(word))
         || status_follows_a_separator(&lower)
         || marker_follows_a_separator(&lower)
@@ -476,6 +494,8 @@ const FRAGMENTS: &[&str] = &[
     "\\",
     "- ",
     "\n  - ",
+    "123456789012",
+    "1,234,567,890,123",
     "{",
     "}",
     "[",

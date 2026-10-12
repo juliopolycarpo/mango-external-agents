@@ -218,6 +218,17 @@ pub const LEAKS: &[Leak] = &[
         "ss-24y",
         &["run cmd &password=", "after"],
     ),
+    // A number of twelve digits or more under a name that counts tokens is not a count.
+    leak(
+        "quota check: tokens: 123456789012 exceeded",
+        "123456789012",
+        &["quota check: tokens", "exceeded"],
+    ),
+    leak(
+        r#"usage {"total_tokens":"123456789012","retry_after":30}"#,
+        "123456789012",
+        &["usage", r#""retry_after":30"#],
+    ),
     leak(
         r#"call failed {"error":"bad","env":[{"name":"HOME","value":"/h"}],"token":"tk-15"}"#,
         "tk-15",
@@ -270,6 +281,7 @@ pub const BENIGN: &[&str] = &[
     "Unexpected token '<' in JSON at position 0",
     "connection refused (os error 111) while connecting to 127.0.0.1:8080",
     "turn failed: context_length_exceeded (-32000)",
+    "quota check: tokens: 4294967295 allowed, max_tokens=4,294,967,295",
 ];
 
 /// Credentials with no name beside them, in the messages a vendor prints them in.

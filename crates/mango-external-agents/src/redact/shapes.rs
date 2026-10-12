@@ -947,3 +947,45 @@ fn a_yaml_sequence_under_a_credential_name_is_redacted_item_by_item() {
         ("token:\n  - expired\nnext", "token:\n  - expired\nnext"),
     ]);
 }
+
+/// A number under a name that counts tokens is a count: `max_tokens: 100000`. A count has at most
+/// ten digits (4,294,967,295 is the largest a 32-bit counter holds, and no model has a window
+/// near it), so a run of twelve or more is a secret that happens to be digits, and is redacted.
+#[test]
+fn a_count_of_twelve_digits_or_more_is_a_credential_and_a_shorter_one_is_a_count() {
+    assert_shown(&[
+        ("tokens: 4294967295", "tokens: 4294967295"),
+        ("tokens: 99999999999", "tokens: 99999999999"),
+        (
+            "max_tokens=4,294,967,295 next",
+            "max_tokens=4,294,967,295 next",
+        ),
+        ("tokens: 100000000000", "tokens=[REDACTED]"),
+        ("tokens: 123456789012", "tokens=[REDACTED]"),
+        ("token_limit=999_999_999_999", "token_limit=[REDACTED]"),
+        // A comma ends a value under every name, so only the digits before it are the value.
+        (
+            "tokens_used: 1,234,567,890,123 left",
+            "tokens_used=[REDACTED],234,567,890,123 left",
+        ),
+        (
+            r#"{"max_tokens": 123456789012, "n": 1}"#,
+            r#"{"max_tokens": [REDACTED], "n": 1}"#,
+        ),
+        (
+            r#"{"max_tokens": 4294967295, "n": 1}"#,
+            r#"{"max_tokens": 4294967295, "n": 1}"#,
+        ),
+        (
+            r#"{"total_tokens":"123456789012","n":1}"#,
+            r#"{"total_tokens":"[REDACTED]","n":1}"#,
+        ),
+        (
+            r#"{"total_tokens":"4294967295","n":1}"#,
+            r#"{"total_tokens":"4294967295","n":1}"#,
+        ),
+        // A name that does not count tokens never kept a number, and the status words stay kept.
+        ("api_token: 12345", "api_token=[REDACTED]"),
+        ("secret: 503", "secret: 503"),
+    ]);
+}

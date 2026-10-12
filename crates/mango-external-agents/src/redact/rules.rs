@@ -13,7 +13,7 @@
 use std::ops::Range;
 
 use super::scan::{Anchor, count_steps, first_match, run_start};
-use super::structured::{CREDENTIAL_NAMES, CREDENTIAL_WORDS};
+use super::structured::{CREDENTIAL_NAMES, CREDENTIAL_WORDS, SECRET_DIGITS};
 use super::{
     Outcome, Rewrite, is_name_byte, is_space_byte, is_value_byte, match_byte, match_word,
     skip_spaces, strip, take_while,
@@ -613,6 +613,12 @@ fn status_phrase_end(bytes: &[u8], start: usize) -> Option<usize> {
     (delimited && marks < 3).then_some(end)
 }
 
+/// Whether the digits in `text` are few enough for a count: twelve or more are a secret, as in the
+/// JSON walk (see [`SECRET_DIGITS`]).
+fn is_a_count(text: &[u8]) -> bool {
+    text.iter().filter(|byte| byte.is_ascii_digit()).count() < SECRET_DIGITS
+}
+
 /// Whether `text` is only digits, with the separators a number is written with.
 fn only_digits(text: &[u8]) -> bool {
     !text.is_empty()
@@ -906,6 +912,7 @@ fn read_assignment(bytes: &[u8], at: usize, query: &mut QueryRun) -> Option<Outc
     if keyword.token
         && digits_end > value_start
         && bytes.get(digits_end).is_none_or(|byte| ends_value(*byte))
+        && is_a_count(&bytes[value_start..digits_end])
         && counts_tokens(bytes, keyword.end)
         && !vetoed()
     {
@@ -1251,6 +1258,7 @@ fn quoted_value(
     if keyword.token
         && counts_tokens(bytes, keyword.end)
         && only_digits(&bytes[opened.inner..end])
+        && is_a_count(&bytes[opened.inner..end])
         && !vetoed()
     {
         return Some(Outcome::Keep { end });
