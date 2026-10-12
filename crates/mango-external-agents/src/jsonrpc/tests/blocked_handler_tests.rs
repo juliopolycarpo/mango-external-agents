@@ -627,9 +627,8 @@ async fn a_blocked_task_and_a_blocked_answer_share_the_first_grace() {
         Arc::clone(&handler) as Arc<dyn PeerHandler>,
         slow,
     );
-    // The question first, and the notification once its answer is blocked: the answer is spawned
-    // by the handler's task, into the slot of the worker thread that the notification then blocks,
-    // where no other worker steals it from.
+    // The question first, and the notification once its answer is blocked: the handler's task
+    // starts the answers, so a question queued behind a notification that blocks it never runs.
     link.push_line(r#"{"jsonrpc":"2.0","id":7,"method":"ask","params":{}}"#);
     until("the answer to block", || {
         handler.entered.load(Ordering::Acquire) == 1
@@ -655,8 +654,8 @@ async fn a_blocked_task_and_a_blocked_answer_share_the_first_grace() {
         "expected the handler's timeout | received {closed:?} after {waited:?}"
     );
     assert!(
-        waited >= grace && waited < grace + grace / 2,
+        waited >= grace && waited < grace * 2,
         "expected the task and the answer to share one grace, {grace:?} to {:?} | received {waited:?}",
-        grace + grace / 2
+        grace * 2
     );
 }

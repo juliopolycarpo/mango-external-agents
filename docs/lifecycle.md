@@ -258,19 +258,20 @@ returns `Ok` says nothing of whether the call has returned.
   (`is_handler_shutdown_timeout`), or the link's own error if closing the link failed.
 - `on_terminated`, and those two on a connection that ended under this side once the reader has
   taken the handler's task to drain it, are waited for by the reader, which the close waits for
-  within its bound. A close that gets to the task before the reader does is in the case above. It then takes the reader down, allows the abort
-  50 ms to land when its bound is spent, and returns the reader's `Timeout`
+  within its bound. A close that gets to the task before the reader does, while the reader has
+  recorded the end but not yet reached the task, is in the case above. The close then takes the
+  reader down, allows the abort 50 ms to land when its bound is spent, and returns the reader's `Timeout`
   (`is_reader_shutdown_timeout`) when the reader is inside a call that blocks, or the link's own
   error. A reader parked at an await, waiting for a task whose call blocks, is taken down, and the
   close returns `Ok`.
 - `on_request` runs on tasks the close lets write their refusals for up to `shutdown_timeout`,
   then aborts without waiting for them. The close returns `Ok`.
 
-A call that blocks its thread for longer than the first grace and then returns is treated as one
-that never does: the close returns the handler's `Timeout`, with the link closed, where it used to
-wait the call out. A handler must not block its thread; this only keeps the close from waiting
-for it. The bound also
-relies on another worker thread of the runtime being free to run its timers, and on the link's own
+A call to `on_notification` or `on_request_handoff` that blocks its thread for longer than the
+first grace and then returns is treated as one that never does: the close returns the handler's
+`Timeout`, with the link closed, where it used to wait the call out. A handler must not block its
+thread; this only keeps the close from waiting for it. The bound also relies on another worker
+thread of the runtime being free to run its timers, and on the link's own
 `send` and `close` not blocking their thread.
 
 A caller that wraps `close` in a timeout shorter than twice `shutdown_timeout` on a connection that

@@ -559,7 +559,7 @@ fn json_value_type(value: &Value) -> &'static str {
 ///   failed.
 /// - [`on_terminated`](Self::on_terminated), and a call of either kind above on a connection that
 ///   ended under this side once the reader has taken the handler's task to drain it (a close that
-///   gets to the task first, as when a caller recorded the end before the reader woke to it, is
+///   gets to the task first, while the reader has recorded the end but not yet reached it, is
 ///   in the case above): the reader is the one waiting, for the call or for the task. The
 ///   close waits for the reader within its bound, then takes it down, gives the abort 50 ms to
 ///   land when its bound is already spent, and returns [`Error::Timeout`] for the operation
