@@ -12,7 +12,7 @@
 //! that is linear only up to some size still fails.
 
 use super::scan::steps;
-use super::{ends_awaiting_value, stderr_text};
+use super::{ends_awaiting_value, message_text, stderr_text};
 use crate::ExtensionValue;
 
 /// A short text and one twice its size, both far past what a quadratic rule survives in a test.
@@ -315,6 +315,13 @@ fn redaction_steps(text: &str) -> usize {
     })
 }
 
+/// The entry point a vendor's messages take: the rules of `stderr_text` and the token pass.
+fn message_steps(text: &str) -> usize {
+    steps::counted(|| {
+        std::hint::black_box(message_text(std::hint::black_box(text)));
+    })
+}
+
 fn awaiting_steps(text: &str) -> usize {
     steps::counted(|| {
         std::hint::black_box(ends_awaiting_value(std::hint::black_box(text)));
@@ -329,9 +336,14 @@ fn extension_steps(text: &str) -> usize {
 
 /// Fails, naming every shape that broke and both lengths, unless `measure` is within the budget
 /// at each length and at most about doubles when the text does.
-fn assert_work_is_linear(caller: &str, measure: fn(&str) -> usize, per_byte: usize) {
+fn assert_work_is_linear(
+    caller: &str,
+    shapes: &[&[Shape]],
+    measure: fn(&str) -> usize,
+    per_byte: usize,
+) {
     let mut failures = Vec::new();
-    for shape in SHAPES {
+    for shape in shapes.iter().copied().flatten() {
         let small = (shape.build)(SMALL);
         let large = (shape.build)(2 * SMALL);
         let (small_steps, large_steps) = (measure(&small), measure(&large));
@@ -365,7 +377,12 @@ fn assert_work_is_linear(caller: &str, measure: fn(&str) -> usize, per_byte: usi
 
 #[test]
 fn redaction_work_is_proportional_to_the_text_for_every_shape() {
-    assert_work_is_linear("redact::stderr_text", redaction_steps, STEPS_PER_BYTE);
+    assert_work_is_linear(
+        "redact::stderr_text",
+        &[SHAPES],
+        redaction_steps,
+        STEPS_PER_BYTE,
+    );
 }
 
 /// Extension normalization redacts the whole value before it keeps 128 code points, so the bound
@@ -374,6 +391,7 @@ fn redaction_work_is_proportional_to_the_text_for_every_shape() {
 fn extension_normalization_work_is_proportional_to_the_value_for_every_shape() {
     assert_work_is_linear(
         "ExtensionValue::normalized",
+        &[SHAPES],
         extension_steps,
         STEPS_PER_BYTE,
     );
@@ -386,9 +404,164 @@ fn extension_normalization_work_is_proportional_to_the_value_for_every_shape() {
 fn ends_awaiting_value_work_is_proportional_to_the_text_for_every_shape() {
     assert_work_is_linear(
         "redact::ends_awaiting_value",
+        &[SHAPES],
         awaiting_steps,
         AWAITING_STEPS_PER_BYTE,
     );
+}
+
+/// Shapes built against the token pass: runs that nearly are tokens, tokens that run on, and
+/// private-key blocks that never end. A scan that reads a run again for each prefix it might begin,
+/// or an end marker again for each begin marker, fails here.
+const TOKEN_SHAPES: &[Shape] = &[
+    Shape {
+        what: "one run of name characters with no token in it",
+        build: |len| "a".repeat(len),
+    },
+    Shape {
+        what: "a token prefix and a body that runs the whole text",
+        build: |len| format!("{}{}", concat!("gh", "p_"), "a".repeat(len)),
+    },
+    Shape {
+        what: "a token prefix repeated inside one run",
+        build: |len| repeated(concat!("gh", "p_"), "", len),
+    },
+    Shape {
+        what: "a hyphenated prefix repeated inside one run",
+        build: |len| repeated(concat!("s", "k-live-"), "", len),
+    },
+    Shape {
+        what: "token prefixes one after another with a body too short",
+        build: |len| repeated(concat!("gh", "p_abc "), "", len),
+    },
+    Shape {
+        what: "access key ids one after another",
+        build: |len| repeated(concat!("AK", "IA0123456789ABCDEF "), "", len),
+    },
+    Shape {
+        what: "access key ids a character too long, one after another",
+        build: |len| repeated(concat!("AK", "IA0123456789ABCDEFG "), "", len),
+    },
+    Shape {
+        what: "web tokens run together on dots",
+        build: |len| repeated(concat!("ey", "Jaaaaaaaaaaaa."), "", len),
+    },
+    Shape {
+        what: "web token headers with a claims part and no signature dot",
+        build: |len| {
+            repeated(
+                concat!("ey", "Jaaaaaaaaaaaa.", "ey", "Jaaaaaaaaaaaa "),
+                "",
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "web token headers with a second part that is no JSON",
+        build: |len| repeated(concat!("ey", "Jaaaaaaaaaaaa.xx "), "", len),
+    },
+    Shape {
+        what: "a web token whose parts run the whole text",
+        build: |len| {
+            format!(
+                "{}{}.{}.{}",
+                concat!("ey", "J"),
+                "a".repeat(len / 3),
+                concat!("ey", "Jb"),
+                "c".repeat(len / 3)
+            )
+        },
+    },
+    Shape {
+        what: "an OAuth prefix repeated with a body too short",
+        build: |len| repeated(concat!("ya", "29.abc "), "", len),
+    },
+    Shape {
+        what: "an OAuth prefix and a body that runs the whole text",
+        build: |len| format!("{}{}", concat!("ya", "29."), "a".repeat(len)),
+    },
+    Shape {
+        what: "private-key begin markers with no end marker",
+        build: |len| repeated(concat!("-----BEGIN PRIV", "ATE KEY-----\n"), "", len),
+    },
+    Shape {
+        what: "certificate begin markers, which are not secrets",
+        build: |len| repeated("-----BEGIN CERTIFICATE-----\n", "", len),
+    },
+    Shape {
+        what: "begin markers with a label that never closes",
+        build: |len| repeated(&format!("-----BEGIN {} ", "A".repeat(52)), "", len),
+    },
+    Shape {
+        what: "end markers with no begin marker",
+        build: |len| repeated(concat!("-----END PRIV", "ATE KEY-----\n"), "", len),
+    },
+    Shape {
+        what: "private-key blocks one after another",
+        build: |len| {
+            repeated(
+                concat!(
+                    "-----BEGIN PRIV",
+                    "ATE KEY-----\nQQ==\n-----END PRIV",
+                    "ATE KEY-----\n"
+                ),
+                "",
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "hyphens only",
+        build: |len| "-".repeat(len),
+    },
+    Shape {
+        what: "JSON line breaks before a run, repeated",
+        build: |len| repeated(concat!("\\ngh", "p_abc "), "", len),
+    },
+    Shape {
+        what: "a backslash and a letter before every run",
+        build: |len| repeated("\\nnnnnnnnnn ", "", len),
+    },
+];
+
+/// The token pass is read for every message a vendor sends, so it is held to the same budget as
+/// the rules, over the shapes above and over every shape of the rules.
+#[test]
+fn message_redaction_work_is_proportional_to_the_text_for_every_shape() {
+    assert_work_is_linear(
+        "redact::bounded",
+        &[SHAPES, TOKEN_SHAPES],
+        message_steps,
+        STEPS_PER_BYTE,
+    );
+}
+
+/// The scan reads a byte of the text and a byte of each run it is in, and a begin marker with no
+/// end marker takes the rest of the text, so each of these has to record at least its length.
+#[test]
+fn the_token_pass_counts_its_steps() {
+    let len = 4096;
+    for (what, text, at_least) in [
+        ("plain text", "x ".repeat(len / 2), len),
+        ("one long run", "x".repeat(len), len),
+        (
+            "a begin marker with no end marker",
+            format!(
+                "{}{}",
+                concat!("-----BEGIN PRIV", "ATE KEY-----\n"),
+                "x ".repeat(len / 2)
+            ),
+            len,
+        ),
+    ] {
+        let received = message_steps(&text);
+        assert!(
+            received >= at_least,
+            "expected {what} of {} bytes to record >= {at_least} scan steps through the token pass \
+             | received: {received}",
+            text.len()
+        );
+    }
 }
 
 #[test]

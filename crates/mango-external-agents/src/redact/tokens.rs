@@ -1,0 +1,281 @@
+//! Well-known credentials with no name beside them.
+//!
+//! The assignment rules find a credential by its name. A token printed alone, `token: expired
+//! (ghp_...)` or a key quoted in prose, has no name to find, but most vendors give theirs away with
+//! a prefix, a length and an alphabet. This pass reads those, and nothing else: a closed list, each
+//! entry case-sensitive, with a minimum length and a body made of the characters that vendor's
+//! tokens are made of, so that `sk-learn`, `task-ant-...` and `npm_config_cache` are words.
+//!
+//! A token has to start where a run of name characters (`A-Za-z0-9_-`) starts, so a prefix inside a
+//! longer word never matches, and it takes the whole run it is in. The two letters of a JSON line
+//! break (`\n`) are the exception, since a string is full of them and the letter would otherwise
+//! be part of the run in front of the token. A match is replaced by `[REDACTED]`, prefix included.
+//!
+//! Every run is read once by the scan and at most once more by the match that starts at it, and a
+//! match ends at the end of a run or past it by a bounded number of runs (a web token is three),
+//! so the work is linear. A private-key block with no end marker takes the rest of the text, which
+//! is read once. See `redact::work` for the shapes that hold this.
+//!
+//! The pass costs a byte-wise read of the whole text, so `stderr_text`, the hot path of a stderr
+//! tail, does not run it; `redact::bounded` and `redact::structured`, which carry a vendor's
+//! messages, do (see `docs/benchmarks.md`).
+
+use super::scan::count_steps;
+use super::{REDACTED, take_while};
+
+/// The characters a token is made of, at most: letters, digits, `_` and `-`.
+fn is_run_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() | (byte == b'_') | (byte == b'-')
+}
+
+/// The letters that follow a backslash as a JSON line break, tab, backspace or form feed.
+fn is_escape_letter(byte: u8) -> bool {
+    matches!(byte, b'n' | b'r' | b't' | b'b' | b'f')
+}
+
+/// `text` with every well-known token replaced, or `None` when it holds none.
+///
+/// # Example
+///
+/// ```ignore
+/// let found = redact("see ghp_0123456789abcdefghijklmnopqrstuv now");
+/// assert_eq!(found.as_deref(), Some("see [REDACTED] now"));
+/// ```
+pub(super) fn redact(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out: Option<String> = None;
+    let mut copied = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        count_steps(1);
+        if !is_run_byte(bytes[at]) {
+            at += 1;
+            continue;
+        }
+        let run_end = take_while(bytes, at, is_run_byte);
+        let escaped = at > 0 && bytes[at - 1] == b'\\' && is_escape_letter(bytes[at]);
+        let found = token_at(text, at, run_end)
+            .map(|end| (at, end))
+            .or_else(|| {
+                escaped
+                    .then(|| token_at(text, at + 1, run_end).map(|end| (at + 1, end)))
+                    .flatten()
+            });
+        let Some((start, end)) = found else {
+            at = run_end;
+            continue;
+        };
+        let out = out.get_or_insert_with(|| String::with_capacity(text.len()));
+        out.push_str(&text[copied..start]);
+        out.push_str(REDACTED);
+        copied = end;
+        at = end;
+    }
+    out.map(|mut out| {
+        out.push_str(&text[copied..]);
+        out
+    })
+}
+
+/// Where the token that starts at `start` ends, when one does. The run of name characters that
+/// holds `start` ends at `run_end`.
+fn token_at(text: &str, start: usize, run_end: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let run = bytes.get(start..run_end)?;
+    match *run.first()? {
+        b'g' => github(run).then_some(run_end),
+        b'x' => slack(run).then_some(run_end),
+        b's' => s_token(run).then_some(run_end),
+        b'r' | b'p' => stripe(run).then_some(run_end),
+        b'A' => aws_or_google(run).then_some(run_end),
+        b'y' => google_oauth(bytes, run, run_end),
+        b'e' => web_token(bytes, run, run_end),
+        b'n' => with_body(run, b"npm_", 30, is_alphanumeric).then_some(run_end),
+        b'h' => with_body(run, b"hf_", 30, is_alphanumeric).then_some(run_end),
+        b'd' => digitalocean(run).then_some(run_end),
+        b'-' => private_key_block(text, start),
+        _ => None,
+    }
+}
+
+fn is_alphanumeric(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+}
+
+fn is_lower_hex(byte: u8) -> bool {
+    byte.is_ascii_digit() | matches!(byte, b'a'..=b'f')
+}
+
+/// Whether `run` is `prefix` and then at least `min` bytes that `body` accepts, and nothing else.
+fn with_body(run: &[u8], prefix: &[u8], min: usize, body: fn(u8) -> bool) -> bool {
+    run.strip_prefix(prefix)
+        .is_some_and(|rest| rest.len() >= min && rest.iter().all(|byte| body(*byte)))
+}
+
+/// `ghp_`, `gho_`, `ghu_`, `ghs_` and `ghr_` and 20 or more letters and digits (36 as GitHub issues
+/// them), the fine-grained `github_pat_` and 22 or more, and GitLab's `glpat-` and 20 or more.
+fn github(run: &[u8]) -> bool {
+    if let Some(rest) = run.strip_prefix(b"gh")
+        && let [kind, b'_', body @ ..] = rest
+    {
+        return matches!(kind, b'p' | b'o' | b'u' | b's' | b'r')
+            && body.len() >= 20
+            && body.iter().all(|byte| byte.is_ascii_alphanumeric());
+    }
+    if let Some(body) = run.strip_prefix(b"github_pat_") {
+        return body.len() >= 22;
+    }
+    run.strip_prefix(b"glpat-")
+        .is_some_and(|body| body.len() >= 20)
+}
+
+/// Slack's `xoxb-`, `xoxp-`, `xoxa-`, `xoxs-` and `xoxr-` and 20 or more letters, digits and
+/// hyphens.
+fn slack(run: &[u8]) -> bool {
+    if let Some(rest) = run.strip_prefix(b"xox")
+        && let [kind, b'-', body @ ..] = rest
+    {
+        return matches!(kind, b'b' | b'p' | b'a' | b's' | b'r')
+            && body.len() >= 20
+            && !body.contains(&b'_');
+    }
+    false
+}
+
+/// `sk-ant-`, `sk-proj-` and `sk-live-` and 16 or more, Stripe's `sk_live_` and `sk_test_` and 16
+/// or more letters and digits, Shopify's `shpat_` family and 32 hex digits, and OpenAI's older
+/// `sk-` and 40 or more letters and digits with a digit and a letter among them.
+fn s_token(run: &[u8]) -> bool {
+    for prefix in [&b"sk-ant-"[..], b"sk-proj-", b"sk-live-"] {
+        if let Some(body) = run.strip_prefix(prefix) {
+            return body.len() >= 16;
+        }
+    }
+    if stripe(run) {
+        return true;
+    }
+    for prefix in [&b"shpat_"[..], b"shpss_", b"shpca_", b"shppa_"] {
+        if with_body(run, prefix, 32, is_lower_hex) {
+            return true;
+        }
+    }
+    run.strip_prefix(b"sk-").is_some_and(|body| {
+        body.len() >= 40
+            && body.iter().all(|byte| byte.is_ascii_alphanumeric())
+            && body.iter().any(u8::is_ascii_digit)
+            && body.iter().any(u8::is_ascii_alphabetic)
+    })
+}
+
+/// `sk_`, `rk_` and `pk_` with `live_` or `test_` and 16 or more letters and digits.
+fn stripe(run: &[u8]) -> bool {
+    let Some(rest) = run
+        .strip_prefix(b"sk_")
+        .or_else(|| run.strip_prefix(b"rk_"))
+        .or_else(|| run.strip_prefix(b"pk_"))
+    else {
+        return false;
+    };
+    for mode in [&b"live_"[..], b"test_"] {
+        if with_body(rest, mode, 16, is_alphanumeric) {
+            return true;
+        }
+    }
+    false
+}
+
+/// An AWS access key id, `AKIA` or `ASIA` and 16 capitals or digits and no more, and a Google API
+/// key, `AIza` and 35 or more letters, digits, `_` and `-`.
+fn aws_or_google(run: &[u8]) -> bool {
+    if run.len() == 20
+        && (run.starts_with(b"AKIA") || run.starts_with(b"ASIA"))
+        && run[4..]
+            .iter()
+            .all(|byte| byte.is_ascii_uppercase() | byte.is_ascii_digit())
+    {
+        return true;
+    }
+    run.strip_prefix(b"AIza")
+        .is_some_and(|body| body.len() >= 35)
+}
+
+/// `ya29.` and 20 or more letters, digits, `_` and `-`: the run is `ya29`, a dot ends it, and the
+/// body is the run after the dot.
+fn google_oauth(bytes: &[u8], run: &[u8], run_end: usize) -> Option<usize> {
+    if run != b"ya29" || bytes.get(run_end) != Some(&b'.') {
+        return None;
+    }
+    let end = take_while(bytes, run_end + 1, is_run_byte);
+    (end - (run_end + 1) >= 20).then_some(end)
+}
+
+/// DigitalOcean's `dop_v1_`, `doo_v1_` and `dor_v1_` and 40 or more hex digits.
+fn digitalocean(run: &[u8]) -> bool {
+    [&b"dop_v1_"[..], b"doo_v1_", b"dor_v1_"]
+        .iter()
+        .any(|prefix| with_body(run, prefix, 40, is_lower_hex))
+}
+
+/// A signed web token: a header and a claims part, each base64url JSON (`eyJ`, which is `{"`) of
+/// 10 or more characters, then a signature that may be empty. The run is the header; the others
+/// follow a dot each.
+fn web_token(bytes: &[u8], run: &[u8], run_end: usize) -> Option<usize> {
+    if !run.starts_with(b"eyJ") || run.len() < 10 || bytes.get(run_end) != Some(&b'.') {
+        return None;
+    }
+    let claims = run_end + 1;
+    let claims_end = take_while(bytes, claims, is_run_byte);
+    if !bytes[claims..claims_end].starts_with(b"eyJ")
+        || claims_end - claims < 10
+        || bytes.get(claims_end) != Some(&b'.')
+    {
+        return None;
+    }
+    Some(take_while(bytes, claims_end + 1, is_run_byte))
+}
+
+/// The longest label inside `-----BEGIN ...-----`: `ENCRYPTED PRIVATE KEY` is 21.
+const MAX_LABEL: usize = 40;
+
+/// A private-key block: `-----BEGIN ... PRIVATE KEY-----` to the line that ends it, or to the end
+/// of the text when it never ends. A certificate and a public key are not secrets and are left.
+fn private_key_block(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let label_start = start + b"-----BEGIN ".len();
+    if !bytes[start..].starts_with(b"-----BEGIN ") {
+        return None;
+    }
+    let after_begin = closing_dashes(bytes, label_start, true)?;
+    let label = &bytes[label_start..after_begin - 5];
+    if !label.ends_with(b"PRIVATE KEY") && !label.ends_with(b"PRIVATE KEY BLOCK") {
+        return None;
+    }
+    // The block goes on to the next end marker. One read of what follows: the matches that come
+    // after an end marker start there, and one that finds none takes the rest of the text.
+    let rest = &text[after_begin..];
+    let Some(offset) = rest.find("-----END ") else {
+        count_steps(rest.len());
+        return Some(text.len());
+    };
+    count_steps(offset);
+    let marker = after_begin + offset + b"-----END ".len();
+    Some(closing_dashes(bytes, marker, false).unwrap_or(marker))
+}
+
+/// The place after the `-----` that closes a label starting at `from`, when 1 to [`MAX_LABEL`]
+/// capitals and spaces come first (and, for the `BEGIN` label, nothing else).
+fn closing_dashes(bytes: &[u8], from: usize, required: bool) -> Option<usize> {
+    let window = bytes.get(from..)?;
+    let label = window
+        .iter()
+        .take(MAX_LABEL)
+        .take_while(|byte| byte.is_ascii_uppercase() | (**byte == b' '))
+        .count();
+    count_steps(label + 1);
+    let end = from + label;
+    let closed = bytes.get(end..end + 5) == Some(b"-----");
+    if required && (!closed || label == 0) {
+        return None;
+    }
+    closed.then_some(end + 5)
+}

@@ -55,6 +55,9 @@ mod shapes;
 mod strip;
 mod structured;
 #[cfg(test)]
+mod token_shapes;
+mod tokens;
+#[cfg(test)]
 mod work;
 
 use std::borrow::Cow;
@@ -75,18 +78,32 @@ pub use structured::structured;
 /// assert_eq!(tail, "Authorization: Bearer [REDACTED] API_KEY=[REDACTED]");
 /// ```
 pub fn stderr_text(raw: &str) -> String {
+    read(raw, false)
+}
+
+/// What a vendor's message is shown as: [`stderr_text`], and the well-known tokens with no name
+/// beside them (`ghp_...`, `AKIA...`, a web token, a private-key block) taken out as well.
+///
+/// The extra pass reads the whole text a byte at a time, which a stderr tail, read line after line,
+/// does not pay for (`docs/benchmarks.md`); a message is short and rare.
+pub(crate) fn message_text(raw: &str) -> String {
+    read(raw, true)
+}
+
+/// [`stderr_text`], with the token pass when `tokens` is set.
+fn read(raw: &str, tokens: bool) -> String {
     // Stripped first rather than last. A CLI that colours its output writes `Authorization:` and
     // ` Bearer sk-live-x` either side of an escape sequence, and a rule that reads the two as
     // neighbours never sees the token at all if the sequence is still sitting between them.
     let (plain, marked) = strip::strip_marking(raw);
-    let mut redacted = rules_round(&plain);
+    let mut redacted = rules_round(&plain, tokens);
     // A marker the stripper left parts a name from the word before it for the rules, and is gone
     // from what they return, so a second call over that would read the same text differently.
     // Reading it again here, until it stops changing, makes the answer one a second call leaves
     // alone. Text with no removed byte, nearly all of it, pays for one round.
     if marked {
         for _ in 0..EXTRA_ROUNDS {
-            let next = rules_round(&redacted);
+            let next = rules_round(&redacted, tokens);
             if next == redacted {
                 break;
             }
@@ -99,9 +116,12 @@ pub fn stderr_text(raw: &str) -> String {
 /// The most times text that carried a marker is read again.
 const EXTRA_ROUNDS: usize = 3;
 
-/// The three rules over text the stripper has handled, and the markers taken out after.
-fn rules_round(plain: &str) -> String {
-    let bearer = redact_bearer(plain);
+/// The three rules over text the stripper has handled, and the markers taken out after. The token
+/// pass goes first when asked: a private-key block that a name redacts the first line of would
+/// otherwise leave the rest of it behind.
+fn rules_round(plain: &str, tokens: bool) -> String {
+    let unnamed = tokens.then(|| tokens::redact(plain)).flatten();
+    let bearer = redact_bearer(unnamed.as_deref().unwrap_or(plain));
     let assignments = redact_assignments(&bearer);
     remove_boundaries(redact_url_passwords(&assignments))
 }
@@ -109,7 +129,7 @@ fn rules_round(plain: &str) -> String {
 /// [`stderr_text`] without the rounds that follow a marker: what one reading of the rules gives.
 #[cfg(test)]
 fn single_round(raw: &str) -> String {
-    rules_round(&strip_control_characters(raw))
+    rules_round(&strip_control_characters(raw), false)
 }
 
 /// Redacts `raw` and then bounds it to `limit`: the order every vendor-written diagnostic needs.
@@ -130,7 +150,7 @@ fn single_round(raw: &str) -> String {
 /// assert!(!text.truncated);
 /// ```
 pub fn bounded(raw: &str, limit: crate::normalize::TextLimit) -> crate::normalize::BoundedText {
-    crate::normalize::bound_text(&stderr_text(raw), limit)
+    crate::normalize::bound_text(&message_text(raw), limit)
 }
 
 /// Whether `dropped`, the text a cut removed from the end of what came before, stops where a

@@ -10,7 +10,7 @@
 
 use serde_json::{Map, Value};
 
-use super::stderr_text;
+use super::message_text;
 
 /// What replaces a credential.
 const REDACTED: &str = "[REDACTED]";
@@ -120,9 +120,10 @@ fn only_digits(text: &str) -> bool {
 ///   "value": "sk-..."}`, in any case;
 /// - the second entry of a two-entry array whose first is a credential's name:
 ///   `["Authorization", "Bearer ..."]`;
-/// - credential-shaped text in every other string, by [`stderr_text`](super::stderr_text), done
-///   before the value is written out because writing escapes a line break into two characters the
-///   text rules do not skip.
+/// - credential-shaped text in every other string, by the rules of [`stderr_text`](super::stderr_text)
+///   and the well-known tokens with no name beside them (`ghp_...`, `AKIA...`), done before the value
+///   is written out because writing escapes a line break into two characters the text rules do not
+///   skip.
 ///
 /// Numbers, booleans, nulls and the shape of the value are otherwise kept, so `"retry_after": 30`
 /// and a sibling `"path"` stay readable. The depth of a [`Value`] is bounded by the parser that
@@ -201,7 +202,7 @@ fn string(text: &str, under: Under) -> String {
     match under {
         Under::Credential { counts: true } if only_digits(text) => text.to_owned(),
         Under::Credential { .. } => String::from(REDACTED),
-        Under::Nothing => stderr_text(text),
+        Under::Nothing => message_text(text),
     }
 }
 
