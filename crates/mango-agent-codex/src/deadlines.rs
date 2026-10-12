@@ -252,13 +252,18 @@ impl Deadlines {
     /// [`teardown`](Self::teardown), 46 s at the defaults. A `close` called inside that window
     /// is still bounded by [`close_worst_case`](Self::close_worst_case) from its own call.
     ///
+    /// This is the enforced ceiling. An exit behind a held stretch reaches the report at exactly
+    /// two `shutdown_timeout` and the reap 12 s short of it at the defaults, because the ended
+    /// turn leaves the teardown no interrupt to wait for and the given-up stretch no hold for the
+    /// client's close.
+    ///
     /// # Example
     ///
     /// ```
     /// use mango_agent_codex::deadlines::Deadlines;
     /// use mango_external_agents::Limits;
     ///
-    /// let lost = Deadlines::from_limits(&Limits::default()).connection_lost_to_closed();
+    /// let lost =Deadlines::from_limits(&Limits::default()).connection_lost_to_closed();
     /// assert_eq!(lost.as_secs(), 46);
     /// ```
     #[must_use]

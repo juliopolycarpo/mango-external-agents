@@ -390,11 +390,24 @@ a turn whose every stage stalls (the interrupt unanswered, a commit parked after
 began, a call holding the client's cancellation, a link whose close never returns, and that child)
 takes 31 s, which is `T` less the backstop. A `close` called inside an overflow's hold wait
 and an overflow's own teardown both finished under their bounds, at 24 s from the call and 29 s
-from the overflow in the run recorded here; the tests assert the bounds, not those two numbers. The rows not driven to their figure are the backstop `st`, which only a client that
-overruns its own bound could spend, and the overflow row's 41 s: a turn whose commit is claimed
-is not interrupted, and behind an overflow the held commit's wait comes first and leaves the turn
-claimed, so the teardown that follows spends no interrupt stage with the existing fakes. The cancel rows are asserted as sums only; the stages they are made of are exercised in
-`tests/cancel_deadlines.rs`.
+from the overflow in the run recorded here; the tests assert the bounds, not those two numbers.
+
+An app-server that exits while the handler is parked in a commit it holds the client's cancellation
+for, with notifications queued behind it, is driven through the connection-loss row. The client
+reports the connection's end exactly 2 `st` after the exit (10 s): the queue never drains behind
+the parked handler, and the held stretch is then waited for one more. The child is reaped 34 s
+after the exit against a link whose close never returns and a child that stalls every stage of the
+stop. That is the 46 s of the row less 12 s that this path cannot spend: once the connection has
+ended the turn is already ended, so the teardown sends no interrupt (`kg`), and the stretch has
+been given up, so the client's close has no hold left to wait for (`st`) and the harness's backstop
+(`st`) is the one only an overrunning client could spend.
+
+The rows not driven to their figure are therefore the backstop `st`, which only a client that
+overruns its own bound could spend, the overflow row's 41 s (a turn whose commit is claimed is not
+interrupted, and behind an overflow the held commit's wait comes first and leaves the turn claimed,
+so the teardown that follows spends no interrupt stage with the existing fakes), and the
+connection-loss row's 46 s, driven to 34 s as above. The cancel rows are asserted as sums only; the
+stages they are made of are exercised in `tests/cancel_deadlines.rs`.
 
 A cancel's first `rt` is the pending
 start and its second the interrupt. In the failed case the third `rt` is the steer hold, paid only

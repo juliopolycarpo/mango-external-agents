@@ -9726,6 +9726,72 @@ mod tests {
                         deadlines.overflow_to_closed()
                     );
                 }
+
+                /// The app-server exits while the handler is parked in a commit it holds the
+                /// client's cancellation for, with notifications queued behind it. The client
+                /// gives that queue one `shutdown_timeout` to drain, which the parked handler
+                /// never lets it, then waits one more for the held stretch before it reports the
+                /// connection's end. The watcher's teardown follows, against a link whose close
+                /// never returns and a child that stalls every stage of its stop.
+                ///
+                /// The row is bounded by `connection_lost_to_closed`. It is driven to the
+                /// teardown's reachable part: after the report the turn is already ended, so the
+                /// interrupt stage is not spent, and the client's close has no stretch left to
+                /// wait for and only its link to wait on.
+                #[tokio::test(start_paused = true)]
+                async fn an_agent_exit_behind_a_held_stretch_is_reaped_within_the_connection_loss_bound()
+                 {
+                    let shared = shared();
+                    let limits = *shared.host.limits();
+                    let deadlines = Deadlines::from_limits(&limits);
+                    let options = as_the_harness_connects(&shared);
+                    let (shared, _session, link, mut stream) =
+                        stalled_session(shared, options).await;
+                    let client = client_of(&shared);
+
+                    let parked = park_commit_of(&shared, &link, turn_completed("completed")).await;
+                    for _ in 0..3 {
+                        link.push_line(
+                            serde_json::json!({"method": "flood", "params": {}}).to_string(),
+                        );
+                    }
+                    tokio::time::sleep(SETTLED).await;
+                    let began = Instant::now();
+                    link.end();
+                    until("the connection: ended by the exit", || client.is_closed()).await;
+                    shared.terminated.cancelled().await;
+                    let reported_after = began.elapsed();
+
+                    let events = ending(&mut stream, began).await.0;
+                    let (teardown, reaped_after) = torn_down(&shared, began).await;
+                    drop(parked);
+
+                    assert!(
+                        is_abandoned_terminal(&events),
+                        "expected the claimed terminal nobody committed: Error(terminal-abandoned) | received: {events:?}"
+                    );
+                    assert!(
+                        matches!(&teardown, Some(Err(Error::CleanupRequired { .. }))),
+                        "expected a teardown behind a child that never exits: CleanupRequired | received: {teardown:?} after {reaped_after:?}"
+                    );
+                    let drain_and_stretch = limits.shutdown_timeout * 2;
+                    within(
+                        "the connection's end reported after the queue's drain and the held stretch",
+                        reported_after,
+                        drain_and_stretch,
+                        drain_and_stretch + std::time::Duration::from_millis(10),
+                    );
+                    // The settle wait, the link's close and the stop's four stages.
+                    let reachable =
+                        drain_and_stretch + limits.shutdown_timeout * 2 + deadlines.process_stop()
+                            - JUST_UNDER * 2;
+                    within(
+                        "the reap of an agent that exited behind a held stretch",
+                        reaped_after,
+                        reachable - std::time::Duration::from_millis(10),
+                        deadlines.connection_lost_to_closed(),
+                    );
+                }
             }
         }
     }
