@@ -19,6 +19,7 @@ use crate::harness::{CapabilityCeiling, DiscoveredCapabilities, HarnessDescripto
 use crate::identity::{HarnessId, HarnessIdentity};
 use crate::normalize::{self, MODEL_CATALOG_MAX_ITEMS, REASONING_EFFORT_MAX_ITEMS, TextLimit};
 use crate::permission::{PermissionMatrix, UnsupportedReason};
+use crate::redact;
 
 /// How the installed CLI was found, and what it can do.
 #[derive(Clone, PartialEq, Eq)]
@@ -108,7 +109,7 @@ impl Discovery {
             executable: self.executable.and_then(bounded_executable),
             version: self
                 .version
-                .map(|version| normalize::bound_text(&version, TextLimit::AccountLabel).text),
+                .map(|version| redact::bounded(&version, TextLimit::AccountLabel).text),
             gate: self.gate.normalized(),
             auth: self.auth.normalized(),
             permission_matrix: self.permission_matrix.normalized(),
@@ -670,7 +671,7 @@ impl GateVerdict {
     pub fn normalized(self) -> Self {
         match self {
             Self::VersionTooOld { found, minimum } => Self::VersionTooOld {
-                found: normalize::bound_text(&found, TextLimit::AccountLabel).text,
+                found: redact::bounded(&found, TextLimit::AccountLabel).text,
                 minimum,
             },
             other => other,
@@ -1606,5 +1607,46 @@ mod tests {
             error.to_string().contains("taken in the future"),
             "received {error}"
         );
+    }
+    /// What a probe prints to say which version it is, or that it is too old, is the CLI's own
+    /// text on its way to a host: redacted like any other diagnostic, and a real version is not
+    /// touched.
+    #[test]
+    fn a_probes_version_text_is_redacted_and_a_version_is_not_changed() {
+        let verdict = GateVerdict::VersionTooOld {
+            found: String::from("1.0.3 (build API_KEY=sk-live-77)"),
+            minimum: String::from("2.0.0"),
+        }
+        .normalized();
+        let GateVerdict::VersionTooOld { found, minimum } = verdict else {
+            panic!("expected the same verdict back");
+        };
+        assert!(
+            !found.contains("sk-live-77") && found.starts_with("1.0.3 (build "),
+            "expected the version kept and its credential redacted | received: {found:?}"
+        );
+        assert_eq!(minimum, "2.0.0");
+
+        let mut discovery = usable();
+        discovery.version = Some(String::from("claude 2.1.270 token=sk-live-78"));
+        let version = discovery.normalized().version.unwrap_or_default();
+        assert!(
+            !version.contains("sk-live-78") && version.starts_with("claude 2.1.270 "),
+            "expected the reported version redacted | received: {version:?}"
+        );
+        for plain in [
+            "2.1.270",
+            "codex-cli 0.9.0-beta.1+build.7",
+            "Claude Code 2.1.270",
+        ] {
+            let GateVerdict::VersionTooOld { found, .. } = (GateVerdict::VersionTooOld {
+                found: plain.to_owned(),
+                minimum: String::new(),
+            })
+            .normalized() else {
+                panic!("expected the same verdict back");
+            };
+            assert_eq!(found, plain, "expected an ordinary version unchanged");
+        }
     }
 }
