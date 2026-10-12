@@ -256,22 +256,41 @@ end steps aside for it and the poison's own failure is never written in that cas
 as the teardown cancels it. A host's `close` finds the turn ended before it closes the client, so
 a hold refused behind it finds nothing to claim.
 
-Three committers run outside a notification call and take no hold. An end of the connection
+**A poison raised while answering an app-server request** gets its stretch whole without a hold.
+A question is answered on a task of its own, one per request, which the client owns and drops at
+the await it is parked at once its shutdown flag rises: at once on an inbound overflow; on the
+app-server's exit, a failed link or the client's outbound budget, after the notifications already
+read have reached the handler, which takes at most one `shutdown_timeout`; and on a host's
+`close`, not before the teardown has ended the turn. The client holds a cancellation off only for
+a call on its handler task, so `hold_cancellation` holds nothing there. The poison therefore runs
+on a task of the harness's own (`Shared::poison_apart`) and the request waits for it. The task is
+not tracked by the client, so no end of the connection stops it, and a request dropped meanwhile
+leaves it to finish alone; the client answers the dropped request itself, with its closed error,
+if the link still takes the write. That drop also wakes the teardown at once, so a poison still on
+its way to the interrupt's answer does not delay it. Only the session's first stop of new work
+spawns a poison and owns that wake, as everywhere else in this section: a request that finds new
+work already stopped leaves the turn and the wake to whoever stopped it.
+
+Only two sites raise a poison there: an approval, or a question round, whose
+`ApprovalRequested` or `QuestionAsked` finds no room on the stream. By then the stream has
+committed its own `stream-overflow` failure, so that is the terminal the host reads, cut or not,
+and the poison's failure is refused behind it. What the stretch decides is the turn's release:
+before, a poison cut between its claim and its release left the turn claimed, and the teardown
+released it and reaped the child one `shutdown_timeout` later than it had to. Now the poison
+finishes, and the teardown costs only its own stages. A poison that is itself not let go for a
+whole `shutdown_timeout` is the case of the replay below: the teardown releases the turn and
+reaps the child, and the poison that lands afterwards finds nothing to claim.
+
+The poison does not use a hold because the alternative is larger than this stretch needs. A
+client made with `WireOptions::with_request_handoff` runs every request on the notification task,
+in wire order and awaited, where a hold works, but a handler that waits for the host's answer
+would then park the request's `Responder` and answer it from another task, every answer would
+take its turn in a bounded outbound queue, and a question would count against the inbound
+notification budget. The harness keeps the per-request task for the host's wait.
+
+Two committers run outside a notification call and take no hold. An end of the connection
 treats them differently:
 
-- **A poison raised while answering an app-server request** runs on a task of its own, one per
-  request, which the client owns. The client drops that task at the await it is parked at once its
-  shutdown flag rises: at once on an inbound overflow; on the app-server's exit, a failed link or
-  the client's outbound budget, after the notifications already read have reached the handler,
-  which takes at most one `shutdown_timeout`; and on a host's `close`, not before the teardown has
-  ended the turn. So this is the one committer that can still be cut between its claim and its
-  release. The turn can then be left claimed and uncommitted, and the teardown fails it as
-  `terminal-abandoned` one `shutdown_timeout` after it starts; the poison's own failure is lost
-  unless it was committed before the cut.
-  The client holds a cancellation off only for a call on its handler task, and a request is
-  answered on a task of its own unless the client hands requests off. Handing them off would move
-  every request onto the notification task, in wire order and awaited, so a handler that waits for
-  the host's answer would have to park the request's `Responder`. The harness does not do that.
 - **The steer replay**, which routes the notifications a steer held and can end or poison the
   turn, runs on a task of the harness's own. The client does not track it, `hold_cancellation`
   holds nothing there, and no end of the connection stops it. A replay that is slow is waited for
