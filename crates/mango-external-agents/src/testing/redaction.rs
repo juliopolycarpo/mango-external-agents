@@ -242,6 +242,9 @@ pub const BENIGN: &[&str] = &[
     "rate limit reached: 429 Too Many Requests, retry after 30s",
     "Rate limit: 90000 tokens per minute exceeded; used 91234 tokens",
     "max_tokens: 100000 > 64000, which is the maximum allowed for this model",
+    // The 13-digit millisecond timestamps the vendors' own streams carry sit under names that say
+    // `At`, not under a name that counts tokens, so the twelve-digit rule does not touch them.
+    r#"{"emittedAtMs":1789334985511,"startedAtMs":1789334985128,"completedAtMs":1789334989478,"input_tokens":120}"#,
     "prompt is too long: 215000 tokens > 200000 maximum",
     "input_tokens=1200 output_tokens=87 total_tokens: 1287",
     "failed to refresh token: 401 Unauthorized",
