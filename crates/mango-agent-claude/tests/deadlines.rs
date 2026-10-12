@@ -312,7 +312,8 @@ async fn a_stream_that_ended_under_a_live_child_reaps_it_after_a_grace_and_a_who
     drop(session);
 }
 
-/// A stop that cannot succeed still ends at the same bound, with the stop's own error.
+/// A stop that cannot succeed still ends at the same bound, with `Error::CleanupRequired` around
+/// the stop's own error.
 #[tokio::test(start_paused = true)]
 async fn a_stop_the_child_ignores_fails_at_the_process_stop_bound() {
     let limits = limits();
@@ -334,6 +335,10 @@ async fn a_stop_the_child_ignores_fails_at_the_process_stop_bound() {
         .await
         .expect("expected the cancel to return | received none within an hour")
         .expect_err("expected a stop the child ignored to fail");
+    assert!(
+        matches!(&error, Error::CleanupRequired { .. }),
+        "expected the stop failure as Error::CleanupRequired | received {error:?}"
+    );
     assert!(
         matches!(error.cause(), Error::Timeout { operation, .. } if operation == "process reaping"),
         "expected Error::Timeout naming process reaping | received {error:?}"

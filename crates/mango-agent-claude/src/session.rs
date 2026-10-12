@@ -83,19 +83,20 @@ impl Teardown {
         }
     }
 
+    /// The retained outcome, or `None` while the stop has not finished.
+    fn outcome(&self) -> Option<Result<()>> {
+        let result = self.result.lock().unwrap_or_else(PoisonError::into_inner);
+        result.as_ref().map(|result| match result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(copy_error(error)),
+        })
+    }
+
     async fn wait(&self) -> Result<()> {
         loop {
             let notified = self.done.notified();
-            if let Some(result) = self
-                .result
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .as_ref()
-            {
-                return match result {
-                    Ok(()) => Ok(()),
-                    Err(error) => Err(copy_error(error)),
-                };
+            if let Some(outcome) = self.outcome() {
+                return outcome;
             }
             notified.await;
         }
@@ -360,6 +361,29 @@ impl ClaudeSession {
     async fn stop_active_turn(&self, reason: CancelReason) -> Result<()> {
         let claim = claim_stop(&mut self.shared.lock(), None, reason);
         await_stop_claim(&self.shared, claim, reason, false).await
+    }
+}
+
+/// A handle on the stop outcome a session retains, that outlives the session itself.
+///
+/// A dropped session's stop runs detached and its result goes to nobody a host can ask, so a test
+/// keeps this to read what the teardown came to.
+#[cfg(test)]
+pub(crate) struct RetainedStop(Arc<Shared>);
+
+#[cfg(test)]
+impl RetainedStop {
+    /// The active turn's retained stop outcome, or `None` while the stop has not finished.
+    pub(crate) fn outcome(&self) -> Option<Result<()>> {
+        let state = self.0.lock();
+        state.active.as_ref()?.teardown.as_ref()?.outcome()
+    }
+}
+
+#[cfg(test)]
+impl ClaudeSession {
+    pub(crate) fn retained_stop(&self) -> RetainedStop {
+        RetainedStop(Arc::clone(&self.shared))
     }
 }
 
@@ -809,17 +833,61 @@ impl Drop for AbandonedStart {
 }
 
 /// Ends a child requested through [`request_stop`], if it had one yet. The pump writes events.
+///
+/// A stop that did not prove the child gone, whether a stage ran out of time, the host's control
+/// answered with an error or its code panicked, comes back as [`Error::CleanupRequired`] carrying
+/// that control, as the Codex and ACP harnesses do. This is the one place a Claude stop failure is
+/// built, so `cancel`, `close`, the pump's own reaps, the host shutdown token and a dropped session
+/// all hand the host the same shape.
 async fn end_turn(
     control: Option<Arc<dyn mango_external_agents::ProcessControl>>,
     reason: CancelReason,
     limits: &mango_external_agents::Limits,
 ) -> Result<Option<StopOutcome>> {
-    if let Some(control) = control {
-        return stop_process_with_limits(control.as_ref(), reason, limits)
-            .await
-            .map(Some);
+    let Some(control) = control else {
+        return Ok(None);
+    };
+    // On a task of its own, so a host control that panics surfaces here as a join error. Run in
+    // line, the panic would unwind the teardown worker before it published an outcome, and every
+    // `cancel` and `close` waiting on it would never return.
+    let limits = *limits;
+    let stop = tokio::spawn({
+        let control = Arc::clone(&control);
+        async move { stop_process_with_limits(control.as_ref(), reason, &limits).await }
+    });
+    match stop.await {
+        Ok(Ok(outcome)) => Ok(Some(outcome)),
+        Ok(Err(source)) => Err(cleanup_required(control, source)),
+        Err(joined) => Err(cleanup_required(control, stop_task_lost(&joined))),
     }
-    Ok(None)
+}
+
+/// What a stop task that never answered says about itself.
+fn stop_task_lost(joined: &tokio::task::JoinError) -> Error {
+    let shape = if joined.is_panic() {
+        "panicked"
+    } else {
+        "was cancelled"
+    };
+    Error::Link {
+        peer: String::from(PROGRAM),
+        message: format!("expected the host's process stop to return | received: it {shape}"),
+    }
+}
+
+/// Wraps a failed stop with the control the host reconciles the child through.
+///
+/// Always the control the host's launcher returned for this child, so `cleanup_control()` names
+/// it even when the host's own control answered with a `CleanupRequired` of its own; that one stays
+/// readable through `cause()`.
+fn cleanup_required(
+    control: Arc<dyn mango_external_agents::ProcessControl>,
+    source: Error,
+) -> Error {
+    Error::CleanupRequired {
+        control,
+        source: Box::new(source),
+    }
 }
 
 /// Records that native work has ended without allowing an older attempt to touch a newer slot.
@@ -1253,13 +1321,19 @@ impl mango_external_agents::Session for ClaudeSession {
             // validates — must not plant a live process nobody holds a handle to. Reaped the same
             // way a stop landing in this window is.
             let claim = claim_stop(&mut self.shared.lock(), Some(&end), CancelReason::Requested);
-            let _ = await_stop_claim(&self.shared, claim, CancelReason::Requested, true).await;
+            let stopped =
+                await_stop_claim(&self.shared, claim, CancelReason::Requested, true).await;
             // A concurrent cancellation may have started the retained worker with
             // `settled: false`. This start failed before a stream existed, so it must finish the
             // no-stream side of the ownership transition after that worker completes.
             settle_owner(&self.shared, &end);
             abandoned.disarm();
-            return Err(error.with_dispatch(Dispatch::Accepted));
+            // A child that could not be reaped outranks the refusal that put it here: its
+            // `CleanupRequired` carries the control the host needs, as in the Codex harness.
+            return Err(stopped
+                .err()
+                .unwrap_or(error)
+                .with_dispatch(Dispatch::Accepted));
         }
         abandoned.disarm();
         abandoned.control = None;
@@ -1323,7 +1397,9 @@ impl mango_external_agents::Session for ClaudeSession {
             }
         };
         let (close, active, taken, mcp_config) = match claim {
-            CloseClaim::Existing(Some(teardown)) => return teardown.wait().await,
+            CloseClaim::Existing(Some(teardown)) => {
+                return self.prefer_late_stop_failure(teardown.wait().await).await;
+            }
             CloseClaim::Existing(None) => return Ok(()),
             CloseClaim::New {
                 close,
@@ -1350,6 +1426,38 @@ impl mango_external_agents::Session for ClaudeSession {
             run_close_teardown(&shared, &close_for_worker, active, mcp_config).await;
         });
         close.wait().await
+    }
+}
+
+impl ClaudeSession {
+    /// A later `close`'s answer when the first gave up on a launch that has since returned a child.
+    ///
+    /// That first close kept an `Error::Timeout` with no control, because no child existed. The
+    /// `start_turn` that owns the launch has since stopped the child it got, and if that stop
+    /// failed, the control to reconcile it with belongs in the answer of the call a host that only
+    /// closes would make next. A stop still running is waited for, bounded stage by stage; a stop
+    /// that succeeded, or one nobody started, leaves the kept answer as it was.
+    async fn prefer_late_stop_failure(&self, kept: Result<()>) -> Result<()> {
+        let pending_launch = matches!(
+            &kept,
+            Err(Error::Timeout { operation, .. }) if operation == PENDING_LAUNCH_OPERATION
+        );
+        if !pending_launch {
+            return kept;
+        }
+        let late = self
+            .shared
+            .lock()
+            .active
+            .as_ref()
+            .and_then(|active| active.teardown.clone());
+        let Some(late) = late else {
+            return kept;
+        };
+        match late.wait_past_launch(Duration::ZERO).await {
+            Some(Err(error)) if error.cleanup_control().is_some() => Err(error),
+            _ => kept,
+        }
     }
 }
 
@@ -2564,3 +2672,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod stop_failure_tests;

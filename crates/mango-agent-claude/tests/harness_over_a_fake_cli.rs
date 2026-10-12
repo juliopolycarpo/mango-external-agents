@@ -4155,8 +4155,9 @@ mod mcp_passthrough {
             .expect("expected the start to return once its stop ran out of time | received a start still pending after an hour")
             .expect("expected the start task to finish");
         assert!(
-            matches!(outcome, Err(ref error) if matches!(error.cause(), Error::Timeout { operation, .. } if operation == "process-tree termination")),
-            "expected the start to report the stop that failed | received {outcome:?}"
+            matches!(outcome, Err(ref error) if error.cleanup_control().is_some()
+                && matches!(error.cause(), Error::Timeout { operation, .. } if operation == "process-tree termination")),
+            "expected the start to report the stop that failed as Error::CleanupRequired with the host's control | received {outcome:?}"
         );
         let argv = launcher.turn_argvs().pop().expect("expected a turn launch");
         let path = std::path::PathBuf::from(
@@ -4280,6 +4281,10 @@ mod mcp_passthrough {
             .await
             .expect("expected the close task to finish")
             .expect_err("expected the bounded native cleanup to fail");
+        assert!(
+            matches!(&error, Error::CleanupRequired { .. }),
+            "expected the stop failure as Error::CleanupRequired | received {error:?}"
+        );
         assert!(
             matches!(error.cause(), Error::Timeout { .. }),
             "received {error:?}"
@@ -5021,6 +5026,10 @@ mod cancelling_and_closing {
             .expect("expected the cancellation task to return")
             .expect_err("expected the bounded stop to report timeout");
         assert!(
+            matches!(&error, Error::CleanupRequired { .. }),
+            "expected the stop failure as Error::CleanupRequired | received {error:?}"
+        );
+        assert!(
             matches!(error.cause(), Error::Timeout { .. }),
             "expected a cleanup timeout, received {error:?}"
         );
@@ -5648,6 +5657,10 @@ mod deadlines {
             began.elapsed()
         );
         assert!(
+            matches!(&error, Error::CleanupRequired { .. }),
+            "expected the stop failure as Error::CleanupRequired | received {error:?}"
+        );
+        assert!(
             matches!(
                 error.cause(),
                 Error::Timeout { operation, after }
@@ -5704,6 +5717,10 @@ mod deadlines {
             began.elapsed()
         );
         assert!(
+            matches!(&error, Error::CleanupRequired { .. }),
+            "expected the stop failure as Error::CleanupRequired | received {error:?}"
+        );
+        assert!(
             matches!(error.cause(), Error::Timeout { operation, .. } if operation == "process reaping"),
             "expected Error::Timeout naming process reaping | received {error:?}"
         );
@@ -5738,6 +5755,10 @@ mod deadlines {
             limits.shutdown_timeout,
             "expected the stop to give the kill one shutdown_timeout | received {:?}",
             began.elapsed()
+        );
+        assert!(
+            matches!(&error, Error::CleanupRequired { .. }),
+            "expected the stop failure as Error::CleanupRequired | received {error:?}"
         );
         assert!(
             matches!(
@@ -5798,7 +5819,7 @@ mod deadlines {
     }
 
     /// The same close over a child that ignores both asks fails at the stop's whole bound, with
-    /// the stop's own error, and the session stays `Closing`.
+    /// `Error::CleanupRequired` around the stop's own error, and the session stays `Closing`.
     #[tokio::test(start_paused = true)]
     async fn a_close_over_a_child_that_ignores_the_stop_fails_at_the_stops_bound() {
         let limits = Limits::default();
@@ -5826,8 +5847,12 @@ mod deadlines {
             began.elapsed()
         );
         assert!(
+            matches!(&error, Error::CleanupRequired { .. }),
+            "expected the stop failure as Error::CleanupRequired | received {error:?}"
+        );
+        assert!(
             matches!(error.cause(), Error::Timeout { operation, .. } if operation == "process reaping"),
-            "expected the stop's own Error::Timeout naming process reaping | received {error:?}"
+            "expected the cause Error::Timeout naming process reaping | received {error:?}"
         );
         assert_eq!(
             session.snapshot().status,

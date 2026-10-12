@@ -237,7 +237,8 @@ failure: putting an error in the transcript for something the user asked for is 
 nothing.
 
 Close waits for a pending launch and for native cleanup before reporting success, each under a
-bound: see [Deadlines](#deadlines). If native cleanup fails, it returns the error, keeps the
+bound: see [Deadlines](#deadlines). If native cleanup fails, it returns the failure as
+`Error::CleanupRequired` carrying the host's `ProcessControl`, keeps the
 session `Closing`, and preserves the MCP artifact in the host's scratch directory because the child
 may still read it. The host reclaims that artifact after independently establishing that no child
 remains. If native cleanup succeeds but artifact removal fails or does not finish in time, the
@@ -306,18 +307,18 @@ The [headless documentation](https://code.claude.com/docs/en/headless.md) names 
 exit code 143, and gives no deadline for any of them. Every stage is bounded by the host's
 `Limits`:
 
-| Stage                                     | Bound                                   | On expiry                                                                    |
-| ----------------------------------------- | --------------------------------------- | ---------------------------------------------------------------------------- |
-| Prompt write and stdin close              | `request_timeout`, for the two together | The turn fails as `claude-stream-broken`; the exit wait and a stop follow    |
-| Silent stream                             | `idle_timeout`, floored at ten minutes  | The same                                                                     |
-| Reading on after the child exited         | `kill_grace`, from the exit             | The read ends as if the stream had                                           |
-| Exit wait before a failure's terminal     | `kill_grace`                            | The terminal is written with no exit status                                  |
-| Stop: the interrupt call                  | `kill_grace`                            | Taken as not delivered; the kill is next                                     |
-| Stop: exit after a delivered interrupt    | `kill_grace`                            | The kill is next                                                             |
-| Stop: the kill                            | `shutdown_timeout`                      | `Error::Timeout` naming `process-tree termination`; no reap is waited for    |
-| Stop: the reap                            | `shutdown_timeout`                      | `Error::Timeout` naming `process reaping`                                    |
-| Close: a launch still inside the launcher | `shutdown_timeout`, from the close      | `Error::Timeout` naming `a pending Claude launch`; the session is `Closing`  |
-| Close: MCP artifact removal               | `shutdown_timeout`, after the stop      | `Error::Timeout` naming `MCP configuration removal`; the session is `Closed` |
+| Stage                                     | Bound                                   | On expiry                                                                                                 |
+| ----------------------------------------- | --------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| Prompt write and stdin close              | `request_timeout`, for the two together | The turn fails as `claude-stream-broken`; the exit wait and a stop follow                                 |
+| Silent stream                             | `idle_timeout`, floored at ten minutes  | The same                                                                                                  |
+| Reading on after the child exited         | `kill_grace`, from the exit             | The read ends as if the stream had                                                                        |
+| Exit wait before a failure's terminal     | `kill_grace`                            | The terminal is written with no exit status                                                               |
+| Stop: the interrupt call                  | `kill_grace`                            | Taken as not delivered; the kill is next                                                                  |
+| Stop: exit after a delivered interrupt    | `kill_grace`                            | The kill is next                                                                                          |
+| Stop: the kill                            | `shutdown_timeout`                      | `Error::CleanupRequired`, cause `Error::Timeout` naming `process-tree termination`; no reap is waited for |
+| Stop: the reap                            | `shutdown_timeout`                      | `Error::CleanupRequired`, cause `Error::Timeout` naming `process reaping`                                 |
+| Close: a launch still inside the launcher | `shutdown_timeout`, from the close      | `Error::Timeout` naming `a pending Claude launch`; the session is `Closing`                               |
+| Close: MCP artifact removal               | `shutdown_timeout`, after the stop      | `Error::Timeout` naming `MCP configuration removal`; the session is `Closed`                              |
 
 The four stop stages are core's `stop_process_with_limits`, which every Claude stop goes through.
 A launcher that reports no graceful interrupt skips both `kill_grace` stages. The interrupt and
@@ -405,8 +406,8 @@ What each path does, and what a host sees when a bound runs out:
   launch is still pending there is no child, so `cancel` returns `Ok` at once. The `start_turn`
   that owns the launch stops the child when the launcher returns it and answers
   `Error::Cancelled`.
-- **`close` with a turn active.** The stop, then the artifact removal. A stop that fails leaves
-  the session `Closing` and busy, and the artifact on disk. A removal that fails or runs out of
+- **`close` with a turn active.** The stop, then the artifact removal. A stop that fails returns
+  `Error::CleanupRequired` and leaves the session `Closing` and busy, and the artifact on disk. A removal that fails or runs out of
   time leaves the session `Closed`. A blocking removal cannot be cancelled, so it carries on
   on the runtime's blocking pool and the artifact goes when the host's mount answers. The wait
   has moved, not gone: dropping a Tokio `Runtime` waits for every blocking task it started, so a
@@ -431,22 +432,56 @@ What each path does, and what a host sees when a bound runs out:
   `claude-terminated` for exit 143, or `claude-stream-broken` when the link itself failed. The
   stop runs after it. Nobody is waiting on that stop, so
   if it fails the next `start_turn` gets `Error::Busy`, and a later `cancel` or `close` returns the
-  stop's error.
+  stop's failure as `Error::CleanupRequired`.
 - **Host shutdown token.** The pump stops the child first and writes `Cancelled { Shutdown }` once
-  the stop returns.
+  the stop returns. A stop that failed is left for the next `cancel` or `close`, as
+  `Error::CleanupRequired`.
 - **Session dropped mid-turn.** `Drop` cannot wait, so the stop runs detached on the runtime that
-  opened the session and its result goes nowhere. If that runtime has shut down, no stop is sent.
+  opened the session and its result, `Error::CleanupRequired` if the stop failed, goes nowhere a
+  host can ask: the session is gone. If that runtime has shut down, no stop is sent.
   The session still releases the host's `ProcessControl`, and the child's fate is that control's
   own `Drop`. The core `TokioLauncher`'s control sends SIGKILL to the process group there on Unix.
   On Windows the launcher's reaper task owns the Job, and the Job closes, ending its members, when
   that task goes with its runtime. A host control with no such `Drop` leaves the child running.
 
-A stop that runs out of time returns the stop's own error: `Error::Timeout` from the stage that
-expired, or whatever the host's `ProcessControl` returned. It is not wrapped in
-`Error::CleanupRequired` and carries no process control, unlike the Codex and ACP harnesses. The
-first outcome of a teardown is kept. Every later `cancel` and `close` gets a copy of it and nothing
-retries. The turn's slot stays taken, so `start_turn` answers `Error::Busy`. A host in that state
-reconciles the child through its own launcher and opens a new session.
+A stop that did not prove the child gone returns `Error::CleanupRequired`, as the Codex and ACP
+harnesses do, so a host reconciles a leftover child with one rule whatever the harness. That is a
+stage that ran out of time (`Error::Timeout` naming `process-tree termination` or `process
+reaping`), an error from the host's `ProcessControl`, and a control that panicked. The error
+carries the host's own `ProcessControl`, the one its launcher returned for that child, through
+`Error::cleanup_control()`, and the failure of the stage as its cause, through `Error::cause()`.
+This holds even when the host's control answers with a `CleanupRequired` of its own: the error
+names the launcher's control, and the control's answer is the cause. It holds for `cancel`,
+`close`, the `start_turn` that owns a late child, and every later call that reads the outcome of a
+stop nobody waited on. A `start_turn` reports it under the `Accepted` dispatch annotation, so
+branch on `cleanup_control()` and `cause()`, which read through that layer, rather than on the
+variant.
+
+No stop failure comes back as a bare `Error::Timeout`. Two close failures have no control to
+carry, and neither is a failed stop. A `close` that gave up on a launch still inside the launcher
+(`a pending Claude launch`) has no child yet. The `start_turn` that owns that launch gets the
+`CleanupRequired` if its stop then fails, and so does a later `close`, which waits for that stop if
+it is still running, one `process_stop` at most, and otherwise repeats the timeout. An artifact
+removal that fails or runs out of time (`MCP configuration removal`) comes after a stop that
+succeeded, on a session that is already `Closed`.
+
+The first outcome of a teardown is kept, as it is in the Codex and ACP harnesses. Every later
+`cancel` and `close` gets a copy of it, with the same control, and nothing retries: the library asks
+a child to stop once, and a host that holds the control is the one that can ask again or reap the
+tree itself. The turn's slot stays taken, so `start_turn` answers `Error::Busy` (`Error::Closed`
+once a `close` has run), and the session stays `Closing` after a `close`. Ending the child through
+the control does not reopen the session, because the library gets no signal that the host reaped
+it, as in the other two harnesses: a host in that state reconciles the child through the control
+the error carried and opens a new session.
+
+Two differences from Codex and ACP follow from how a Claude session is built, which runs one child
+per turn where they run one per session. A second `cancel` returns the kept failure, where theirs
+returns `Ok` because their turn was released before the stop; the turn's slot is still taken here.
+And the cause stays typed, as it does in Codex, where ACP carries it as text.
+
+A host that moved from 0.6 matched `Error::Timeout` on these calls. Read `cleanup_control()` first
+and finish the stop through the control it returns, and read `cause()` for the stage that failed:
+`Error::Timeout` is what `cause()` returns for a stage that ran out.
 
 Not bounded by anything here:
 

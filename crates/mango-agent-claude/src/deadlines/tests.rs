@@ -5,8 +5,7 @@
 //! crate can hand a session a remover that stalls. The rest of the worst cases are driven from
 //! `tests/deadlines.rs`.
 
-#[path = "../../tests/support/mod.rs"]
-mod support;
+use crate::test_support as support;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
