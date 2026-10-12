@@ -2423,6 +2423,62 @@ mod tests {
         assert_eq!(error.vendor_code.as_deref(), Some("-32000"));
     }
 
+    /// The three shapes above are the ones the redactor always read. Every shape a vendor prints
+    /// goes through the same two doors, an error's message and a notice's description, and comes
+    /// out without its credential and with the words that tell a host what happened; an ordinary
+    /// message goes through as it was.
+    #[test]
+    fn the_redaction_corpus_holds_through_an_error_and_a_notice() {
+        use crate::testing::redaction::{BENIGN, LEAKS};
+        let through_error = |text: &str| {
+            let kind = EventKind::Error {
+                error: VendorError::new(ErrorCode::from_static("codex-failed"), text),
+            };
+            let EventKind::Error { error } = kind.normalized().expect("expected an error event")
+            else {
+                panic!("expected an error event");
+            };
+            error.message
+        };
+        let through_notice =
+            |text: &str| match EventKind::notice(NoticeSeverity::Warning, "title", Some(text)) {
+                Some(EventKind::Notice { description, .. }) => description.unwrap_or_default(),
+                other => panic!("expected a notice, received {other:?}"),
+            };
+        for leak in LEAKS {
+            for (door, shown) in [
+                ("an error message", through_error(leak.text)),
+                ("a notice description", through_notice(leak.text)),
+            ] {
+                assert!(
+                    !shown.contains(leak.secret),
+                    "expected {door} for {:?} without {:?} | received: {shown:?}",
+                    leak.text,
+                    leak.secret
+                );
+                for kept in leak.keeps {
+                    assert!(
+                        shown.contains(kept),
+                        "expected {door} for {:?} to keep {kept:?} | received: {shown:?}",
+                        leak.text
+                    );
+                }
+            }
+        }
+        for text in BENIGN {
+            assert_eq!(
+                &through_error(text),
+                text,
+                "expected an ordinary message to reach a host unchanged"
+            );
+            assert_eq!(
+                &through_notice(text),
+                text,
+                "expected an ordinary description to reach a host unchanged"
+            );
+        }
+    }
+
     /// A cut before the `@` that closes a URL's password leaves `redis://app:hunter2`, which no rule
     /// recognises, so the text is redacted whole and bounded after.
     #[test]

@@ -22,6 +22,7 @@ enum Failure {
 struct FailingServer {
     thread_id: String,
     failure: Failure,
+    message: String,
     started: AtomicBool,
 }
 
@@ -36,7 +37,7 @@ impl FailingServer {
             Failure::StartRefused => vec![
                 serde_json::json!({
                     "id": id,
-                    "error": {"code": -32603, "message": CREDENTIAL_SHAPED},
+                    "error": {"code": -32603, "message": self.message},
                 })
                 .to_string(),
             ],
@@ -50,7 +51,7 @@ impl FailingServer {
                         "turn": {
                             "id": "redacted-failure",
                             "status": "failed",
-                            "error": {"message": CREDENTIAL_SHAPED},
+                            "error": {"message": self.message},
                         },
                     },
                 })
@@ -61,12 +62,18 @@ impl FailingServer {
 }
 
 async fn session_over(failure: Failure) -> Box<dyn Session> {
+    session_saying(failure, CREDENTIAL_SHAPED).await
+}
+
+/// A session whose server fails the one turn it is asked for, with `message`.
+async fn session_saying(failure: Failure, message: &str) -> Box<dyn Session> {
     let transcript = Transcript::load("turn");
     let server = Arc::new(FailingServer {
         thread_id: transcript
             .thread_id()
             .expect("expected the recording to name its thread"),
         failure,
+        message: message.to_owned(),
         started: AtomicBool::new(false),
     });
     let launcher = Arc::new(FakeLauncher::new());
@@ -159,4 +166,65 @@ async fn a_credential_shaped_thread_id_still_falls_back_to_a_fresh_thread() {
         "expected thread/start after the missing rollout | received: {:?}",
         launcher.written()
     );
+}
+
+/// Every shape the redactor reads, through both of the doors a server's message uses, and an
+/// ordinary server message through the failed turn unchanged.
+#[tokio::test]
+async fn every_shape_in_the_corpus_is_redacted_through_both_doors() {
+    use mango_external_agents::testing::redaction::{BENIGN, LEAKS};
+    for leak in LEAKS {
+        let session = session_saying(Failure::TurnFailed, leak.text).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "try"))
+            .await
+            .expect("expected the server's acceptance before its failure");
+        let events = drain(&mut turn).await;
+        let Some(EventKind::Error { error }) = events.last() else {
+            panic!("expected the turn to end in an error | received: {events:#?}");
+        };
+        assert!(
+            !error.message.contains(leak.secret),
+            "expected a failed turn for {:?} without {:?} | received: {:?}",
+            leak.text,
+            leak.secret,
+            error.message
+        );
+
+        let session = session_saying(Failure::StartRefused, leak.text).await;
+        let Err(failure) = session.start_turn(TurnRequest::new("turn-1", "try")).await else {
+            panic!("expected the server's refusal of turn/start to fail the start");
+        };
+        let Error::Vendor(error) = failure.cause() else {
+            panic!("expected a vendor error | received: {failure:?}");
+        };
+        assert!(
+            !error.message.contains(leak.secret),
+            "expected a refused request for {:?} without {:?} | received: {:?}",
+            leak.text,
+            leak.secret,
+            error.message
+        );
+        for kept in leak.keeps {
+            assert!(
+                error.message.contains(kept),
+                "expected a refused request for {:?} to keep {kept:?} | received: {:?}",
+                leak.text,
+                error.message
+            );
+        }
+    }
+    for text in BENIGN {
+        let session = session_saying(Failure::StartRefused, text).await;
+        let Err(failure) = session.start_turn(TurnRequest::new("turn-1", "try")).await else {
+            panic!("expected the server's refusal of turn/start to fail the start");
+        };
+        let Error::Vendor(error) = failure.cause() else {
+            panic!("expected a vendor error | received: {failure:?}");
+        };
+        assert_eq!(
+            &error.message, text,
+            "expected an ordinary refusal to reach the host unchanged"
+        );
+    }
 }

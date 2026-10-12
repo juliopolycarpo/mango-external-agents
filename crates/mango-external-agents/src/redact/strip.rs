@@ -10,8 +10,9 @@
 //! One pass over the text. Nothing here looks back, and a scan for an OSC terminator stops at the
 //! next escape, so the work is linear in the length of the text.
 
+use super::rules::{AUTHORIZATION, names_a_keyword};
 use super::scan::{count_steps, first_match};
-use super::{AUTHORIZATION, is_unsafe_to_render, match_credential_keyword, match_word};
+use super::{is_unsafe_to_render, match_word};
 
 /// Marks where a removed byte stood in front of a credential name. Every C0 control is stripped
 /// from the input, so it cannot already be in the text; it is not a letter, so a name after it
@@ -157,7 +158,7 @@ fn starts_a_removed_character(byte: u8) -> bool {
 /// `Authorization` header.
 fn starts_credential_name(bytes: &[u8], at: usize) -> bool {
     count_steps(1);
-    match_credential_keyword(bytes, at).is_some() || match_word(bytes, at, AUTHORIZATION).is_some()
+    names_a_keyword(bytes, at) || match_word(bytes, at, AUTHORIZATION).is_some()
 }
 
 /// Whether `text` ends in an authorization scheme, `Bearer` or `Basic`, whose token the bearer

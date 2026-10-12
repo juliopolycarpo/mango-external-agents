@@ -129,7 +129,9 @@ pub(crate) fn prompt_failure(
 /// any other vendor text; a refusal of a setup request is returned as an error and never passes it.
 ///
 /// Redacted here, whole, with the data appended and before anything cuts it, so both reach the
-/// host redacted. The core's sink redacts a terminal again, which changes nothing a second time.
+/// host redacted. The core's sink redacts a terminal again. A second pass is not promised to be a
+/// no-op for every text (`redact::boundaries` pins inputs where it differs, and each one reveals
+/// nothing), but it is one over the corpus in `testing::redaction`, which is what is held.
 ///
 /// An explicit `"data": null` says nothing, so it reads as no data. The connection already
 /// drops it while parsing; this arm holds the rule for an error built any other way, where the
@@ -276,6 +278,46 @@ mod tests {
             vendor_error("session/prompt", &refusal),
             "expected the unchanged vendor failure for a non-authentication code"
         );
+    }
+
+    /// The corpus as an agent sends it: in the message, and as a string inside `data`, where an
+    /// agent that forwards an upstream's JSON body puts it.
+    #[test]
+    fn every_shape_in_the_corpus_is_redacted_in_the_message_and_in_a_data_string() {
+        use mango_external_agents::testing::redaction::{BENIGN, LEAKS};
+        for leak in LEAKS {
+            let in_message = vendor_error("session/new", &AcpError::new(-31_004, leak.text));
+            let in_data = vendor_error(
+                "session/new",
+                &AcpError::new(-31_004, "refused").data(serde_json::json!(leak.text)),
+            );
+            for failure in [&in_message, &in_data] {
+                assert!(
+                    !failure.message.contains(leak.secret),
+                    "expected {:?} without {:?} | received: {:?}",
+                    leak.text,
+                    leak.secret,
+                    failure.message
+                );
+            }
+            // A data string is shown as JSON, with its quotes escaped, so only the message keeps
+            // its words verbatim.
+            for kept in leak.keeps {
+                assert!(
+                    in_message.message.contains(kept),
+                    "expected {:?} to keep {kept:?} | received: {:?}",
+                    leak.text,
+                    in_message.message
+                );
+            }
+        }
+        for text in BENIGN {
+            let failure = vendor_error("session/new", &AcpError::new(-31_004, *text));
+            assert_eq!(
+                &failure.message, text,
+                "expected an ordinary agent message to reach the host unchanged"
+            );
+        }
     }
 
     #[test]

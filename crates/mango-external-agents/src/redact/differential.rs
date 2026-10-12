@@ -16,10 +16,17 @@
 //! marker, and the answer must be the one 0.4.1's rules give with the marker read as a hyphen,
 //! with the hyphens of both taken out. A difference anywhere else is a credential left in a
 //! diagnostic, or text altered for nothing, and the failure names the input.
+//!
+//! The second exception is the rules added after 0.4.1: a quoted name or value, a keyword glued to
+//! the letters before it, any authorization scheme, a query parameter, a cookie, a userinfo that is
+//! a token, a password phrase, and the values that say a credential is missing or count tokens.
+//! `carries_a_new_trigger` lists what each needs in the text. An input without one has to come out
+//! as 0.4.1 returned it, byte for byte, which is what keeps a new rule from changing what the old
+//! ones did; an input with one is held to the cases in `redact::shapes` and the corpus in
+//! `testing::redaction`, not to 0.4.1, which is frozen and never edited.
 
-use super::reference::{
-    self, Rewrite, bearer_rule, remove_boundaries, starts_a_word, strip_every_character,
-};
+use super::reference::{self, Rewrite, remove_boundaries, strip_every_character};
+use super::rules::{assignment_rule, bearer_rule, url_password_rule};
 use super::strip::strip_control_characters;
 use super::{
     REDACTED, as_text, ends_awaiting_value, redact_assignments, redact_bearer,
@@ -29,16 +36,26 @@ use super::{
 /// A rule under test, described the way the replaced scan wants it: where the match ends and the
 /// text that stands in its place.
 fn described(
-    rule: impl Fn(&[u8], usize) -> Option<super::Rewrite>,
-) -> impl Fn(&[u8], usize) -> Option<Rewrite> {
+    rule: impl Fn(&[u8], usize) -> Option<super::Outcome>,
+) -> impl Fn(&[u8], usize) -> Option<Described> {
     move |bytes, at| {
-        let found = rule(bytes, at)?;
-        let kept = as_text(bytes, at, found.kept_end);
-        Some(Rewrite {
-            end: found.end,
-            replacement: format!("{kept}{}{REDACTED}", found.joiner),
+        Some(match rule(bytes, at)? {
+            super::Outcome::Keep { end } => Described::Keep { end },
+            super::Outcome::Redact(found) => {
+                let kept = as_text(bytes, at, found.kept_end);
+                Described::Redact(Rewrite {
+                    end: found.end,
+                    replacement: format!("{kept}{}{REDACTED}", found.joiner),
+                })
+            }
         })
     }
+}
+
+/// A rule's answer in the replaced scan's terms.
+enum Described {
+    Redact(Rewrite),
+    Keep { end: usize },
 }
 
 /// How this redactor's answer relates to the one 0.4.1 shipped.
@@ -49,6 +66,112 @@ enum Agreement {
     /// Different, because a removed byte stands in a name or a scheme and this redactor
     /// reads it as part of the run it interrupts. See [`as_a_hyphen`].
     ReadsAMarkerAsPartOfAName,
+    /// Different, because the text carries something only a rule added after 0.4.1 reads. See
+    /// [`carries_a_new_trigger`].
+    ANewRuleApplies,
+}
+
+/// The words a status can be told in, a count named like a token, and the other words a rule added
+/// after 0.4.1 reads: a value that says a credential is missing is left alone, a number counting
+/// tokens is left alone, a cookie, a passphrase and a private key are credentials.
+const NEW_WORDS: &[&str] = &[
+    "cookie",
+    "pwd",
+    "passphrase",
+    "private",
+    "signature",
+    "api key",
+    "secret key",
+    "not ",
+    "missing",
+    "expired",
+    "invalid",
+    "required",
+    "revoked",
+    "unauthorized",
+    "forbidden",
+    "unset",
+    "empty",
+    "unknown",
+    "none",
+    "null",
+    "denied",
+    "rejected",
+    "failed",
+    "refused",
+    "absent",
+    "undefined",
+    "unavailable",
+    "count",
+    "limit",
+    "used",
+    "usage",
+    "budget",
+    "remaining",
+    "total",
+    "max",
+    "tokens",
+];
+
+/// The keywords a name is built from.
+const KEYWORDS: &[&str] = &["secret", "token", "password", "passwd", "credential", "api"];
+
+/// Whether the text holds something that a rule added after 0.4.1 reads, so that the answer may
+/// differ from 0.4.1's and the difference is a rule's and not a regression.
+///
+/// What it lists, and nothing else, may differ. Every input without one has to come out as 0.4.1
+/// returned it, byte for byte: that is what keeps a change to the rules from altering what the
+/// rules always did. A quote, an escape, a query string or a `&`, a word of [`NEW_WORDS`], a
+/// keyword glued to the letters before it (`mytoken`, `accessToken`), a password followed by a
+/// colon (its value may run on), an `Authorization` header with a scheme other than bearer and
+/// basic, and a userinfo long enough to be a token each qualify.
+fn carries_a_new_trigger(raw: &str) -> bool {
+    let plain = reference::strip_control_characters(raw);
+    let lower = plain.to_ascii_lowercase();
+    if lower.contains(['"', '\'', '\\', '?', '&'])
+        || NEW_WORDS.iter().any(|word| lower.contains(word))
+    {
+        return true;
+    }
+    let bytes = lower.as_bytes();
+    for keyword in KEYWORDS {
+        for (at, _) in lower.match_indices(keyword) {
+            let glued = at > 0 && bytes[at - 1].is_ascii_alphanumeric();
+            if glued {
+                return true;
+            }
+        }
+    }
+    if (lower.contains("password") || lower.contains("passwd")) && lower.contains(':') {
+        return true;
+    }
+    if lower.contains("://") && lower.contains('@') {
+        let longest = lower
+            .split(|c: char| !c.is_ascii_alphanumeric() && !"_-.~%".contains(c))
+            .map(str::len)
+            .max()
+            .unwrap_or(0);
+        if longest >= 20 {
+            return true;
+        }
+    }
+    // `authorization`, then spaces, a colon and spaces: anything but `bearer` and `basic` next.
+    for (at, _) in lower.match_indices("authorization") {
+        let rest = lower[at + "authorization".len()..]
+            .trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '\u{1}')
+            .strip_prefix(':')
+            .map(|rest| rest.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '\u{1}'));
+        if let Some(rest) = rest {
+            let word: String = rest
+                .chars()
+                .take_while(char::is_ascii_alphanumeric)
+                .collect();
+            if !word.is_empty() && word != "bearer" && word != "basic" {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// What 0.4.1's own rules return when the marker in a name or a scheme is a hyphen, with
@@ -88,6 +211,9 @@ fn agreement_with_0_4_1(raw: &str) -> Result<Agreement, String> {
     if marked && hyphen == head.replace('-', "") {
         return Ok(Agreement::ReadsAMarkerAsPartOfAName);
     }
+    if carries_a_new_trigger(raw) {
+        return Ok(Agreement::ANewRuleApplies);
+    }
     Err(format!(
         "expected the whole redactor to return what 0.4.1 shipped, or, where a removed byte stands \
          in the text, what 0.4.1's rules return with that byte read as a hyphen, hyphens taken out \
@@ -96,19 +222,26 @@ fn agreement_with_0_4_1(raw: &str) -> Result<Agreement, String> {
     ))
 }
 
-/// `rewrite` as it was first written: `rule` tried at every word boundary, the text pushed a
-/// character at a time.
-fn rewrite_every_word(raw: &str, rule: impl Fn(&[u8], usize) -> Option<Rewrite>) -> String {
+/// `rewrite` as it was first written: `rule` tried at every byte, the text pushed a character at
+/// a time. A rule decides for itself where a match may start, and a match it leaves alone is
+/// stepped over.
+fn rewrite_every_word(raw: &str, rule: impl Fn(&[u8], usize) -> Option<Described>) -> String {
     let bytes = raw.as_bytes();
     let mut out = String::with_capacity(raw.len());
     let mut at = 0;
     while at < bytes.len() {
-        if starts_a_word(bytes, at)
-            && let Some(found) = rule(bytes, at)
-        {
-            out.push_str(&found.replacement);
-            at = found.end;
-            continue;
+        match rule(bytes, at) {
+            Some(Described::Redact(found)) => {
+                out.push_str(&found.replacement);
+                at = found.end;
+                continue;
+            }
+            Some(Described::Keep { end }) => {
+                out.push_str(&raw[at..end]);
+                at = end;
+                continue;
+            }
+            None => {}
         }
         let next = next_char_boundary(raw, at);
         out.push_str(&raw[at..next]);
@@ -165,15 +298,15 @@ fn assert_matches_the_replaced_scan(raw: &str) {
         strip_control_characters,
         plain.clone(),
     );
-    let bearer = rewrite_every_word(&plain, bearer_rule);
-    let assignments = rewrite_every_word(&bearer, described(super::assignment_rule));
-    let urls = rewrite_every_word(&assignments, described(super::url_password_rule));
+    let bearer = rewrite_every_word(&plain, described(bearer_rule));
+    let assignments = rewrite_every_word(&bearer, described(assignment_rule));
+    let urls = rewrite_every_word(&assignments, described(url_password_rule));
     for input in [raw, plain.as_str()] {
         expect(
             "the bearer rule",
             input,
             redact_bearer,
-            rewrite_every_word(input, bearer_rule),
+            rewrite_every_word(input, described(bearer_rule)),
         );
     }
     for input in [raw, bearer.as_str()] {
@@ -181,7 +314,7 @@ fn assert_matches_the_replaced_scan(raw: &str) {
             "the assignment rule",
             input,
             redact_assignments,
-            rewrite_every_word(input, described(super::assignment_rule)),
+            rewrite_every_word(input, described(assignment_rule)),
         );
     }
     for input in [raw, assignments.as_str()] {
@@ -189,7 +322,7 @@ fn assert_matches_the_replaced_scan(raw: &str) {
             "the URL password rule",
             input,
             redact_url_passwords,
-            rewrite_every_word(input, described(super::url_password_rule)),
+            rewrite_every_word(input, described(url_password_rule)),
         );
     }
     expect(
@@ -221,7 +354,10 @@ fn assert_awaiting_agrees_with_0_4_1(raw: &str) {
         return;
     }
     assert!(
-        agreement_with_0_4_1(raw) == Ok(Agreement::ReadsAMarkerAsPartOfAName),
+        matches!(
+            agreement_with_0_4_1(raw),
+            Ok(Agreement::ReadsAMarkerAsPartOfAName | Agreement::ANewRuleApplies)
+        ),
         "expected ends_awaiting_value to return {shipped} as 0.4.1 did, unless the redactor also \
          differs from 0.4.1 | input {raw:?} received {received}"
     );

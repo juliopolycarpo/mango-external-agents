@@ -73,6 +73,7 @@ const SCAN_BLOCK: usize = 32;
 /// assert_eq!(first_match(b"error: no key", 0, |byte| byte == b':'), Some(5));
 /// assert_eq!(first_match(b"error: no key", 6, |byte| byte == b':'), None);
 /// ```
+#[inline]
 pub(super) fn first_match(bytes: &[u8], from: usize, wanted: impl Fn(u8) -> bool) -> Option<usize> {
     let rest = bytes.get(from..)?;
     let (blocks, _) = rest.as_chunks::<SCAN_BLOCK>();

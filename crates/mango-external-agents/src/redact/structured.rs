@@ -20,12 +20,13 @@ const REDACTED: &str = "[REDACTED]";
 ///
 /// The one list: the text rules match these words case-insensitively inside a name, and this walk
 /// matches them inside a key or a field name.
-pub(super) const CREDENTIAL_WORDS: [&str; 10] = [
+pub(super) const CREDENTIAL_WORDS: [&str; 11] = [
     "secret",
     "token",
     "password",
     "passwd",
     "pwd",
+    "passphrase",
     "credential",
     "apikey",
     "privatekey",

@@ -142,6 +142,58 @@ const SHAPES: &[Shape] = &[
         what: "scheme separators one after another with one-letter schemes",
         build: |len| repeated("a://", "", len),
     },
+    Shape {
+        what: "a quoted keyword repeated in a name with no value",
+        build: |len| repeated("\"token_", "\":", len),
+    },
+    Shape {
+        what: "nothing but quotes and a colon",
+        build: |len| repeated("\"", ":x", len),
+    },
+    Shape {
+        what: "a keyword glued to letters, repeated, before one assignment",
+        build: |len| repeated("atoken", "=v", len),
+    },
+    Shape {
+        what: "a keyword repeated in a name whose value says it is missing",
+        build: |len| repeated("token_", ": expired", len),
+    },
+    Shape {
+        what: "a plural keyword repeated in a name whose value is a count",
+        build: |len| repeated("tokens_", ": 100000", len),
+    },
+    Shape {
+        what: "a quote that is never closed after a name",
+        build: |len| repeated("token=\"", "a", len),
+    },
+    Shape {
+        what: "a quoted value of backslashes",
+        build: |len| repeated("api_key='", &"\\".repeat(len), len),
+    },
+    Shape {
+        what: "a password colon repeated on one long line",
+        build: |len| repeated("password: ", "", len),
+    },
+    Shape {
+        what: "a cookie colon repeated on one long line",
+        build: |len| repeated("cookie: ", "", len),
+    },
+    Shape {
+        what: "query parameters one after another",
+        build: |len| repeated("?key=a&token=b", "", len),
+    },
+    Shape {
+        what: "status words one after another after a name",
+        build: |len| repeated("token: ", &"not ".repeat(len / 4), len),
+    },
+    Shape {
+        what: "authorization headers one after another with unusual schemes",
+        build: |len| repeated("authorization: x y ", "", len),
+    },
+    Shape {
+        what: "token-length userinfo with no password, repeated",
+        build: |len| repeated("a://aaaaaaaaaaaaaaaaaaa1@", "", len),
+    },
 ];
 
 fn redaction_steps(text: &str) -> usize {
