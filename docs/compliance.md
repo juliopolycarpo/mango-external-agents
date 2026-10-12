@@ -153,8 +153,8 @@ own deployment.
   The token pass reads the whole text a byte at a time, which costs plain stderr lines 120% more
   instructions (10.39 M to 22.5 M per 320 KiB), and a byte-class gate does not help because plain
   tails are full of `_` and `-`. Stderr tails are read line after line on the hot path, so
-  `stderr_text` does not run it (its cost against the previous release is within 1% on every
-  plain case, and 3.9% on text that carries a credential on every line); `redact::bounded` and `redact::structured` do, at 2.2 times the instructions on
+  `stderr_text` does not run it (its cost against the previous release is 0.8% to 2.4% on the
+  plain cases, and 8.2% on text that carries a credential on every line); `redact::bounded` and `redact::structured` do, at 2.3 times the instructions on
   plain text of 16 KiB. The measurements are in `docs/benchmarks.md`.
 
   What the rules keep on purpose, where a rule redacts less than the release before it (each is
