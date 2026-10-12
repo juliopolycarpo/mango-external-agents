@@ -620,7 +620,7 @@ async fn a_blocked_task_and_a_blocked_answer_share_the_first_grace() {
     let handler = ThreadBlockedCall::arc(BlockedCall::NotificationAndRequest, &gate);
     let link = ScriptedLink::new();
     let mut slow = options();
-    slow.shutdown_timeout = Duration::from_millis(400);
+    slow.shutdown_timeout = Duration::from_secs(1);
     let grace = slow.shutdown_timeout;
     let client = Client::connect(
         link.clone().into_link(),
@@ -657,5 +657,98 @@ async fn a_blocked_task_and_a_blocked_answer_share_the_first_grace() {
         waited >= grace && waited < grace * 2,
         "expected the task and the answer to share one grace, {grace:?} to {:?} | received {waited:?}",
         grace * 2
+    );
+}
+
+/// A sender whose `close` lets the handler's blocked call return, and does not finish until the
+/// handler's task has ended, so the task ends after the close gave up waiting for it and before
+/// the link is closed.
+struct ReleasesTheHandlerOnClose {
+    inner: Box<dyn crate::link::LinkSender>,
+    gate: Arc<ThreadGate>,
+    task: Arc<std::sync::OnceLock<tokio::task::AbortHandle>>,
+}
+
+#[async_trait::async_trait]
+impl crate::link::LinkSender for ReleasesTheHandlerOnClose {
+    async fn send(&mut self, message: String) -> crate::Result<()> {
+        self.inner.send(message).await
+    }
+
+    async fn close(&mut self) -> crate::Result<()> {
+        self.gate.release();
+        let began = Instant::now();
+        while !self
+            .task
+            .get()
+            .is_some_and(tokio::task::AbortHandle::is_finished)
+        {
+            if began.elapsed() > Duration::from_secs(4) {
+                return Err(Error::Link {
+                    peer: String::from("ACP agent"),
+                    message: String::from("the handler's task did not end after its call returned"),
+                });
+            }
+            tokio::task::yield_now().await;
+        }
+        self.inner.close().await
+    }
+}
+
+/// A close that gave up waiting for the handler's task, and then found it ended while it closed
+/// the link, returns `Ok`: the timeout says the task is still running as the close ends, and it
+/// is not. The task takes longer than the close waited for it to end, and ends before the link is
+/// closed; without the second look the close returns the handler's timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_task_that_ends_while_the_link_is_closed_does_not_fail_the_close() {
+    let gate = ThreadGate::arc();
+    let _release = ReleaseOnDrop(Arc::clone(&gate));
+    let handler = ThreadBlockedCall::arc(BlockedCall::Notification, &gate);
+    let link = ScriptedLink::new();
+    let (sender, receiver) = link.clone().into_link().split();
+    let task = Arc::new(std::sync::OnceLock::new());
+    let client = Client::connect(
+        crate::link::Link::new(
+            Box::new(ReleasesTheHandlerOnClose {
+                inner: sender,
+                gate: Arc::clone(&gate),
+                task: Arc::clone(&task),
+            }),
+            receiver,
+        ),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        options(),
+    );
+    let worker = client
+        .state
+        .worker_abort
+        .get()
+        .expect("expected the handler's task to have an abort handle")
+        .clone();
+    let _ = task.set(worker);
+    link.push_line(r#"{"jsonrpc":"2.0","method":"note","params":{}}"#);
+    until("the handler to block inside the call", || {
+        handler.entered.load(Ordering::Acquire) == 1
+    })
+    .await;
+
+    let bound = bound_with_both_allowances();
+    let began = Instant::now();
+    let closed = tokio::time::timeout(bound + LOAD_MARGIN, client.close()).await;
+    let waited = began.elapsed();
+    let Ok(closed) = closed else {
+        panic!(
+            "expected close to return within {bound:?} | received: still waiting after {waited:?}"
+        );
+    };
+    let observed = (
+        closed.is_ok(),
+        handler.returned.load(Ordering::Acquire),
+        waited >= options().shutdown_timeout,
+    );
+    assert_eq!(
+        observed,
+        (true, 1, true),
+        "expected the close to wait out the first grace for the task and then end with Ok(()) once the task had ended: (true, 1, true) | received {observed:?} (closed, returned, waited a grace) with {closed:?} after {waited:?}"
     );
 }
