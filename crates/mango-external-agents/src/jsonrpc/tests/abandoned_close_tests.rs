@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Semaphore;
 
 /// A close that is held: polled to wherever it parks, and then kept without being polled again.
-type Closing<'a> = Pin<Box<dyn Future<Output = crate::Result<()>> + 'a>>;
+pub(super) type Closing<'a> = Pin<Box<dyn Future<Output = crate::Result<()>> + 'a>>;
 
 /// The `shutdown_timeout` every client here runs under.
 fn shutdown() -> Duration {
@@ -28,7 +28,7 @@ fn shutdown() -> Duration {
 /// On a paused clock a sleep ends only once the runtime has nothing else to run, so a close that
 /// is still pending then is parked on what it waits for and not on a step it could still take.
 /// The sleep is shorter than anything the close waits out, so the close has not timed out.
-async fn park(what: &str, close: &mut Closing<'_>) {
+pub(super) async fn park(what: &str, close: &mut Closing<'_>) {
     tokio::select! {
         biased;
         finished = close.as_mut() => {
@@ -200,10 +200,12 @@ async fn a_close_cut_behind_a_held_write_writes_nothing_queued_and_a_second_fini
 }
 
 /// A handler whose `on_terminated` does not return until the test lets it.
-struct ParkedTermination {
-    entered: AtomicUsize,
-    returned: AtomicUsize,
-    gate: Semaphore,
+pub(super) struct ParkedTermination {
+    pub(super) entered: AtomicUsize,
+    pub(super) returned: AtomicUsize,
+    /// How many times the call was dropped before it returned, as an abort does.
+    pub(super) cut: AtomicUsize,
+    pub(super) gate: Semaphore,
 }
 
 impl ParkedTermination {
@@ -211,6 +213,7 @@ impl ParkedTermination {
         Arc::new(Self {
             entered: AtomicUsize::new(0),
             returned: AtomicUsize::new(0),
+            cut: AtomicUsize::new(0),
             gate: Semaphore::new(0),
         })
     }
@@ -222,12 +225,41 @@ impl PeerHandler for ParkedTermination {
 
     async fn on_terminated(&self, _termination: PeerTermination) {
         self.entered.fetch_add(1, Ordering::AcqRel);
+        let mut cut = CountsIfDropped::new(&self.cut);
         self.gate
             .acquire()
             .await
             .expect("expected the termination gate to stay open")
             .forget();
+        cut.finished();
         self.returned.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Counts a call that was dropped before it said it finished, which is what an abort does to it.
+struct CountsIfDropped<'a> {
+    counter: &'a AtomicUsize,
+    finished: bool,
+}
+
+impl<'a> CountsIfDropped<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        Self {
+            counter,
+            finished: false,
+        }
+    }
+
+    fn finished(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for CountsIfDropped<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.counter.fetch_add(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -291,7 +323,7 @@ async fn a_second_close_gives_up_on_a_first_held_while_the_handler_is_being_told
 }
 
 /// A client whose peer has exited, with its handler inside `on_terminated` and held there.
-async fn peer_exited_with_the_handler_held() -> (Client, Arc<ParkedTermination>) {
+pub(super) async fn peer_exited_with_the_handler_held() -> (Client, Arc<ParkedTermination>) {
     let link = ScriptedLink::new();
     let handler = ParkedTermination::arc();
     let client = Client::connect(

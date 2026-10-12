@@ -1220,6 +1220,9 @@ pub struct Client {
     /// The reader's task, so that a close can tell it is being made from that task without
     /// taking the lock a close that waits for the reader holds.
     reader: tokio::task::Id,
+    /// Stops the reader without the lock on its handle, which a close that was leaked, polled
+    /// and never dropped, holds for good.
+    reader_abort: tokio::task::AbortHandle,
 }
 
 /// How a connection came to its end.
@@ -2658,6 +2661,7 @@ impl Client {
         Self {
             state,
             reader: pump.id(),
+            reader_abort: pump.abort_handle(),
             pump: Mutex::new(Some(pump)),
         }
     }
@@ -3519,11 +3523,10 @@ impl Drop for Client {
         self.state.abort_in_flight();
         self.state.cancelling_handler.store(true, Ordering::SeqCst);
         self.state.abort_notifications();
-        if let Ok(mut pump) = self.pump.try_lock()
-            && let Some(pump) = pump.take()
-        {
-            pump.abort();
-        }
+        // Not through the lock on the reader's handle: a close future holds it while it waits for
+        // the reader, and one that was leaked holds it for good. An abort of a task that has
+        // ended is nothing.
+        self.reader_abort.abort();
     }
 }
 
@@ -5148,6 +5151,7 @@ mod tests {
     mod handoff_hold_tests;
     mod handoff_queue_tests;
     mod invalid_request_tests;
+    mod kept_close_drop_tests;
     mod on_request_end_tests;
     mod ordered_response_tests;
     mod outbound_bound_tests;
