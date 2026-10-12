@@ -191,6 +191,46 @@ const SHAPES: &[Shape] = &[
         build: |len| repeated("authorization: x y ", "", len),
     },
     Shape {
+        what: "a status after a name with no space, repeated on one line",
+        build: |len| repeated("token:set.", "", len),
+    },
+    Shape {
+        what: "a cookie status repeated on one line",
+        build: |len| repeated("Cookie: set.", "", len),
+    },
+    Shape {
+        what: "a password and a status repeated on one line",
+        build: |len| repeated("password: not set.", "", len),
+    },
+    Shape {
+        what: "an authorization status repeated on one line",
+        build: |len| repeated("Authorization: 401 Unauthorized.", "", len),
+    },
+    Shape {
+        what: "an authorization reason that is no status, repeated on one line",
+        build: |len| repeated("Authorization: bad bad.", "", len),
+    },
+    Shape {
+        what: "a keyword repeated in a name before an empty quoted value",
+        build: |len| repeated("token_", "=\"\"", len),
+    },
+    Shape {
+        what: "a quoted keyword repeated in a name before a bare closing brace",
+        build: |len| format!("{{\"{}\":}}", "token_".repeat(len / 6)),
+    },
+    Shape {
+        what: "a keyword repeated in a query name before an ampersand",
+        build: |len| format!("?{}=&", "token_".repeat(len / 6)),
+    },
+    Shape {
+        what: "a capitalised keyword repeated before a blank and `key`",
+        build: |len| repeated("token", &"Token".repeat(len / 5), len / 5) + " key=v",
+    },
+    Shape {
+        what: "a brace and a string that never close, repeated",
+        build: |len| repeated("token=[\"", "{[", len),
+    },
+    Shape {
         what: "token-length userinfo with no password, repeated",
         build: |len| repeated("a://aaaaaaaaaaaaaaaaaaa1@", "", len),
     },

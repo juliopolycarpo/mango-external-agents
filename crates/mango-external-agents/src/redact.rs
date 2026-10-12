@@ -118,7 +118,8 @@ pub(crate) fn ends_awaiting_value(dropped: &str) -> bool {
     // Each probe finishes one waiting state: a name that wants its separator, a separator that
     // wants its value, `Authorization` that wants `:`, `Authorization:` that wants a scheme and a
     // scheme that wants its token. `Z` is the value; it survives only when nothing claimed it.
-    const PROBES: [&str; 4] = ["\n=Z", "\n:bearer Z", "\nbearer Z", "\nZ"];
+    // The last continues the line, as a cut inside a quoted JSON string does.
+    const PROBES: [&str; 5] = ["\n=Z", "\n:bearer Z", "\nbearer Z", "\nZ", " Z"];
     // Only the two rules that read across a line break: a URL password cannot span one.
     let plain = strip_control_characters(dropped);
     // Nothing is awaited without a keyword in the text, and most tails have none.
@@ -718,8 +719,9 @@ mod tests {
             ("=:", true),
             ("", false),
             ("   ", false),
-            (",", false),
-            ("  ;x", false),
+            // Whether it is a value is the rule's to say; the locator only asks if anything stands.
+            (",", true),
+            ("  ;x", true),
         ] {
             assert_eq!(
                 has_value(text.as_bytes(), 0),

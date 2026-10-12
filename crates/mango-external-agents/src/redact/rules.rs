@@ -104,16 +104,22 @@ struct Keyword {
     token: bool,
 }
 
-/// `api`, `private` or `secret`, an optional separator or space, then `key`.
+/// `api`, `private`, `secret` or `access`, an optional separator, a dot or spaces, then `key`.
 fn match_key_shape(bytes: &[u8], at: usize) -> Option<usize> {
-    let after_word = ["api", "private", "secret"]
+    let after_word = ["api", "private", "secret", "access"]
         .iter()
         .find_map(|word| match_word(bytes, at, word.as_bytes()))?;
     let after_separator = match bytes.get(after_word) {
-        Some(b'_' | b'-' | b' ') => after_word + 1,
+        Some(b'_' | b'-' | b'.') => after_word + 1,
+        Some(b' ' | b'\t') => take_while(bytes, after_word, is_blank_byte),
         _ => after_word,
     };
     match_word(bytes, after_separator, b"key")
+}
+
+/// A space or a tab: the gap that may stand inside a name such as `api key`.
+fn is_blank_byte(byte: u8) -> bool {
+    (byte == b' ') | (byte == b'\t')
 }
 
 /// The keyword that makes a name a credential's, from the one list the JSON walk uses too.
@@ -155,21 +161,33 @@ fn match_keyword(bytes: &[u8], at: usize) -> Option<Keyword> {
     None
 }
 
-/// A query parameter that is a credential's only when it is the whole name.
-fn match_query_name(bytes: &[u8], at: usize) -> Option<Keyword> {
-    if !matches!(
+/// Whether a query parameter's name starts at `at`: right after a `?` or a `&`.
+fn starts_a_parameter(bytes: &[u8], at: usize) -> bool {
+    matches!(
         at.checked_sub(1).and_then(|before| bytes.get(before)),
         Some(b'?' | b'&')
-    ) {
+    )
+}
+
+/// A query parameter that is a credential's only when it is the whole name (`key`, `auth`,
+/// `sig`), or when it ends in `signature` or `sig` (`X-Amz-Signature`).
+fn match_query_name(bytes: &[u8], at: usize) -> Option<Keyword> {
+    if !starts_a_parameter(bytes, at) {
         return None;
     }
-    let end = take_while(bytes, at, |byte| byte.is_ascii_alphanumeric());
+    let end = take_while(bytes, at, |byte| {
+        byte.is_ascii_alphanumeric() | (byte == b'-') | (byte == b'_')
+    });
     let name = &bytes[at..end];
-    let credential = ["key", "signature"]
-        .iter()
+    let whole = std::iter::once(&"key")
         .chain(CREDENTIAL_NAMES.iter())
         .any(|word| name.eq_ignore_ascii_case(word.as_bytes()));
-    credential.then_some(Keyword {
+    let last = name
+        .rsplit(|byte| (*byte == b'-') | (*byte == b'_'))
+        .next()
+        .unwrap_or(name);
+    let signed = last.eq_ignore_ascii_case(b"signature") || last.eq_ignore_ascii_case(b"sig");
+    (whole || signed).then_some(Keyword {
         end,
         kind: Kind::Token,
         whole: true,
@@ -180,12 +198,15 @@ fn match_query_name(bytes: &[u8], at: usize) -> Option<Keyword> {
 /// Whether some keyword starts at `at`, for a caller that only asks whether a text names a
 /// credential at all.
 pub(super) fn names_a_keyword(bytes: &[u8], at: usize) -> bool {
-    starts_a_keyword(bytes, at)
-        && (match_keyword(bytes, at).is_some() || match_query_name(bytes, at).is_some())
+    if starts_a_parameter(bytes, at) && match_query_name(bytes, at).is_some() {
+        return true;
+    }
+    starts_a_keyword(bytes, at) && match_keyword(bytes, at).is_some()
 }
 
 /// Whether the two bytes at `at` open some keyword, of `key` or of `signature`: `se`cret,
-/// `si`g, `to`ken, `pa`ssword, `pw`d, `pr`ivate, `cr`edential, `co`okie, `ap`i, `au`th, `ke`y.
+/// `si`g, `to`ken, `pa`ssword, `pw`d, `pr`ivate, `cr`edential, `co`okie, `ap`i, `au`th, `ac`cess,
+/// `ke`y.
 ///
 /// Every byte of a name is a start, since a keyword may end a name or follow a capital, and most
 /// are the beginning of nothing. This turns those away before any word is compared.
@@ -206,7 +227,7 @@ fn starts_a_keyword(bytes: &[u8], at: usize) -> bool {
         b't' => second == b'o',
         b'p' => (second == b'a') | (second == b'w') | (second == b'r'),
         b'c' => (second == b'r') | (second == b'o'),
-        b'a' => (second == b'p') | (second == b'u'),
+        b'a' => (second == b'p') | (second == b'u') | (second == b'c'),
         _ => second == b'e',
     }
 }
@@ -241,6 +262,13 @@ fn keyword_may_start(bytes: &[u8], at: usize, end: usize) -> bool {
 /// Whether the rest of a name after `token` says it counts tokens: `tokens`, `token_limit`,
 /// `tokenCount`. A number under such a name is a count and not a credential.
 fn counts_tokens(bytes: &[u8], after_keyword: usize) -> bool {
+    // `auth_tokens_secret` is a secret's name with tokens in it: nothing else may follow.
+    let name_end = take_while(bytes, after_keyword, is_name_byte);
+    if (after_keyword..name_end)
+        .any(|at| starts_a_keyword(bytes, at) && match_keyword(bytes, at).is_some())
+    {
+        return false;
+    }
     const COUNTS: [&str; 8] = [
         "count",
         "limit",
@@ -274,78 +302,68 @@ fn counts_tokens(bytes: &[u8], after_keyword: usize) -> bool {
 /// The longest status word, `unauthorized`, `unavailable` and `configured` among them.
 const LONGEST_STATUS_WORD: usize = 12;
 
-/// Whether a word is a status word or an HTTP error status (`401`, `503`).
-///
-/// Words that say a credential is absent or refused (`not`, `set`, `missing`, `expired`,
-/// `invalid`, `required`, `revoked`, `unauthorized`, `forbidden`, `empty`, `denied`, ...) and the
-/// words of an HTTP reason phrase (`too many requests`, `internal server error`, `bad request`).
-/// A value made only of these is a status, not a credential. Every other word is a value, which
-/// includes any word this list does not know: when in doubt the text is redacted.
-fn is_status_word(word: &[u8]) -> bool {
+/// How a word counts toward a status.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Word {
+    /// Not a status word: the text is a value.
+    Value,
+    /// Says a credential is absent or refused: `not`, `set`, `missing`, `expired`, `invalid`.
+    State,
+    /// Part of an HTTP reason phrase (`too many requests`, `internal server error`): a status only
+    /// after the number that goes with it.
+    Reason,
+    /// An HTTP error status, `401` or `503`.
+    Number,
+}
+
+/// What a word says. Every word this list does not know is a value, so in doubt the text is
+/// redacted.
+fn status_word(word: &[u8]) -> Word {
     if (word.len() > LONGEST_STATUS_WORD) | word.is_empty() {
-        return false;
+        return Word::Value;
     }
     let mut lower = [0u8; LONGEST_STATUS_WORD];
     for (to, from) in lower.iter_mut().zip(word) {
         *to = from.to_ascii_lowercase();
     }
     let word = &lower[..word.len()];
-    let http =
-        word.len() == 3 && matches!(word[0], b'4' | b'5') && word.iter().all(u8::is_ascii_digit);
-    http || matches!(
-        word,
-        b"not"
-            | b"set"
-            | b"found"
-            | b"provided"
-            | b"configured"
-            | b"missing"
-            | b"expired"
-            | b"invalid"
-            | b"required"
-            | b"revoked"
-            | b"unauthorized"
-            | b"forbidden"
-            | b"unset"
-            | b"empty"
-            | b"unknown"
-            | b"none"
-            | b"null"
-            | b"denied"
-            | b"rejected"
-            | b"failed"
-            | b"refused"
-            | b"absent"
-            | b"undefined"
-            | b"unavailable"
-            | b"bad"
-            | b"request"
-            | b"requests"
-            | b"too"
-            | b"many"
-            | b"internal"
-            | b"server"
-            | b"error"
-            | b"service"
-            | b"timeout"
-    )
+    if word.len() == 3 && matches!(word[0], b'4' | b'5') && word.iter().all(u8::is_ascii_digit) {
+        return Word::Number;
+    }
+    match word {
+        b"not" | b"set" | b"found" | b"provided" | b"configured" | b"missing" | b"expired"
+        | b"invalid" | b"required" | b"revoked" | b"unauthorized" | b"forbidden" | b"unset"
+        | b"empty" | b"unknown" | b"none" | b"null" | b"denied" | b"rejected" | b"failed"
+        | b"refused" | b"absent" | b"undefined" | b"unavailable" => Word::State,
+        b"bad" | b"request" | b"requests" | b"too" | b"many" | b"internal" | b"server"
+        | b"error" | b"service" | b"timeout" => Word::Reason,
+        _ => Word::Value,
+    }
 }
 
 /// Where the value at `start` ends, when it is nothing but status words: `not set`, `missing`,
-/// `401 Unauthorized`, up to the end of the text, a line break or a delimiter. Anything else after
-/// the words, such as another word or an underscore, makes it a value.
+/// `401 Unauthorized`, closed by the end of the text, white space, or a few marks of punctuation
+/// and then one of those. Anything else after the words, such as another word, a digit, an
+/// underscore, or a mark with text glued to it (`set.hunter2`), makes it a value. The words of an
+/// HTTP reason phrase count only after the number.
 ///
 /// Reads a handful of words at most, so it costs the same however much text follows.
 fn status_phrase_end(bytes: &[u8], start: usize) -> Option<usize> {
     let mut at = start;
     let mut words = 0;
+    let mut reason = false;
+    let mut numbered = false;
     let end = loop {
         let word_end = take_while(bytes, at, |byte| byte.is_ascii_alphanumeric());
-        if word_end == at || !is_status_word(&bytes[at..word_end]) {
-            return None;
+        match status_word(&bytes[at..word_end]) {
+            Word::Value => return None,
+            Word::Reason => reason = true,
+            Word::Number if words > 0 => return None,
+            Word::Number => numbered = true,
+            Word::State => {}
         }
         words += 1;
-        let next = take_while(bytes, word_end, |byte| (byte == b' ') | (byte == b'\t'));
+        let next = take_while(bytes, word_end, is_blank_byte);
         // Another word follows only if there are few enough of them to be all status words.
         if next == word_end || !bytes.get(next).is_some_and(u8::is_ascii_alphanumeric) {
             break word_end;
@@ -355,14 +373,19 @@ fn status_phrase_end(bytes: &[u8], start: usize) -> Option<usize> {
         }
         at = next;
     };
-    let delimited = match bytes.get(end) {
-        None => true,
-        Some(byte) => {
-            is_space_byte(*byte)
-                || matches!(byte, b',' | b';' | b'.' | b')' | b']' | b'}' | b'"' | b'\'')
-        }
-    };
-    delimited.then_some(end)
+    if reason && !numbered {
+        return None;
+    }
+    // Up to two marks of punctuation, then the text must end or a gap begin.
+    let marks = bytes[end..]
+        .iter()
+        .take(3)
+        .take_while(|byte| matches!(byte, b'.' | b',' | b';' | b')' | b']' | b'}' | b'"' | b'\''))
+        .count();
+    let delimited = bytes
+        .get(end + marks)
+        .is_none_or(|byte| is_space_byte(*byte));
+    (delimited && marks < 3).then_some(end)
 }
 
 /// Whether `text` is only digits, with the separators a number is written with.
@@ -378,58 +401,84 @@ fn only_digits(text: &[u8]) -> bool {
 /// `authorization : <scheme> <token>`, however it was spaced and cased, with the name and the
 /// value optionally quoted.
 ///
-/// Any scheme counts, not only `bearer` and `basic`: `token`, `digest`, an API gateway's own. The
-/// words after the scheme are a token unless they say a credential is missing (`Authorization:
-/// header missing`).
+/// Any scheme counts, not only `bearer` and `basic`. A scheme that takes one token (`bearer`,
+/// `basic`, `token`, ...) has that token redacted. One that takes several (`Digest`, `AWS4-HMAC-
+/// SHA256`) has the rest of its line redacted. One this list does not know is as likely to be a
+/// credential as a scheme, so everything after the colon is, to the end of the line or a quote:
+/// `Authorization: sk-live-1 was rejected` leaves no key behind. A value in quotes ends at its
+/// closing quote.
+///
+/// Words that only say a credential is missing (`Authorization: required`, `Authorization: 401
+/// Unauthorized`) are kept.
 #[inline]
 pub(super) fn bearer_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
-    if !starts_a_word(bytes, at) {
+    if !(starts_a_word(bytes, at) || is_camel_boundary(bytes, at)) {
         return None;
     }
     let after_keyword = match_word(bytes, at, AUTHORIZATION)?;
     let after_quote = skip_quote(bytes, after_keyword);
     let after_colon = match_byte(bytes, skip_spaces(bytes, after_quote), b':')?;
-    let scheme_start = skip_quote(bytes, skip_spaces(bytes, after_colon));
+    let value = skip_spaces(bytes, after_colon);
+    let scheme_start = skip_quote(bytes, value);
+    let quoted = scheme_start != value;
+    // The bounded read first: what follows may be a megabyte, and a status is a few words.
+    if !quoted && let Some(end) = status_phrase_end(bytes, scheme_start) {
+        return Some(Outcome::Keep { end });
+    }
     let after_scheme = take_while(bytes, scheme_start, |byte| {
         byte.is_ascii_alphanumeric() | (byte == b'-') | (byte == b'_') | (byte == b'.')
     });
     if after_scheme == scheme_start {
         return None;
     }
+    let scheme = &bytes[scheme_start..after_scheme];
     // A boundary marker stands where a byte was removed between the scheme and its token.
     let token_start = take_while(bytes, after_scheme, |byte| {
         is_space_byte(byte) || byte == strip::BOUNDARY_BYTE
     });
-    if token_start == after_scheme {
-        return None;
-    }
-    let quoted = scheme_start != skip_spaces(bytes, after_colon);
-    let token_end = match (
-        quoted,
-        is_single_token_scheme(&bytes[scheme_start..after_scheme]),
-    ) {
-        // Inside quotes the value ends at the closing one.
-        (true, _) => take_while(bytes, token_start, |byte| {
-            is_value_byte(byte) && !is_quote(byte)
-        }),
-        (false, true) => take_while(bytes, token_start, is_value_byte),
-        // `Digest username="a", response="b"` and `AWS4-HMAC-SHA256 Credential=..., Signature=...`
-        // are several parts, each of which is a credential.
-        (false, false) => line_end(bytes, token_start),
+    let (end, takes_a_token) = if quoted {
+        let opened = opened_before(bytes, scheme_start)?;
+        let end = close_quote(bytes, &opened);
+        if status_phrase_end(bytes, scheme_start).is_some_and(|status| status == end) {
+            return Some(Outcome::Keep { end });
+        }
+        (end, token_start < end && is_known_scheme(scheme))
+    } else if is_single_token_scheme(scheme) {
+        (take_while(bytes, token_start, is_value_byte), true)
+    } else if is_multi_part_scheme(scheme) {
+        (line_end(bytes, token_start), true)
+    } else {
+        // A quote or a bracket ends it too: the line may be a JSON text on one line.
+        let end = take_while(bytes, scheme_start, |byte| {
+            !matches!(byte, b'\n' | b'\r' | b'"' | b'\'' | b'}' | b']')
+        });
+        (trim_end(bytes, scheme_start, end), false)
     };
-    if token_end == token_start {
+    // A scheme with nothing after it carries no credential.
+    if end <= scheme_start || (takes_a_token && (token_start == after_scheme || end <= token_start))
+    {
         return None;
     }
-    // `Authorization: required` or `Authorization: 401 Unauthorized` is a status, not a header. Only
-    // the words straight after the colon count: a scheme followed by anything is a credential.
-    if let Some(end) = status_phrase_end(bytes, scheme_start) {
-        return Some(Outcome::Keep { end });
-    }
+    let (kept_end, joiner) = if takes_a_token {
+        (after_scheme, " ")
+    } else {
+        (scheme_start, "")
+    };
     Some(Outcome::Redact(Rewrite {
-        end: token_end,
-        kept_end: after_scheme,
-        joiner: " ",
+        end,
+        kept_end,
+        joiner,
     }))
+}
+
+/// The quote that opens the value whose text starts at `inner`.
+fn opened_before(bytes: &[u8], inner: usize) -> Option<Opened> {
+    let quote = *bytes.get(inner.checked_sub(1)?)?;
+    is_quote(quote).then_some(Opened {
+        inner,
+        quote,
+        escaped: inner >= 2 && bytes[inner - 2] == b'\\',
+    })
 }
 
 /// Whether an authorization scheme carries one token, so that a word after it is not part of it.
@@ -444,6 +493,27 @@ fn is_single_token_scheme(scheme: &[u8]) -> bool {
     ]
     .iter()
     .any(|single| scheme.eq_ignore_ascii_case(single))
+}
+
+/// Whether an authorization scheme carries several parts, each of which is a credential.
+fn is_multi_part_scheme(scheme: &[u8]) -> bool {
+    [
+        &b"digest"[..],
+        b"aws4-hmac-sha256",
+        b"oauth",
+        b"hmac",
+        b"hawk",
+        b"mac",
+        b"signature",
+        b"vapid",
+    ]
+    .iter()
+    .any(|multi| scheme.eq_ignore_ascii_case(multi))
+}
+
+/// Whether a scheme is one of those above.
+fn is_known_scheme(scheme: &[u8]) -> bool {
+    is_single_token_scheme(scheme) || is_multi_part_scheme(scheme)
 }
 
 /// The next `:` and the one place [`bearer_rule`] can start to reach it.
@@ -470,11 +540,16 @@ pub(super) fn header_colon(bytes: &[u8], from: usize) -> Option<Anchor> {
 // ---- the assignment rule --------------------------------------------------------------------
 
 /// `api_key=`, `secret:`, `"token": `, … and whatever value follows.
+///
+/// Every start in a name reaches the same separator and the same value, so a rule that decides
+/// about the value alone (an empty one, a status, a count) answers [`Outcome::Keep`] past the
+/// separator, and the other starts of the name are not asked. The bounded reads come first: the
+/// value may be a megabyte of text and a status is a few words.
 #[inline]
 pub(super) fn assignment_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
     // Every byte of a name is a start now, since a keyword may end a name or follow a capital.
     // Most are not the first letter of anything, and are turned away on that alone.
-    if !starts_a_keyword(bytes, at) {
+    if !(starts_a_keyword(bytes, at) || starts_a_parameter(bytes, at)) {
         return None;
     }
     let keyword = match_keyword(bytes, at)
@@ -506,50 +581,119 @@ pub(super) fn assignment_rule(bytes: &[u8], at: usize) -> Option<Outcome> {
         match_byte(bytes, separator, b'=').or_else(|| match_byte(bytes, separator, b':'))?;
     let value_start = skip_spaces(bytes, after_separator);
     if let Some(opened) = open_quote(bytes, value_start) {
-        return quoted_value(bytes, &keyword, opened);
+        return quoted_value(bytes, &keyword, opened, after_separator);
     }
-    let in_query = {
-        let name_start = run_start(bytes, at, is_name_byte);
-        matches!(
-            name_start
-                .checked_sub(1)
-                .and_then(|before| bytes.get(before)),
-            Some(b'?' | b'&')
-        )
+    let in_query = starts_a_parameter(bytes, run_start(bytes, at, is_name_byte));
+    let ends_value = |byte: u8| {
+        !is_value_byte(byte)
+            || (in_query && matches!(byte, b'&' | b'#'))
+            || (quoted_name && matches!(byte, b'}' | b']'))
     };
-    let value_end = match (keyword.kind, colon && !in_query) {
-        (Kind::Line, _) => line_end(bytes, value_start),
-        (Kind::Phrase, true) => phrase_end(bytes, value_start),
-        _ => take_while(bytes, value_start, |byte| {
-            is_value_byte(byte)
-                && !(in_query && matches!(byte, b'&' | b'#'))
-                && !(quoted_name && matches!(byte, b'}' | b']'))
-        }),
-    };
-    if value_end == value_start {
-        return None;
-    }
     if let Some(end) = status_phrase_end(bytes, value_start) {
         return Some(Outcome::Keep { end });
     }
+    let digits_end = take_while(bytes, value_start, is_number_byte);
     if keyword.token
+        && digits_end > value_start
+        && bytes.get(digits_end).is_none_or(|byte| ends_value(*byte))
         && counts_tokens(bytes, keyword.end)
-        && only_digits(&bytes[value_start..value_end])
     {
-        return Some(Outcome::Keep { end: value_end });
+        return Some(Outcome::Keep { end: digits_end });
+    }
+    if is_a_path_for_pwd(bytes, at, &keyword, value_start)
+        || is_a_token_type(bytes, &keyword, value_start)
+    {
+        return Some(Outcome::Keep { end: value_start });
+    }
+    let value_end = match (keyword.kind, colon && !in_query) {
+        (Kind::Line, _) => line_end(bytes, value_start),
+        (Kind::Phrase, true) => phrase_end(bytes, value_start),
+        _ => match bytes.get(value_start) {
+            // The brackets close the value, and whatever is glued after them goes with it.
+            Some(b'[' | b'{') => take_while(bytes, closing_bracket(bytes, value_start), |byte| {
+                !ends_value(byte)
+            }),
+            _ => take_while(bytes, value_start, |byte| !ends_value(byte)),
+        },
+    };
+    if value_end == value_start {
+        return Some(Outcome::Keep {
+            end: after_separator,
+        });
     }
     // A name that was quoted keeps its quote and its separator as they stood, so a JSON text
     // keeps its shape. A bare name has always been written back as `name=[REDACTED]`.
-    let (kept_end, joiner) = match (after_name == name_end, keyword.kind) {
-        (true, Kind::Line) => (value_start, ""),
-        (true, _) => (name_end, "="),
-        (false, _) => (value_start, ""),
+    let (kept_end, joiner) = match (quoted_name, keyword.kind) {
+        (false, Kind::Line) => (value_start, ""),
+        (false, _) => (name_end, "="),
+        (true, _) => (value_start, ""),
     };
     Some(Outcome::Redact(Rewrite {
         end: value_end,
         kept_end,
         joiner,
     }))
+}
+
+/// A digit or one of the marks a number is written with.
+fn is_number_byte(byte: u8) -> bool {
+    byte.is_ascii_digit() | (byte == b',') | (byte == b'_')
+}
+
+/// `pwd` is also the shell's name for the working directory: `PWD=/home/u/project`.
+fn is_a_path_for_pwd(bytes: &[u8], at: usize, keyword: &Keyword, value_start: usize) -> bool {
+    keyword.end - at == 3
+        && bytes[at..keyword.end].eq_ignore_ascii_case(b"pwd")
+        && bytes.get(value_start) == Some(&b'/')
+}
+
+/// `"token_type": "Bearer"` names a scheme and not a credential.
+fn is_a_token_type(bytes: &[u8], keyword: &Keyword, value_start: usize) -> bool {
+    if !keyword.token {
+        return false;
+    }
+    let rest = &bytes[keyword.end..];
+    let kind = rest
+        .strip_prefix(b"_")
+        .or(rest.strip_prefix(b"-"))
+        .unwrap_or(rest);
+    if kind.len() < 4 || !kind[..4].eq_ignore_ascii_case(b"type") {
+        return false;
+    }
+    let value_end = take_while(bytes, value_start, |byte| byte.is_ascii_alphabetic());
+    let value = &bytes[value_start..value_end];
+    ["bearer", "basic", "mac"]
+        .iter()
+        .any(|scheme| value.eq_ignore_ascii_case(scheme.as_bytes()))
+        && bytes.get(value_end).is_none_or(|byte| !is_name_byte(*byte))
+}
+
+/// Where the bracket that opens at `start` closes, counting the brackets and the strings inside:
+/// a JSON array or object that is one credential's value. An unclosed one ends with its line.
+fn closing_bracket(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut at = start;
+    while let Some(byte) = bytes.get(at) {
+        count_steps(1);
+        at += 1;
+        match (quote, *byte) {
+            (_, b'\n' | b'\r') => return at - 1,
+            (Some(_), b'\\') => at += 1,
+            (Some(open), byte) if byte == open => quote = None,
+            (Some(_), _) => {}
+            (None, b'"' | b'\'') => quote = Some(*byte),
+            (None, b'[' | b'{') => depth += 1,
+            (None, b']' | b'}') => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return at;
+                }
+            }
+            (None, _) => {}
+        }
+    }
+    bytes.len()
 }
 
 /// A quote that opens a value at `at`: where its text starts, the quote and whether it is escaped.
@@ -589,12 +733,22 @@ fn close_quote(bytes: &[u8], opened: &Opened) -> usize {
 
 /// A value inside quotes runs to the closing quote whatever it holds, spaces and punctuation
 /// included, and the quotes and the separator stand as they were.
-fn quoted_value(bytes: &[u8], keyword: &Keyword, opened: Opened) -> Option<Outcome> {
+fn quoted_value(
+    bytes: &[u8],
+    keyword: &Keyword,
+    opened: Opened,
+    after_separator: usize,
+) -> Option<Outcome> {
     let end = close_quote(bytes, &opened);
     if end == opened.inner {
-        return None;
+        return Some(Outcome::Keep {
+            end: after_separator,
+        });
     }
     if status_phrase_end(bytes, opened.inner).is_some_and(|status| status == end) {
+        return Some(Outcome::Keep { end });
+    }
+    if is_a_token_type(bytes, keyword, opened.inner) {
         return Some(Outcome::Keep { end });
     }
     if keyword.token && counts_tokens(bytes, keyword.end) && only_digits(&bytes[opened.inner..end])
@@ -656,22 +810,26 @@ pub(super) fn assignment_separator(bytes: &[u8], from: usize) -> Option<Anchor> 
             starts: 0..0,
         });
     }
-    let (mut name_start, mut first) = name_run(bytes, name_end);
+    let (name_start, mut first) = name_run(bytes, name_end);
     if name_start == name_end {
         return Some(Anchor {
             at: separator,
             starts: 0..0,
         });
     }
-    // `api key` and `private key`: the run is `key` and the word before it is the other half.
-    if name_end - name_start == 3
-        && bytes[name_start..name_end].eq_ignore_ascii_case(b"key")
-        && name_start >= 2
-        && bytes[name_start - 1] == b' '
+    // `api key`, `private key` and `secret  key`: the run is `key`, and the other half is the word
+    // before the blanks. A keyword is at most seven letters long, so only the last eight bytes
+    // before the blanks are starts: the word may be a megabyte long, and each start reads on to
+    // the end of it.
+    if bytes[name_start..name_end]
+        .get(..3)
+        .is_some_and(|word| word.eq_ignore_ascii_case(b"key"))
     {
-        name_start = run_start(bytes, name_start - 1, |byte| byte.is_ascii_alphabetic());
-        if starts_a_keyword(bytes, name_start) {
-            first = name_start;
+        let gap = run_start(bytes, name_start, |byte| {
+            is_blank_byte(byte) || (byte == b'.')
+        });
+        if gap < name_start {
+            first = first.min(gap.saturating_sub(MOST_BEFORE_A_GAP));
         }
     }
     Some(Anchor {
@@ -679,6 +837,10 @@ pub(super) fn assignment_separator(bytes: &[u8], from: usize) -> Option<Anchor> 
         starts: first..name_end,
     })
 }
+
+/// The longest keyword that a gap can follow, `private` or `secret ` with its blank, and a byte for
+/// the capital a glued name starts with (`xAPI key`).
+const MOST_BEFORE_A_GAP: usize = 8;
 
 /// Where the run of name bytes that ends at `end` starts, and the first place in it that can hold
 /// a keyword (`end` when none can).
@@ -699,16 +861,19 @@ fn name_run(bytes: &[u8], end: usize) -> (usize, usize) {
             first = start;
         }
     }
+    // A query parameter is a start of its own: `?X-Amz-Signature=` opens with a letter that is no
+    // keyword's.
+    if starts_a_parameter(bytes, start) && start < end {
+        first = start;
+    }
     (start, first)
 }
 
-/// Whether a value starts after `from`, past any spaces: the check [`assignment_rule`] makes
-/// before it redacts anything.
+/// Whether anything stands after `from`, past any spaces. Whether it is a value is for the rule,
+/// which answers [`Outcome::Keep`] for the whole name when it is not: a cookie's line may open
+/// with a `;`, and a locator that required more would never ask.
 pub(super) fn has_value(bytes: &[u8], from: usize) -> bool {
-    let value_start = skip_spaces(bytes, from);
-    bytes
-        .get(value_start)
-        .is_some_and(|byte| is_value_byte(*byte))
+    skip_spaces(bytes, from) < bytes.len()
 }
 
 // ---- the URL rule ---------------------------------------------------------------------------
@@ -765,7 +930,16 @@ fn token_userinfo(bytes: &[u8], start: usize) -> Option<Range<usize>> {
     let end = take_while(bytes, start, |byte| {
         byte.is_ascii_alphanumeric() | matches!(byte, b'_' | b'-' | b'.' | b'~' | b'%')
     });
-    let token_like = end - start >= 20 && bytes[start..end].iter().any(u8::is_ascii_digit);
+    let user = &bytes[start..end];
+    // A name such as `jenkins-deploy-agent-01` is long and has a digit; a token also has a capital
+    // or an underscore, is long enough to be random, or opens like one.
+    let looks_random = user.iter().any(u8::is_ascii_uppercase)
+        || user.contains(&b'_')
+        || user.len() >= 32
+        || [&b"xox"[..], b"sk-", b"pat-"].iter().any(|prefix| {
+            user.len() >= prefix.len() && user[..prefix.len()].eq_ignore_ascii_case(prefix)
+        });
+    let token_like = user.len() >= 20 && user.iter().any(u8::is_ascii_digit) && looks_random;
     (token_like && bytes.get(end) == Some(&b'@')).then_some(start..end)
 }
 

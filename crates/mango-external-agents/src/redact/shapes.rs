@@ -244,3 +244,169 @@ fn a_removed_byte_inside_a_quoted_shape_does_not_hide_it() {
         ),
     ]);
 }
+
+#[test]
+fn a_quoted_authorization_value_ends_at_its_closing_quote() {
+    assert_shown(&[
+        (
+            r#"{"Authorization":"AWS4-HMAC-SHA256 Credential=AKIAX/1, SignedHeaders=host, Signature=beef01"}"#,
+            r#"{"Authorization":"AWS4-HMAC-SHA256 [REDACTED]"}"#,
+        ),
+        (
+            r#"{"Authorization":"Digest username=\"a\", response=\"beef01\""}"#,
+            r#"{"Authorization":"Digest [REDACTED]"}"#,
+        ),
+        (
+            r#"{"Authorization":"Bearer abc def","Accept":"a"}"#,
+            r#"{"Authorization":"Bearer [REDACTED]","Accept":"a"}"#,
+        ),
+        // The escaping backslash of a JSON text inside a string stays where it was.
+        (
+            r#"{\"Authorization\":\"Bearer abc\",\"Accept\":\"a\"}"#,
+            r#"{\"Authorization\":\"Bearer [REDACTED]\",\"Accept\":\"a\"}"#,
+        ),
+        // A status in quotes is a status.
+        (
+            r#"{"Authorization":"401 Unauthorized"}"#,
+            r#"{"Authorization":"401 Unauthorized"}"#,
+        ),
+    ]);
+}
+
+#[test]
+fn an_unknown_scheme_redacts_its_line_and_not_the_next_one() {
+    assert_shown(&[
+        (
+            "Authorization: sk-live-1 was rejected by the server",
+            "Authorization: [REDACTED]",
+        ),
+        (
+            "Authorization: ghp_abc123\nContent-Type: application/json\nHost: x",
+            "Authorization: [REDACTED]\nContent-Type: application/json\nHost: x",
+        ),
+        (
+            "ProxyAuthorization: Bearer sk-live-1",
+            "ProxyAuthorization: Bearer [REDACTED]",
+        ),
+        (
+            "Authorization: Digest username=\"a\", response=\"b\"\nHost: x",
+            "Authorization: Digest [REDACTED]\nHost: x",
+        ),
+    ]);
+}
+
+#[test]
+fn a_status_that_ends_in_a_mark_with_text_glued_to_it_is_a_value() {
+    assert_shown(&[
+        ("secret: set.hunter2", "secret=[REDACTED]"),
+        ("token: none.abc123", "token=[REDACTED]"),
+        ("password: null)Passw0rd", "password=[REDACTED]"),
+        ("api_key: error.sk-abc123", "api_key=[REDACTED]"),
+        ("Cookie: set.sid=abc; x=y", "Cookie: [REDACTED]"),
+        ("token: expired.password=abc", "token=[REDACTED]"),
+        // The same words closed by a mark and then a gap, or the end, are a status.
+        (
+            "token: expired. Sign in again",
+            "token: expired. Sign in again",
+        ),
+        ("secret: missing)", "secret: missing)"),
+        // Reason words are a status only after the number.
+        ("PASSWORD=server", "PASSWORD=[REDACTED]"),
+        (
+            "secret: internal server error",
+            "secret=[REDACTED] server error",
+        ),
+        (
+            "token: 500 Internal Server Error",
+            "token: 500 Internal Server Error",
+        ),
+        (
+            "token: 429 Too Many Requests",
+            "token: 429 Too Many Requests",
+        ),
+        ("token: 401", "token: 401"),
+    ]);
+}
+
+#[test]
+fn a_count_is_kept_only_when_the_whole_name_is_a_count() {
+    assert_shown(&[
+        ("verification_tokens=123456", "verification_tokens=123456"),
+        ("auth_tokens_secret=12345", "auth_tokens_secret=[REDACTED]"),
+        (
+            "token_limit_password=424242",
+            "token_limit_password=[REDACTED]",
+        ),
+        ("secret_tokens=123", "secret_tokens=[REDACTED]"),
+    ]);
+}
+
+#[test]
+fn a_json_array_or_object_under_a_credential_is_redacted_whole() {
+    assert_shown(&[
+        (r#"{"tokens":["sk-a","sk-b"]}"#, r#"{"tokens":[REDACTED]}"#),
+        (
+            r#"{"credentials":{"user":"u","pass":"p-secret"},"x":1}"#,
+            r#"{"credentials":[REDACTED],"x":1}"#,
+        ),
+        (r#"{"tokens": [1,2,3]}"#, r#"{"tokens": [REDACTED]}"#),
+        (
+            r#"{"secret":["a]b","c"],"k":2}"#,
+            r#"{"secret":[REDACTED],"k":2}"#,
+        ),
+        // What was redacted stays redacted, and stays one `[REDACTED]`.
+        (r#"{"token": [REDACTED]}"#, r#"{"token": [REDACTED]}"#),
+    ]);
+    let once = stderr_text(r#"{"token": 12345}"#);
+    assert_eq!(
+        stderr_text(&once),
+        once,
+        "expected a second pass over {once:?} to change nothing"
+    );
+}
+
+#[test]
+fn a_cookie_line_and_a_glued_key_name_are_found_by_their_locators() {
+    assert_shown(&[
+        (
+            "Cookie: ;sid=hunter2-secret; theme=dark",
+            "Cookie: [REDACTED]",
+        ),
+        ("Cookie: , sid=hunter2-secret", "Cookie: [REDACTED]"),
+        ("xAPI key: sk-live-hunter2", "xAPI key=[REDACTED]"),
+        (
+            r#"{"myApi key": "sk-live-hunter2"}"#,
+            r#"{"myApi key": "[REDACTED]"}"#,
+        ),
+        ("api  key: sk-1", "api  key=[REDACTED]"),
+        ("api.key=sk-1", "api.key=[REDACTED]"),
+        ("openai.api.key=sk-1", "openai.api.key=[REDACTED]"),
+        ("access_key=AKIA1", "access_key=[REDACTED]"),
+        (
+            "GET /v1?X-Amz-Signature=abc&x=1",
+            "GET /v1?X-Amz-Signature=[REDACTED]&x=1",
+        ),
+    ]);
+}
+
+#[test]
+fn ordinary_text_that_looks_like_a_name_is_kept() {
+    assert_shown(&[
+        // The shell's working directory.
+        (
+            "OLDPWD=/home/u PWD=/home/u/proj",
+            "OLDPWD=/home/u PWD=/home/u/proj",
+        ),
+        ("pwd=hunter2", "pwd=[REDACTED]"),
+        // A user name that is long and has a digit.
+        (
+            "ssh://jenkins-deploy-agent-01@build.example.com/x",
+            "ssh://jenkins-deploy-agent-01@build.example.com/x",
+        ),
+        (
+            r#"{"token_type":"Bearer","expires_in":3600}"#,
+            r#"{"token_type":"Bearer","expires_in":3600}"#,
+        ),
+        (r#"{"token_type":"abc"}"#, r#"{"token_type":"[REDACTED]"}"#),
+    ]);
+}

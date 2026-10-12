@@ -152,6 +152,26 @@ pub const LEAKS: &[Leak] = &[
         &["env private key"],
     ),
     leak(
+        r#"signed {"Authorization":"AWS4-HMAC-SHA256 Credential=AKIAX/1, Signature=beef16","Host":"h"}"#,
+        "beef16",
+        &["signed", r#""Host":"h""#],
+    ),
+    leak(
+        "upstream said Authorization: sk-live-17 was rejected\nHost: example.com",
+        "sk-live-17",
+        &["upstream said Authorization: ", "Host: example.com"],
+    ),
+    leak(
+        r#"call failed {"tokens":["sk-18a","sk-18b"],"retry_after":30}"#,
+        "sk-18b",
+        &["call failed", r#""retry_after":30"#],
+    ),
+    leak(
+        "presigned GET /b/k?X-Amz-Signature=sig19abc&X-Amz-Expires=60 failed",
+        "sig19abc",
+        &["presigned GET /b/k?", "X-Amz-Expires=60 failed"],
+    ),
+    leak(
         r#"call failed {"error":"bad","env":[{"name":"HOME","value":"/h"}],"token":"tk-15"}"#,
         "tk-15",
         &["call failed", r#""error":"bad""#, r#""value":"/h""#],
@@ -186,6 +206,11 @@ pub const BENIGN: &[&str] = &[
     "contact user@example.com about the quota",
     r#"{"level":"info","msg":"done","status":200,"dur_ms":87}"#,
     r#"{"error":{"type":"overloaded_error","message":"Overloaded"},"request_id":"req_1"}"#,
+    "Authorization: 401 Unauthorized",
+    "token: 429 Too Many Requests",
+    "env OLDPWD=/home/u PWD=/home/u/project",
+    "clone failed for ssh://jenkins-deploy-agent-01@build.example.com/repo.git",
+    r#"{"access_token":"[REDACTED]","token_type":"Bearer","expires_in":3600}"#,
     "the secret service is unavailable",
     "key not found in cache",
     "cache_key: layer-3",
