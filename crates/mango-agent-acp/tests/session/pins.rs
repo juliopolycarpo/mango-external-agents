@@ -19,6 +19,8 @@ mod failures;
 mod peer;
 #[path = "pins/prompt_auth.rs"]
 mod prompt_auth;
+#[path = "pins/redaction.rs"]
+mod redaction;
 #[path = "pins/wire.rs"]
 mod wire;
 

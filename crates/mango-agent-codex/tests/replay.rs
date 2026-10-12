@@ -6,6 +6,8 @@
 
 #[path = "replay/contracts.rs"]
 mod contracts;
+#[path = "replay/redaction.rs"]
+mod redaction;
 mod support;
 #[path = "replay/teardown.rs"]
 mod teardown;
