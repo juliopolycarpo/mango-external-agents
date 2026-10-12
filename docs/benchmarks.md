@@ -102,6 +102,18 @@ so there the step is smaller: a byte-wise search made the plain cases about 1.7 
 instructions on x86-64, a scalar one holds none. A vectorized `bound_text` holds `pminub`, and a
 vectorized `first_line_feed` or `redact::scan::first_match` holds `pcmpeqb`.
 
+`first_match` has to be inlined into the locator that calls it (`#[inline]`): left as a call, the
+search is still vectorized, but the call and the setup around each `:` cost about a quarter more
+instructions on plain tails, and the bigger locators in `redact::rules` made the compiler stop
+inlining it. A byte every rule turns away has to be turned away on that byte before a keyword is
+compared, in `starts_a_keyword` and by `name_run`, which looks at the bytes of a name once.
+Check `objdump -d` on `redact_bearer` and `redact_assignments` for `pcmpeqb`.
+
+An instruction-count receipt is more stable than wall time for a change to the rules. On Linux
+where `perf_event_open` works for the caller's own children, count user-space instructions of
+`BENCH_SAMPLES=1 <bench binary> <case>` and of `BENCH_SAMPLES=11`; the difference over ten is the
+instructions of one sample, with the setup cancelled.
+
 ## Why this harness
 
 The runner is a small `std`-only module (`benches/support/mod.rs` in each crate that has benches)

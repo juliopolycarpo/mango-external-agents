@@ -31,12 +31,35 @@ own deployment.
   The same holds for the other text a vendor generates: a compaction summary (an activity's
   content) and a notice (`EventKind::Notice`) are for display only, and a host must not feed either
   to its own model as instructions.
-- **Redaction.** stderr crossing a diagnostic boundary is redacted for credential-shaped text. So is
-  a vendor's error message, which the core redacts before it bounds it, whichever harness produced
-  it, a JSON-RPC peer's error message when it is an error object (a malformed `error` member is
-  quoted whole and is not), and the title and description of a notice. A vendor's
-  transcript content (assistant text, reasoning, tool output) is the answer and not a diagnostic,
-  and is not redacted.
+- **Redaction.** A vendor's own diagnostic text is redacted for credential-shaped text before it is
+  bounded, wherever it enters, and a vendor's transcript content is not. What is redacted where:
+
+  | Text                                                                                | Redacted | By                                                              |
+  | ----------------------------------------------------------------------------------- | -------- | --------------------------------------------------------------- |
+  | stderr crossing a diagnostic boundary                                               | yes      | `redact::stderr_text`                                           |
+  | an `EventKind::Error` message and its vendor code                                   | yes      | the core, whichever harness produced it                         |
+  | the title, description and unknown severity of an `EventKind::Notice`               | yes      | `EventKind::notice`                                             |
+  | a JSON-RPC peer's error message, when it is an error object                         | yes      | `JsonRpcError::into_vendor_error`                               |
+  | a setup `Error::Vendor` message                                                     | yes      | the core, then bounded                                          |
+  | an ACP agent's error message and its `data`, a JSON value read as structure         | yes      | `redact::structured`, then `stderr_text`                        |
+  | an ACP compaction error                                                             | yes      | `redact::bounded`                                               |
+  | a malformed JSON-RPC `error` member                                                 | n/a      | a fixed description; the member is never quoted                 |
+  | `CallFailureCause::Peer`, the peer's message exactly as sent                        | **no**   | exact by design, so a harness may compare it; never show it raw |
+  | assistant text, reasoning, tool output and tool errors (`is_error`, denial reasons) | no       | the answer, not a diagnostic                                    |
+
+  `CallFailureCause::Peer` holds the peer's error exactly as sent, because the caller of a request
+  may need its words and its data. A harness must not show it to a host raw: it converts it with
+  `JsonRpcError::into_vendor_error`, which redacts, or runs the message through
+  `redact::stderr_text`. Codex recognises two refusals (a missing rollout and an unloaded thread) by
+  their text, so it compares the redacted form of the answer with `stderr_text` of the expected
+  text, which keeps a credential-shaped thread id from hiding the refusal.
+
+  Beyond `name=value` and `Authorization: Bearer`, the rules read quoted pairs (`{"api_key":"sk-x"}`),
+  names with a keyword at the end or after a capital (`accessToken`, `PGPASSWORD`), any authorization
+  scheme, cookies, a `password:` phrase, a query-string credential and a token used as a URL's user.
+  A status after a name (`OPENAI_API_KEY: not set`), a number under a name that counts tokens
+  (`max_tokens: 100000`) and the rest of a query string are kept; a value that could be a credential
+  is redacted. `testing::redaction` holds the corpus of both kinds.
   `Debug` and `Display` for process, transport, MCP, JSON-RPC, error, session-listing, stream-handle
   and event payload carriers report only safe metadata. The same policy covers discovery and receipts,
   configuration, interactions, identity containers and extension values; callers handle originals through
