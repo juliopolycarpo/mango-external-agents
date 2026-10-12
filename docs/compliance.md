@@ -82,6 +82,8 @@ own deployment.
   cannot make the answer hide less than that other, whatever order they ran in or what a newer
   rule makes of the same place. The answer is then read again until a reading changes nothing,
   which makes it a fixed point; a text that does not settle in eight readings is hidden whole.
+  Ordinary text settles in a few readings. Text written to defeat the bound, some hundreds of
+  bytes of dense quoted credential names, can reach it, and the caller then gets the marker alone.
 
   What the newer readers add, and what each costs:
 

@@ -126,9 +126,11 @@ pub(crate) fn message_text(raw: &str) -> String {
     read_until_stable(raw, &union::Plain)
 }
 
-/// The most readings of one text before it is given up on and hidden whole. No input the searches
-/// generate comes near it; it is the bound that makes "a second call changes nothing" hold by
-/// construction.
+/// The most readings of one text before it is given up on and hidden whole. Ordinary text settles
+/// in a few readings: none of the repository's captured vendor payloads needs more than four.
+/// Text written to defeat it, some hundreds of bytes of dense quoted credential names, can reach
+/// the bound, and what a caller then gets is the marker alone. It is the bound that makes "a
+/// second call changes nothing" hold by construction.
 const MAX_READINGS: usize = 8;
 
 /// `raw` read by every reader and `layer` until a reading changes nothing.
