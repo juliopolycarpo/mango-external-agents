@@ -209,7 +209,7 @@ pub(super) struct ParkedTermination {
 }
 
 impl ParkedTermination {
-    fn arc() -> Arc<Self> {
+    pub(super) fn arc() -> Arc<Self> {
         Arc::new(Self {
             entered: AtomicUsize::new(0),
             returned: AtomicUsize::new(0),

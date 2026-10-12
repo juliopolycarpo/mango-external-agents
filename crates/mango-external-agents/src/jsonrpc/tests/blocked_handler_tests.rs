@@ -6,6 +6,7 @@
 //! past it. The primitive is released by the test, and by a guard on every path out of it, so a
 //! failing run leaves no thread blocked and no runtime stuck at shutdown.
 
+use super::abandoned_close_tests::ParkedTermination;
 use super::outbox_tests::{options, until, within};
 use super::*;
 use crate::jsonrpc::{
@@ -239,5 +240,77 @@ async fn a_close_that_failed_to_close_the_link_returns_that_failure_behind_a_blo
     assert!(
         matches!(&closed, Err(Error::Link { message, .. }) if message == "close refused"),
         "expected the link's own failure, Error::Link \"close refused\" | received {closed:?} after {waited:?}"
+    );
+}
+
+/// The options every client here runs under, with no time at all for a close to wait out.
+fn spent() -> ClientOptions {
+    let mut spent = options();
+    spent.shutdown_timeout = Duration::ZERO;
+    spent
+}
+
+/// With a `shutdown_timeout` of zero the close's bound is spent before it reaches the reader.
+/// The first close still takes the reader and aborts it: a handler parked at an await is cut,
+/// and the close completes with `Ok`.
+#[tokio::test(start_paused = true)]
+async fn a_close_with_no_time_left_still_takes_the_reader_down() {
+    let handler = ParkedTermination::arc();
+    let link = ScriptedLink::new();
+    let client = Client::connect(
+        link.clone().into_link(),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        spent(),
+    );
+    link.end();
+    until("the handler to be told of the exit", || {
+        handler.entered.load(Ordering::Acquire) == 1
+    })
+    .await;
+
+    let closed = within("the close", client.close()).await;
+    let observed = (
+        closed.is_ok(),
+        handler.cut.load(Ordering::Acquire),
+        handler.returned.load(Ordering::Acquire),
+    );
+    assert_eq!(
+        observed,
+        (true, 1, 0),
+        "expected a close with no time left to abort the handler's call and complete: (true, 1, 0) | received {observed:?} (closed, cut, returned) with {closed:?}"
+    );
+}
+
+/// The same close behind a handler that blocks its thread gives up with the reader's timeout
+/// once the allowance has passed, and does not wait for the handler.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_with_no_time_left_gives_up_behind_a_blocked_handler() {
+    let gate = ThreadGate::arc();
+    let _release = ReleaseOnDrop(Arc::clone(&gate));
+    let handler = ThreadBlockedTermination::arc(&gate);
+    let link = ScriptedLink::new();
+    let client = Client::connect(
+        link.clone().into_link(),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        spent(),
+    );
+    link.end();
+    until("the handler to block inside on_terminated", || {
+        handler.entered.load(Ordering::Acquire) == 1
+    })
+    .await;
+
+    let bound = READER_ABORT_SETTLE;
+    let began = Instant::now();
+    let closed = tokio::time::timeout(bound + LOAD_MARGIN, client.close()).await;
+    let waited = began.elapsed();
+    let Ok(closed) = closed else {
+        panic!(
+            "expected close to return within {bound:?} | received: still waiting after {waited:?}"
+        );
+    };
+    assert!(
+        matches!(&closed, Err(error) if is_reader_shutdown_timeout(error)),
+        "expected the reader's timeout | received {closed:?} after {waited:?}"
     );
 }
