@@ -24,8 +24,8 @@ use mango_external_agents::process::stop_process_with_limits;
 use mango_external_agents::{
     CancelReason, CancelToken, CloseReason, Configuration, ConfigurationState, Dispatch, Error,
     ErrorCode, EventKind, EventSink, ExecutablePath, HostContext, PermissionResponse, Result,
-    SessionLifecycle, SessionState as CoreSessionState, SessionStatus, StdioSpec, StopOutcome,
-    StructureClose, TurnRequest, TurnStream, VendorError, event, transports::stdio,
+    Resumability, SessionLifecycle, SessionState as CoreSessionState, SessionStatus, StdioSpec,
+    StopOutcome, StructureClose, TurnRequest, TurnStream, VendorError, event, transports::stdio,
 };
 use serde_json::json;
 
@@ -278,8 +278,39 @@ struct Mutable {
     /// prompt. The harness never silently selects a different native id for a strict session;
     /// callers receive an explicit refusal until they open a fresh session themselves.
     nonresumable: Option<CancelReason>,
+    /// Why `nonresumable` was set: the first cause wins, and it is what the snapshot publishes as
+    /// [`Resumability`]. Written only through [`Mutable::mark_nonresumable`].
+    taint: Option<Resumability>,
     /// The one close worker that owns the session artifact and publishes its final state.
     close_teardown: Option<Arc<Teardown>>,
+}
+
+impl Mutable {
+    /// The single writer of the continuation taint, so the refusal `start_turn` gives and the
+    /// verdict the snapshot publishes cannot disagree.
+    ///
+    /// The caller publishes the result with [`publish_resumability`] under the same lock.
+    fn mark_nonresumable(&mut self, reason: CancelReason, cause: Resumability) {
+        self.nonresumable = Some(reason);
+        self.taint.get_or_insert(cause);
+    }
+
+    /// What a host may conclude about the stored conversation right now.
+    ///
+    /// `Unknown` until a `system/init` proves the conversation exists, and again for a strict
+    /// resume no turn has confirmed. A taint outranks both.
+    fn resumability(&self) -> Resumability {
+        match self.taint {
+            Some(cause) => cause,
+            None if self.established => Resumability::Resumable,
+            None => Resumability::Unknown,
+        }
+    }
+}
+
+/// Publishes the verdict of [`Mutable::resumability`] while the caller still holds the lock.
+fn publish_resumability(shared: &Shared, state: &Mutable) {
+    shared.core_state.set_resumability(state.resumability());
 }
 
 impl Drop for Mutable {
@@ -355,6 +386,7 @@ impl ClaudeSession {
             active: None,
             mcp_config: mcp_config.map(Arc::new),
             nonresumable: None,
+            taint: None,
             close_teardown: None,
         };
         Self {
@@ -1000,7 +1032,11 @@ fn record_stop(
     reason: CancelReason,
     settled: bool,
 ) {
-    record_stop_locked(&mut shared.lock(), end, taint_continuation, reason, settled);
+    let mut state = shared.lock();
+    record_stop_locked(&mut state, end, taint_continuation, reason, settled);
+    // Before the stop's waiters are released: a host reading the snapshot once `cancel` returns
+    // sees how this stop ended.
+    publish_resumability(shared, &state);
 }
 
 fn record_stop_locked(
@@ -1027,7 +1063,7 @@ fn record_stop_locked(
     // retire the slot between the reap and its forced-stop taint. A stale cleanup must not taint
     // the continuation a newer attempt now owns.
     if owns_active_turn && taint_continuation {
-        state.nonresumable = Some(reason);
+        state.mark_nonresumable(reason, Resumability::TaintedByKill);
     }
     if should_clear {
         state.active = None;
@@ -2262,9 +2298,11 @@ fn apply_init(shared: &Shared, end: &Arc<TurnEnd>, init: RunInit) -> Result<()> 
             // the host's cleanup later sends SIGINT or escalates. A graceful stop only says the
             // process left cleanly; it cannot establish which history that process had loaded.
             mark_unconfirmed_resume_nonresumable(&mut state, end);
+            publish_resumability(shared, &state);
             return Err(error);
         }
     };
+    publish_resumability(shared, &state);
 
     if let Some(commands) = init.commands {
         shared
@@ -2394,7 +2432,9 @@ fn resume_confirmation_pending(shared: &Shared) -> bool {
 /// This is separate from forced-stop tainting. A graceful interrupt preserves an established
 /// Claude conversation, but it cannot turn an unverified resume into a verified one.
 fn taint_unconfirmed_resume(shared: &Shared, end: &TurnEnd) {
-    mark_unconfirmed_resume_nonresumable(&mut shared.lock(), end);
+    let mut state = shared.lock();
+    mark_unconfirmed_resume_nonresumable(&mut state, end);
+    publish_resumability(shared, &state);
 }
 
 /// Records a strict-resume verification failure only while this attempt still owns the session.
@@ -2405,7 +2445,10 @@ fn mark_unconfirmed_resume_nonresumable(state: &mut Mutable, end: &TurnEnd) {
             .as_ref()
             .is_some_and(|active| std::ptr::eq(active.end.as_ref(), end))
     {
-        state.nonresumable = Some(end.get().copied().unwrap_or(CancelReason::Shutdown));
+        state.mark_nonresumable(
+            end.get().copied().unwrap_or(CancelReason::Shutdown),
+            Resumability::Unverified,
+        );
     }
 }
 
@@ -2465,8 +2508,46 @@ mod tests {
         install_teardown_locked, no_result_error, prompt_line, record_stop_locked, request_stop,
         settle_owner_locked,
     };
-    use mango_external_agents::{CancelReason, CancelToken, ExitStatus};
+    use mango_external_agents::{CancelReason, CancelToken, ExitStatus, Resumability};
     use std::sync::Arc;
+
+    /// The verdict a host reads is derived from the same state `start_turn` refuses on, in the
+    /// order the conversation lived through it.
+    #[test]
+    fn the_verdict_follows_the_conversation_and_the_first_taint_wins() {
+        let mut state = Mutable::default();
+        assert_eq!(state.resumability(), Resumability::Unknown);
+
+        state.established = true;
+        assert_eq!(state.resumability(), Resumability::Resumable);
+
+        state.mark_nonresumable(CancelReason::Requested, Resumability::TaintedByKill);
+        assert_eq!(state.resumability(), Resumability::TaintedByKill);
+
+        state.mark_nonresumable(CancelReason::Shutdown, Resumability::Unverified);
+        let received = state.resumability();
+        assert_eq!(
+            received,
+            Resumability::TaintedByKill,
+            "expected the first cause to stay: tainted-by-kill | received: {received}"
+        );
+        assert_eq!(
+            state.nonresumable,
+            Some(CancelReason::Shutdown),
+            "expected the refusal to carry the latest reason, as before"
+        );
+    }
+
+    /// A strict resume that never reached `system/init` is not an established conversation, and a
+    /// taint still outranks that.
+    #[test]
+    fn an_unconfirmed_resume_is_unknown_until_it_is_tainted() {
+        let mut state = Mutable::default();
+        state.resume_pending = true;
+        assert_eq!(state.resumability(), Resumability::Unknown);
+        state.mark_nonresumable(CancelReason::Shutdown, Resumability::Unverified);
+        assert_eq!(state.resumability(), Resumability::Unverified);
+    }
 
     /// `cancel` takes the turn under one guard and names its teardown under the next, and the pump
     /// runs between them on another worker: after Claude's own `result`, `record_stop` marks the

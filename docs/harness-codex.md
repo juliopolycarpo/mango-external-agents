@@ -143,6 +143,11 @@ mean configuration failure, so other refusals, timeouts and broken connections r
 This distinction follows the pinned [thread resume error mapping][resume-error] and is covered by
 fake app-server tests for both outcomes.
 
+`SessionSnapshot::resumability` is always `Resumability::Unknown` here. The app-server resumes a
+thread by id however a turn ended, and a cancelled turn ends with the vendor's own `interrupted`
+status, so there is no stop outcome to turn into a verdict. A host that stored a Codex
+thread id attempts `thread/resume` and reads the result; `Unknown` is not a warning.
+
 `turn/start` on a live turn is taken by the app-server as a **steer** — its own documentation says
 `turnTrigger` is "ignored when this request steers an already-active turn". A host that meant a new
 turn would hold a stream that never gets a `turn/completed` of its own, so admission is one locked

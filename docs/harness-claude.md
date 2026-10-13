@@ -247,16 +247,52 @@ session is `Closed` and close reports the removal error.
 **The vendor's own turn is left unfinished.** This is a real asymmetry and it is the vendor's
 documented behaviour, not this harness's choice:
 
-> If you stop a `claude -p` run with SIGTERM … Claude Code exits with code 143. Claude Code leaves
-> the turn that was in progress unfinished and records no result for it. … When you resume the
-> session, Claude Code continues the turn that SIGTERM left unfinished.
+> If you stop a `claude -p` run with SIGTERM, for example with `kill` or from a process
+> supervisor, Claude Code exits with code 143. Claude Code leaves the turn that was in progress
+> unfinished and records no result for it. To end the turn instead, send SIGINT … When you resume
+> the session, Claude Code leaves the interrupted turn as it is, and your next prompt drives the
+> conversation. To have Claude Code continue the interrupted turn on resume instead, set
+> `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`.
 > — [headless.md](https://code.claude.com/docs/en/headless.md)
+
+An earlier revision of that page said the opposite default ("Claude Code continues the turn that
+SIGTERM left unfinished"), and this harness was written against it. The default has since changed,
+and the opt-in variable can still be turned on in the vendor's own configuration, which this
+library neither reads nor controls. The harness therefore keeps the conservative reading: it cannot
+prove that a killed conversation will not resume work the user cancelled.
 
 After forced termination the harness marks the session nonresumable and refuses another turn with
 the recorded cancellation reason. It never silently mints a replacement native conversation for a
 strict session, and it never resumes the killed prompt. SIGINT is what the vendor documents as
 ending a turn cleanly. A launcher reports that graceful interruption separately from forced
 termination, which preserves the existing native continuation.
+
+### Resumability after a stop
+
+`Session::cancel` returns `Ok(())` for a clean interrupt and for a kill alike, and the
+`Cancelled` marker carries only the host's reason. How the stop ended is on the snapshot instead:
+`SessionSnapshot::resumability`, a non-exhaustive `Resumability`. It is published before `cancel`
+returns, and a `SessionSubscription` wakes for it.
+
+| Value           | Meaning for Claude                                                                                  | Strict resume          |
+| --------------- | --------------------------------------------------------------------------------------------------- | ---------------------- |
+| `Unknown`       | No `system/init` yet, or a strict resume no turn has confirmed. No evidence either way.             | decide on other facts  |
+| `Resumable`     | `system/init` proved the conversation exists, and every stop since was a clean finish or a SIGINT.  | safe                   |
+| `TaintedByKill` | The child had to be force-terminated (SIGTERM or process-tree kill), even before its `system/init`. | do not; open a new one |
+| `Unverified`    | A strict resume was not confirmed: another handle, or the CLI ended before `system/init`.           | do not; open a new one |
+
+A tainted value is permanent for the session and equals the refusal `start_turn` gives
+(`Error::Cancelled` with the recorded reason); the first cause wins. A host that persists the
+vendor handle stores the value beside it whenever it changes, and strict-resumes a stored
+conversation only when it reads `Resumable`. `Resumability::allows_strict_resume` is that test.
+
+```rust,ignore
+session.cancel(CancelReason::Requested).await?;
+let stored = session.snapshot().resumability;
+database.save(session.ids().native_session_id, stored); // serde: "tainted-by-kill", ...
+```
+
+Codex and ACP sessions report `Unknown` always; see their guides for what a host does there.
 
 Closing stdin is also what the vendor documents as cancelling a pending prompt, and this harness
 closes it immediately after the prompt — so a run that would otherwise wait for an answer nobody

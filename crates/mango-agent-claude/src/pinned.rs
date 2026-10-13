@@ -70,10 +70,10 @@ pub const VENDOR_ENVIRONMENT_KEYS: &[&str] =
 /// transcript for something the user asked for.
 ///
 /// The same page is explicit that SIGTERM leaves the vendor's own turn **unfinished** — "Claude
-/// Code leaves the turn that was in progress unfinished and records no result for it … When you
-/// resume the session, Claude Code continues the turn that SIGTERM left unfinished." The
-/// cancellation this harness reports is therefore the host's, not the vendor's; see
-/// `docs/harness-claude.md`.
+/// Code leaves the turn that was in progress unfinished and records no result for it". Whether a
+/// later resume then continues that turn depends on the vendor revision and on
+/// `CLAUDE_CODE_RESUME_INTERRUPTED_TURN`. The cancellation this harness reports is therefore the
+/// host's, not the vendor's; see `docs/harness-claude.md`.
 ///
 /// <https://code.claude.com/docs/en/headless.md>
 pub const SIGTERM_EXIT_CODE: i32 = 143;
