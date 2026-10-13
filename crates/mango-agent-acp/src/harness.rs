@@ -41,9 +41,9 @@ use mango_external_agents::session::{
 use mango_external_agents::state::{SessionSnapshot, TransportSelection};
 use mango_external_agents::transport::TransportKind;
 use mango_external_agents::{
-    AcpSpec, AuthState, Capabilities, CapabilityCeiling, DiscoveredCapabilities, Discovery, Error,
-    ExecutablePath, GateVerdict, Harness, HarnessDescriptor, HarnessIdentity, HostContext,
-    LaunchSpec, LineLimits, LineStream, Result, SessionId, StdioSpec,
+    AcpSpec, AuthState, Capabilities, CapabilityCeiling, DiscoveredCapabilities, Discovery,
+    DiscoveryReceipt, Error, ExecutablePath, GateVerdict, Harness, HarnessDescriptor,
+    HarnessIdentity, HostContext, LaunchSpec, LineLimits, LineStream, Result, SessionId, StdioSpec,
 };
 
 use crate::client::{self, SessionState};
@@ -481,6 +481,11 @@ impl Harness for AcpHarness {
             }
             .with_dispatch(mango_external_agents::Dispatch::NotSubmitted));
         }
+        // A floor the profile pinned is applied before the agent exists: starting a build the
+        // profile refuses is already running it against the user's own configuration.
+        // Returned as the bare `VersionGate`, as the Codex and Claude harnesses return theirs.
+        self.refuse_below_floor_before_spawn(host, executable, request.discovery.as_ref())
+            .await?;
         let spec = AcpSpec::ChildPipes(StdioSpec::new(self.profile.resolved_argv(executable)));
         let launched =
             transport::connect(host, &spec, self.descriptor.vendor_environment_keys).await?;
@@ -728,6 +733,8 @@ impl Harness for AcpHarness {
     ) -> Result<SessionPage> {
         host.absolute_cwd()?;
         validate_listing_workspace(host, &query)?;
+        self.refuse_below_floor_before_spawn(host, &self.executable, None)
+            .await?;
         let spec =
             AcpSpec::ChildPipes(StdioSpec::new(self.profile.resolved_argv(&self.executable)));
         let launched =
@@ -791,6 +798,48 @@ struct Opened {
 }
 
 impl AcpHarness {
+    /// Applies the profile's `minimum_version` before any agent process is started.
+    ///
+    /// Nothing happens for a profile that pins no floor, which is every built-in one. Otherwise
+    /// the version is the host's receipt when it passed one (it has already paid for that probe)
+    /// and one run of the profile's version argv when it did not. A version that cannot be read
+    /// or compared is `Unknown` and proceeds; an executable that cannot be launched is left for
+    /// the agent launch that follows to report.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::VersionGate`] when the version is readable and below the floor.
+    async fn refuse_below_floor_before_spawn(
+        &self,
+        host: &HostContext,
+        executable: &ExecutablePath,
+        receipt: Option<&DiscoveryReceipt>,
+    ) -> Result<()> {
+        let Some(minimum) = self.profile.minimum_version.as_deref() else {
+            return Ok(());
+        };
+        let version = match receipt {
+            Some(receipt) => receipt.discovery.version.clone(),
+            None => {
+                let argv = self.profile.resolved_version_argv(executable);
+                if argv.is_empty() {
+                    return Ok(());
+                }
+                match run_version(host, &self.descriptor, argv).await {
+                    Ok(version) => version,
+                    Err(Error::Launch { .. }) => return Ok(()),
+                    Err(error) => return Err(error),
+                }
+            }
+        };
+        match gate(version.as_deref(), Some(minimum)) {
+            GateVerdict::VersionTooOld { found, minimum } => {
+                Err(Error::VersionGate { found, minimum })
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The handshake and the session, as one fallible step the caller can tear down after.
     async fn handshake_and_open(
         &self,

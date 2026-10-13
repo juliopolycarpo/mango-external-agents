@@ -859,8 +859,15 @@ invariant, not a default. A profile test asserts no built-in argv names one. A h
 
 ### No version floors
 
-No profile pins a `minimum_version`. A floor nobody has checked would refuse a build that works, and
-`GateVerdict::Unknown` is the honest answer for a version this harness cannot read.
+No built-in profile pins a `minimum_version`. A floor nobody has checked would refuse a build that
+works, and `GateVerdict::Unknown` is the honest answer for a version this harness cannot read.
+
+A host's custom profile may pin one with `AcpProfile::with_minimum_version`. Discovery reports it as
+`GateVerdict::VersionTooOld`, and `open_session` and `list_sessions` apply it before the agent is
+started: they refuse with `Error::VersionGate { found, minimum }` and launch nothing but the profile's
+version argv. The version comes from the `DiscoveryReceipt` on the request when the host passed one,
+and otherwise from one run of that argv. A profile with no floor pays for no probe, and a version
+that cannot be read proceeds as `Unknown`.
 
 ### Environment keys
 
