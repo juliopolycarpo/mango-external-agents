@@ -16,13 +16,25 @@ use super::{Random, labels};
 use crate::StderrTail;
 use crate::redact::stderr_tail;
 
-const PREFIXES: [&str; 6] = [
+const PREFIXES: [&str; 8] = [
     "",
     "",
     "stderr | ",
     "2026-10-13T10:00:00Z [agent] ",
     "  ",
     "> ",
+    "\u{2713} ",
+    "\u{65e5}\u{672c} | ",
+];
+
+/// Text with characters of two, three and four bytes and a combining mark, which a push, a block
+/// or a cut can split anywhere.
+const MULTIBYTE: [&str; 5] = [
+    "na\u{ef}ve caf\u{e9} \u{65e5}\u{672c}\u{8a9e} \u{2713} done",
+    "e\u{301}e\u{301}e\u{301} combining",
+    "\u{1f980}\u{1f980} four-byte characters \u{1f4a5}",
+    "loading 10%\r",
+    "\u{2713}",
 ];
 const KEY_LABELS: [&str; 7] = [
     "PRIVATE KEY",
@@ -101,6 +113,10 @@ pub(super) fn stream(random: &mut Random) -> Stream {
     'stream: for _ in 0..1 + random.below(7) {
         canary += 1;
         match random.below(6) {
+            0 if random.below(2) == 0 => {
+                let wide = *random.pick(&MULTIBYTE);
+                line(&mut text, &format!("{wide} {canary}"));
+            }
             0 => line(&mut text, &format!("filler line {canary} is fine")),
             1 => line(
                 &mut text,
@@ -118,6 +134,9 @@ pub(super) fn stream(random: &mut Random) -> Stream {
                 for _ in 0..random.below(9) {
                     canary += 1;
                     line(&mut text, &body(canary));
+                    if random.below(8) == 0 {
+                        line(&mut text, "warn: retrying in 2s");
+                    }
                 }
                 if random.below(6) == 0 {
                     line(&mut text, "=AbCd");

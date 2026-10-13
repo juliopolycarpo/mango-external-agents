@@ -172,6 +172,37 @@ enum KeyLine {
     Other,
 }
 
+/// The spans a tail that starts inside a private key hides: the key as the whole stream hides it
+/// when its end marker is in reach, and the leading run of its lines otherwise.
+///
+/// `left` is how many bytes of the tail are still within [`MAX_BLOCK_BYTES`] of the begin marker
+/// that the cut dropped. When the first `-----END ` of the text starts within that and closes a
+/// private key, the whole stream's block read hides everything from the begin marker to it, so the
+/// tail hides everything from its first key line (or its start, when the first line is not a key's)
+/// to it, lines in between that are not a key's included: another writer's line between the key's
+/// lines is hidden with the key. With no end marker in reach only the leading run of key-shaped
+/// lines is hidden, and a line that is not a key's ends it.
+///
+/// # Example
+///
+/// ```ignore
+/// let text = "QUJDREVGR0hJSktMTU5P\nwarn: retrying in 2s\nQUJDREVGR0hJSktMTU5P\n-----END PRIVATE KEY-----\nok\n";
+/// assert_eq!(inside_key_hides(text, 16 * 1024).len(), 1);
+/// ```
+pub(super) fn inside_key_hides(text: &str, left: usize) -> Vec<Hide> {
+    let run = leading_key_run_hides(text);
+    let window = text.floor_char_boundary(left.saturating_add(MAX_MARK_BYTES).min(text.len()));
+    let Some(marker) = text[..window].find("-----END ").filter(|at| *at <= left) else {
+        return run;
+    };
+    count_steps(marker + 1);
+    let Some(close) = end_marker_close(text.as_bytes(), marker) else {
+        return run;
+    };
+    let from = run.first().map_or(0, |hide| hide.start);
+    vec![Hide::marker(from, close)]
+}
+
 /// The spans of the leading run of a key's lines in `text`, for a tail whose first byte is inside
 /// a private key because the begin marker was dropped by the cut.
 ///
@@ -373,6 +404,11 @@ pub(super) fn last_key_mark_after(bytes: &[u8], after: usize) -> Option<KeyMark>
     // reads a word at a time) and then past its run.
     let text = std::str::from_utf8(bytes).ok();
     loop {
+        // The place the search starts is a lower bound and a marker is ASCII, so it moves on to a
+        // character boundary when `after` fell inside a multibyte character.
+        if let Some(text) = text {
+            at = text.ceil_char_boundary(at.min(text.len()));
+        }
         let offset = match text {
             Some(text) => text.get(at..).and_then(|rest| rest.find('-')),
             None => bytes

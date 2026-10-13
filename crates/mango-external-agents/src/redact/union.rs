@@ -344,15 +344,18 @@ impl Layer for Tail {
 }
 
 /// A stderr tail whose first byte is inside a private key: [`Tail`], and the lines of the key that
-/// the cut left at its start (`tokens::leading_key_run_hides`).
-pub(super) struct TailInsideKey;
+/// the cut left at its start (`tokens::inside_key_hides`).
+pub(super) struct TailInsideKey {
+    /// How many bytes of the text are within the reach of the dropped begin marker.
+    pub(super) left: usize,
+}
 
 impl Layer for TailInsideKey {
     fn own_spans(&self, plain: &str, marked: bool) -> Option<Vec<Hide>> {
         Some(union(vec![
             floor::current_hides(plain, marked),
             tokens::tail_hides(plain),
-            tokens::leading_key_run_hides(plain),
+            tokens::inside_key_hides(plain, self.left),
         ]))
     }
 }

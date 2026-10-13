@@ -210,7 +210,11 @@ own deployment.
   lines, a PEM or PGP header, blank lines, the PGP checksum, one shorter last line (or a line still
   being written at the end of the tail) and an end marker directly after, behind the one prefix that
   every line carries. No begin line is put back, so the first line that is none of these ends the
-  run and everything after it reads as any text: a sentence that mentions the begin marker, with
+  run and everything after it reads as any text, unless the key's end marker is in the tail within
+  16 KiB of the begin marker (the reach of a block, counted from what the tail dropped): then the
+  whole stream hides everything from the begin marker to the end marker, and the tail hides
+  everything from its first key line to that marker, a line another writer put between the key's
+  lines included: a sentence that mentions the begin marker, with
   ordinary log lines after it, hides nothing ordinary. The state expires 64 KiB after the begin
   marker, farther than any block reaches, and a public key or a certificate opens nothing. A text
   that is handed to `stderr_tail` without the stream behind it (the tail a host's own
@@ -267,9 +271,9 @@ own deployment.
   - a text handed to `stderr_tail` whose private key lost its begin line and whose end marker is
     not in it either: `StderrTail::read` hides the leading run of the key's lines from what it
     dropped, but a text that comes from a host's own control has no begin marker to go by. A
-    stderr tail that starts inside a key reads only the leading run of key-shaped lines, so a
-    key whose lines are interrupted by a line that is not a key's (and continues after it) shows
-    the lines after the interruption;
+    stderr tail that starts inside a key with no end marker in reach reads only the leading run
+    of key-shaped lines, so a key whose lines are interrupted by a line that is not a key's shows
+    what follows the interruption;
   - a bare token outside the closed list, and any credential with no prefix: an AWS secret access
     key (40 characters of base64) or an Azure key has nothing to recognise it by;
   - a key's body at the start of a text handed to `stderr_tail` when its lines do not share one

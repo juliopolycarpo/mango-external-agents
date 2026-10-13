@@ -162,9 +162,10 @@ pub fn stderr_tail(raw: &str) -> String {
 
 /// [`stderr_tail`] for a tail whose first byte is inside a private key, because the begin marker
 /// was in the text the tail's cut dropped: the lines of the key at the start of the text are hidden
-/// too (`tokens::leading_key_run_hides`).
-pub(crate) fn stderr_tail_inside_key(raw: &str) -> String {
-    read_until_stable(raw, &union::TailInsideKey)
+/// too (`tokens::inside_key_hides`). `left` is how many bytes of the text are still within the
+/// reach of a block from the begin marker (`OpenKey::left`).
+pub(crate) fn stderr_tail_inside_key(raw: &str, left: usize) -> String {
+    read_until_stable(raw, &union::TailInsideKey { left })
 }
 
 /// What a vendor's message is shown as: everything [`stderr_text`] hides, and the well-known tokens

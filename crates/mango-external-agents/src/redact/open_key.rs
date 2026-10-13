@@ -103,8 +103,16 @@ fn may_end_a_marker(dropped: &[u8]) -> bool {
 impl OpenKey {
     /// Whether the text fed ends inside a private key: its last marker is a begin marker, which
     /// no end marker has closed and [`REACH`] has not passed.
+    #[cfg(test)]
     pub(crate) fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// How many bytes after the text fed so far still lie within the reach of the begin marker
+    /// that opened the key, or `None` when no key is open. A block closes a key only when its end
+    /// marker starts within that many bytes of the begin marker.
+    pub(crate) fn left(&self) -> Option<usize> {
+        self.open.then(|| REACH.saturating_sub(self.since))
     }
 
     /// Reads the next bytes the tail dropped.
@@ -137,7 +145,10 @@ impl OpenKey {
             let joined = [kept, dropped].concat();
             let (plain, _) = strip_marking(&String::from_utf8_lossy(&joined));
             let (before, _) = strip_marking(&String::from_utf8_lossy(kept));
-            last_key_mark_after(plain.as_bytes(), before.len())
+            // The carry may end inside a multibyte character or an escape, which the two decodes
+            // read as different lengths; a marker that closes within a few bytes of the end of the
+            // carry is read again, and reading it again changes nothing.
+            last_key_mark_after(plain.as_bytes(), before.len().saturating_sub(4))
         } else {
             None
         };
@@ -146,12 +157,17 @@ impl OpenKey {
             Some(KeyMark::End) => (self.open, self.since) = (false, 0),
             None => {}
         }
-        self.since = self.since.saturating_add(dropped.len());
+        // The bytes of the block after the marker are not counted: the count errs towards a key
+        // that is still in reach, which hides more and never less.
+        if marker.is_none() {
+            self.since = self.since.saturating_add(dropped.len());
+        }
         self.keep(dropped);
         if self.since > REACH {
-            // A key this old was a sentence that mentioned a marker. What the carry holds is not
-            // read again, or the marker in it would open the key once more.
-            (self.open, self.since, self.carried) = (false, 0, 0);
+            // A key this old was a sentence that mentioned a marker. The carry stays: a marker that
+            // starts in it and ends in the next drop is a new one, and the old marker is farther
+            // back than the carry reaches.
+            (self.open, self.since) = (false, 0);
         }
     }
 
@@ -284,6 +300,153 @@ mod tests {
                 expected,
                 "expected {drop:?} to be {}",
                 if expected { "read" } else { "skipped" }
+            );
+        }
+    }
+
+    /// The oracle: after any feed sequence, the state is open exactly when the last private-key
+    /// marker of the whole history is a begin marker and no more than [`REACH`] bytes follow it,
+    /// whatever the pieces are written with (escapes before and inside a marker, multibyte text,
+    /// dashes that are not a marker) and wherever the feeds split them (inside a marker, an escape
+    /// or a character; across the carry and the block).
+    #[test]
+    fn the_state_is_open_exactly_when_the_last_marker_is_a_begin_within_reach() {
+        let begin = "-----BEGIN PRIVATE KEY-----\n";
+        let begin_rsa = "-----BEGIN RSA PRIVATE KEY-----\n";
+        let end = "-----END PRIVATE KEY-----\n";
+        let end_ec = "-----END EC PRIVATE KEY-----\n";
+        let colour_begin = "\u{1b}[36m-----BEGIN PRIVATE KEY-----\n";
+        let inside_begin = "-----BEGIN \u{1b}[0mPRIVATE KEY-----\n";
+        let bold_begin = "\u{1b}[1m-----BEGIN OPENSSH PRIVATE KEY-----\u{1b}[0m\n";
+        let title_end = "\u{1b}]0;title\u{7}-----END PRIVATE KEY-----\n";
+        let wide_begin = "\u{2713} -----BEGIN PRIVATE KEY-----\n";
+        let notes: [&str; 11] = [
+            "-----BEGIN CERTIFICATE-----\n",
+            "-----BEGIN PUBLIC KEY-----\n",
+            "-----END CERTIFICATE-----\n",
+            "----------------------------------------\n",
+            "-----BEGIN PRIVATE KEY----\n",
+            "na\u{ef}ve caf\u{e9} \u{65e5}\u{672c}\u{8a9e} \u{2713} done\n",
+            "request id 7f3c2a1e-9b4d-4c8a-a1b2-0123456789ab\n",
+            "loading 10%\r",
+            "\u{1f980}\u{1f980} e\u{301}e\u{301}\n",
+            "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=\n",
+            "e--f -- ---- -----\n",
+        ];
+        let begins = [
+            begin,
+            begin_rsa,
+            colour_begin,
+            inside_begin,
+            bold_begin,
+            wide_begin,
+        ];
+        let ends = [end, end_ec, title_end];
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move |below: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            usize::try_from(seed % below as u64).unwrap_or(0)
+        };
+        let sizes = [
+            1,
+            2,
+            3,
+            7,
+            55,
+            56,
+            57,
+            64,
+            255,
+            256,
+            257,
+            1000,
+            4095,
+            4096,
+            4097,
+            usize::MAX,
+        ];
+        let mut open_cases = 0;
+        let cases: usize = std::env::var("MEA_OPEN_KEY_CASES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(4000);
+        for case in 0..cases {
+            let mut text = String::new();
+            let mut state = (false, 0usize); // open, raw bytes since the last marker
+            let mut shape = Vec::new();
+            for _ in 0..1 + next(8) {
+                let (piece, mark) = match next(5) {
+                    0 => (begins[next(begins.len())].to_owned(), Some(true)),
+                    1 => (ends[next(ends.len())].to_owned(), Some(false)),
+                    2 => (
+                        "x".repeat(if next(6) == 0 { 22_000 } else { 1 + next(900) }) + "\n",
+                        None,
+                    ),
+                    _ => (notes[next(notes.len())].to_owned(), None),
+                };
+                shape.push((mark, text.len(), piece.len()));
+                text.push_str(&piece);
+                match mark {
+                    Some(open) => state = (open, 0),
+                    None => state.1 += piece.len(),
+                }
+            }
+            let expected = state.0 && state.1 <= REACH;
+            open_cases += usize::from(expected);
+            for _ in 0..3 {
+                let mut key = OpenKey::default();
+                let mut rest = text.as_bytes();
+                let mut splits = Vec::new();
+                while !rest.is_empty() {
+                    let size = sizes[next(sizes.len())].min(rest.len());
+                    splits.push(size);
+                    key.feed(&rest[..size]);
+                    rest = &rest[size..];
+                }
+                assert_eq!(
+                    key.is_open(),
+                    expected,
+                    "expected the key {} after case {case} | received {} | splits {splits:?} | pieces {shape:?} | history {:?}",
+                    if expected { "open" } else { "closed" },
+                    if expected { "closed" } else { "open" },
+                    text.chars().take(160).collect::<String>()
+                        + &format!(" ... {} bytes", text.len())
+                );
+            }
+        }
+        assert!(
+            open_cases > cases / 20,
+            "expected the oracle to reach the open state | received {open_cases} of {cases}"
+        );
+    }
+
+    #[test]
+    fn a_marker_split_where_the_old_key_expires_is_still_read_whole() {
+        let mut first = BEGIN.to_vec();
+        first.resize(6 * BLOCK - 20, b'x');
+        first.extend_from_slice(b"\n-----BEGIN PRIVATE");
+        let key = fed(&[&first, b" KEY-----\n"]);
+        assert!(
+            key.is_open(),
+            "expected the second key open although the first expired inside the block that holds the start of its marker | received closed"
+        );
+    }
+
+    #[test]
+    fn a_marker_after_multibyte_text_is_read_in_a_second_feed() {
+        // The search for a split marker starts a few dozen bytes before the end of the carry, at
+        // every alignment against the three-byte character at the start of it.
+        for padding in 0..8 {
+            let first = format!(
+                "\u{2713} done\nrequest id 7f3c2a1e-9b4d-4c8a-a1b2-0123456789ab{}\n",
+                "a".repeat(padding)
+            );
+            let key = fed(&[first.as_bytes(), BEGIN]);
+            assert!(
+                key.is_open(),
+                "expected open after multibyte text and a begin marker in a second feed, padding {padding} | received closed"
             );
         }
     }

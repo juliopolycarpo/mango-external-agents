@@ -582,7 +582,8 @@ impl StderrTail {
     /// blank line, the PGP checksum, one shorter last line or a line still being written) behind
     /// the one prefix every line carries, and an end marker right after. No begin line is put
     /// back: the first line that is not a key's ends the run, and everything after it reads as
-    /// any text. Public keys and certificates are not private keys and open nothing.
+    /// any text, unless the end marker is in the tail within the reach of a block from the begin
+    /// marker (16 KiB): then everything up to it is hidden, as the whole stream hides it. Public keys and certificates are not private keys and open nothing.
     ///
     /// # Example
     ///
@@ -594,12 +595,9 @@ impl StderrTail {
     /// assert_eq!(tail.read(), "Authorization: Bearer [REDACTED]");
     /// ```
     pub fn read(&self) -> String {
-        self.read_with(|text, inside_key| {
-            if inside_key {
-                redact::stderr_tail_inside_key(text)
-            } else {
-                redact::stderr_tail(text)
-            }
+        self.read_with(|text, left| match left {
+            Some(left) => redact::stderr_tail_inside_key(text, left),
+            None => redact::stderr_tail(text),
         })
     }
 
@@ -612,12 +610,12 @@ impl StderrTail {
     /// concurrent reader runs the same function on its own copy. A push that lands after the copy
     /// is not part of this read and is part of the next, so the tail is read as one snapshot, in
     /// push order.
-    fn read_with(&self, reader: impl FnOnce(&str, bool) -> String) -> String {
-        let (copy, inside_key) = {
+    fn read_with(&self, reader: impl FnOnce(&str, Option<usize>) -> String) -> String {
+        let (copy, left) = {
             let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            (state.buffer.clone(), state.key.is_open())
+            (state.buffer.clone(), state.key.left())
         };
-        reader(&String::from_utf8_lossy(&copy), inside_key)
+        reader(&String::from_utf8_lossy(&copy), left)
     }
 }
 
@@ -2076,6 +2074,32 @@ mod tests {
             checked > 700,
             "expected most reads checked | received {checked}"
         );
+    }
+
+    /// The reviewer's public repro: multibyte text before the begin marker, pushed in pieces that
+    /// cut the text anywhere.
+    #[test]
+    fn a_key_after_multibyte_text_is_hidden_at_every_push_size() {
+        let base64 = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj";
+        let mut stream = String::from(
+            "na\u{ef}ve caf\u{e9} \u{65e5}\u{672c}\u{8a9e} \u{2713} done\nerror: connection refused (os error 111)\nloading 10%\r",
+        );
+        stream.push_str("-----BEGIN PRIVATE KEY-----\n");
+        stream.push_str(&format!("{base64}\n{base64}\nfiller line\n"));
+        for (size, padding) in
+            (0..8).flat_map(|padding| [1, 2, 3, 16, 64].map(|size| (size, padding)))
+        {
+            let stream = stream.replacen("done\n", &format!("done{}\n", "a".repeat(padding)), 1);
+            let (kept, shown) = shown_in_tail(&stream, 150, size);
+            assert!(
+                !kept.contains("BEGIN") && kept.contains("MIIEvQ"),
+                "expected the cut to drop the begin line and keep body lines, push size {size}, padding {padding} | received {kept:?}"
+            );
+            assert!(
+                !shown.contains("MIIEvQ"),
+                "expected the body hidden, push size {size}, padding {padding} | received {shown:?}"
+            );
+        }
     }
 
     #[test]

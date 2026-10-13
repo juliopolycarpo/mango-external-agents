@@ -1086,7 +1086,7 @@ fn a_tail_inside_a_key_hides_the_leading_run_of_the_keys_lines_and_no_more() {
             "[REDACTED]\nok\nINFO request 7 finished\n".to_owned(),
         ),
     ] {
-        let hidden = inside(&text);
+        let hidden = inside(&text, 16 * 1024);
         assert_eq!(
             hidden, expected,
             "expected {what} read as the start of a key | input {text:?}"
@@ -1099,6 +1099,31 @@ fn a_tail_inside_a_key_hides_the_leading_run_of_the_keys_lines_and_no_more() {
 fn a_tail_inside_a_key_leaves_ordinary_lines_alone() {
     let text =
         "INFO request 7 finished in 12ms\nWARN retrying the connection\ndeadbeef is a word\n";
-    assert_eq!(super::stderr_tail_inside_key(text), text);
+    assert_eq!(super::stderr_tail_inside_key(text, 16 * 1024), text);
     assert_eq!(super::stderr_tail(text), text);
+}
+
+/// Another writer's line between a key's lines is hidden with the key when the end marker is in
+/// reach of the begin marker, as the whole stream hides it, and is read as any text when it is not.
+#[test]
+fn a_line_between_a_keys_lines_is_hidden_when_the_end_marker_is_in_reach() {
+    use super::stderr_tail_inside_key as inside;
+    let long = KEY_LINE;
+    let text = format!("{long}\n{long}\nwarn: retrying in 2s\n{long}\n{END}\nafter\n");
+    let in_reach = inside(&text, 16 * 1024);
+    assert_eq!(
+        in_reach, "[REDACTED]\nafter\n",
+        "expected the key hidden to its end marker, the interleaved line with it | input {text:?}"
+    );
+    let out_of_reach = inside(&text, 0);
+    assert!(
+        out_of_reach.contains("warn: retrying in 2s\n") && out_of_reach.ends_with("after\n"),
+        "expected the lines past the leading run read as any text | received {out_of_reach:?}"
+    );
+    let prefixed = format!("stderr | {long}\nwarn: x\nstderr | {long}\nstderr | {END}\nafter\n");
+    assert_eq!(
+        inside(&prefixed, 16 * 1024),
+        "stderr | [REDACTED]\nafter\n",
+        "expected the first line's prefix to stay | input {prefixed:?}"
+    );
 }
