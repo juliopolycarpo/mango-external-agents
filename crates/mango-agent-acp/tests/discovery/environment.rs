@@ -15,9 +15,15 @@ const BASE_LOCATIONS: [(&str, &str); 4] = [
     ("XDG_CACHE_HOME", "/work/xdg/cache"),
 ];
 
-/// Variables no child may receive: a session directory, credentials, and proxies that can carry
-/// userinfo.
-const NEVER_FORWARDED: [(&str, &str); 19] = [
+/// Variables no child may receive: a session directory, credentials, proxies that can carry
+/// userinfo, and the variables that make a process load code it was not shipped with.
+const NEVER_FORWARDED: [(&str, &str); 25] = [
+    ("LD_PRELOAD", "/work/canary-preload.so"),
+    ("LD_LIBRARY_PATH", "/work/canary-libs"),
+    ("DYLD_INSERT_LIBRARIES", "/work/canary-insert.dylib"),
+    ("DYLD_LIBRARY_PATH", "/work/canary-dylibs"),
+    ("NODE_OPTIONS", "--require /work/canary.js"),
+    ("BUN_OPTIONS", "--preload /work/canary.js"),
     ("ANTHROPIC_API_KEY", "canary-anthropic-key"),
     ("ANTHROPIC_AUTH_TOKEN", "canary-anthropic-token"),
     ("CLAUDE_CODE_OAUTH_TOKEN", "canary-claude-oauth"),
