@@ -879,9 +879,15 @@ vendor documents were read on 2026-10-13.
 | `copilot`  | `COPILOT_HOME`        | the whole `~/.copilot` tree                         | [Copilot config directory](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference): "You can change the location of this directory by setting the `COPILOT_HOME` environment variable" |
 | `goose`    | `GOOSE_PATH_ROOT`     | "all goose data, config, and state files"           | [Goose environment variables](https://github.com/block/goose/blob/main/documentation/docs/guides/environment-variables.md)                                                                                                  |
 
-`codex-acp` and `claude-agent-acp` add no location variable: their READMEs name none. The CLIs they
-wrap document `CODEX_HOME` and `CLAUDE_CONFIG_DIR`, which the Codex and Claude harnesses forward;
-carrying them across to an adapter that does not state them is left for a capture that proves it.
+The two adapters forward the variable of the CLI they drive, which the Codex and Claude harnesses
+already forward. Neither adapter's README names it, so the documents are the underlying CLI's:
+
+| Profile            | Key added           | Document                                                                                                                                                                                                                                                                                |
+| ------------------ | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `codex-acp`        | `CODEX_HOME`        | [Codex advanced configuration](https://learn.chatgpt.com/docs/config-file/config-advanced): "Codex stores its local state under `CODEX_HOME` (defaults to `~/.codex`)." The [adapter's README](https://github.com/agentclientprotocol/codex-acp) says it "starts the Codex App Server". |
+| `claude-agent-acp` | `CLAUDE_CONFIG_DIR` | [Claude Code environment variables](https://code.claude.com/docs/en/env-vars): "Override the configuration directory (default: `~/.claude`)." The [adapter's README](https://github.com/agentclientprotocol/claude-agent-acp) says it is built on "the official Claude Agent SDK".      |
+
+Without them the adapter reads the default-location account when the user relocated the home.
 
 Location variables a vendor documents or reads that are **not** forwarded, because they are not
 home locations or can carry a secret: Cursor's `CURSOR_DATA_DIR` (read in the bundle, undocumented),
@@ -892,29 +898,36 @@ home locations or can carry a secret: Cursor's `CURSOR_DATA_DIR` (read in the bu
 `COPILOT_CACHE_HOME` (cache only), `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` and `GITHUB_TOKEN`; Goose's
 `GOOSE_PROVIDER__API_KEY`, `GOOSE_DISABLE_KEYRING` and the Langfuse keys; every `*_PROXY`.
 
-OpenCode keeps `auth.json` under its data directory
-([providers](https://opencode.ai/docs/providers/) documents `~/.local/share/opencode/auth.json`) and
-its source resolves that directory from `XDG_DATA_HOME`, which the base list now carries. Its docs do
-not say so.
+#### Why each base location key is there
 
-The base allowlist carries the four XDG base directories (`XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
-`XDG_STATE_HOME`, `XDG_CACHE_HOME`) beside `HOME`, because Cursor's CLI resolves its account from
-them on Linux. Without them a user who keeps Cursor's configuration under a custom
-`XDG_CONFIG_HOME` saw the default account's state through this library, and a turn ran on that
-account. Evidence for Cursor `2026.09.10-fd3934a`:
+The base allowlist carries the four XDG base directories and the two Windows per-user directories
+beside `HOME` and `USERPROFILE`, because a vendor CLI resolves its own files from them. Without
+them a user who keeps a CLI's configuration under a custom `XDG_CONFIG_HOME` saw the default
+account's state through this library, and a Cursor turn ran on that account. Each key has a reader
+that a person can check without logging in; documents were read on 2026-10-13.
 
-- [Cursor's configuration page](https://cursor.com/docs/cli/reference/configuration), read
-  2026-10-13: "Override with environment variables: `CURSOR_CONFIG_DIR`: custom directory path;
-  `XDG_CONFIG_HOME` (Linux/BSD): uses `$XDG_CONFIG_HOME/cursor/cli-config.json`". The page does not
-  say where the login lives.
-- The installed bundle resolves the login file from the same variable. On Linux it joins
-  `process.env.XDG_CONFIG_HOME || ~/.config` with `cursor/auth.json`; on Windows it joins
-  `process.env.APPDATA || ~/AppData/Roaming` with `Cursor/auth.json`. It also reads
-  `XDG_STATE_HOME` and `XDG_RUNTIME_DIR` for its agent stores. Reproduce with
-  `grep -a -o 'XDG_[A-Z_]*' ~/.local/share/cursor-agent/versions/*/*.js | sort | uniq -c`. No token is
-  read to learn this.
+| Key               | Reader           | Evidence                                                                                                                                                                                                                                                                                                                                                                |
+| ----------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `XDG_CONFIG_HOME` | Cursor           | Document: [Cursor configuration](https://cursor.com/docs/cli/reference/configuration), "`XDG_CONFIG_HOME` (Linux/BSD): uses `$XDG_CONFIG_HOME/cursor/cli-config.json`". The page does not say where the login lives; the bundle does (below).                                                                                                                           |
+| `XDG_CACHE_HOME`  | Copilot          | Document: [Copilot config directory](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference), Linux cache is "`$XDG_CACHE_HOME/copilot` or `~/.cache/copilot`".                                                                                                                                                                    |
+| `XDG_STATE_HOME`  | Cursor; OpenCode | Observation: Cursor's bundle joins it with `cursor/agent-stores` (command below). OpenCode's source: `const state = process.env.XDG_STATE_HOME \|\| ...` ([`global-roots.ts` L8](https://github.com/anomalyco/opencode/blob/b4a57f6849b9a368439b5fc2511fe167db1a6863/packages/util/src/global-roots.ts#L8)); its docs do not mention it.                                |
+| `XDG_DATA_HOME`   | OpenCode         | Source: `const data = process.env.XDG_DATA_HOME \|\| ...` ([`global-roots.ts` L5](https://github.com/anomalyco/opencode/blob/b4a57f6849b9a368439b5fc2511fe167db1a6863/packages/util/src/global-roots.ts#L5)). [OpenCode providers](https://opencode.ai/docs/providers/) documents the credential file at `~/.local/share/opencode/auth.json`, the default of that root. |
+| `APPDATA`         | Cursor; Goose    | Document: [Goose config files](https://github.com/block/goose/blob/main/documentation/docs/guides/config-files.md), "Windows: `%APPDATA%\Block\goose\config\config.yaml`". Observation: Cursor's bundle joins `process.env.APPDATA \|\| ~/AppData/Roaming` with `Cursor/auth.json`.                                                                                     |
+| `LOCALAPPDATA`    | Copilot          | Document: [Copilot config directory](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference), the Windows cache is `%LOCALAPPDATA%/copilot`.                                                                                                                                                                                       |
+
+Observations, all read-only text searches that read no credential and run no CLI:
+
+- Cursor `2026.09.10-fd3934a`:
+  `grep -a -o -h '.\{80\}XDG_[A-Z_]*.\{80\}' ~/.local/share/cursor-agent/versions/*/*.js` shows
+  `process.env.XDG_CONFIG_HOME || ~/.config` joined with `cursor/auth.json` for the login file on
+  Linux, `XDG_STATE_HOME` joined with `cursor/agent-stores`, and `APPDATA` for the Windows login
+  file. The same bundle lists `XDG_RUNTIME_DIR` among variables it strips from an environment it
+  hands on.
+- OpenCode: `curl -s https://raw.githubusercontent.com/anomalyco/opencode/b4a57f6849b9a368439b5fc2511fe167db1a6863/packages/util/src/global-roots.ts | grep XDG`
+  prints the four `process.env.XDG_*_HOME` reads.
 - A maintainer ran `cursor-agent status` with `XDG_CONFIG_HOME` pointing at an empty directory and
-  got "Not logged in", where the same call without the variable reported the signed-in account.
+  got "Not logged in", where the same call without the variable reported the signed-in account. The
+  variable-set side of that run was not repeated for this page.
 
 `XDG_RUNTIME_DIR` is not forwarded: it holds the login session's sockets, and Cursor's bundle lists
 it with `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS` and `WAYLAND_DISPLAY` among the variables it

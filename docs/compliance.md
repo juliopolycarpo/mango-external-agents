@@ -40,8 +40,10 @@ own deployment.
   variables that may hold keys (`CODEX_CONFIG`, `OPENCODE_CONFIG_CONTENT`), and
   `XDG_RUNTIME_DIR`, which holds the login session's sockets (Cursor's own CLI strips it from an
   environment it hands on). `XDG_DATA_DIRS` and `XDG_CONFIG_DIRS` are system search paths and stay out
-  too. Tests assert that the keys arrive and that these do not. The vendor-specific location
-  variables each profile adds, and the document behind each, are in `docs/harness-acp.md`.
+  too. Tests assert that the keys arrive and that these do not. The reader of each base location key, and the
+  vendor-specific location variables each profile adds with the document behind each, are in
+  `docs/harness-acp.md`. A host whose own process runs under redirected XDG directories (Flatpak,
+  Snap) now has them honoured by the child; `docs/adopt.md` shows how to filter the source instead.
 - **Vendor tools never enter the host's tool registry.** A vendor-initiated tool call is answered
   with a protocol error, never executed by the host.
 - **Vendor assistant text is never replayed** into the host's own model context by the library.

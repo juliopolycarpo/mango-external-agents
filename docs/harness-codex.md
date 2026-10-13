@@ -938,6 +938,19 @@ render as `ActivityKind::Mcp`.
 One variable survives the allowlist: `CODEX_HOME`, the directory the user's own CLI keeps its
 configuration in. A child that could not find it would run under a configuration the user never
 chose. `OPENAI_API_KEY` is deliberately absent — this library does no API-key plumbing of any kind.
+The document is [Codex advanced configuration](https://learn.chatgpt.com/docs/config-file/config-advanced),
+read 2026-10-13: "Codex stores its local state under `CODEX_HOME` (defaults to `~/.codex`)."
+
+The base allowlist reaches this CLI too: `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`,
+`XDG_CACHE_HOME`, `APPDATA` and `LOCALAPPDATA`, beside `HOME`. No Codex document found names an
+XDG variable; the state this harness depends on, the account and the sessions, lives under
+`CODEX_HOME`. An observation on the installed `0.162.1` standalone binary
+(`strings -a <codex> | grep -o -E 'XDG_[A-Z_]+|APPDATA|LOCALAPPDATA|CODEX_HOME' | sort | uniq -c`)
+finds `CODEX_HOME` 56 times and `XDG_CONFIG_HOME`, truncated fragments of the data, cache and
+runtime-directory names, `APPDATA` and `LOCALAPPDATA` a few times each, the shape of a directories
+library bundled into the binary. Whether the CLI calls it for
+anything the harness uses was not determined, so the XDG variables reaching Codex are a
+consequence of the shared base list, not something this harness relies on.
 
 ## Why the protocol types are hand-written
 
