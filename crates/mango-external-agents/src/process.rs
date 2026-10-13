@@ -575,6 +575,12 @@ impl StderrTail {
     /// beside them. A tail is read once, when a failure is reported, so it can afford the token
     /// pass that a per-line read cannot.
     ///
+    /// The tail also remembers whether the text it dropped from the front ended inside a private
+    /// key (a begin marker with no end marker after it). The lines of that key that it kept are
+    /// then hidden to the end marker, or the lines of base64 under where the header was when there
+    /// is none, as if the begin line were still there; the read starts with `[REDACTED]` in that
+    /// case. Public keys and certificates are not private keys and open nothing.
+    ///
     /// # Example
     ///
     /// ```

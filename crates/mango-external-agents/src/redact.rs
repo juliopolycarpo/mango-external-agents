@@ -128,9 +128,12 @@ pub fn stderr_text(raw: &str) -> String {
 /// call returns is one a second call leaves alone; text that never settles is hidden whole.
 ///
 /// A tail is cut on a line, so a token with a prefix is either whole in it or gone. A private key
-/// loses its begin line to a cut and keeps the base64 lines under it: a tail that starts with
-/// lines of base64 and then a private key's end marker has them hidden, which makes the start of
-/// any text this reads a place where a key may have been cut.
+/// loses its begin line to a cut and keeps the lines under it. [`StderrTail::read`] knows when the
+/// text it dropped ended inside a key and reads the tail as the body of one. This function, which
+/// is handed a text and not the stream it came from, reads the start of the text instead: lines
+/// of a key's body (base64, a PEM header, a PGP checksum, behind one prefix that is the same on
+/// every line) and then a private key's end marker are hidden, which makes the start of any text
+/// it reads a place where a key may have been cut.
 ///
 /// Costs a byte-wise read of the whole text more than [`stderr_text`] (2.4 times the instructions
 /// on plain lines, and about 4.7 times on lines that carry credentials, which are read a second

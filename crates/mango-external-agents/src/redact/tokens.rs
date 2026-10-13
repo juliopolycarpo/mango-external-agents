@@ -126,17 +126,29 @@ fn orphaned_end_hides(text: &str) -> Vec<Hide> {
 
 /// The start of the first line within [`MAX_BLOCK_BYTES`] that holds the end marker of a private
 /// key, where the marker starts and where it closes.
+///
+/// The marker is searched for first, in one pass over the start of the text, and the lines are
+/// walked only when there is one: nearly every text has no end marker of a key, and the walk is
+/// what a read of every line would cost.
 fn first_end_line(text: &str) -> Option<(usize, usize, usize)> {
     let bytes = text.as_bytes();
+    let reach = MAX_BLOCK_BYTES + MAX_PREFIX + MAX_MARK_BYTES;
+    let window = &text[..text.floor_char_boundary(reach.min(text.len()))];
+    let (mut from, mut found) = (0, None);
+    while found.is_none() {
+        let offset = window[from..].find("-----END ")?;
+        count_steps(offset + 1);
+        let marker = from + offset;
+        found = end_marker_close(bytes, marker).map(|close| (marker, close));
+        from = marker + 1;
+    }
+    let (marker, close) = found?;
     let mut at = 0;
     while at <= MAX_BLOCK_BYTES {
         let end = take_while(bytes, at, |byte| !matches!(byte, b'\n' | b'\r' | b'\\'));
         count_steps(end - at + 1);
-        if let Some(offset) = text[at..end].find("-----END ") {
-            let marker = at + offset;
-            if let Some(close) = end_marker_close(bytes, marker) {
-                return Some((at, marker, close));
-            }
+        if marker <= end {
+            return Some((at, marker, close));
         }
         at = line_break(bytes, end)?;
     }

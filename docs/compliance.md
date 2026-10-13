@@ -182,9 +182,19 @@ own deployment.
   eight readings (written to defeat it) is returned as `[REDACTED]` whole, which `stderr_text` never
   does. Two properties of a cut tail matter to it. A tail is cut on a line (`StderrTail::push`), so
   a token with a prefix is whole in the tail or gone from it, never a back half with no prefix. A
-  private key spans lines, and a cut can drop its begin marker and keep the base64 lines under
-  it, so the start of the text `stderr_tail` reads is read as the possible end of a key: lines of
-  base64 and then a private key's end marker, at the very start, are hidden with the marker.
+  private key spans lines, and a cut can drop its begin marker and keep the lines under it.
+  `StderrTail` therefore remembers the text it dropped (`redact::OpenKey`, fed every byte the tail
+  discards, a flag and a fixed 56-byte carry): when the last private-key marker there is a begin
+  marker no end marker has closed, `read` puts a begin line back in front of the tail, and the
+  block read hides the body to the end marker, as it does with the begin line present, or the lines
+  of base64 directly under the header when there is no end marker yet (the read then starts with
+  `[REDACTED]`). The state expires 64 KiB after the begin marker, farther than any block reaches,
+  and a public key or a certificate opens nothing. A text that is handed to `stderr_tail` without
+  the stream behind it (the tail a host's own `ProcessControl` returns) has only the start of the
+  text to go by: lines of a key's body at the very start (base64, a PEM header, a PGP checksum
+  line; after the blanks of an indented log, or behind one prefix of up to 64 bytes that is the
+  same on every line and on the end marker's line) and then a private key's end marker are hidden
+  with the marker.
 
   The answers differ from the release before's in two ways. `stderr_text` differs only by the
   extra reading above, which can only hide more. `redact::bounded` and `redact::structured` hide
@@ -206,7 +216,12 @@ own deployment.
   fixed point on `stderr_text`, `stderr_tail`, `bounded` and `structured` (`stderr_tail` with no
   exception), `structured` keeps a JSON text JSON, no entry point panics, `stderr_text` is the
   release before's answer wherever that is a fixed point, and `stderr_tail` hides at least what
-  `stderr_text` hides and is `stderr_text` wherever the token pass finds nothing. A long search runs 4,000,000 inputs per family and seed
+  `stderr_text` hides and is `stderr_text` wherever the token pass finds nothing. A second search
+  pushes generated streams (filler, tokens, assignments and private keys with every label, with
+  and without an end marker, behind a prefix or not, LF or CRLF) into a `StderrTail` in pieces of
+  one byte up to the whole stream, at capacities from 8 bytes up, and after every push holds
+  `read()` to `stderr_tail` of the whole stream so far: no canary the whole stream hides may show
+  in the tail. A long search runs 4,000,000 inputs per family and seed
   (`MEA_REDACT_SEARCH_COUNT=4000000 MEA_REDACT_SEARCH_SEED=n cargo nextest run -p
   mango-external-agents --release --lib --run-ignored only -E 'test(redact::search)'`).
 
@@ -225,13 +240,13 @@ own deployment.
     release before read, a number of twelve digits under a count name, in a stderr tail:
     `stderr_text` and `stderr_tail` read a line at a time, as the release before did, and a tail is
     cut on a line. The paths that carry a vendor's messages read all of these;
-  - a private key whose begin line a tail's cut dropped and whose end marker the tail does not hold
-    (the child died mid-key): what is left is base64 lines with nothing to recognise them by;
+  - a text handed to `stderr_tail` whose private key lost its begin line and whose end marker is
+    not in it either: `StderrTail::read` hides such a key from what it dropped, but a text that
+    comes from a host's own control has no begin marker to go by;
   - a bare token outside the closed list, and any credential with no prefix: an AWS secret access
     key (40 characters of base64) or an Azure key has nothing to recognise it by;
-  - a key's body after a cut when the lines above the end marker are not a key's (a timestamp or an
-    agent's tag in front of each line): only blanks in front, base64, the headers of an encrypted
-    key and a PGP checksum line are read;
+  - a key's body at the start of a text handed to `stderr_tail` when its lines do not share one
+    prefix with the end marker's line, or the prefix is longer than 64 bytes;
   - a token a control byte the stripper removes glues to the word next to it (`progress\rghp_...`
     reads as one run, in `stderr_text` as in `stderr_tail`);
   - a token glued to other name characters (`_ghp_..._`, `ghp_...-`), behind an encoding (`%20ghp_...`,
