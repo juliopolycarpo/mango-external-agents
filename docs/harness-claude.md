@@ -296,18 +296,31 @@ termination, which preserves the existing native continuation.
 instead: `SessionSnapshot::resumability`, a non-exhaustive `Resumability`. A `SessionSubscription`
 wakes for every change.
 
-| Value            | Meaning for Claude                                                                                                                             | Strict resume          |
-| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
-| `Unknown`        | No `system/init` yet, a strict resume no turn has confirmed, or a stop is pending. No evidence either way.                                     | decide on other facts  |
-| `Resumable`      | `system/init` proved the conversation exists, and every turn since finished with the vendor's `result` or was stopped by a graceful interrupt. | safe                   |
-| `UnfinishedTurn` | A turn ended with no `result` and no clean interrupt: the child was force-terminated, died, went silent, or a stop did not complete.           | do not; open a new one |
-| `Unverified`     | A strict resume was not confirmed: another handle, or the CLI ended before `system/init`.                                                      | do not; open a new one |
+| Value            | Meaning for Claude                                                                                                                            | Strict resume      |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
+| `Unknown`        | No turn has finished yet, a turn is running, a stop is pending, or a strict resume no turn has confirmed. No evidence either way.             | no                 |
+| `Resumable`      | `system/init` proved the conversation exists, and its latest turn finished with the vendor's `result` or was stopped by a graceful interrupt. | yes                |
+| `UnfinishedTurn` | A turn ended with no `result` and no clean interrupt: the child was force-terminated, died, went silent, or a stop did not complete.          | no; open a new one |
+| `Unverified`     | A strict resume was not confirmed: another handle, or the CLI ended before `system/init`.                                                     | no; open a new one |
+
+**The rule for a host is exactly: strict-resume only on `Resumable`.** Every other value, `Unknown`
+included, means "do not rely on this conversation without another reason".
+
+`Resumable` describes a conversation at rest. It is published when the vendor finishes a turn (its
+`result` record, success or failure) or takes a graceful interrupt, and it is withdrawn the moment
+the next turn is admitted. A host that stores what it reads and then crashes mid-turn has therefore
+stored `Unknown`, not `Resumable`, and nothing more is needed from its recovery record to be safe.
+Likewise a freshly opened session that resumes a conversation whose last turn finished reads
+`Unknown` until its first turn finishes: the harness has verified nothing yet.
 
 Only a turn the vendor finished leaves the conversation `Resumable`, whatever the host's control
-later answers about the child. A tainted value is permanent for the session, and the first cause
-wins. It is wider than the refusal `start_turn` gives, which is unchanged: a kill or an unconfirmed
-resume refuses later turns with `Error::Cancelled`, while a child that died or a silent stream
-publishes `UnfinishedTurn` and leaves the session usable.
+later answers about the child. A finished turn whose child cannot be reaped stays `Resumable`; the
+process is owed cleanup, and that is the `CleanupRequired` the stop returns. A tainted value keeps
+its first cause. It is wider than the refusal `start_turn` gives, which is unchanged: a kill or an
+unconfirmed resume refuses later turns with `Error::Cancelled`, so those values last for the
+session, while a child that died or a silent stream publishes `UnfinishedTurn` and leaves the
+session usable. A later turn the vendor finishes on that session publishes `Resumable` again, since
+the conversation's latest turn is then finished.
 
 How each ending reads. "Terminal" is the snapshot read on the turn's terminal event; "stop
 returned" is after `cancel` (or `close`) returns; "closed" is after `close`. The terminal of a
@@ -316,25 +329,23 @@ while a stop is pending the value is `Unknown`, never a `Resumable` the stop may
 
 | Ending                                                                | Terminal                      | Stop returned    | Closed           |
 | --------------------------------------------------------------------- | ----------------------------- | ---------------- | ---------------- |
+| Session opened, or a strict resume before its first turn finishes     | n/a                           | n/a              | `Unknown`        |
 | Turn finished with `result` (success or failure)                      | `Resumable`                   | n/a              | `Resumable`      |
+| Finished turn whose child could not be reaped                         | `Resumable`                   | `Resumable`      | `Resumable`      |
+| Later turn finished after an unfinished one                           | `Resumable`                   | n/a              | `Resumable`      |
 | Child died mid-turn after `system/init` (exit 143, 1, 0)              | `UnfinishedTurn`              | n/a              | `UnfinishedTurn` |
 | Idle timeout or unreadable stream after `system/init`                 | `UnfinishedTurn`              | n/a              | `UnfinishedTurn` |
 | Child died before any `system/init` (control with graceful interrupt) | `Unknown`                     | n/a              | `Unknown`        |
 | `cancel` that interrupted gracefully                                  | `Unknown` or `Resumable`      | `Resumable`      | `Resumable`      |
 | `cancel` that had to kill                                             | `Unknown` or `UnfinishedTurn` | `UnfinishedTurn` | `UnfinishedTurn` |
 | `close`, host `CancelToken`, dropped stream, dropped session          | as `cancel`                   | as `cancel`      | as `cancel`      |
-| Stop that failed (`CleanupRequired`)                                  | `Unknown` or `UnfinishedTurn` | `UnfinishedTurn` | `UnfinishedTurn` |
+| Stop that failed (`CleanupRequired`) on an unfinished turn            | `Unknown` or `UnfinishedTurn` | `UnfinishedTurn` | `UnfinishedTurn` |
 | Launch that failed over a child it could not end                      | n/a                           | `UnfinishedTurn` | `UnfinishedTurn` |
 | Strict resume the vendor did not confirm                              | `Unverified`                  | n/a              | `Unverified`     |
 
-A host stores the value beside the vendor handle whenever it changes, and strict-resumes a stored
-conversation only when it reads `Resumable`. `Resumability::allows_strict_resume` is that test.
-
-**`Resumable` describes a conversation at rest.** It turns true when `system/init` arrives, while
-the first turn is still running. A host that loses the session mid-turn (a crash, a dropped
-connection) never sees a stop recorded, and the child may have died without one. If the host's own
-`RecoveryRecord` shows a turn with no terminal when the session was lost, treat the conversation as
-`UnfinishedTurn` whatever value was stored.
+While a turn runs the value is `Unknown` (a session that was `Resumable` after its previous turn
+reads `Unknown` from the admission of the next one). A host stores the value beside the vendor handle
+whenever it changes. `Resumability::allows_strict_resume` is the test.
 
 ```rust,ignore
 session.cancel(CancelReason::Requested).await?;

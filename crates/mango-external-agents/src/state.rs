@@ -180,20 +180,21 @@ impl TransportSelection {
 /// persists anything: the host reads this off the snapshot (or a [`SessionSubscription`] wake) and
 /// stores it beside the vendor handle.
 ///
-/// `Resumable` describes a conversation at rest. It is published as soon as the vendor proves the
-/// conversation exists, while the first turn may still be running, so a host that loses the
-/// session mid-turn must not trust a stored `Resumable`: when its own `RecoveryRecord` shows a turn
-/// with no terminal at that moment, treat the conversation as `UnfinishedTurn`.
+/// `Resumable` describes a conversation at rest: it is published only once the vendor has
+/// finished a turn, and withdrawn (`Unknown`) as soon as the next turn is admitted. A host that
+/// persists what it reads and then loses the session mid-turn has therefore stored `Unknown`, not
+/// `Resumable`. The rule for a host is exactly: strict-resume only on `Resumable`.
 ///
 /// `Unknown` is the default and is not a verdict. A harness that cannot say reports it, and a
 /// host reads it as "no evidence either way", never as "safe".
 ///
-/// - **Claude Code** reports all four values. `Resumable` once the conversation exists and every
-///   turn since either finished with the vendor's own `result` or was stopped by a graceful
-///   interrupt; `UnfinishedTurn` after a turn the vendor did not finish and nobody interrupted
-///   cleanly (the child was force-terminated, died, went silent, or a stop did not complete);
-///   `Unverified` after a strict resume that could not be confirmed. `Unknown` before the first
-///   `system/init`.
+/// - **Claude Code** reports all four values. `Resumable` once the conversation's latest turn
+///   finished with the vendor's own `result` or was stopped by a graceful interrupt;
+///   `UnfinishedTurn` after a turn the vendor did not finish and nobody interrupted cleanly (the
+///   child was force-terminated, died, went silent, or a stop did not complete); `Unverified`
+///   after a strict resume that could not be confirmed. `Unknown` before the first turn finishes
+///   (including a freshly opened session resuming a conversation whose last turn finished: the
+///   harness has verified nothing yet), while a turn runs, and while a stop is pending.
 /// - **Codex** and **ACP** always report `Unknown`. Codex resumes a thread by id regardless of how
 ///   a turn ended, and an ACP agent decides per profile whether it can load a session, so neither
 ///   has a stop outcome this library can turn into a verdict.
@@ -217,15 +218,17 @@ pub enum Resumability {
     /// No evidence either way. The default, and all a Codex or ACP session ever reports.
     #[default]
     Unknown,
-    /// The conversation was written, and every turn since finished or was interrupted cleanly.
+    /// The conversation exists and its latest turn finished, or was interrupted cleanly.
     Resumable,
     /// A turn ended without the vendor's `result` and without a clean interrupt, so the stored
     /// conversation may end at a prompt the vendor left unfinished: the child was
     /// force-terminated, died, went silent, or a stop did not complete and the child may still be
-    /// running. Permanent for the session.
+    /// running. A later turn the vendor finishes settles it, unless the ending refused later
+    /// turns (a kill), in which case it lasts for the session.
     UnfinishedTurn,
     /// A strict resume could not be confirmed: the vendor did not identify the requested
-    /// conversation, or ended before it started. Permanent for the session.
+    /// conversation, or ended before it started. Later turns are refused, so it lasts for the
+    /// session.
     Unverified,
 }
 
@@ -237,7 +240,7 @@ impl Resumability {
         matches!(self, Self::Resumable)
     }
 
-    /// Whether the conversation was found unsafe to resume. Once true it never changes back.
+    /// Whether the conversation was found unsafe to resume.
     pub const fn is_tainted(self) -> bool {
         matches!(self, Self::UnfinishedTurn | Self::Unverified)
     }
@@ -534,11 +537,11 @@ impl SessionState {
 
     /// Records whether the stored conversation is safe to strict-resume.
     ///
-    /// Sticky for a tainted value: once [`Resumability::is_tainted`] is published nothing replaces
-    /// it, because a forced termination or an unconfirmed resume is not undone by a later calm
-    /// turn. The comparison happens inside the write, for the reason
-    /// [`set_status`](Self::set_status) gives, and a value equal to the current one leaves the
-    /// revision alone.
+    /// The harness decides which transitions are legal, because they differ by vendor: a Claude
+    /// turn the vendor finishes later settles an earlier unfinished one, while a kill refuses every
+    /// later turn and so never gets that chance. The comparison happens inside the write, for the
+    /// reason [`set_status`](Self::set_status) gives, and a value equal to the current one leaves
+    /// the revision alone.
     ///
     /// # Example
     ///
@@ -563,13 +566,14 @@ impl SessionState {
     /// );
     ///
     /// state.set_resumability(Resumability::UnfinishedTurn);
-    /// state.set_resumability(Resumability::Resumable);
     /// assert_eq!(state.snapshot().resumability, Resumability::UnfinishedTurn);
+    /// state.set_resumability(Resumability::Resumable);
+    /// assert_eq!(state.snapshot().resumability, Resumability::Resumable);
     /// ```
     pub fn set_resumability(&self, resumability: Resumability) {
         let now = self.clock.now();
         self.sender.send_if_modified(|current| {
-            if current.resumability == resumability || current.resumability.is_tainted() {
+            if current.resumability == resumability {
                 return false;
             }
             let mut next = SessionSnapshot::clone(current);
@@ -934,24 +938,21 @@ mod tests {
         assert!(after.resumability.allows_strict_resume());
     }
 
-    /// A tainted conversation stays tainted: a later calm turn does not make a killed prompt safe.
+    /// The harness owns the legal transitions, so a published value replaces the previous one,
+    /// tainted or not: a later finished turn settles an earlier unfinished one.
     #[test]
-    fn a_tainted_resumability_is_never_replaced() {
+    fn a_published_resumability_replaces_a_tainted_one() {
         for tainted in [Resumability::UnfinishedTurn, Resumability::Unverified] {
             let state = state();
             state.set_resumability(tainted);
-            let settled = state.snapshot().revision;
+            assert!(state.snapshot().resumability.is_tainted());
             state.set_resumability(Resumability::Resumable);
-            state.set_resumability(Resumability::Unverified);
-            state.set_resumability(Resumability::UnfinishedTurn);
-            let received = state.snapshot();
+            let received = state.snapshot().resumability;
             assert_eq!(
-                received.resumability, tainted,
-                "expected resumability to stay: {tainted} | received: {}",
-                received.resumability
+                received,
+                Resumability::Resumable,
+                "expected resumability after a replacement: resumable | received: {received}"
             );
-            assert_eq!(received.revision, settled);
-            assert!(received.resumability.is_tainted());
         }
     }
 

@@ -3,7 +3,7 @@
 //!
 //! The host reads the value on the terminal event, after `cancel` or `close` returns, and once the
 //! session is closed, and stores it beside the vendor handle, so a case reads it at those three
-//! moments. Nothing here sleeps to settle: a test waits on the session's state subscription, on a
+//! moments. Nothing here waits on a timer to settle: a test waits on the session's state subscription, on a
 //! terminal event, or on a `close`, which joins the stop it follows.
 
 mod support;
@@ -86,11 +86,12 @@ async fn drain(session: &dyn Session, turn: &mut TurnStream) -> (Vec<EventKind>,
     drain_within(session, turn, Duration::from_secs(5)).await
 }
 
-/// Waits until the session publishes `wanted`, so a test never races the pump's `system/init`.
-async fn wait_for(session: &dyn Session, wanted: Resumability) {
+/// Waits until the pump has folded this run's `system/init` into the session, which publishes the
+/// vendor's handle. The verdict does not change at `system/init`, so the handle is the signal.
+async fn wait_for_init(session: &dyn Session) {
     let mut changes = session.subscribe();
     let reached = tokio::time::timeout(Duration::from_secs(5), async {
-        while changes.current().resumability != wanted {
+        while changes.current().ids.native_session_id != NATIVE_ID {
             if changes.changed().await.is_none() {
                 return;
             }
@@ -98,9 +99,9 @@ async fn wait_for(session: &dyn Session, wanted: Resumability) {
     })
     .await;
     assert!(
-        reached.is_ok() && changes.current().resumability == wanted,
-        "expected resumability: {wanted} | received: {}",
-        changes.current().resumability
+        reached.is_ok() && changes.current().ids.native_session_id == NATIVE_ID,
+        "expected the vendor handle: {NATIVE_ID} | received: {}",
+        changes.current().ids.native_session_id
     );
 }
 
@@ -366,7 +367,7 @@ async fn cancel_records_how_it_stopped_the_child() {
             .start_turn(TurnRequest::new("turn-1", "hold"))
             .await
             .expect("expected a turn");
-        wait_for(session.as_ref(), Resumability::Resumable).await;
+        wait_for_init(session.as_ref()).await;
 
         session
             .cancel(CancelReason::Requested)
@@ -397,7 +398,7 @@ async fn a_terminal_written_before_a_kill_finishes_never_reads_resumable() {
             .start_turn(TurnRequest::new("turn-1", "hold"))
             .await
             .expect("expected a turn");
-        wait_for(session.as_ref(), Resumability::Resumable).await;
+        wait_for_init(session.as_ref()).await;
 
         let stopper = {
             let session = Arc::clone(&session);
@@ -453,7 +454,7 @@ async fn close_records_how_it_stopped_the_child() {
             .start_turn(TurnRequest::new("turn-1", "hold"))
             .await
             .expect("expected a turn");
-        wait_for(session.as_ref(), Resumability::Resumable).await;
+        wait_for_init(session.as_ref()).await;
 
         session
             .close(CloseReason::Requested)
@@ -483,7 +484,7 @@ async fn a_cancelled_host_records_how_it_stopped_the_child() {
             .start_turn(TurnRequest::new("turn-1", "hold"))
             .await
             .expect("expected a turn");
-        wait_for(session.as_ref(), Resumability::Resumable).await;
+        wait_for_init(session.as_ref()).await;
 
         token.cancel();
         let (_, at_terminal) = drain(session.as_ref(), &mut turn).await;
@@ -508,7 +509,7 @@ async fn a_dropped_stream_records_how_it_stopped_the_child() {
             .start_turn(TurnRequest::new("turn-1", "hold"))
             .await
             .expect("expected a turn");
-        wait_for(session.as_ref(), Resumability::Resumable).await;
+        wait_for_init(session.as_ref()).await;
 
         drop(turn);
         session
@@ -532,7 +533,7 @@ async fn a_dropped_session_records_how_the_child_was_stopped() {
             .start_turn(TurnRequest::new("turn-1", "hold"))
             .await
             .expect("expected a turn");
-        wait_for(session.as_ref(), Resumability::Resumable).await;
+        wait_for_init(session.as_ref()).await;
         let mut changes = session.subscribe();
 
         drop(turn);
@@ -567,7 +568,7 @@ async fn a_stop_that_fails_leaves_the_conversation_unfinished() {
         .start_turn(TurnRequest::new("turn-1", "hold"))
         .await
         .expect("expected a turn");
-    wait_for(session.as_ref(), Resumability::Resumable).await;
+    wait_for_init(session.as_ref()).await;
 
     let cancelled = session.cancel(CancelReason::Requested).await;
     let error = cancelled.expect_err("expected the refused kill to fail the cancel");
@@ -645,6 +646,136 @@ async fn a_turn_refused_before_launch_changes_nothing() {
         session.as_ref(),
         Resumability::Resumable,
         "a turn refused before launch",
+    );
+}
+
+// ---- A running turn, a finished turn whose reap fails, and a later turn -----------------------
+
+/// A host that persists what it reads and then crashes mid-turn has last stored the value of a
+/// running turn, so a running turn must not read `Resumable`: not at admission, not after
+/// `system/init`, and not on a session that was `Resumable` after its previous turn.
+#[tokio::test]
+async fn a_running_turn_does_not_read_resumable() {
+    let launcher = Arc::new(
+        FakeClaudeCli::new()
+            .with_graceful_interrupt()
+            .with_turn(Run::replaying(&format!("{}\n{RESULT}", init(NATIVE_ID))))
+            .with_turn(Run::stalling([init(NATIVE_ID)])),
+    );
+    let session = open(&launcher).await;
+    let mut first = session
+        .start_turn(TurnRequest::new("turn-1", "hello"))
+        .await
+        .expect("expected a turn");
+    let (_, finished) = drain(session.as_ref(), &mut first).await;
+    assert_is(finished, Resumability::Resumable, "on the first terminal");
+
+    let mut second = session
+        .start_turn(TurnRequest::new("turn-2", "again"))
+        .await
+        .expect("expected a second turn");
+    assert_resumability(
+        session.as_ref(),
+        Resumability::Unknown,
+        "the admission of a second turn",
+    );
+    // The same handle is announced again, so the second `system/init` publishes nothing; the
+    // stalled child cannot finish, so what is read from here on is a running turn.
+    assert_resumability(
+        session.as_ref(),
+        Resumability::Unknown,
+        "a running second turn",
+    );
+
+    session
+        .cancel(CancelReason::Requested)
+        .await
+        .expect("expected a graceful interruption");
+    drain(session.as_ref(), &mut second).await;
+    assert_resumability(
+        session.as_ref(),
+        Resumability::Resumable,
+        "a graceful interrupt of the second turn",
+    );
+}
+
+#[tokio::test]
+async fn a_fresh_turn_reads_unknown_after_system_init() {
+    let launcher = stalled(true);
+    let session = open(&launcher).await;
+    let _turn = session
+        .start_turn(TurnRequest::new("turn-1", "hold"))
+        .await
+        .expect("expected a turn");
+    wait_for_init(session.as_ref()).await;
+    assert_resumability(
+        session.as_ref(),
+        Resumability::Unknown,
+        "system/init of a running first turn",
+    );
+}
+
+/// The turn finished, so the conversation is resumable; only the process is owed cleanup, and
+/// that is the error `close` carries.
+#[tokio::test]
+async fn a_finished_turn_whose_child_cannot_be_reaped_stays_resumable() {
+    let inner = Arc::new(
+        FakeClaudeCli::new().with_turn(Run::stalling([init(NATIVE_ID), RESULT.to_owned()])),
+    );
+    let tap = Arc::new(ControlTap::refusing_kill(Arc::clone(&inner)));
+    let session = open_on(&host_under(tap, Limits::default())).await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "hello"))
+        .await
+        .expect("expected a turn");
+    let (events, at_terminal) = drain(session.as_ref(), &mut turn).await;
+    assert!(
+        matches!(events.last(), Some(EventKind::Completed)),
+        "expected the vendor's finished turn to complete | received: {events:?}"
+    );
+    assert_is(at_terminal, Resumability::Resumable, "on the terminal");
+
+    let closed = session.close(CloseReason::Requested).await;
+    let error = closed.expect_err("expected the refused kill to fail the close");
+    assert!(
+        error.cleanup_control().is_some(),
+        "expected a CleanupRequired carrying the host's control | received: {error:?}"
+    );
+    assert_resumability(
+        session.as_ref(),
+        Resumability::Resumable,
+        "a close whose reap of a finished turn failed",
+    );
+    inner.end_turns_for_host_cleanup();
+}
+
+/// After a child died mid-turn the session stays usable, and a later turn the vendor finishes
+/// leaves the conversation's last turn finished.
+#[tokio::test]
+async fn a_later_finished_turn_clears_an_unfinished_one() {
+    let launcher = Arc::new(
+        FakeClaudeCli::new()
+            .with_graceful_interrupt()
+            .with_turn(unfinished(vec![init(NATIVE_ID), ASSISTANT.to_owned()], 1))
+            .with_turn(Run::replaying(&format!("{}\n{RESULT}", init(NATIVE_ID)))),
+    );
+    let session = open(&launcher).await;
+    let mut first = session
+        .start_turn(TurnRequest::new("turn-1", "work"))
+        .await
+        .expect("expected a turn");
+    let (_, dead) = drain(session.as_ref(), &mut first).await;
+    assert_is(dead, Resumability::UnfinishedTurn, "on the first terminal");
+
+    let mut second = session
+        .start_turn(TurnRequest::new("turn-2", "again"))
+        .await
+        .expect("expected the session to stay usable after a child died");
+    let (_, finished) = drain(session.as_ref(), &mut second).await;
+    assert_is(
+        finished,
+        Resumability::Resumable,
+        "on the terminal of the later turn",
     );
 }
 
