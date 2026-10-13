@@ -183,15 +183,17 @@ impl TransportSelection {
 /// `Resumable` describes a conversation at rest. It is published as soon as the vendor proves the
 /// conversation exists, while the first turn may still be running, so a host that loses the
 /// session mid-turn must not trust a stored `Resumable`: when its own `RecoveryRecord` shows a turn
-/// with no terminal at that moment, treat the conversation as `TaintedByKill`.
+/// with no terminal at that moment, treat the conversation as `UnfinishedTurn`.
 ///
 /// `Unknown` is the default and is not a verdict. A harness that cannot say reports it, and a
 /// host reads it as "no evidence either way", never as "safe".
 ///
 /// - **Claude Code** reports all four values. `Resumable` once the conversation exists and every
-///   stop since was a graceful interrupt or a normal finish; `TaintedByKill` after the child had
-///   to be force-terminated; `Unverified` after a strict resume that could not be confirmed.
-///   `Unknown` before the first `system/init`.
+///   turn since either finished with the vendor's own `result` or was stopped by a graceful
+///   interrupt; `UnfinishedTurn` after a turn the vendor did not finish and nobody interrupted
+///   cleanly (the child was force-terminated, died, went silent, or a stop did not complete);
+///   `Unverified` after a strict resume that could not be confirmed. `Unknown` before the first
+///   `system/init`.
 /// - **Codex** and **ACP** always report `Unknown`. Codex resumes a thread by id regardless of how
 ///   a turn ended, and an ACP agent decides per profile whether it can load a session, so neither
 ///   has a stop outcome this library can turn into a verdict.
@@ -202,9 +204,9 @@ impl TransportSelection {
 /// use mango_external_agents::Resumability;
 ///
 /// // A host stores the value with the vendor handle and checks it before a strict resume.
-/// let stored = Resumability::TaintedByKill;
+/// let stored = Resumability::UnfinishedTurn;
 /// assert!(!stored.allows_strict_resume());
-/// assert_eq!(stored.as_str(), "tainted-by-kill");
+/// assert_eq!(stored.as_str(), "unfinished-turn");
 /// ```
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
@@ -215,11 +217,13 @@ pub enum Resumability {
     /// No evidence either way. The default, and all a Codex or ACP session ever reports.
     #[default]
     Unknown,
-    /// The conversation was written and every stop since ended it gracefully or not at all.
+    /// The conversation was written, and every turn since finished or was interrupted cleanly.
     Resumable,
-    /// The vendor child had to be force-terminated, so the conversation may end at a prompt the
-    /// vendor left unfinished. Permanent for the session.
-    TaintedByKill,
+    /// A turn ended without the vendor's `result` and without a clean interrupt, so the stored
+    /// conversation may end at a prompt the vendor left unfinished: the child was
+    /// force-terminated, died, went silent, or a stop did not complete and the child may still be
+    /// running. Permanent for the session.
+    UnfinishedTurn,
     /// A strict resume could not be confirmed: the vendor did not identify the requested
     /// conversation, or ended before it started. Permanent for the session.
     Unverified,
@@ -235,7 +239,7 @@ impl Resumability {
 
     /// Whether the conversation was found unsafe to resume. Once true it never changes back.
     pub const fn is_tainted(self) -> bool {
-        matches!(self, Self::TaintedByKill | Self::Unverified)
+        matches!(self, Self::UnfinishedTurn | Self::Unverified)
     }
 
     /// The stable kebab-case name, the same one the serde form uses.
@@ -243,7 +247,7 @@ impl Resumability {
         match self {
             Self::Unknown => "unknown",
             Self::Resumable => "resumable",
-            Self::TaintedByKill => "tainted-by-kill",
+            Self::UnfinishedTurn => "unfinished-turn",
             Self::Unverified => "unverified",
         }
     }
@@ -558,9 +562,9 @@ impl SessionState {
     ///     ),
     /// );
     ///
-    /// state.set_resumability(Resumability::TaintedByKill);
+    /// state.set_resumability(Resumability::UnfinishedTurn);
     /// state.set_resumability(Resumability::Resumable);
-    /// assert_eq!(state.snapshot().resumability, Resumability::TaintedByKill);
+    /// assert_eq!(state.snapshot().resumability, Resumability::UnfinishedTurn);
     /// ```
     pub fn set_resumability(&self, resumability: Resumability) {
         let now = self.clock.now();
@@ -933,13 +937,13 @@ mod tests {
     /// A tainted conversation stays tainted: a later calm turn does not make a killed prompt safe.
     #[test]
     fn a_tainted_resumability_is_never_replaced() {
-        for tainted in [Resumability::TaintedByKill, Resumability::Unverified] {
+        for tainted in [Resumability::UnfinishedTurn, Resumability::Unverified] {
             let state = state();
             state.set_resumability(tainted);
             let settled = state.snapshot().revision;
             state.set_resumability(Resumability::Resumable);
             state.set_resumability(Resumability::Unverified);
-            state.set_resumability(Resumability::TaintedByKill);
+            state.set_resumability(Resumability::UnfinishedTurn);
             let received = state.snapshot();
             assert_eq!(
                 received.resumability, tainted,
@@ -965,7 +969,7 @@ mod tests {
         let all = [
             (Resumability::Unknown, "unknown"),
             (Resumability::Resumable, "resumable"),
-            (Resumability::TaintedByKill, "tainted-by-kill"),
+            (Resumability::UnfinishedTurn, "unfinished-turn"),
             (Resumability::Unverified, "unverified"),
         ];
         for (value, name) in all {

@@ -1,8 +1,10 @@
 //! What `SessionSnapshot::resumability` says about a Claude conversation after each way a turn can
 //! end, against a scripted `claude`.
 //!
-//! The host reads the value after `cancel` returns (or after a failed first strict-resume turn)
-//! and stores it beside the vendor handle, so every assertion here reads it at that moment.
+//! The host reads the value on the terminal event, after `cancel` or `close` returns, and once the
+//! session is closed, and stores it beside the vendor handle, so a case reads it at those three
+//! moments. Nothing here sleeps to settle: a test waits on the session's state subscription, on a
+//! terminal event, or on a `close`, which joins the stop it follows.
 
 mod support;
 
@@ -11,25 +13,40 @@ use std::time::Duration;
 
 use mango_agent_claude::ClaudeHarness;
 use mango_external_agents::{
-    CancelReason, EventKind, Harness, OpenSession, Resumability, ResumeMode, Session, TurnRequest,
-    TurnStream,
+    CancelReason, CancelToken, CloseReason, Error, EventKind, ExitStatus, Harness, HostContext,
+    Limits, LineLimits, OpenSession, ProcessLauncher, Resumability, ResumeMode, Session,
+    TurnRequest, TurnStream, VendorError,
 };
-use support::{FakeClaudeCli, Run, host};
+use support::{ControlTap, FakeClaudeCli, Run, host, host_under};
 
 const NATIVE_ID: &str = "aaaaaaaa-1111-2222-3333-444444444444";
 const OTHER_ID: &str = "bbbbbbbb-1111-2222-3333-444444444444";
 const RESULT: &str = r#"{"type":"result","is_error":false}"#;
+const ASSISTANT: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}"#;
 
 fn init(id: &str) -> String {
     format!(r#"{{"type":"system","subtype":"init","session_id":"{id}"}}"#)
 }
 
-async fn open(launcher: &Arc<FakeClaudeCli>) -> Box<dyn Session> {
-    let host = host(Arc::clone(launcher));
+fn unfinished(lines: Vec<String>, code: i32) -> Run {
+    Run::Transcript {
+        lines,
+        exit: ExitStatus {
+            code: Some(code),
+            signal: None,
+        },
+    }
+}
+
+async fn open_on(host: &HostContext) -> Box<dyn Session> {
     ClaudeHarness::new()
-        .open_session(&host, OpenSession::new("chat-1"))
+        .open_session(host, OpenSession::new("chat-1"))
         .await
         .expect("expected a session")
+}
+
+async fn open(launcher: &Arc<FakeClaudeCli>) -> Box<dyn Session> {
+    open_on(&host(Arc::clone(launcher))).await
 }
 
 async fn open_resuming(launcher: &Arc<FakeClaudeCli>, id: &str) -> Box<dyn Session> {
@@ -43,8 +60,13 @@ async fn open_resuming(launcher: &Arc<FakeClaudeCli>, id: &str) -> Box<dyn Sessi
         .expect("expected a strict resume session")
 }
 
-async fn drain(turn: &mut TurnStream) -> Vec<EventKind> {
-    let collected = tokio::time::timeout(Duration::from_secs(5), async {
+/// Everything a turn produced up to its terminal, and what the snapshot said at that moment.
+async fn drain_within(
+    session: &dyn Session,
+    turn: &mut TurnStream,
+    bound: Duration,
+) -> (Vec<EventKind>, Resumability) {
+    let collected = tokio::time::timeout(bound, async {
         let mut events = Vec::new();
         while let Some(event) = turn.recv().await {
             let terminal = event.is_terminal();
@@ -56,7 +78,12 @@ async fn drain(turn: &mut TurnStream) -> Vec<EventKind> {
         events
     })
     .await;
-    collected.expect("expected the turn to end rather than hang")
+    let events = collected.expect("expected the turn to end rather than hang");
+    (events, session.snapshot().resumability)
+}
+
+async fn drain(session: &dyn Session, turn: &mut TurnStream) -> (Vec<EventKind>, Resumability) {
+    drain_within(session, turn, Duration::from_secs(5)).await
 }
 
 /// Waits until the session publishes `wanted`, so a test never races the pump's `system/init`.
@@ -85,6 +112,34 @@ fn assert_resumability(session: &dyn Session, expected: Resumability, after: &st
     );
 }
 
+fn assert_is(received: Resumability, expected: Resumability, moment: &str) {
+    assert_eq!(
+        received, expected,
+        "expected resumability {moment}: {expected} | received: {received}"
+    );
+}
+
+/// A terminal written before the stop finishes may say `Unknown` (the stop is pending). When the
+/// stop ends in a kill it never says `Resumable`; after a graceful interrupt it may.
+fn assert_terminal_while_stopping(received: Resumability, graceful: bool, moment: &str) {
+    let allowed: &[Resumability] = if graceful {
+        &[Resumability::Unknown, Resumability::Resumable]
+    } else {
+        &[Resumability::Unknown, Resumability::UnfinishedTurn]
+    };
+    assert!(
+        allowed.contains(&received),
+        "expected resumability {moment}: one of {allowed:?} | received: {received}"
+    );
+}
+
+fn failure_of(events: &[EventKind]) -> VendorError {
+    match events.last() {
+        Some(EventKind::Error { error }) => error.clone(),
+        other => panic!("expected a terminal error event | received: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn a_session_that_has_not_run_a_turn_is_unknown() {
     let launcher = Arc::new(FakeClaudeCli::new());
@@ -92,8 +147,10 @@ async fn a_session_that_has_not_run_a_turn_is_unknown() {
     assert_resumability(session.as_ref(), Resumability::Unknown, "opening");
 }
 
+// ---- Endings the vendor finished ------------------------------------------------------------
+
 #[tokio::test]
-async fn a_completed_turn_leaves_the_conversation_resumable() {
+async fn a_completed_turn_is_resumable_at_the_terminal_and_after_close() {
     let launcher = Arc::new(
         FakeClaudeCli::new().with_turn(Run::replaying(&format!("{}\n{RESULT}", init(NATIVE_ID)))),
     );
@@ -102,67 +159,268 @@ async fn a_completed_turn_leaves_the_conversation_resumable() {
         .start_turn(TurnRequest::new("turn-1", "hello"))
         .await
         .expect("expected a turn");
-    drain(&mut turn).await;
-    assert_resumability(
-        session.as_ref(),
-        Resumability::Resumable,
-        "a completed turn",
-    );
+    let (_, at_terminal) = drain(session.as_ref(), &mut turn).await;
+    assert_is(at_terminal, Resumability::Resumable, "on the terminal");
+
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected the close to land");
+    assert_resumability(session.as_ref(), Resumability::Resumable, "close");
 }
 
 #[tokio::test]
-async fn a_graceful_interrupt_leaves_the_conversation_resumable() {
+async fn a_failed_result_the_vendor_finished_keeps_the_conversation_resumable() {
+    let failed = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1,"errors":["overloaded"]}"#;
+    let launcher = Arc::new(
+        FakeClaudeCli::new().with_turn(Run::replaying(&format!("{}\n{failed}", init(NATIVE_ID)))),
+    );
+    let session = open(&launcher).await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "hello"))
+        .await
+        .expect("expected a turn");
+    let (events, at_terminal) = drain(session.as_ref(), &mut turn).await;
+    assert_eq!(
+        failure_of(&events).code.as_str(),
+        "claude-error_during_execution"
+    );
+    assert_is(at_terminal, Resumability::Resumable, "on the terminal");
+}
+
+// ---- Endings the vendor did not finish, with nobody asking for a stop -----------------------
+
+/// A child that exits mid-turn leaves a turn unfinished, whatever its status and whatever the
+/// host's control would answer to a later interrupt (this one says it delivered it).
+#[tokio::test]
+async fn a_child_that_dies_mid_turn_leaves_the_conversation_unfinished() {
+    for code in [143, 1, 0] {
+        let launcher = Arc::new(FakeClaudeCli::new().with_graceful_interrupt().with_turn(
+            unfinished(vec![init(NATIVE_ID), ASSISTANT.to_owned()], code),
+        ));
+        let session = open(&launcher).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "work"))
+            .await
+            .expect("expected a turn");
+        let (events, at_terminal) = drain(session.as_ref(), &mut turn).await;
+        assert!(
+            matches!(events.last(), Some(EventKind::Error { .. })),
+            "expected a terminal error for exit {code} | received: {events:?}"
+        );
+        assert_is(
+            at_terminal,
+            Resumability::UnfinishedTurn,
+            &format!("on the terminal after exit {code}"),
+        );
+
+        session
+            .close(CloseReason::Requested)
+            .await
+            .expect("expected the close to land");
+        assert_is(
+            session.snapshot().resumability,
+            Resumability::UnfinishedTurn,
+            &format!("after close, exit {code}"),
+        );
+    }
+}
+
+/// A fresh conversation whose child died before `system/init` was never written, so there is
+/// nothing unfinished to resume and the verdict stays `Unknown`.
+#[tokio::test]
+async fn a_child_that_dies_before_init_leaves_nothing_to_taint() {
     let launcher = Arc::new(
         FakeClaudeCli::new()
             .with_graceful_interrupt()
-            .with_turn(Run::stalling([init(NATIVE_ID)])),
+            .with_turn(Run::exiting(1)),
     );
     let session = open(&launcher).await;
     let mut turn = session
-        .start_turn(TurnRequest::new("turn-1", "hold"))
+        .start_turn(TurnRequest::new("turn-1", "work"))
         .await
         .expect("expected a turn");
-    wait_for(session.as_ref(), Resumability::Resumable).await;
+    let (_, at_terminal) = drain(session.as_ref(), &mut turn).await;
+    assert_is(at_terminal, Resumability::Unknown, "on the terminal");
+}
+
+/// The snapshot read on the terminal event is already the final value, on a runtime where the pump
+/// and the reader run on different threads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_terminal_of_a_dead_child_never_precedes_its_verdict() {
+    for round in 0..200 {
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_graceful_interrupt()
+                .with_turn(unfinished(vec![init(NATIVE_ID), ASSISTANT.to_owned()], 1)),
+        );
+        let session = open(&launcher).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "work"))
+            .await
+            .expect("expected a turn");
+        let (_, at_terminal) = drain(session.as_ref(), &mut turn).await;
+        assert_is(
+            at_terminal,
+            Resumability::UnfinishedTurn,
+            &format!("on the terminal, round {round}"),
+        );
+    }
+}
+
+/// The idle timeout is a floor of ten minutes, so this runs on a paused clock.
+#[tokio::test(start_paused = true)]
+async fn a_stream_that_goes_silent_leaves_the_conversation_unfinished() {
+    let launcher = Arc::new(
+        FakeClaudeCli::new()
+            .with_graceful_interrupt()
+            .with_turn(Run::stalling([init(NATIVE_ID), ASSISTANT.to_owned()])),
+    );
+    let session = open(&launcher).await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "work"))
+        .await
+        .expect("expected a turn");
+    let (events, at_terminal) = drain_within(
+        session.as_ref(),
+        &mut turn,
+        Duration::from_secs(60 * 60 * 3),
+    )
+    .await;
+    assert!(
+        matches!(events.last(), Some(EventKind::Error { .. })),
+        "expected a terminal error for the idle timeout | received: {events:?}"
+    );
+    assert_is(at_terminal, Resumability::UnfinishedTurn, "on the terminal");
 
     session
-        .cancel(CancelReason::Requested)
+        .close(CloseReason::Requested)
         .await
-        .expect("expected a graceful interruption");
-    drain(&mut turn).await;
+        .expect("expected the close to land");
+    assert_resumability(session.as_ref(), Resumability::UnfinishedTurn, "close");
+}
 
-    assert_eq!(launcher.graceful_interrupts(), 1, "expected a SIGINT stop");
-    assert_resumability(
-        session.as_ref(),
-        Resumability::Resumable,
-        "a graceful interrupt",
+#[tokio::test]
+async fn a_stream_the_harness_cannot_read_leaves_the_conversation_unfinished() {
+    let oversized = "x".repeat(8192);
+    let launcher = Arc::new(
+        FakeClaudeCli::new()
+            .with_graceful_interrupt()
+            .with_turn(Run::stalling([init(NATIVE_ID), oversized])),
+    );
+    let narrow = Limits {
+        line: LineLimits {
+            max_line_bytes: 4096,
+            max_buffered_bytes: 8192,
+        },
+        ..Limits::default()
+    };
+    let session = open_on(&host_under(Arc::clone(&launcher) as _, narrow)).await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "work"))
+        .await
+        .expect("expected a turn");
+    let (events, at_terminal) = drain(session.as_ref(), &mut turn).await;
+    assert!(
+        matches!(events.last(), Some(EventKind::Error { .. })),
+        "expected a terminal error for the unreadable line | received: {events:?}"
+    );
+    assert_is(at_terminal, Resumability::UnfinishedTurn, "on the terminal");
+}
+
+// ---- Endings someone asked for ---------------------------------------------------------------
+
+fn stalled(graceful: bool) -> Arc<FakeClaudeCli> {
+    let launcher = FakeClaudeCli::new().with_turn(Run::stalling([init(NATIVE_ID)]));
+    Arc::new(if graceful {
+        launcher.with_graceful_interrupt()
+    } else {
+        launcher
+    })
+}
+
+fn after_stop(graceful: bool) -> Resumability {
+    if graceful {
+        Resumability::Resumable
+    } else {
+        Resumability::UnfinishedTurn
+    }
+}
+
+/// The stop took the path the case names, so a verdict is not read off a stop that never ran.
+fn assert_stopped_by(launcher: &FakeClaudeCli, graceful: bool) {
+    let (interrupts, kills) = (launcher.graceful_interrupts(), launcher.kill_requests());
+    let (wanted_interrupts, wanted_kills) = if graceful { (1, 0) } else { (0, 1) };
+    assert!(
+        interrupts == wanted_interrupts && kills >= wanted_kills,
+        "expected graceful interrupts: {wanted_interrupts}, kills: {wanted_kills}+ | received: {interrupts}, {kills}"
     );
 }
 
 #[tokio::test]
-async fn a_forced_termination_taints_the_conversation() {
-    let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::stalling([init(NATIVE_ID)])));
-    let session = open(&launcher).await;
-    let mut turn = session
-        .start_turn(TurnRequest::new("turn-1", "hold"))
-        .await
-        .expect("expected a turn");
-    wait_for(session.as_ref(), Resumability::Resumable).await;
+async fn cancel_records_how_it_stopped_the_child() {
+    for graceful in [true, false] {
+        let launcher = stalled(graceful);
+        let session = open(&launcher).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+        wait_for(session.as_ref(), Resumability::Resumable).await;
 
-    session
-        .cancel(CancelReason::Requested)
-        .await
-        .expect("expected the cancel to land");
-    drain(&mut turn).await;
+        session
+            .cancel(CancelReason::Requested)
+            .await
+            .expect("expected the cancel to land");
+        let (_, at_terminal) = drain(session.as_ref(), &mut turn).await;
 
-    assert_eq!(launcher.kill_requests(), 1, "expected a forced stop");
-    assert_resumability(
-        session.as_ref(),
-        Resumability::TaintedByKill,
-        "a forced termination",
-    );
+        assert_stopped_by(&launcher, graceful);
+        // The terminal is written before the stop finishes: it may read `Unknown`, never a
+        // `Resumable` the stop is about to withdraw. `cancel` has returned, so it is final here.
+        assert_is(at_terminal, after_stop(graceful), "after cancel returned");
+        session
+            .close(CloseReason::Requested)
+            .await
+            .expect("expected the close to land");
+        assert_resumability(session.as_ref(), after_stop(graceful), "close");
+    }
 }
 
-/// The kill is the verdict even when the child died before it ever announced a conversation.
+/// Read on the terminal while the stop is still running, the value is never a `Resumable` that the
+/// kill then withdraws. Different threads read and stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_terminal_written_before_a_kill_finishes_never_reads_resumable() {
+    for round in 0..200 {
+        let launcher = stalled(false);
+        let session: Arc<dyn Session> = Arc::from(open(&launcher).await);
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+        wait_for(session.as_ref(), Resumability::Resumable).await;
+
+        let stopper = {
+            let session = Arc::clone(&session);
+            tokio::spawn(async move { session.cancel(CancelReason::Requested).await })
+        };
+        let (_, at_terminal) = drain(session.as_ref(), &mut turn).await;
+        assert_terminal_while_stopping(
+            at_terminal,
+            false,
+            &format!("on the terminal, round {round}"),
+        );
+        stopper
+            .await
+            .expect("expected the cancel task to finish")
+            .expect("expected the cancel to land");
+        assert_resumability(
+            session.as_ref(),
+            Resumability::UnfinishedTurn,
+            &format!("cancel returned, round {round}"),
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_forced_termination_before_init_taints_the_conversation() {
     let launcher =
@@ -177,14 +435,220 @@ async fn a_forced_termination_before_init_taints_the_conversation() {
         .cancel(CancelReason::Requested)
         .await
         .expect("expected the cancel to land");
-    drain(&mut turn).await;
+    drain(session.as_ref(), &mut turn).await;
 
     assert_resumability(
         session.as_ref(),
-        Resumability::TaintedByKill,
+        Resumability::UnfinishedTurn,
         "a forced termination before init",
     );
 }
+
+#[tokio::test]
+async fn close_records_how_it_stopped_the_child() {
+    for graceful in [false, true] {
+        let launcher = stalled(graceful);
+        let session = open(&launcher).await;
+        let _turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+        wait_for(session.as_ref(), Resumability::Resumable).await;
+
+        session
+            .close(CloseReason::Requested)
+            .await
+            .expect("expected the close to land");
+
+        assert_stopped_by(&launcher, graceful);
+        assert_resumability(session.as_ref(), after_stop(graceful), "close");
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_host_records_how_it_stopped_the_child() {
+    for graceful in [false, true] {
+        let launcher = stalled(graceful);
+        let token = CancelToken::new();
+        let host = HostContext::builder()
+            .launcher(Arc::clone(&launcher) as Arc<dyn ProcessLauncher>)
+            .cwd(std::env::temp_dir())
+            .scratch(std::env::temp_dir())
+            .client_info("mea-tests", "0.0.0")
+            .cancel(token.clone())
+            .build()
+            .expect("expected a host");
+        let session = open_on(&host).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+        wait_for(session.as_ref(), Resumability::Resumable).await;
+
+        token.cancel();
+        let (_, at_terminal) = drain(session.as_ref(), &mut turn).await;
+        assert_terminal_while_stopping(at_terminal, graceful, "on the terminal");
+        // `close` joins the stop the pump started, so it is the barrier that follows it.
+        session
+            .close(CloseReason::Requested)
+            .await
+            .expect("expected the close to land");
+
+        assert_stopped_by(&launcher, graceful);
+        assert_resumability(session.as_ref(), after_stop(graceful), "close");
+    }
+}
+
+#[tokio::test]
+async fn a_dropped_stream_records_how_it_stopped_the_child() {
+    for graceful in [false, true] {
+        let launcher = stalled(graceful);
+        let session = open(&launcher).await;
+        let turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+        wait_for(session.as_ref(), Resumability::Resumable).await;
+
+        drop(turn);
+        session
+            .close(CloseReason::Requested)
+            .await
+            .expect("expected the close to land");
+
+        assert_stopped_by(&launcher, graceful);
+        assert_resumability(session.as_ref(), after_stop(graceful), "close");
+    }
+}
+
+/// A host that drops the session handle and the stream without closing leaves the verdict where
+/// the last stop put it. The subscription outlives the handle and ends with the session's state.
+#[tokio::test]
+async fn a_dropped_session_records_how_the_child_was_stopped() {
+    for graceful in [false, true] {
+        let launcher = stalled(graceful);
+        let session = open(&launcher).await;
+        let turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+        wait_for(session.as_ref(), Resumability::Resumable).await;
+        let mut changes = session.subscribe();
+
+        drop(turn);
+        drop(session);
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            while changes.changed().await.is_some() {}
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "expected the session state to end after the drop | received: still open"
+        );
+
+        assert_stopped_by(&launcher, graceful);
+        assert_is(
+            changes.current().resumability,
+            after_stop(graceful),
+            "after the session was dropped",
+        );
+    }
+}
+
+// ---- A stop that does not complete -----------------------------------------------------------
+
+/// A refused kill leaves a child that may still be mid-turn: the least resumable state there is.
+#[tokio::test]
+async fn a_stop_that_fails_leaves_the_conversation_unfinished() {
+    let inner = Arc::new(FakeClaudeCli::new().with_turn(Run::stalling([init(NATIVE_ID)])));
+    let tap = Arc::new(ControlTap::refusing_kill(Arc::clone(&inner)));
+    let session = open_on(&host_under(tap, Limits::default())).await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "hold"))
+        .await
+        .expect("expected a turn");
+    wait_for(session.as_ref(), Resumability::Resumable).await;
+
+    let cancelled = session.cancel(CancelReason::Requested).await;
+    let error = cancelled.expect_err("expected the refused kill to fail the cancel");
+    assert!(
+        error.cleanup_control().is_some(),
+        "expected a CleanupRequired carrying the host's control | received: {error:?}"
+    );
+    assert_resumability(
+        session.as_ref(),
+        Resumability::UnfinishedTurn,
+        "a cancel whose stop failed",
+    );
+    assert!(inner.a_child_is_running(), "expected the child to remain");
+
+    let (_, at_terminal) = drain(session.as_ref(), &mut turn).await;
+    assert_is(at_terminal, Resumability::UnfinishedTurn, "on the terminal");
+    let _ = session.close(CloseReason::Requested).await;
+    assert_resumability(
+        session.as_ref(),
+        Resumability::UnfinishedTurn,
+        "a close after a failed stop",
+    );
+    inner.end_turns_for_host_cleanup();
+}
+
+/// A launcher that fails over a child it could not end leaves that child possibly running.
+#[tokio::test]
+async fn a_launch_that_fails_over_a_child_leaves_the_conversation_unfinished() {
+    let inner = Arc::new(FakeClaudeCli::new().with_turn(Run::stalling([init(NATIVE_ID)])));
+    let tap = Arc::new(ControlTap::failing_launch_over_a_child(Arc::clone(&inner)));
+    let session = open_on(&host_under(tap, Limits::default())).await;
+
+    let error = session
+        .start_turn(TurnRequest::new("turn-1", "hold"))
+        .await
+        .expect_err("expected the launch to fail");
+    assert!(
+        error.cleanup_control().is_some(),
+        "expected a CleanupRequired carrying the child's control | received: {error:?}"
+    );
+    assert_resumability(
+        session.as_ref(),
+        Resumability::UnfinishedTurn,
+        "a failed launch over a child",
+    );
+    inner.end_turns_for_host_cleanup();
+}
+
+/// A turn refused before any launch ran nothing, so it changes nothing.
+#[tokio::test]
+async fn a_turn_refused_before_launch_changes_nothing() {
+    let launcher = Arc::new(
+        FakeClaudeCli::new().with_turn(Run::replaying(&format!("{}\n{RESULT}", init(NATIVE_ID)))),
+    );
+    let session = open(&launcher).await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "hello"))
+        .await
+        .expect("expected a turn");
+    drain(session.as_ref(), &mut turn).await;
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected the close to land");
+
+    let refused = session
+        .start_turn(TurnRequest::new("turn-2", "too late"))
+        .await
+        .expect_err("expected a closed session to refuse a turn");
+    assert!(
+        matches!(refused.cause(), Error::Closed { .. }),
+        "expected a closed refusal | received: {refused:?}"
+    );
+    assert_resumability(
+        session.as_ref(),
+        Resumability::Resumable,
+        "a turn refused before launch",
+    );
+}
+
+// ---- Strict resume ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn a_confirmed_strict_resume_is_resumable() {
@@ -202,7 +666,7 @@ async fn a_confirmed_strict_resume_is_resumable() {
         .start_turn(TurnRequest::new("turn-1", "continue"))
         .await
         .expect("expected the deferred resume to start");
-    drain(&mut turn).await;
+    drain(session.as_ref(), &mut turn).await;
 
     assert_resumability(
         session.as_ref(),
@@ -232,11 +696,14 @@ async fn a_strict_resume_the_vendor_did_not_confirm_is_unverified() {
             .start_turn(TurnRequest::new("turn-1", "continue"))
             .await
             .expect("expected the deferred resume to start");
-        drain(&mut turn).await;
+        let (_, at_terminal) = drain(session.as_ref(), &mut turn).await;
 
+        assert_is(at_terminal, Resumability::Unverified, label);
         assert_resumability(session.as_ref(), Resumability::Unverified, label);
     }
 }
+
+// ---- A strict resume the CLI ends before it starts -------------------------------------------
 
 /// What `claude -p --resume <unknown uuid> --output-format stream-json --verbose` printed on
 /// stdout with an empty `CLAUDE_CONFIG_DIR` (Claude Code 2.1.296, signed out): this one record,
@@ -244,18 +711,11 @@ async fn a_strict_resume_the_vendor_did_not_confirm_is_unverified() {
 const MISSING_CONVERSATION_RESULT: &str = r#"{"type":"result","subtype":"error_during_execution","duration_ms":0,"duration_api_ms":0,"is_error":true,"num_turns":0,"stop_reason":null,"session_id":"3f2c1a90-1b2c-4d3e-8f4a-5b6c7d8e9f01","total_cost_usd":0,"usage":{"output_tokens_details":{"thinking_tokens":0},"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard","fallback_credit":null},"modelUsage":{},"permission_denials":[],"uuid":"cda4c431-888f-4a71-8740-1f03574505ac","errors":["No conversation found with session ID: 3f2c1a90-1b2c-4d3e-8f4a-5b6c7d8e9f01"],"result_index":0}"#;
 const MISSING_ID: &str = "3f2c1a90-1b2c-4d3e-8f4a-5b6c7d8e9f01";
 
-fn failure_of(events: &[EventKind]) -> mango_external_agents::VendorError {
-    match events.last() {
-        Some(EventKind::Error { error }) => error.clone(),
-        other => panic!("expected a terminal error event | received: {other:?}"),
-    }
-}
-
-/// The CLI ended a strict resume with an errored `result` before it announced the session. That
-/// shape — not the vendor's wording — is what the harness reads, so a host can tell a conversation
-/// the CLI would not start from a transport failure (`claude-stream-broken`).
+/// The code and the message are the 0.7.0 ones. A host matching `claude-stream-broken` for a
+/// refused resume keeps matching; the new facts are the snapshot's `Unverified` and the
+/// result's subtype as the failure's `vendor_code`.
 #[tokio::test]
-async fn a_strict_resume_the_cli_ends_before_init_fails_with_its_own_code() {
+async fn a_strict_resume_the_cli_ends_before_init_keeps_its_code_and_adds_facts() {
     let launcher = Arc::new(
         FakeClaudeCli::new()
             .with_graceful_interrupt()
@@ -266,26 +726,73 @@ async fn a_strict_resume_the_cli_ends_before_init_fails_with_its_own_code() {
         .start_turn(TurnRequest::new("turn-1", "continue"))
         .await
         .expect("expected the deferred resume to start");
-    let error = failure_of(&drain(&mut turn).await);
+    let (events, at_terminal) = drain(session.as_ref(), &mut turn).await;
+    let error = failure_of(&events);
 
     assert_eq!(
         error.code.as_str(),
-        "claude-resume-failed",
-        "expected error code: claude-resume-failed | received: {}",
+        "claude-stream-broken",
+        "expected error code: claude-stream-broken | received: {}",
         error.code
     );
-    assert!(!error.retryable, "expected a non-retryable failure");
-    assert_resumability(
-        session.as_ref(),
-        Resumability::Unverified,
-        "a resume the CLI ended before init",
+    assert_eq!(
+        error.message,
+        Error::Protocol {
+            expected: String::from(
+                "a system/init record confirming the requested Claude resume handle before conversation content or result"
+            ),
+            received: String::from("a result record before resume confirmation"),
+        }
+        .to_string(),
+        "expected the 0.7.0 message"
     );
+    assert_eq!(
+        error.vendor_code.as_deref(),
+        Some("error_during_execution"),
+        "expected vendor_code: error_during_execution | received: {:?}",
+        error.vendor_code
+    );
+    assert!(!error.retryable, "expected a non-retryable failure");
+    assert_is(at_terminal, Resumability::Unverified, "on the terminal");
 }
 
-/// The code must not depend on the sentence. The same structure with other words, or with none,
-/// is the same failure.
+/// A vendor result that is not a failure, or content before init, carries no vendor code: only an
+/// errored `result` says the CLI ended the run.
 #[tokio::test]
-async fn the_resume_failure_code_does_not_depend_on_the_vendors_wording() {
+async fn a_strict_resume_refused_for_another_reason_carries_no_vendor_code() {
+    let wordings = [
+        (
+            "a succeeded result",
+            r#"{"type":"result","subtype":"success","is_error":false}"#,
+        ),
+        ("an assistant record", ASSISTANT),
+    ];
+    for (label, record) in wordings {
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::replaying(record)));
+        let session = open_resuming(&launcher, MISSING_ID).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "continue"))
+            .await
+            .expect("expected the deferred resume to start");
+        let (events, _) = drain(session.as_ref(), &mut turn).await;
+        let error = failure_of(&events);
+        assert_eq!(
+            error.code.as_str(),
+            "claude-stream-broken",
+            "expected error code for {label}: claude-stream-broken | received: {}",
+            error.code
+        );
+        assert_eq!(
+            error.vendor_code, None,
+            "expected no vendor_code for {label} | received: {:?}",
+            error.vendor_code
+        );
+    }
+}
+
+/// The subtype is read from the record's structure, never from the vendor's wording.
+#[tokio::test]
+async fn the_vendor_code_does_not_depend_on_the_vendors_wording() {
     let wordings = [
         r#""errors":["Failed to resume session: transcript unreadable"]"#,
         r#""errors":[]"#,
@@ -301,42 +808,15 @@ async fn the_resume_failure_code_does_not_depend_on_the_vendors_wording() {
             .start_turn(TurnRequest::new("turn-1", "continue"))
             .await
             .expect("expected the deferred resume to start");
-        let error = failure_of(&drain(&mut turn).await);
+        let (events, _) = drain(session.as_ref(), &mut turn).await;
+        let error = failure_of(&events);
         assert_eq!(
-            error.code.as_str(),
-            "claude-resume-failed",
-            "expected error code for {wording}: claude-resume-failed | received: {}",
-            error.code
+            error.vendor_code.as_deref(),
+            Some("error_during_execution"),
+            "expected vendor_code for {wording}: error_during_execution | received: {:?}",
+            error.vendor_code
         );
     }
-}
-
-/// A failure after `system/init` is a failure of the turn, not of the resume: the conversation was
-/// found, so the code stays the result's own and the conversation stays resumable.
-#[tokio::test]
-async fn an_errored_result_after_a_confirmed_resume_keeps_the_results_own_code() {
-    let failed = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1,"errors":["overloaded"]}"#;
-    let launcher = Arc::new(
-        FakeClaudeCli::new().with_turn(Run::replaying(&format!("{}\n{failed}", init(NATIVE_ID)))),
-    );
-    let session = open_resuming(&launcher, NATIVE_ID).await;
-    let mut turn = session
-        .start_turn(TurnRequest::new("turn-1", "continue"))
-        .await
-        .expect("expected the deferred resume to start");
-    let error = failure_of(&drain(&mut turn).await);
-
-    assert_eq!(
-        error.code.as_str(),
-        "claude-error_during_execution",
-        "expected error code: claude-error_during_execution | received: {}",
-        error.code
-    );
-    assert_resumability(
-        session.as_ref(),
-        Resumability::Resumable,
-        "a failed turn on a confirmed resume",
-    );
 }
 
 /// A fresh session has no resume to fail, so an errored result with no init stays what it was.
@@ -349,7 +829,8 @@ async fn an_errored_result_on_a_fresh_session_is_not_a_resume_failure() {
         .start_turn(TurnRequest::new("turn-1", "hello"))
         .await
         .expect("expected a turn");
-    let error = failure_of(&drain(&mut turn).await);
+    let (events, _) = drain(session.as_ref(), &mut turn).await;
+    let error = failure_of(&events);
 
     assert_eq!(
         error.code.as_str(),
@@ -357,147 +838,4 @@ async fn an_errored_result_on_a_fresh_session_is_not_a_resume_failure() {
         "expected error code: claude-error_during_execution | received: {}",
         error.code
     );
-}
-
-/// The other ways a turn's child is stopped while the session is alive or on its way out. The
-/// snapshot is what a host stores, so a path that kills without tainting would hand a later
-/// session a killed conversation marked `Resumable`.
-mod other_stops {
-    use super::*;
-    use mango_external_agents::{CancelToken, CloseReason, HostContext};
-
-    fn stalled(graceful: bool) -> Arc<FakeClaudeCli> {
-        let launcher = FakeClaudeCli::new().with_turn(Run::stalling([init(NATIVE_ID)]));
-        Arc::new(if graceful {
-            launcher.with_graceful_interrupt()
-        } else {
-            launcher
-        })
-    }
-
-    fn expected(graceful: bool) -> Resumability {
-        if graceful {
-            Resumability::Resumable
-        } else {
-            Resumability::TaintedByKill
-        }
-    }
-
-    /// The stop took the path the case names, so a verdict is not read off a stop that never ran.
-    fn assert_stopped_by(launcher: &FakeClaudeCli, graceful: bool) {
-        let (interrupts, kills) = (launcher.graceful_interrupts(), launcher.kill_requests());
-        let (wanted_interrupts, wanted_kills) = if graceful { (1, 0) } else { (0, 1) };
-        assert!(
-            interrupts == wanted_interrupts && kills >= wanted_kills,
-            "expected graceful interrupts: {wanted_interrupts}, kills: {wanted_kills}+ | received: {interrupts}, {kills}"
-        );
-    }
-
-    /// The child is gone and the harness had its turn at recording how it ended.
-    async fn settled(launcher: &FakeClaudeCli) {
-        let ended = tokio::time::timeout(Duration::from_secs(5), async {
-            while !launcher.all_children_ended() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await;
-        assert!(ended.is_ok(), "expected the stopped child to end");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    #[tokio::test]
-    async fn close_records_how_it_stopped_the_child() {
-        for graceful in [false, true] {
-            let launcher = stalled(graceful);
-            let session = open(&launcher).await;
-            let _turn = session
-                .start_turn(TurnRequest::new("turn-1", "hold"))
-                .await
-                .expect("expected a turn");
-            wait_for(session.as_ref(), Resumability::Resumable).await;
-
-            session
-                .close(CloseReason::Requested)
-                .await
-                .expect("expected the close to land");
-
-            assert_stopped_by(&launcher, graceful);
-            assert_resumability(
-                session.as_ref(),
-                expected(graceful),
-                if graceful {
-                    "a close that interrupted gracefully"
-                } else {
-                    "a close that had to kill"
-                },
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn a_cancelled_host_records_how_it_stopped_the_child() {
-        for graceful in [false, true] {
-            let launcher = stalled(graceful);
-            let token = CancelToken::new();
-            let host: HostContext = HostContext::builder()
-                .launcher(Arc::clone(&launcher) as Arc<dyn mango_external_agents::ProcessLauncher>)
-                .cwd(std::env::temp_dir())
-                .scratch(std::env::temp_dir())
-                .client_info("mea-tests", "0.0.0")
-                .cancel(token.clone())
-                .build()
-                .expect("expected a host");
-            let session = ClaudeHarness::new()
-                .open_session(&host, OpenSession::new("chat-1"))
-                .await
-                .expect("expected a session");
-            let mut turn = session
-                .start_turn(TurnRequest::new("turn-1", "hold"))
-                .await
-                .expect("expected a turn");
-            wait_for(session.as_ref(), Resumability::Resumable).await;
-
-            token.cancel();
-            drain(&mut turn).await;
-            settled(&launcher).await;
-
-            assert_stopped_by(&launcher, graceful);
-            assert_resumability(
-                session.as_ref(),
-                expected(graceful),
-                if graceful {
-                    "a host shutdown that interrupted gracefully"
-                } else {
-                    "a host shutdown that had to kill"
-                },
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn a_dropped_stream_records_how_it_stopped_the_child() {
-        for graceful in [false, true] {
-            let launcher = stalled(graceful);
-            let session = open(&launcher).await;
-            let turn = session
-                .start_turn(TurnRequest::new("turn-1", "hold"))
-                .await
-                .expect("expected a turn");
-            wait_for(session.as_ref(), Resumability::Resumable).await;
-
-            drop(turn);
-            settled(&launcher).await;
-
-            assert_stopped_by(&launcher, graceful);
-            assert_resumability(
-                session.as_ref(),
-                expected(graceful),
-                if graceful {
-                    "a dropped stream that interrupted gracefully"
-                } else {
-                    "a dropped stream that had to kill"
-                },
-            );
-        }
-    }
 }

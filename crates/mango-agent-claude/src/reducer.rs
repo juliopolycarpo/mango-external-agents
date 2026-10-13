@@ -991,27 +991,25 @@ fn result_error(record: &StreamRecord) -> Option<VendorError> {
     }
 }
 
-/// The code of a strict resume the CLI ended with an errored `result` before it announced the
-/// session.
-pub(crate) const RESUME_FAILED_CODE: &str = "claude-resume-failed";
-
-/// The failure of a strict resume whose first record was an errored `result`, if `record` is one.
+/// The documented subtype of an errored `result` record, when `record` is one.
 ///
-/// The signal is the shape the vendor documents, not its wording. `system/init` "is the first event
-/// in the stream unless startup events precede it", and a failure inside the run is printed "as the
-/// result on stdout" — so an errored `result` while a resume is still unconfirmed means the CLI
-/// ended the run before it started the conversation. That covers a conversation the CLI cannot
-/// find (`No conversation found with session ID`, documented in its error reference as a message
-/// with exit code 1) and the other resume failures it documents, which share the shape and none of
-/// which has a structured field of its own. The vendor's `errors` text is carried as the message
-/// for a person to read; nothing here matches on it.
+/// Only a subtype this file names comes back, as the static label from [`NAMED_RESULT_SUBTYPES`],
+/// so the vendor's own string never reaches a host through it. A strict resume that ends with such
+/// a record before `system/init` carries it as the failure's `vendor_code`: the vendor documents
+/// `system/init` as the first event and an in-run failure as the `result`, which says the run ended
+/// before the conversation started, not why. Hooks and plugin events can precede `system/init` and
+/// a missing login prints the same way.
 ///
-/// <https://code.claude.com/docs/en/headless.md> and
-/// <https://code.claude.com/docs/en/errors.md>
-pub(crate) fn resume_failure(record: &StreamRecord) -> Option<VendorError> {
-    let mut error = result_error(record)?;
-    error.code = ErrorCode::from_static(RESUME_FAILED_CODE);
-    Some(error)
+/// <https://code.claude.com/docs/en/headless.md>
+pub(crate) fn errored_result_subtype(record: &StreamRecord) -> Option<&'static str> {
+    if record.kind() != Some("result") || !record.result().is_error() {
+        return None;
+    }
+    let subtype = record.subtype().unwrap_or("error");
+    NAMED_RESULT_SUBTYPES
+        .iter()
+        .copied()
+        .find(|named| *named == subtype)
 }
 
 /// The result subtypes this harness will name, in a code and in a sentence it writes itself.
@@ -1570,28 +1568,24 @@ mod tests {
         );
     }
 
-    /// A subtype is a field the vendor fills in, and a code is diagnostic text a host is shown.
-    ///
-    /// Only an errored `result` is a resume failure, and it keeps the vendor's text for a person.
+    /// Only an errored `result` has a subtype to report, and only a named one is reported.
     #[test]
-    fn a_resume_failure_is_an_errored_result_with_the_vendors_text() {
-        let errored = StreamRecord::parse(
-            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["No conversation found with session ID: x"]}"#,
-        )
-        .expect("record");
-        let failure = super::resume_failure(&errored)
-            .expect("expected an errored result to be a resume failure");
-        assert_eq!(failure.code.as_str(), super::RESUME_FAILED_CODE);
-        assert_eq!(failure.message, "No conversation found with session ID: x");
-
-        let succeeded =
-            StreamRecord::parse(r#"{"type":"result","is_error":false}"#).expect("record");
-        assert!(
-            super::resume_failure(&succeeded).is_none(),
-            "expected no resume failure for a result with is_error: false"
+    fn an_errored_result_reports_only_a_subtype_the_harness_names() {
+        let parse = |line: &str| StreamRecord::parse(line).expect("record");
+        let named =
+            parse(r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#);
+        assert_eq!(
+            super::errored_result_subtype(&named),
+            Some("error_during_execution")
         );
-        let assistant = StreamRecord::parse(r#"{"type":"assistant"}"#).expect("record");
-        assert!(super::resume_failure(&assistant).is_none());
+        let unnamed = parse(r#"{"type":"result","subtype":"sk-live-canary","is_error":true}"#);
+        assert_eq!(super::errored_result_subtype(&unnamed), None);
+        let bare = parse(r#"{"type":"result","is_error":true}"#);
+        assert_eq!(super::errored_result_subtype(&bare), Some("error"));
+        let succeeded = parse(r#"{"type":"result","subtype":"success","is_error":false}"#);
+        assert_eq!(super::errored_result_subtype(&succeeded), None);
+        let assistant = parse(r#"{"type":"assistant","is_error":true}"#);
+        assert_eq!(super::errored_result_subtype(&assistant), None);
     }
 
     /// The documented subtypes become the harness's own label. Anything else becomes the generic

@@ -281,6 +281,9 @@ struct Mutable {
     /// Why `nonresumable` was set: the first cause wins, and it is what the snapshot publishes as
     /// [`Resumability`]. Written only through [`Mutable::mark_nonresumable`].
     taint: Option<Resumability>,
+    /// Where the verdict is published from places that hold only this state, such as the moment a
+    /// stop is requested. `None` for a state built without a session.
+    core_state: Option<CoreSessionState>,
     /// The one close worker that owns the session artifact and publishes its final state.
     close_teardown: Option<Arc<Teardown>>,
 }
@@ -295,17 +298,52 @@ impl Mutable {
         self.taint.get_or_insert(cause);
     }
 
+    /// Records that a turn left the conversation unfinished without refusing later turns.
+    ///
+    /// For an ending nobody asked for (a child that died, a silent stream, a stop that did not
+    /// complete): the published verdict is conservative, while `start_turn` keeps its behaviour.
+    /// A first cause stays.
+    fn mark_unfinished(&mut self) {
+        self.taint.get_or_insert(Resumability::UnfinishedTurn);
+    }
+
+    /// Whether a stop has been asked for and has not yet been recorded.
+    ///
+    /// Until it is, nothing says how the child will end, so the verdict cannot be `Resumable`.
+    fn stop_pending(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|active| active.end.get().is_some() && !active.stopped)
+    }
+
     /// What a host may conclude about the stored conversation right now.
     ///
-    /// `Unknown` until a `system/init` proves the conversation exists, and again for a strict
-    /// resume no turn has confirmed. A taint outranks both.
+    /// `Unknown` until a `system/init` proves the conversation exists, again for a strict resume
+    /// no turn has confirmed, and again while a stop is pending: a graceful interrupt keeps the
+    /// conversation and a kill does not, and the terminal event is written before the stop
+    /// finishes. A taint outranks all of them.
     fn resumability(&self) -> Resumability {
         match self.taint {
             Some(cause) => cause,
-            None if self.established => Resumability::Resumable,
+            None if self.established && !self.stop_pending() => Resumability::Resumable,
             None => Resumability::Unknown,
         }
     }
+
+    /// Publishes [`Self::resumability`] from code that holds only this state.
+    fn publish(&self) {
+        if let Some(core_state) = &self.core_state {
+            core_state.set_resumability(self.resumability());
+        }
+    }
+}
+
+/// Publishes that a turn left the conversation unfinished, before the failure that says so is
+/// returned or the terminal that follows it is emitted.
+fn taint_unfinished(shared: &Shared) {
+    let mut state = shared.lock();
+    state.mark_unfinished();
+    publish_resumability(shared, &state);
 }
 
 /// Publishes the verdict of [`Mutable::resumability`] while the caller still holds the lock.
@@ -387,6 +425,7 @@ impl ClaudeSession {
             mcp_config: mcp_config.map(Arc::new),
             nonresumable: None,
             taint: None,
+            core_state: Some(core_state.clone()),
             close_teardown: None,
         };
         Self {
@@ -598,7 +637,7 @@ fn start_teardown(
     }
     let shared_for_worker = Arc::clone(shared);
     let teardown_for_worker = Arc::clone(teardown);
-    let lost = LostWorker::new(teardown, taken.control.clone());
+    let lost = LostWorker::new(teardown, taken.control.clone()).tainting(shared);
     spawn_owned(shared, async move {
         let _lost = lost;
         run_teardown(
@@ -629,14 +668,17 @@ async fn run_teardown(
         Arc::clone(&teardown.proven_gone),
     )
     .await;
-    if let Ok(outcome) = outcome {
-        record_stop(
+    match outcome {
+        Ok(outcome) => record_stop(
             shared,
             &taken.end,
             taint_continuation && !matches!(outcome, Some(StopOutcome::Interrupted)),
             reason,
             settled,
-        );
+        ),
+        // A stop that did not complete leaves a child that may still be mid-turn. Published
+        // before the failure reaches any `cancel` or `close` waiting on it.
+        Err(_) => taint_unfinished(shared),
     }
     teardown.finish(outcome.map(drop));
 }
@@ -665,6 +707,8 @@ fn finish_unstarted_teardown(shared: &Shared, end: &Arc<TurnEnd>) {
 /// The reservation stays taken, as it does after any stop that failed, and the error is what every
 /// later `cancel` and `close` repeats. `error` must carry the control, as `CleanupRequired` does.
 fn retain_failed_launch(shared: &Shared, end: &Arc<TurnEnd>, error: &Error) {
+    // The child the launcher could not end may be running a turn.
+    taint_unfinished(shared);
     let teardown = shared
         .lock()
         .active
@@ -793,10 +837,14 @@ fn request_stop(state: &mut Mutable, reason: CancelReason) -> Option<TakenTurn> 
         return None;
     }
     active.stop.cancel();
-    Some(TakenTurn {
+    let taken = TakenTurn {
         end: Arc::clone(&active.end),
         control: active.control.as_ref().map(Arc::clone),
-    })
+    };
+    // The terminal can be written before the stop finishes, so the verdict stops being
+    // `Resumable` the moment the stop is asked for and settles when it is recorded.
+    state.publish();
+    Some(taken)
 }
 
 /// Clones the stopping owner so close can attach to the teardown a caller already claimed.
@@ -912,7 +960,8 @@ impl Drop for AbandonedStart {
         };
         // This worker only installs the stop a later call publishes. Dropped unrun, it would leave
         // the teardown with no worker and every `cancel` waiting on it, so the guard publishes.
-        let lost = LostWorker::new(&teardown, owned_control.clone().or(taken.control.clone()));
+        let lost = LostWorker::new(&teardown, owned_control.clone().or(taken.control.clone()))
+            .tainting(&self.shared);
         let shared = Arc::clone(&self.shared);
         let reason = taken.end.get().copied().unwrap_or(CancelReason::Requested);
         let lease = self.mcp_lease.take();
@@ -1063,7 +1112,7 @@ fn record_stop_locked(
     // retire the slot between the reap and its forced-stop taint. A stale cleanup must not taint
     // the continuation a newer attempt now owns.
     if owns_active_turn && taint_continuation {
-        state.mark_nonresumable(reason, Resumability::TaintedByKill);
+        state.mark_nonresumable(reason, Resumability::UnfinishedTurn);
     }
     if should_clear {
         state.active = None;
@@ -1108,9 +1157,18 @@ struct LostWorker {
     /// The session a close worker settles. A close lost after its child was reaped has no worker
     /// left to mark the session `Closed`, so the guard does.
     closing: Option<Arc<Shared>>,
+    /// The session whose verdict a lost stop makes conservative: a stop that never ran, or whose
+    /// outcome was never recorded, leaves a child that may have been mid-turn.
+    unfinished: Option<Arc<Shared>>,
 }
 
 impl LostWorker {
+    /// Publishes `UnfinishedTurn` on `shared` if this worker is dropped before it finishes.
+    fn tainting(mut self, shared: &Arc<Shared>) -> Self {
+        self.unfinished = Some(Arc::clone(shared));
+        self
+    }
+
     fn new(
         teardown: &Arc<Teardown>,
         control: Option<Arc<dyn mango_external_agents::ProcessControl>>,
@@ -1121,6 +1179,7 @@ impl LostWorker {
             mcp: None,
             child_stop: None,
             closing: None,
+            unfinished: None,
         }
     }
 }
@@ -1129,6 +1188,9 @@ impl Drop for LostWorker {
     fn drop(&mut self) {
         if self.teardown.outcome().is_some() {
             return;
+        }
+        if let Some(shared) = self.unfinished.take() {
+            taint_unfinished(&shared);
         }
         let lost = Error::Link {
             peer: String::from("tokio runtime"),
@@ -2071,19 +2133,25 @@ async fn pump(
             match record.kind() {
                 Some(kind @ ("stream_event" | "assistant" | "user" | "result")) => {
                     taint_unconfirmed_resume(&shared, &end);
-                    failure = Some(
-                        crate::reducer::resume_failure(&record)
-                            .filter(|_| kind == "result")
-                            .map_or_else(
-                                || Error::Protocol {
-                                    expected: String::from(
-                                        "a system/init record confirming the requested Claude resume handle before conversation content or result",
-                                    ),
-                                    received: format!("a {kind} record before resume confirmation"),
-                                },
-                                Error::Vendor,
-                            ),
-                    );
+                    let protocol = Error::Protocol {
+                        expected: String::from(
+                            "a system/init record confirming the requested Claude resume handle before conversation content or result",
+                        ),
+                        received: format!("a {kind} record before resume confirmation"),
+                    };
+                    // Same code and message as ever. An errored `result` here also carries the
+                    // vendor's subtype, so a host can tell "the CLI ended the run before it
+                    // started the conversation" from a link that broke.
+                    failure = Some(match crate::reducer::errored_result_subtype(&record) {
+                        Some(subtype) => Error::Vendor(
+                            VendorError::new(
+                                ErrorCode::from_static("claude-stream-broken"),
+                                protocol.to_string(),
+                            )
+                            .with_vendor_code(subtype, false),
+                        ),
+                        None => protocol,
+                    });
                     break;
                 }
                 // Non-conversation notices say nothing about which history this process loaded.
@@ -2221,6 +2289,12 @@ async fn finish(
         }
         let _ = sink.cancel(reason).await;
     } else {
+        // No `result` and nobody's request: the child died, the link broke or the stream went
+        // silent. Only a turn the vendor finished leaves the conversation `Resumable`, whatever
+        // the host's control later answers about the child. Published before the terminal.
+        if shared.lock().established {
+            taint_unfinished(shared);
+        }
         // The exit status is worth a moment, because it is what names an exit the vendor documents
         // — but only a moment. A link that broke while the child worked on, or an idle timeout,
         // reaches here with a process that is alive and has no intention of exiting, and a turn
@@ -2265,6 +2339,8 @@ fn forget_reservation(shared: &Shared, end: &Arc<TurnEnd>) {
         .is_some_and(|active| Arc::ptr_eq(&active.end, end) && active.control.is_none())
     {
         state.active = None;
+        // A stop asked for against this reservation will never be recorded.
+        state.publish();
     }
 }
 
@@ -2474,12 +2550,10 @@ fn no_result_error(
     exit: Option<mango_external_agents::ExitStatus>,
     stderr_tail: String,
 ) -> VendorError {
-    // The one vendor failure the pump hands over whole: a resume the CLI ended before it started,
-    // already carrying its own code and the vendor's text.
-    if let Some(Error::Vendor(vendor)) = &failure
-        && vendor.code.as_str() == crate::reducer::RESUME_FAILED_CODE
-    {
-        return vendor.clone();
+    // The one vendor failure the pump hands over whole: a strict resume that ended with an errored
+    // `result` before `system/init`, already `claude-stream-broken` with its subtype attached.
+    if let Some(Error::Vendor(vendor)) = failure {
+        return vendor;
     }
     if let Some(failure) = failure {
         return VendorError::new(
@@ -2535,15 +2609,15 @@ mod tests {
         state.established = true;
         assert_eq!(state.resumability(), Resumability::Resumable);
 
-        state.mark_nonresumable(CancelReason::Requested, Resumability::TaintedByKill);
-        assert_eq!(state.resumability(), Resumability::TaintedByKill);
+        state.mark_nonresumable(CancelReason::Requested, Resumability::UnfinishedTurn);
+        assert_eq!(state.resumability(), Resumability::UnfinishedTurn);
 
         state.mark_nonresumable(CancelReason::Shutdown, Resumability::Unverified);
         let received = state.resumability();
         assert_eq!(
             received,
-            Resumability::TaintedByKill,
-            "expected the first cause to stay: tainted-by-kill | received: {received}"
+            Resumability::UnfinishedTurn,
+            "expected the first cause to stay: unfinished-turn | received: {received}"
         );
         assert_eq!(
             state.nonresumable,
@@ -2561,6 +2635,62 @@ mod tests {
         assert_eq!(state.resumability(), Resumability::Unknown);
         state.mark_nonresumable(CancelReason::Shutdown, Resumability::Unverified);
         assert_eq!(state.resumability(), Resumability::Unverified);
+    }
+
+    /// A stop that has been asked for and not recorded cannot be told apart from a kill, so the
+    /// verdict is `Unknown` until the stop is recorded, and a recorded graceful stop restores it.
+    #[test]
+    fn a_pending_stop_withdraws_resumable_until_it_is_recorded() {
+        let end = Arc::new(TurnEnd::new());
+        let mut state = Mutable::default();
+        state.established = true;
+        state.active = Some(ActiveTurn {
+            end: Arc::clone(&end),
+            stop: CancelToken::new(),
+            control: None,
+            stopped: false,
+            settled: false,
+            teardown: None,
+        });
+        assert_eq!(state.resumability(), Resumability::Resumable);
+
+        request_stop(&mut state, CancelReason::Requested).expect("expected a takeable turn");
+        let pending = state.resumability();
+        assert_eq!(
+            pending,
+            Resumability::Unknown,
+            "expected resumability while the stop is pending: unknown | received: {pending}"
+        );
+
+        record_stop_locked(&mut state, &end, false, CancelReason::Requested, false);
+        let recorded = state.resumability();
+        assert_eq!(
+            recorded,
+            Resumability::Resumable,
+            "expected resumability after a graceful stop: resumable | received: {recorded}"
+        );
+    }
+
+    /// An ending nobody asked for taints the published verdict and leaves the refusal alone, so a
+    /// session whose child died stays usable.
+    #[test]
+    fn an_unfinished_turn_taints_the_verdict_without_refusing_later_turns() {
+        let mut state = Mutable::default();
+        state.established = true;
+        state.mark_unfinished();
+        assert_eq!(state.resumability(), Resumability::UnfinishedTurn);
+        assert_eq!(
+            state.nonresumable, None,
+            "expected no refusal for an unfinished turn | received: {:?}",
+            state.nonresumable
+        );
+
+        state.mark_nonresumable(CancelReason::Requested, Resumability::Unverified);
+        assert_eq!(
+            state.resumability(),
+            Resumability::UnfinishedTurn,
+            "expected the first cause to stay"
+        );
     }
 
     /// `cancel` takes the turn under one guard and names its teardown under the next, and the pump

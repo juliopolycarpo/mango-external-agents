@@ -181,10 +181,10 @@ id, and each turn spawns, streams and reaps its own child.
   remains an unverified candidate in `Session::ids()` while `SessionSnapshot::resumed` is false.
   The first turn passes it to `--resume`; only `system/init` echoing that exact UUID confirms the
   resumed snapshot. A missing, invalid or different id ends that turn with a failure instead
-  of presenting another conversation as the requested history; an errored `result` the CLI prints
-  before any `system/init` is `claude-resume-failed` (see
-  [A strict resume the CLI refuses](#a-strict-resume-the-cli-refuses)), and the other cases stay
-  `claude-stream-broken` carrying a protocol message. Conversation content or a result
+  of presenting another conversation as the requested history. It is `claude-stream-broken`
+  carrying a protocol message; an errored `result` the CLI prints before any `system/init` adds the
+  result's subtype as the failure's `vendor_code` (see
+  [A strict resume the CLI refuses](#a-strict-resume-the-cli-refuses)). Conversation content or a result
   before that confirmation is refused without emitting it. A later turn is held to the same handle.
   When its `system/init` supplies an id, the [documented `--resume <uuid>` form](https://code.claude.com/docs/en/headless.md)
   requires it to be UUID-shaped and this harness requires it to match the persisted handle. A
@@ -292,38 +292,61 @@ termination, which preserves the existing native continuation.
 ### Resumability after a stop
 
 `Session::cancel` returns `Ok(())` for a clean interrupt and for a kill alike, and the
-`Cancelled` marker carries only the host's reason. How the stop ended is on the snapshot instead:
-`SessionSnapshot::resumability`, a non-exhaustive `Resumability`. It is published before `cancel`
-returns, and a `SessionSubscription` wakes for it.
+`Cancelled` marker carries only the host's reason. How the conversation stands is on the snapshot
+instead: `SessionSnapshot::resumability`, a non-exhaustive `Resumability`. A `SessionSubscription`
+wakes for every change.
 
-| Value           | Meaning for Claude                                                                                  | Strict resume          |
-| --------------- | --------------------------------------------------------------------------------------------------- | ---------------------- |
-| `Unknown`       | No `system/init` yet, or a strict resume no turn has confirmed. No evidence either way.             | decide on other facts  |
-| `Resumable`     | `system/init` proved the conversation exists, and every stop since was a clean finish or a SIGINT.  | safe                   |
-| `TaintedByKill` | The child had to be force-terminated (SIGTERM or process-tree kill), even before its `system/init`. | do not; open a new one |
-| `Unverified`    | A strict resume was not confirmed: another handle, or the CLI ended before `system/init`.           | do not; open a new one |
+| Value            | Meaning for Claude                                                                                                                             | Strict resume          |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
+| `Unknown`        | No `system/init` yet, a strict resume no turn has confirmed, or a stop is pending. No evidence either way.                                     | decide on other facts  |
+| `Resumable`      | `system/init` proved the conversation exists, and every turn since finished with the vendor's `result` or was stopped by a graceful interrupt. | safe                   |
+| `UnfinishedTurn` | A turn ended with no `result` and no clean interrupt: the child was force-terminated, died, went silent, or a stop did not complete.           | do not; open a new one |
+| `Unverified`     | A strict resume was not confirmed: another handle, or the CLI ended before `system/init`.                                                      | do not; open a new one |
 
-A tainted value is permanent for the session and equals the refusal `start_turn` gives
-(`Error::Cancelled` with the recorded reason); the first cause wins. Every way the harness stops a
-child records it the same way: `cancel`, `close`, a cancelled host `CancelToken` and a dropped
-`TurnStream` each read `Resumable` after a graceful interrupt and `TaintedByKill` after a kill.
-A host that persists the vendor handle stores the value beside it whenever it changes, and
-strict-resumes a stored conversation only when it reads `Resumable`.
-`Resumability::allows_strict_resume` is that test.
+Only a turn the vendor finished leaves the conversation `Resumable`, whatever the host's control
+later answers about the child. A tainted value is permanent for the session, and the first cause
+wins. It is wider than the refusal `start_turn` gives, which is unchanged: a kill or an unconfirmed
+resume refuses later turns with `Error::Cancelled`, while a child that died or a silent stream
+publishes `UnfinishedTurn` and leaves the session usable.
+
+How each ending reads. "Terminal" is the snapshot read on the turn's terminal event; "stop
+returned" is after `cancel` (or `close`) returns; "closed" is after `close`. The terminal of a
+cancelled turn is written at once, before the stop finishes (see [Deadlines](#deadlines)), so
+while a stop is pending the value is `Unknown`, never a `Resumable` the stop may withdraw.
+
+| Ending                                                                | Terminal                      | Stop returned    | Closed           |
+| --------------------------------------------------------------------- | ----------------------------- | ---------------- | ---------------- |
+| Turn finished with `result` (success or failure)                      | `Resumable`                   | n/a              | `Resumable`      |
+| Child died mid-turn after `system/init` (exit 143, 1, 0)              | `UnfinishedTurn`              | n/a              | `UnfinishedTurn` |
+| Idle timeout or unreadable stream after `system/init`                 | `UnfinishedTurn`              | n/a              | `UnfinishedTurn` |
+| Child died before any `system/init` (control with graceful interrupt) | `Unknown`                     | n/a              | `Unknown`        |
+| `cancel` that interrupted gracefully                                  | `Unknown` or `Resumable`      | `Resumable`      | `Resumable`      |
+| `cancel` that had to kill                                             | `Unknown` or `UnfinishedTurn` | `UnfinishedTurn` | `UnfinishedTurn` |
+| `close`, host `CancelToken`, dropped stream, dropped session          | as `cancel`                   | as `cancel`      | as `cancel`      |
+| Stop that failed (`CleanupRequired`)                                  | `Unknown` or `UnfinishedTurn` | `UnfinishedTurn` | `UnfinishedTurn` |
+| Launch that failed over a child it could not end                      | n/a                           | `UnfinishedTurn` | `UnfinishedTurn` |
+| Strict resume the vendor did not confirm                              | `Unverified`                  | n/a              | `Unverified`     |
+
+A host stores the value beside the vendor handle whenever it changes, and strict-resumes a stored
+conversation only when it reads `Resumable`. `Resumability::allows_strict_resume` is that test.
 
 **`Resumable` describes a conversation at rest.** It turns true when `system/init` arrives, while
 the first turn is still running. A host that loses the session mid-turn (a crash, a dropped
 connection) never sees a stop recorded, and the child may have died without one. If the host's own
 `RecoveryRecord` shows a turn with no terminal when the session was lost, treat the conversation as
-`TaintedByKill` whatever value was stored.
+`UnfinishedTurn` whatever value was stored.
 
 ```rust,ignore
 session.cancel(CancelReason::Requested).await?;
 let stored = session.snapshot().resumability;
-database.save(session.ids().native_session_id, stored); // serde: "tainted-by-kill", ...
+database.save(session.ids().native_session_id, stored); // serde: "unfinished-turn", ...
 ```
 
-Codex and ACP sessions report `Unknown` always; see their guides for what a host does there.
+**Codex and ACP sessions report `Unknown` always.** For a host, `Unknown` there is "this library
+has no verdict", not "unsafe": Codex resumes a thread by id however a turn ended, and an ACP agent
+decides per profile whether it can load a session. Attempt the resume with the agent's own
+operation and handle its refusal; see [the Codex guide](harness-codex.md#sessions-turns-and-steering)
+and [the ACP guide](harness-acp.md#sessions).
 
 ### A strict resume the CLI refuses
 
@@ -346,27 +369,31 @@ ID"), and that `system/init` is the first event and an in-run failure is printed
 says the conversation is missing: `error_during_execution` is the generic subtype, exit 1 is the
 generic failure code, and the only specific part is prose. The same page documents other resume
 failures (`Failed to resume the conversation`, an unreadable transcript) with the same shape. So the
-harness does not claim "not found", and it never matches the wording.
+harness never matches the wording and does not claim "not found".
 
-What it reads is the shape. An errored `result` while a strict resume is still unconfirmed, before
-any `system/init`, ends the turn with the code **`claude-resume-failed`**, carrying the vendor's
-`errors` text for a person to read (redacted like any vendor message). It is not retryable, the
-session's `resumability` becomes `Unverified`, and the next `start_turn` is refused as before.
-A transport or authentication failure on a conversation that exists arrives after `system/init`
-and keeps its own code, so `claude-resume-failed` is distinguishable from it.
+What it reads is the shape, and the shape proves little. An errored `result` while a strict resume
+is unconfirmed means the run ended with a failure before it announced the session. It does **not**
+prove the conversation is gone: hooks and plugin events can precede `system/init`, and an in-run
+failure such as missing authentication prints as a `result` the same way. The harness does not
+rename the failure. The turn ends as before, `claude-stream-broken` with the same protocol message,
+so a host matching that code for this case keeps matching. Two facts are added:
+
+- `SessionSnapshot::resumability` becomes `Unverified`, and the next `start_turn` is refused as it
+  always was;
+- the failure's `vendor_code` is the result's subtype (`error_during_execution`) when it is one the
+  harness names, and absent for a result that is not an error or for content before `system/init`.
+  The vendor's own `errors` text is not carried.
 
 What a host does:
 
-1. After a failed first strict-resume turn, read `error.code`. `claude-resume-failed` means the CLI
-   ended the resume before starting the conversation; the stored conversation is not usable through
-   this handle. Stop persisting it as resumable.
-2. It does not say why. Missing, expired, copied to another machine or unreadable all look alike
-   here; the vendor's text says which, to a person. Opening a new session and resending is a
-   product decision, not one the library authorises, and `claude-stream-broken` or any other code
-   gives no such licence.
-3. The stream error carries no `Dispatch`, and the CLI's zero usage and `num_turns: 0` are the
-   vendor's own report, not something the library proves. The host's `RecoveryRecord` for the turn
-   still decides replay.
+1. After a failed first strict-resume turn, read `resumability` and the failure's `vendor_code`.
+   `Unverified` with a `vendor_code` means the CLI ended the run before announcing the session. It
+   is not a verdict on the stored conversation: do not delete it on this signal alone, and do not
+   record it as unresumable without knowing why. Show the failure to a person.
+2. Opening a new session and resending is a product decision, not one the library authorises.
+3. **Replay safety is not proven.** The prompt was already written to the child's stdin before the
+   CLI answered, and the terminal carries no `Dispatch`. The CLI's zero usage and `num_turns: 0`
+   are the vendor's own report. The host's `RecoveryRecord` for the turn still decides replay.
 
 Not captured with `mea capture`: that command records `--version` and `--help` for Claude and runs
 no turn, so there is no fixture for this record. The tests replay the observed line through the
