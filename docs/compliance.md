@@ -175,8 +175,8 @@ own deployment.
   hide more of a child's diagnostic output than a diagnostic can spare). The measurements are in
   `docs/benchmarks.md`.
 
-  **`stderr_tail` hides at least what `stderr_text` hides** (the same union, of the spans of the
-  rules of the release before and of the token pass), and is `stderr_text` itself wherever the token
+  **`stderr_tail` hides at least what `stderr_text` hides** (the union of the spans
+  `stderr_text` replaces, read exactly as it reads them, and the spans of the token pass), and is `stderr_text` itself wherever the token
   pass finds nothing. It is read again until a reading changes nothing, with the bound the message
   path uses, so it is a fixed point where `stderr_text` is not; text that does not settle within
   eight readings (written to defeat it) is returned as `[REDACTED]` whole, which `stderr_text` never

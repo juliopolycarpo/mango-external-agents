@@ -231,13 +231,16 @@ fn assert_nothing_main_hid_is_shown(raw: &str) {
 fn assert_the_first_reading_covers_the_floor(text: &str) {
     let (plain, marked) = strip::strip_marking(text);
     let floors = floor::hides(&plain, marked);
+    let currents = floor::current_hides(&plain, marked);
     let readers: [(&str, &dyn union::Layer); 2] = [
         ("the union", &union::Plain),
         ("the tail's union", &union::Tail),
     ];
     for (name, layer) in readers {
         let all = union::hides(&plain, marked, layer);
-        for hide in &floors {
+        // The tail also covers the spans `stderr_text` replaces today.
+        let current: &[union::Hide] = if name == "the union" { &[] } else { &currents };
+        for hide in floors.iter().chain(current) {
             let covered = all
                 .iter()
                 .any(|span| span.start <= hide.start && hide.end <= span.end);
@@ -265,6 +268,17 @@ fn assert_the_first_reading_covers_the_floor(text: &str) {
             "expected the spans of the release before to give its answer",
             text,
             format!("spans: {applied:?}, its answer: {expected:?}"),
+        );
+    }
+    // The tail is built on the spans of `stderr_text` as it answers today, which the release
+    // before's spans are not (a URL password under a credential's name is read again).
+    let current = union::finish(&plain, &floor::current_hides(&plain, marked));
+    let shown = stderr_text(text);
+    if current != shown {
+        fail(
+            "expected the spans the tail is built on to give stderr_text's answer",
+            text,
+            format!("spans: {current:?}, stderr_text: {shown:?}"),
         );
     }
 }

@@ -86,10 +86,10 @@ fn unsettled_round(plain: &str) -> String {
 ///
 /// `marked` is whether the stripper took a byte out: such a text is read again, as `main` did.
 pub(super) fn hides(plain: &str, marked: bool) -> Vec<Hide> {
-    let (mut all, mut text) = round_hides(plain);
+    let (mut all, mut text, _) = round_hides(plain, false);
     if marked {
         for _ in 0..EXTRA_ROUNDS {
-            let (next, after) = round_hides(&text);
+            let (next, after, _) = round_hides(&text, false);
             if after == text {
                 break;
             }
@@ -100,19 +100,48 @@ pub(super) fn hides(plain: &str, marked: bool) -> Vec<Hide> {
     all
 }
 
-/// One round as spans of `plain`, and the text it leaves.
-fn round_hides(plain: &str) -> (Vec<Hide>, String) {
+/// The spans of `plain` that [`stderr_text`](super::stderr_text) replaces today: [`hides`], and the
+/// reading of the assignments that follows a URL password redacted under a credential's name, and
+/// the extra rounds that text gets when that happened or the stripper took a byte out. Applying
+/// them to `plain` gives `stderr_text`'s answer, which is what a reader that must hide at least
+/// what `stderr_text` hides (`redact::stderr_tail`) is built on.
+pub(super) fn current_hides(plain: &str, marked: bool) -> Vec<Hide> {
+    let (mut all, mut text, reread) = round_hides(plain, true);
+    if marked || reread {
+        for _ in 0..EXTRA_ROUNDS {
+            let (next, after, _) = round_hides(&text, true);
+            if after == text {
+                break;
+            }
+            all = compose(all, &text, next);
+            text = after;
+        }
+    }
+    all
+}
+
+/// One round as spans of `plain`, the text it leaves, and whether a URL password was redacted
+/// under a credential's name. With `settle`, the assignments are read once more after the URL
+/// passwords when one was, as [`rules_round`] does.
+fn round_hides(plain: &str, settle: bool) -> (Vec<Hide>, String, bool) {
     let mut bearer = Vec::new();
     let after_bearer = bearer_stage(plain, Some(&mut bearer));
     let mut assignments = Vec::new();
     let after_assignments = assignment_stage(&after_bearer, Some(&mut assignments));
     let mut urls = Vec::new();
-    let (after_urls, _) = url_stage(&after_assignments, Some(&mut urls));
-    let marks = boundary_hides(&after_urls);
-    let after = apply(&after_urls, &marks);
+    let (after_urls, named) = url_stage(&after_assignments, Some(&mut urls));
+    let mut again = Vec::new();
+    let settled = if settle && named {
+        assignment_stage(&after_urls, Some(&mut again))
+    } else {
+        after_urls.clone()
+    };
+    let marks = boundary_hides(&settled);
+    let after = apply(&settled, &marks);
     let first = compose(bearer, &after_bearer, assignments);
     let second = compose(first, &after_assignments, urls);
-    (compose(second, &after_urls, marks), after)
+    let third = compose(second, &after_urls, again);
+    (compose(third, &settled, marks), after, named)
 }
 
 /// The bytes the stripper left to part words, which the rules take out when they are done.

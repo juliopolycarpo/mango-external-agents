@@ -863,3 +863,20 @@ fn a_cut_key_is_read_within_the_distance_a_block_is() {
         "expected an end marker past the 16 KiB a block is searched not to close a cut key"
     );
 }
+
+/// Found by the long search: `stderr_text` reads a URL password under a credential's name and then
+/// the assignments once more, and the tail's token read hides the key's lines up to where the URL
+/// begins, so a union built on the rules as the release before ran them left `QXZ1J` showing.
+#[test]
+fn a_stderr_tail_hides_what_stderr_text_hides_after_a_key_and_a_url_under_a_name() {
+    let text = format!("'token': {BEGIN}{KEY_LINE}-----END\\\"x://token:;QXZ0J@host}}QXZ1J ");
+    let (tail, text_form) = (stderr_tail(&text), stderr_text(&text));
+    assert!(
+        !text_form.contains("QXZ1J"),
+        "expected stderr_text to hide the canary, the premise of this test | received {text_form:?}"
+    );
+    assert!(
+        !tail.contains("QXZ1J") && !tail.contains("QXZ0J"),
+        "expected a stderr tail to hide what stderr_text hides | received: {tail:?}, stderr_text: {text_form:?}"
+    );
+}
