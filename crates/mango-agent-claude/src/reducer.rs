@@ -991,6 +991,27 @@ fn result_error(record: &StreamRecord) -> Option<VendorError> {
     }
 }
 
+/// The documented subtype of an errored `result` record, when `record` is one.
+///
+/// Only a subtype this file names comes back, as the static label from [`NAMED_RESULT_SUBTYPES`],
+/// so the vendor's own string never reaches a host through it. A strict resume that ends with such
+/// a record before `system/init` carries it as the failure's `vendor_code`: the vendor documents
+/// `system/init` as the first event and an in-run failure as the `result`, which says the run ended
+/// before the conversation started, not why. Hooks and plugin events can precede `system/init` and
+/// a missing login prints the same way.
+///
+/// <https://code.claude.com/docs/en/headless.md>
+pub(crate) fn errored_result_subtype(record: &StreamRecord) -> Option<&'static str> {
+    if record.kind() != Some("result") || !record.result().is_error() {
+        return None;
+    }
+    let subtype = record.subtype().unwrap_or("error");
+    NAMED_RESULT_SUBTYPES
+        .iter()
+        .copied()
+        .find(|named| *named == subtype)
+}
+
 /// The result subtypes this harness will name, in a code and in a sentence it writes itself.
 ///
 /// Every terminal `subtype` observed on a failed `--print` run — the four that carry their
@@ -1547,8 +1568,26 @@ mod tests {
         );
     }
 
-    /// A subtype is a field the vendor fills in, and a code is diagnostic text a host is shown.
-    ///
+    /// Only an errored `result` has a subtype to report, and only a named one is reported.
+    #[test]
+    fn an_errored_result_reports_only_a_subtype_the_harness_names() {
+        let parse = |line: &str| StreamRecord::parse(line).expect("record");
+        let named =
+            parse(r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#);
+        assert_eq!(
+            super::errored_result_subtype(&named),
+            Some("error_during_execution")
+        );
+        let unnamed = parse(r#"{"type":"result","subtype":"sk-live-canary","is_error":true}"#);
+        assert_eq!(super::errored_result_subtype(&unnamed), None);
+        let bare = parse(r#"{"type":"result","is_error":true}"#);
+        assert_eq!(super::errored_result_subtype(&bare), Some("error"));
+        let succeeded = parse(r#"{"type":"result","subtype":"success","is_error":false}"#);
+        assert_eq!(super::errored_result_subtype(&succeeded), None);
+        let assistant = parse(r#"{"type":"assistant","is_error":true}"#);
+        assert_eq!(super::errored_result_subtype(&assistant), None);
+    }
+
     /// The documented subtypes become the harness's own label. Anything else becomes the generic
     /// one rather than a `claude-` prefix wrapped around whatever arrived — bounding its shape
     /// afterwards would still be printing the vendor's own string inside those bounds.

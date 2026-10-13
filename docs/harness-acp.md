@@ -972,6 +972,11 @@ sees.
 | `start_review`          | `Error::NotSupported`                                                                                                            |
 | `refresh_account_usage` | `Error::NotSupported` — v1 reports a session's context window, never an account's plan quota                                     |
 
+`SessionSnapshot::resumability` is always `Resumability::Unknown`. Whether a stored session can be
+loaded again is the agent's own answer, per profile: `session/load` exists only when the agent
+advertises `loadSession`, and what a cancelled prompt leaves behind is not specified by the
+protocol. A host strict-resumes and handles the refusal; `Unknown` is not a verdict either way.
+
 Teardown has one owner per session: the connection's shutdown task, which closes the connection
 and reaps the child through a single shared reaper. `close`, the watcher that notices an agent
 exit or a failed transport, and an abandoned request all join that task rather than killing the

@@ -65,7 +65,7 @@ administrator policy removes surfaces as a refusal from `open_session`, not as a
 Session state is read through `Session::snapshot` and watched through `Session::subscribe`. It
 carries the two ids, the harness identity, the transport selection, the lifecycle status, the
 session-effective capabilities, the configuration state, the configuration catalog, the slash
-commands, and whether the vendor resumed.
+commands, whether the vendor resumed, and `resumability`.
 
 Two rules follow from the split:
 
