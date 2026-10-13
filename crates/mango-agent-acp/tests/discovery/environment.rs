@@ -17,7 +17,11 @@ const BASE_LOCATIONS: [(&str, &str); 4] = [
 
 /// Variables no child may receive: a session directory, credentials, and proxies that can carry
 /// userinfo.
-const NEVER_FORWARDED: [(&str, &str); 15] = [
+const NEVER_FORWARDED: [(&str, &str); 19] = [
+    ("ANTHROPIC_API_KEY", "canary-anthropic-key"),
+    ("ANTHROPIC_AUTH_TOKEN", "canary-anthropic-token"),
+    ("CLAUDE_CODE_OAUTH_TOKEN", "canary-claude-oauth"),
+    ("CODEX_API_KEY", "canary-codex-key"),
     ("XDG_RUNTIME_DIR", "/run/user/1000"),
     ("CURSOR_API_KEY", "canary-cursor-api-key"),
     ("CURSOR_AUTH_TOKEN", "canary-cursor-token"),
@@ -40,9 +44,11 @@ const NEVER_FORWARDED: [(&str, &str); 15] = [
 
 /// The location variable each vendor documents for relocating its own home, by profile id.
 ///
-/// Each is cited in `docs/harness-acp.md`. `codex-acp` and `claude-agent-acp` are absent on
-/// purpose: their adapters' READMEs name no location variable.
-const PROFILE_LOCATIONS: [(&str, &str, &str); 6] = [
+/// Each is cited in `docs/harness-acp.md`. The two adapters forward the variable of the CLI they
+/// drive, which the Codex and Claude harnesses already forward for the same reason.
+const PROFILE_LOCATIONS: [(&str, &str, &str); 8] = [
+    ("codex-acp", "CODEX_HOME", "/work/codex"),
+    ("claude-agent-acp", "CLAUDE_CONFIG_DIR", "/work/claude"),
     ("cursor", "CURSOR_CONFIG_DIR", "/work/cursor"),
     ("grok", "GROK_HOME", "/work/grok"),
     ("opencode", "OPENCODE_CONFIG_DIR", "/work/opencode"),

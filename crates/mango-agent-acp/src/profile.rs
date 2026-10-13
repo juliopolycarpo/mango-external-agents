@@ -721,7 +721,13 @@ fn codex_acp() -> AcpProfile {
     // `NO_BROWSER` is the adapter's own documented way to stop it opening a sign-in page. The
     // library never opens a browser; letting the variable through is how a host says the adapter
     // must not either.
-    .with_vendor_environment_keys(&["NO_BROWSER"])
+    //
+    // `CODEX_HOME` is where the Codex App Server the adapter starts keeps its state and sign-in:
+    // "Codex stores its local state under `CODEX_HOME` (defaults to `~/.codex`)", from
+    // <https://learn.chatgpt.com/docs/config-file/config-advanced>. Without it the adapter reads
+    // the default-location account. `CODEX_API_KEY`, `OPENAI_API_KEY` and `CODEX_CONFIG` are not
+    // forwarded.
+    .with_vendor_environment_keys(&["NO_BROWSER", "CODEX_HOME"])
 }
 
 /// The ACP adapter that fronts Claude Code.
@@ -744,6 +750,11 @@ fn claude_agent_acp() -> AcpProfile {
         "https://github.com/agentclientprotocol/claude-agent-acp",
     )
     .with_login_hint("claude auth login")
+    // The adapter drives Claude Code through the Claude Agent SDK, so the user's configuration
+    // directory is Claude Code's: "Override the configuration directory (default: `~/.claude`)",
+    // from <https://code.claude.com/docs/en/env-vars>. `ANTHROPIC_API_KEY`,
+    // `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` are not forwarded.
+    .with_vendor_environment_keys(&["CLAUDE_CONFIG_DIR"])
 }
 
 #[cfg(test)]
