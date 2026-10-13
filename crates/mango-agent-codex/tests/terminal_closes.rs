@@ -24,7 +24,7 @@ use support::{Transcript, workspace_path};
 
 fn host(launcher: Arc<FakeLauncher>) -> HostContext {
     HostContext::builder()
-        .launcher(launcher)
+        .launcher(support::VersionAnsweringLauncher::over(launcher))
         .cwd(workspace_path())
         .client_info("mango-test", "0.0.1")
         .environment(EnvSource::from_pairs([
