@@ -128,8 +128,9 @@ pub fn stderr_text(raw: &str) -> String {
 /// call returns is one a second call leaves alone; text that never settles is hidden whole.
 ///
 /// A tail is cut on a line, so a token with a prefix is either whole in it or gone. A private key
-/// loses its begin line to a cut and keeps the lines under it. [`StderrTail::read`](crate::StderrTail::read) knows when the
-/// text it dropped ended inside a key and reads the tail as the body of one. This function, which
+/// loses its begin line to a cut and keeps the lines under it.
+/// [`StderrTail::read`](crate::StderrTail::read) knows when the text it dropped ended inside a key
+/// and hides the leading run of the key's lines that the tail kept. This function, which
 /// is handed a text and not the stream it came from, reads the start of the text instead: lines
 /// of a key's body (base64, a PEM header, a PGP checksum, behind one prefix that is the same on
 /// every line) and then a private key's end marker are hidden, which makes the start of any text

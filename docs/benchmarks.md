@@ -275,16 +275,32 @@ of the rules, of the token pass and of the cut key).
 | `stderr_tail-4MiB/pem`          |                                  - |                           467,551,378 |         |
 | `stderr_tail-16MiB/pem`         |                                  - |                         1,887,858,358 |         |
 
-Every row of this bench that `main` has was counted again on the head of the branch against `main` at `04dbbfc`: 69 rows, the `stderr_text`, `bounded` and 1 MiB token-pass rows. None moved: the 53 rows of a million instructions or more are within 0.03%, and the six 16 KiB rows of about 79,000 instructions, the smallest, are within 0.62% (all lower on the head, a difference of layout and not of work). `redact::message_text` is what `bounded` runs before it bounds the text, and `structured` runs the same union per string leaf; a one-off count of `bounded` over 16 KiB and 1 MiB of plain, credential and token lines and of `structured` over a nested value with credential leaves gave the same instructions on `main` and on the head to within 0.02%. The worst shape of the key read, begin markers with no end marker, is linear: 117,001,718 instructions at 1 MiB, 467,551,378 at 4 MiB (4.00 times) and 1,887,858,358 at 16 MiB (16.14 times).
+Every row of this bench that `main` has was counted again on the head of the branch against `main` at `5fb3302`: 69 rows, the `stderr_text`, `bounded` and 1 MiB token-pass rows, both built at one codegen unit. None moved: the 53 rows of a million instructions or more are within 0.04%, and the 16 KiB rows of about 79,000 instructions, the smallest, are within 0.5% (all lower on the head, a difference of layout and not of work). The twelve `bounded-16KiB` rows are within 0.05%, the four that last under 0.1 ms (`names`, `quoted-names`, `quotes`, `slashes`) included, so a wall-clock ratio of 1.2 on one of them in a single run is the machine and not the code: the same `main` binary measured 0.052 and 0.082 ms for `quotes` in two of five alternating runs. `redact::message_text` is what `bounded` runs before it bounds the text, and `structured` runs the same union per string leaf; a one-off count of `bounded` over 16 KiB and 1 MiB of plain, credential and token lines and of `structured` over a nested value with credential leaves gave the same instructions on `main` and on the head to within 0.02%. The worst shape of the key read, begin markers with no end marker, is linear: 117,001,718 instructions at 1 MiB, 467,551,378 at 4 MiB (4.00 times) and 1,887,858,358 at 16 MiB (16.14 times).
 
 `StderrTail::push` also reads what the tail drops, to know whether the dropped text ended inside a
-private key (`redact::OpenKey`: a scan for the two markers, a flag and a 56-byte carry, no
-allocation, and the lock is held for it as it is for the drain). A one-off timing of pushing 64 MiB
-of log lines (and of lines with a 24-line key every 200 lines) into a 16 KiB tail, `main` against the
-head, three runs each, medians: with a 64-byte push 18.6 and 19.1 ns per byte on `main` against 19.2
-and 19.7 on the head; with 4 KiB, 2.1 against 2.5; with a push of 64 KiB, which is more than the tail
-holds and drops nearly all of it, 0.26 against 0.9. One-byte pushes were within the noise of the
-runs (39 to 51 ns per byte on both).
+private key (`redact::OpenKey`: a flag, a counter and a 256-byte carry, no allocation on the usual
+path, and the lock is held for it as it is for the drain). A drop is read in blocks of 4 KiB. A
+block with no hyphen is skipped by one byte search (`<[u8]>::contains`, the standard library's
+memchr), and one with a hyphen is gated by a single vectorised pass that looks for five hyphens
+after a capital or a space (the dashes a marker closes with), for a byte the stripper removes, and
+for a hyphen first in the block; only a block that passes it is searched for markers, hyphen run by
+hyphen run. A one-off timing of pushing 64 MiB of log lines into a 16 KiB tail, `main` against the
+head, three runs each, medians, in ns per byte (`main` / head), by the size of each push:
+
+| Log                                            |           1 B |          64 B |       4 KiB |      16 KiB |      64 KiB |
+| ---------------------------------------------- | ------------: | ------------: | ----------: | ----------: | ----------: |
+| `no-hyphen`, no hyphen in the text             | 35.77 / 36.86 | 16.98 / 18.64 | 1.56 / 1.96 | 0.51 / 0.60 | 0.21 / 0.30 |
+| `plain`, an ISO date (two hyphens) per line    | 38.05 / 45.54 | 16.24 / 17.93 | 1.69 / 1.92 | 0.50 / 0.84 | 0.21 / 0.48 |
+| `with-keys`, a 24-line key every 200 lines     | 36.03 / 36.95 | 18.31 / 18.40 | 1.74 / 2.16 | 0.57 / 0.90 | 0.23 / 0.61 |
+| `hyphens`, a 40-dash line and `-----` per line | 39.01 / 42.90 | 16.90 / 20.20 | 1.61 / 2.58 | 0.49 / 1.11 | 0.21 / 0.77 |
+| `candidates`, `-----BEGIN-----` lines          | 37.95 / 42.66 | 16.88 / 20.91 | 1.64 / 2.74 | 0.51 / 1.58 | 0.21 / 1.23 |
+
+A push the size of a line or smaller costs the same within the noise of the runs. A push of 16 KiB
+or more drops nearly all of what it carries, and that drop is what is read: a log with no hyphen
+costs 0.09 ns per byte more at 64 KiB, a log with dates 0.27, and the worst shapes (every line
+carrying runs of dashes, or marker candidates) 0.56 and 1.02. At 64 KiB, 0.3 to 1.2 ns per byte is
+20 to 80 microseconds for a push of that size, and the child's pipe delivers far less than that
+per second.
 
 Milliseconds for one 256 KiB text of each shape, release, default profile, the rules of the release
 before (`stderr_text` on `main`), `stderr_text` now, `bounded` on `main` and now, and `structured` on

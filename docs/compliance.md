@@ -203,16 +203,21 @@ own deployment.
   a token with a prefix is whole in the tail or gone from it, never a back half with no prefix. A
   private key spans lines, and a cut can drop its begin marker and keep the lines under it.
   `StderrTail` therefore remembers the text it dropped (`redact::OpenKey`, fed every byte the tail
-  discards, a flag and a fixed 56-byte carry): when the last private-key marker there is a begin
-  marker no end marker has closed, `read` puts a begin line back in front of the tail, and the
-  block read hides the body to the end marker, as it does with the begin line present, or the lines
-  of base64 directly under the header when there is no end marker yet (the read then starts with
-  `[REDACTED]`). The state expires 64 KiB after the begin marker, farther than any block reaches,
-  and a public key or a certificate opens nothing. A text that is handed to `stderr_tail` without
-  the stream behind it (the tail a host's own `ProcessControl` returns) has only the start of the
-  text to go by: lines of a key's body at the very start (base64, a PEM header, a PGP checksum
-  line; after the blanks of an indented log, or behind one prefix of up to 64 bytes that is the
-  same on every line and on the end marker's line) and then a private key's end marker are hidden
+  discards, a flag, a counter and a fixed 256-byte carry of raw bytes, read as the redactor reads
+  text: with the escapes and control characters stripped, so a marker beside a colour code or split
+  by a drop is a marker). When the last private-key marker there is a begin marker no end marker has
+  closed, `read` hides the leading run of key-shaped lines of the tail and nothing else: base64
+  lines, a PEM or PGP header, blank lines, the PGP checksum, one shorter last line (or a line still
+  being written at the end of the tail) and an end marker directly after, behind the one prefix that
+  every line carries. No begin line is put back, so the first line that is none of these ends the
+  run and everything after it reads as any text: a sentence that mentions the begin marker, with
+  ordinary log lines after it, hides nothing ordinary. The state expires 64 KiB after the begin
+  marker, farther than any block reaches, and a public key or a certificate opens nothing. A text
+  that is handed to `stderr_tail` without the stream behind it (the tail a host's own
+  `ProcessControl` returns) has only the start of the text to go by: lines of a key's body at the
+  very start (base64, a PEM header, a PGP checksum line; after the blanks of an indented log, or
+  behind one prefix of up to 64 bytes that is the same on every line and on the end marker's line)
+  and then a private key's end marker are hidden
   with the marker.
 
   The answers differ from the release before's in two ways. `stderr_text` differs only by the
@@ -260,8 +265,11 @@ own deployment.
     `stderr_text` and `stderr_tail` read a line at a time, as the release before did, and a tail is
     cut on a line. The paths that carry a vendor's messages read all of these;
   - a text handed to `stderr_tail` whose private key lost its begin line and whose end marker is
-    not in it either: `StderrTail::read` hides such a key from what it dropped, but a text that
-    comes from a host's own control has no begin marker to go by;
+    not in it either: `StderrTail::read` hides the leading run of the key's lines from what it
+    dropped, but a text that comes from a host's own control has no begin marker to go by. A
+    stderr tail that starts inside a key reads only the leading run of key-shaped lines, so a
+    key whose lines are interrupted by a line that is not a key's (and continues after it) shows
+    the lines after the interruption;
   - a bare token outside the closed list, and any credential with no prefix: an AWS secret access
     key (40 characters of base64) or an Azure key has nothing to recognise it by;
   - a key's body at the start of a text handed to `stderr_tail` when its lines do not share one

@@ -475,7 +475,7 @@ fn message_steps(text: &str) -> usize {
 }
 
 /// The entry point a stderr tail takes: the rules of `stderr_text` and the token pass, and the
-/// read of a private key whose begin line a cut dropped.
+/// read of a private key whose begin line a cut dropped, when the text is handed in whole.
 fn tail_steps(text: &str) -> usize {
     steps::counted(|| {
         std::hint::black_box(stderr_tail(std::hint::black_box(text)));

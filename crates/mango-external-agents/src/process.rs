@@ -430,7 +430,7 @@ struct TailState {
     /// name that lets [`redact::stderr_tail`] recognise it.
     discard: Option<Discard>,
     /// Whether the text dropped from the front ended inside a private key, so what the tail keeps
-    /// first is the body of a key whose begin line is gone.
+    /// first may be the body of a key whose begin line is gone.
     key: OpenKey,
 }
 
@@ -576,10 +576,13 @@ impl StderrTail {
     /// pass that a per-line read cannot.
     ///
     /// The tail also remembers whether the text it dropped from the front ended inside a private
-    /// key (a begin marker with no end marker after it). The lines of that key that it kept are
-    /// then hidden to the end marker, or the lines of base64 under where the header was when there
-    /// is none, as if the begin line were still there; the read starts with `[REDACTED]` in that
-    /// case. Public keys and certificates are not private keys and open nothing.
+    /// key (a begin marker with no end marker after it, read as the redactor reads text: beside
+    /// colour codes, or split by a drop, it is still a marker). The lines of that key that it
+    /// kept are then hidden: the leading run of key-shaped lines (base64, a PEM or PGP header, a
+    /// blank line, the PGP checksum, one shorter last line or a line still being written) behind
+    /// the one prefix every line carries, and an end marker right after. No begin line is put
+    /// back: the first line that is not a key's ends the run, and everything after it reads as
+    /// any text. Public keys and certificates are not private keys and open nothing.
     ///
     /// # Example
     ///
