@@ -1722,9 +1722,17 @@ impl ChildReaper {
             let result = Arc::clone(&self.result);
             tokio::spawn(async move {
                 let _complete = ReapCompletion(done);
-                let outcome = stop_process_with_limits(control.as_ref(), reason, &limits).await;
-                *result.lock().unwrap_or_else(PoisonError::into_inner) =
-                    Some(outcome.map(|_| ()).map_err(|error| error.to_string()));
+                // On a task of its own, so a host control that panics is told apart from this
+                // reaper being lost: the outcome below names the host's control, not the agent.
+                let outcome = tokio::spawn(async move {
+                    stop_process_with_limits(control.as_ref(), reason, &limits).await
+                })
+                .await
+                .map_or_else(
+                    |joined| Err(control_stop_lost(&joined)),
+                    |stopped| stopped.map(|_| ()).map_err(|error| error.to_string()),
+                );
+                *result.lock().unwrap_or_else(PoisonError::into_inner) = Some(outcome);
             });
         }
         self.done.cancelled().await;
@@ -1738,6 +1746,26 @@ impl ChildReaper {
                 source: Box::new(Error::Vendor(link_failure(message))),
             })
     }
+}
+
+/// What a stop task that never answered says about itself: the host's `ProcessControl` panicked
+/// or its task was cancelled. The agent is not the party that failed.
+///
+/// The message rides the `acp-link-closed` code like every other cleanup failure.
+///
+/// ```ignore
+/// let message = control_stop_lost(&join_error);
+/// assert!(message.ends_with("expected the host's process stop to return | received: it panicked"));
+/// ```
+fn control_stop_lost(joined: &tokio::task::JoinError) -> String {
+    let shape = if joined.is_panic() {
+        "panicked"
+    } else {
+        "was cancelled"
+    };
+    format!(
+        "the host's process control failed: expected the host's process stop to return | received: it {shape}"
+    )
 }
 
 /// Signals every competing reaper even if an injected process control panics.
@@ -2185,6 +2213,28 @@ mod tests {
         }
     }
 
+    /// A named process control whose stop panics, the way a buggy host control would.
+    struct PanickingStopControl;
+
+    #[async_trait::async_trait]
+    impl ProcessControl for PanickingStopControl {
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+
+        fn stderr_tail(&self) -> String {
+            String::new()
+        }
+
+        async fn wait(&self) -> Result<ExitStatus> {
+            Ok(ExitStatus::default())
+        }
+
+        async fn kill(&self, _reason: CancelReason) -> Result<()> {
+            panic!("test control stop panicked");
+        }
+    }
+
     #[async_trait::async_trait]
     impl ProcessControl for CountingProcessControl {
         fn pid(&self) -> Option<u32> {
@@ -2432,6 +2482,70 @@ mod tests {
         })
         .await
         .expect("expected the detached kill to complete after its waiter was cancelled");
+    }
+
+    /// A host control that panics in its stop is reported as the host's control failing, under the
+    /// same `acp-link-closed` code, and still hands the control back for reconciliation.
+    #[tokio::test]
+    async fn a_panicking_control_stop_names_the_host_control_under_the_link_code() {
+        let control: Arc<dyn ProcessControl> = Arc::new(PanickingStopControl);
+        let reaper = super::ChildReaper::new(control, mango_external_agents::Limits::default());
+
+        let error =
+            tokio::time::timeout(Duration::from_secs(5), reaper.reap(CancelReason::Shutdown))
+                .await
+                .expect(
+                    "expected reap: settled after a panicking control | received: still pending",
+                )
+                .expect_err("expected reap result: Err(CleanupRequired) | received: Ok");
+
+        assert!(
+            error.cleanup_control().is_some(),
+            "expected a cleanup-required error carrying the host's control | received: {error:?}"
+        );
+        let Error::CleanupRequired { source, .. } = &error else {
+            panic!("expected Error::CleanupRequired | received: {error:?}");
+        };
+        let Error::Vendor(vendor) = source.as_ref() else {
+            panic!("expected the cause: Error::Vendor | received: {source:?}");
+        };
+        assert_eq!(
+            vendor.code.as_str(),
+            "acp-link-closed",
+            "expected the vendor code: acp-link-closed | received: {}",
+            vendor.code.as_str()
+        );
+        assert!(
+            vendor.message.contains("the host's process control")
+                && vendor.message.contains("panicked"),
+            "expected a message naming the host's process control and `panicked` | received: {}",
+            vendor.message
+        );
+    }
+
+    /// A stop task the runtime lost, by a panic or by an abort, is told as the host's control
+    /// failing, never as the agent failing.
+    #[tokio::test]
+    async fn a_lost_control_stop_names_the_host_control_and_how_it_was_lost() {
+        let panicked = tokio::spawn(async { panic!("test control stop panicked") });
+        let panic_error = panicked
+            .await
+            .expect_err("expected the panicking task to fail its join");
+        let aborted = tokio::spawn(std::future::pending::<()>());
+        aborted.abort();
+        let abort_error = aborted
+            .await
+            .expect_err("expected the aborted task to fail its join");
+
+        for (joined, shape) in [(panic_error, "panicked"), (abort_error, "was cancelled")] {
+            let message = super::control_stop_lost(&joined);
+            let expected =
+                format!("expected the host's process stop to return | received: it {shape}");
+            assert!(
+                message.starts_with("the host's process control") && message.ends_with(&expected),
+                "expected a message from `the host's process control` ending in `{expected}` | received: {message}"
+            );
+        }
     }
 
     /// A live connection over a silent fake child whose kills are counted.

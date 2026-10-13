@@ -321,8 +321,10 @@ A session dropped on a thread
 without a Tokio runtime hands that worker to the runtime it was opened on. Every `close` waits for
 the worker's result, so none reports success before the child is reaped. If the worker cannot reap
 the child, or panics inside the host's process control, each caller receives the same
-`Error::CleanupRequired` control for host reconciliation. `Closed` is published only after the
-reap succeeds.
+`Error::CleanupRequired` control for host reconciliation. A control that panics is told apart from
+the app-server failing: the error's cause is an `Error::Link` whose peer is `the host's process
+control`, as in the Claude harness, and `codex app-server` stays the peer of the link failures
+only. `Closed` is published only after the reap succeeds.
 
 Stopping a turn has four deadlines, and none of them borrows another's meaning. The
 [app-server protocol](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md)
