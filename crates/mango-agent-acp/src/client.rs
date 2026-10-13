@@ -2114,10 +2114,11 @@ impl ConnectionHandle {
 ///
 /// The tail is redacted here, whatever the control did: one from the library's own launchers
 /// arrives redacted from [`StderrTail`](mango_external_agents::StderrTail), but a host's own
-/// `ProcessControl` is only asked to redact, and this text goes into an error the host logs.
-/// The second pass never reveals anything and may redact more.
+/// `ProcessControl` is only asked to redact, and this text goes into an error the host logs. A
+/// tail is read once, here, so it is read for well-known tokens too (`redact::stderr_tail`). The
+/// second pass never reveals anything and may redact more.
 pub(crate) fn with_stderr(message: &str, control: &dyn ProcessControl) -> String {
-    let tail = mango_external_agents::redact::stderr_text(&control.stderr_tail());
+    let tail = mango_external_agents::redact::stderr_tail(&control.stderr_tail());
     let tail = tail.trim();
     if tail.is_empty() {
         return message.to_owned();
@@ -2397,6 +2398,28 @@ mod tests {
         assert!(
             message.contains("the agent's stderr: fatal: API_KEY=[REDACTED]"),
             "expected the redacted stderr in the message | received {message:?}"
+        );
+    }
+
+    #[test]
+    fn a_link_failure_hides_a_bare_token_in_a_stderr_tail_the_host_did_not_redact() {
+        const TOKEN: &str = concat!("gh", "p_0123456789abcdefghijklmnopqrstuvwxyz");
+        let control = UnredactedTailControl {
+            tail: concat!(
+                "fatal: push rejected for gh",
+                "p_0123456789abcdefghijklmnopqrstuvwxyz",
+                " by the remote"
+            ),
+        };
+
+        let message = super::with_stderr("the agent exited", &control);
+
+        assert!(
+            !message.contains(TOKEN)
+                && message.contains(
+                    "the agent's stderr: fatal: push rejected for [REDACTED] by the remote"
+                ),
+            "expected a bare token in the tail hidden in the message | received {message:?}"
         );
     }
 

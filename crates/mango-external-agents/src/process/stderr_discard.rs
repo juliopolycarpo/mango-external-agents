@@ -1,8 +1,9 @@
 //! What a stderr tail keeps dropping after a cut.
 //!
-//! [`redact::stderr_text`] can only hide a value it can still see the name of. A cut that drops
-//! a credential's name and keeps its value hands the value back verbatim, so a cut is not done
-//! where the bytes run out: it goes on to a place the redactor's rules cannot reach across.
+//! [`redact::stderr_tail`], by the rules of [`redact::stderr_text`], can only hide a value it can
+//! still see the name of. A cut that drops a credential's name and keeps its value hands the value
+//! back verbatim, so a cut is not done where the bytes run out: it goes on to a place the
+//! redactor's rules cannot reach across.
 //! Two things reach across a cut. The rest of a line whose start was dropped, and a value the
 //! rules read on the next line, because they skip line breaks between a name, its separator and
 //! its value. Bytes are only ever dropped here; nothing is cut before redaction.

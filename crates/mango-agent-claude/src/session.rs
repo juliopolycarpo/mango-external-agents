@@ -2673,8 +2673,9 @@ fn no_result_error(
     };
     // Redacted here although `StderrTail::read` redacts: the control is the host's own
     // `ProcessControl`, whose tail is only asked to be redacted, and this text goes into an error
-    // the host logs. The second pass never reveals anything and may redact more.
-    let detail = mango_external_agents::redact::stderr_text(&stderr_tail)
+    // the host logs. A tail is read once, here, so it is read for well-known tokens too. The
+    // second pass never reveals anything and may redact more.
+    let detail = mango_external_agents::redact::stderr_tail(&stderr_tail)
         .trim()
         .to_owned();
     let message = if detail.is_empty() {
@@ -3227,6 +3228,33 @@ mod tests {
             String::new(),
         );
         assert_eq!(error.code.as_str(), "claude-terminated");
+    }
+
+    /// The error is normalised when it is emitted, which would hide a token too; this reads the
+    /// error as `no_result_error` makes it, so the tail is held to its own read.
+    #[test]
+    fn hides_a_bare_token_in_a_stderr_tail_the_host_did_not_redact() {
+        const TOKEN: &str = concat!("gh", "p_0123456789abcdefghijklmnopqrstuvwxyz");
+        let error = no_result_error(
+            None,
+            Some(ExitStatus {
+                code: Some(1),
+                signal: None,
+            }),
+            String::from(concat!(
+                "error: push rejected for gh",
+                "p_0123456789abcdefghijklmnopqrstuvwxyz",
+                " by the remote"
+            )),
+        );
+        assert!(
+            !error.message.contains(TOKEN)
+                && error
+                    .message
+                    .ends_with("error: push rejected for [REDACTED] by the remote"),
+            "expected a bare token in the tail hidden | received {:?}",
+            error.message
+        );
     }
 
     #[test]

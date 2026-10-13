@@ -11,9 +11,13 @@
 //! that comes close to one (`sk-learn`, `npm_config_cache`, a git SHA, a certificate). The prefixes
 //! are read by [`redact::bounded`](crate::redact::bounded) and
 //! [`redact::structured`](crate::redact::structured), the entry points for a vendor's messages, and
-//! not by [`redact::stderr_text`](crate::redact::stderr_text), which stays on the hot path of a
-//! stderr tail. A harness test that runs [`LEAKS`] through `stderr_text` therefore must not run
-//! [`BARE_TOKENS`] through it; [`BENIGN_NEAR_TOKENS`] come back unchanged from every entry point.
+//! by [`redact::stderr_tail`](crate::redact::stderr_tail), which reads a stderr tail once when a
+//! failure is reported. They are not read by [`redact::stderr_text`](crate::redact::stderr_text),
+//! which a host may run over every line of a stream. A harness test that runs [`LEAKS`] through
+//! `stderr_text` therefore must not run [`BARE_TOKENS`] through it, and one that runs them through
+//! `stderr_tail` must leave out the rows that hide a number (a count of twelve digits or more under
+//! a name that counts tokens), which only the message entry points read.
+//! [`BENIGN_NEAR_TOKENS`] come back unchanged from every entry point.
 //!
 //! Every token here is synthetic and written in pieces, so that no source line holds a complete
 //! credential shape.
@@ -281,7 +285,8 @@ pub const BENIGN: &[&str] = &[
 /// name that counts tokens.
 ///
 /// Redacted by [`redact::bounded`](crate::redact::bounded) and
-/// [`redact::structured`](crate::redact::structured); see the module documentation for why
+/// [`redact::structured`](crate::redact::structured), and, except the two rows that hide a number,
+/// by [`redact::stderr_tail`](crate::redact::stderr_tail); see the module documentation for why
 /// [`redact::stderr_text`](crate::redact::stderr_text) is not asked. The `secret` of each row is the
 /// whole token, prefix included.
 pub const BARE_TOKENS: &[Leak] = &[
@@ -599,7 +604,8 @@ pub const BARE_TOKENS: &[Leak] = &[
 /// Text that comes close to a well-known token and is not one: hyphenated and underscored
 /// ordinary words, base64 that is not a JWT, hashes and ids, paths, model and package names, cloud
 /// resource names, certificates and the prefixes with nothing after them. Every entry comes back
-/// byte for byte from [`redact::stderr_text`](crate::redact::stderr_text) and from
+/// byte for byte from [`redact::stderr_text`](crate::redact::stderr_text), from
+/// [`redact::stderr_tail`](crate::redact::stderr_tail) and from
 /// [`redact::bounded`](crate::redact::bounded).
 pub const BENIGN_NEAR_TOKENS: &[&str] = &[
     "pip install scikit-learn failed: sk-learn is not a package",
@@ -642,4 +648,18 @@ pub const BENIGN_NEAR_TOKENS: &[&str] = &[
     "separator ----- and ----------- and ----- BEGIN -----",
     "sk- alone and sk-ant- and sk-live-short",
     "the build tool task-runner-sk-ant-config reads it",
+    // Stderr as a CLI really writes it: stack traces, paths, hashes and ids, package and model
+    // identifiers. A tail is read for tokens with a prefix, and none of this is one.
+    "Error: connect ECONNREFUSED 127.0.0.1:3000\n    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1555:16)\n    at Client._connectionCallback (/home/u/app/node_modules/pg/lib/client.js:132:17)",
+    "thread 'main' panicked at src/main.rs:42:5:\ncalled `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound, message: \"No such file or directory\" }\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+    "Traceback (most recent call last):\n  File \"/usr/lib/python3.12/site-packages/sklearn/utils/validation.py\", line 1049, in check_array\n    raise ValueError(msg)\nValueError: Found array with 0 sample(s) while a minimum of 1 is required by sk-learn estimators",
+    "npm ERR! code ERESOLVE\nnpm ERR! While resolving: @sk-labs/sk-learn-bridge@1.2.3\nnpm ERR! Found: react@18.3.1\nnpm ERR! A complete log of this run can be found in: /home/u/.npm/_logs/2026-10-12T10_11_12_131Z-debug-0.log",
+    "huggingface_hub.errors.RepositoryNotFoundError: 404 Client Error. Repository Not Found for url: https://huggingface.co/api/models/meta-llama/Llama-3.1-8B-Instruct/revision/main.\nhf_hub_download(repo_id=\"bert-base-uncased\", filename=\"config.json\") hf_transfer_enabled=1",
+    "fatal: reference is not a tree: 9fceb02d0ae598e95dc970b74767f19372d61af8\nerror: pathspec 'origin/main' did not match any file(s) known to git",
+    "x-request-id: req_01HZX3K9T7Q2W8M4N5P6R7S8T9 trace 4bf92f3577b34da6a3ce929d0e0e4736 span 00f067aa0ba902b7 id 550e8400-e29b-41d4-a716-446655440000",
+    "Error response from daemon: pull access denied for sk-learn/sk-learn-notebook, repository does not exist\nimage sha256:3b4f1c0e9a8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b not found",
+    "error[E0432]: unresolved import `tokio_util::codec::LinesCodec`\n  --> src/transport.rs:12:5\n   |\n12 | use tokio_util::codec::LinesCodec;\n   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `LinesCodec` in `codec`",
+    "npm WARN deprecated sha512-XnL6g8ZPqkVd0aT4nQhWk5mC3p0Yb1EoR7uJxS2dLwHf9AiZy6GcMvKtN8rBqPjD+Q/4ZsU1w3eTg== integrity checksum",
+    "task_01J9ZQ8K3V7M2N4P5R6S8T0W1X and run_2026-10-12T10:11:12Z finished; workflow-sk-ant-gateway-v2 restarted",
+    "ssh: connect to host build-01.example.com port 22: Connection timed out\nrsync error: unexplained error (code 255) at io.c(231) [sender=3.2.7]",
 ];
