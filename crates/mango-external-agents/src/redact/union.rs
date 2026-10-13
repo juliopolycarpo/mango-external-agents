@@ -311,16 +311,12 @@ pub(super) trait Layer {
         String::from(REDACTED)
     }
 
-    /// The floor: the spans of the release before this one, over the stripped text. A layer that
-    /// must hide at least what `stderr_text` hides reads them as `stderr_text` does.
-    fn floor(&self, plain: &str, marked: bool) -> Vec<Hide> {
-        floor::hides(plain, marked)
-    }
-
-    /// The readers other than the floor, over the stripped text: the reads added since the release
-    /// before this one and the well-known tokens, in the union.
-    fn reads(&self, plain: &str) -> Vec<Hide> {
-        union(vec![super::read_hides(plain), tokens::hides(plain)])
+    /// The spans this layer hides over the stripped text when it reads the text by itself, and
+    /// not as the union of the floor, the reads added since and its own `layer`. Only a reader
+    /// that must replay what an older entry point answers (`Tail`) has one; the others read the
+    /// text as [`hides`] does.
+    fn own_spans(&self, _plain: &str, _marked: bool) -> Option<Vec<Hide>> {
+        None
     }
 }
 
@@ -339,23 +335,25 @@ impl Layer for Plain {}
 pub(super) struct Tail;
 
 impl Layer for Tail {
-    fn floor(&self, plain: &str, marked: bool) -> Vec<Hide> {
-        floor::current_hides(plain, marked)
-    }
-
-    fn reads(&self, plain: &str) -> Vec<Hide> {
-        tokens::tail_hides(plain)
+    fn own_spans(&self, plain: &str, marked: bool) -> Option<Vec<Hide>> {
+        Some(union(vec![
+            floor::current_hides(plain, marked),
+            tokens::tail_hides(plain),
+        ]))
     }
 }
 
 /// The spans of `plain`, the text the stripper left, that every reader and `layer` hide.
 ///
 /// The readers are the rules of the release before (`floor`), the reads added since
-/// (`read_hides`), and the well-known tokens, or the ones `layer` names in [`Layer::reads`]. None
-/// of them sees what another has changed, so none of them can make another miss its place.
+/// (`read_hides`), and the well-known tokens. None of them sees what another has changed, so none
+/// of them can make another miss its place. A layer with [`Layer::own_spans`] answers by itself.
 pub(super) fn hides(plain: &str, marked: bool, layer: &dyn Layer) -> Vec<Hide> {
-    let floor = layer.floor(plain, marked);
-    let others = layer.reads(plain);
+    if let Some(own) = layer.own_spans(plain, marked) {
+        return own;
+    }
+    let floor = floor::hides(plain, marked);
+    let others = union(vec![super::read_hides(plain), tokens::hides(plain)]);
     layer.layer(plain, floor, others)
 }
 
