@@ -601,9 +601,11 @@ async fn refuse_outdated_before_spawn(
         None => read_version(host, executable).await?,
     };
     if host.cancel().is_cancelled() {
+        // No agent was started, so nothing was submitted: the caller may open again.
         return Err(Error::Cancelled {
             reason: mango_external_agents::CancelReason::Shutdown,
-        });
+        }
+        .with_dispatch(mango_external_agents::Dispatch::NotSubmitted));
     }
     refuse_below_floor(version.as_deref())
 }

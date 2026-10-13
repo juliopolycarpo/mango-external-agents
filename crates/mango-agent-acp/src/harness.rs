@@ -842,7 +842,8 @@ impl AcpHarness {
         if host.cancel().is_cancelled() {
             return Err(Error::Cancelled {
                 reason: mango_external_agents::CancelReason::Shutdown,
-            });
+            }
+            .with_dispatch(mango_external_agents::Dispatch::NotSubmitted));
         }
         match gate(version.as_deref(), Some(minimum)) {
             GateVerdict::VersionTooOld { found, minimum } => {

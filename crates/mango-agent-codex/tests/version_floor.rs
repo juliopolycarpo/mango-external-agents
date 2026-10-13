@@ -397,6 +397,14 @@ async fn a_shutdown_during_a_hung_probe_starts_no_app_server() {
         "expected Cancelled | received {:?}",
         result.as_ref().err()
     );
+    assert!(
+        result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.dispatch().is_safe_to_replay()),
+        "expected a cancellation before any agent started to be safe to replay | received {:?}",
+        result.as_ref().err().map(|error| error.dispatch())
+    );
     assert_eq!(
         launcher.live_children(),
         0,
@@ -427,6 +435,14 @@ async fn a_host_that_was_shut_down_starts_no_app_server() {
         ),
         "expected Cancelled | received {:?}",
         result.as_ref().err()
+    );
+    assert!(
+        result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.dispatch().is_safe_to_replay()),
+        "expected a cancellation before any agent started to be safe to replay | received {:?}",
+        result.as_ref().err().map(|error| error.dispatch())
     );
 }
 

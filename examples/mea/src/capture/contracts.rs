@@ -121,6 +121,9 @@ async fn claude_with(host: &HostContext, out_dir: &Path) -> Result<()> {
 }
 
 async fn codex_contract_with(host: &HostContext, out_dir: &Path, workspace: &Path) -> Result<()> {
+    // `app-server generate-json-schema` is still the app-server binary: a build below the floor
+    // is refused before it runs, as it is for a capture and for a session.
+    super::require_supported_codex(host).await?;
     let version = command_output(
         host,
         vec![String::from("codex"), String::from("--version")],
