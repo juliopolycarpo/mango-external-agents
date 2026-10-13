@@ -1879,11 +1879,7 @@ impl Shared {
                         .map_or_else(|| String::from("none"), |signal| signal.to_string())
                 ));
             }
-            // Redacted here even though `StderrTail::read` already redacts: the control is the
-            // host's own `ProcessControl`, its tail is only asked to be redacted, and this text
-            // is about to cross into a failure the host logs. The second pass never reveals
-            // anything and may redact more.
-            let stderr = mango_external_agents::redact::stderr_text(&control.stderr_tail());
+            let stderr = reported_stderr(control.as_ref());
             if !stderr.is_empty() {
                 message.push_str(&format!("; stderr: {stderr}"));
             }
@@ -4171,6 +4167,16 @@ impl CodexSession {
     }
 }
 
+/// The control's stderr tail as it goes into a failure the host logs.
+///
+/// Redacted here even though `StderrTail::read` already redacts: the control is the host's own
+/// `ProcessControl`, its tail is only asked to be redacted. The tail is read for names and for
+/// well-known tokens (`redact::stderr_tail`); it is read once, when a connection has ended. The
+/// second pass never reveals anything and may redact more.
+fn reported_stderr(control: &dyn ProcessControl) -> String {
+    mango_external_agents::redact::stderr_tail(&control.stderr_tail())
+}
+
 fn supports_image_mime_type(mime_type: &str) -> bool {
     ["image/png", "image/jpeg", "image/gif", "image/webp"]
         .iter()
@@ -5291,6 +5297,29 @@ mod tests {
             error.message.contains("stderr: fatal: API_KEY=[REDACTED]"),
             "expected the redacted stderr in the failure | received {:?}",
             error.message
+        );
+    }
+
+    /// The failure of a connection that ended names the tail of a control that is the host's own,
+    /// so the tail is read here for a token with no name beside it: the failure is normalised
+    /// afterwards, which would hide it too, and this is the seam that does not rely on that.
+    #[test]
+    fn the_reported_stderr_hides_a_bare_token_in_a_tail_the_host_did_not_redact() {
+        const TOKEN: &str = concat!("gh", "p_0123456789abcdefghijklmnopqrstuvwxyz");
+        let control = UnredactedTailControl {
+            tail: concat!(
+                "fatal: push rejected for gh",
+                "p_0123456789abcdefghijklmnopqrstuvwxyz",
+                " by the remote"
+            ),
+        };
+
+        let received = super::reported_stderr(&control);
+
+        assert!(
+            !received.contains(TOKEN)
+                && received == "fatal: push rejected for [REDACTED] by the remote",
+            "expected a bare token in the tail hidden | received {received:?}"
         );
     }
 
