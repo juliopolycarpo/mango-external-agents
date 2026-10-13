@@ -358,3 +358,146 @@ async fn an_errored_result_on_a_fresh_session_is_not_a_resume_failure() {
         error.code
     );
 }
+
+/// The other ways a turn's child is stopped while the session is alive or on its way out. The
+/// snapshot is what a host stores, so a path that kills without tainting would hand a later
+/// session a killed conversation marked `Resumable`.
+mod other_stops {
+    use super::*;
+    use mango_external_agents::{CancelToken, CloseReason, HostContext};
+
+    fn stalled(graceful: bool) -> Arc<FakeClaudeCli> {
+        let launcher = FakeClaudeCli::new().with_turn(Run::stalling([init(NATIVE_ID)]));
+        Arc::new(if graceful {
+            launcher.with_graceful_interrupt()
+        } else {
+            launcher
+        })
+    }
+
+    fn expected(graceful: bool) -> Resumability {
+        if graceful {
+            Resumability::Resumable
+        } else {
+            Resumability::TaintedByKill
+        }
+    }
+
+    /// The stop took the path the case names, so a verdict is not read off a stop that never ran.
+    fn assert_stopped_by(launcher: &FakeClaudeCli, graceful: bool) {
+        let (interrupts, kills) = (launcher.graceful_interrupts(), launcher.kill_requests());
+        let (wanted_interrupts, wanted_kills) = if graceful { (1, 0) } else { (0, 1) };
+        assert!(
+            interrupts == wanted_interrupts && kills >= wanted_kills,
+            "expected graceful interrupts: {wanted_interrupts}, kills: {wanted_kills}+ | received: {interrupts}, {kills}"
+        );
+    }
+
+    /// The child is gone and the harness had its turn at recording how it ended.
+    async fn settled(launcher: &FakeClaudeCli) {
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            while !launcher.all_children_ended() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "expected the stopped child to end");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn close_records_how_it_stopped_the_child() {
+        for graceful in [false, true] {
+            let launcher = stalled(graceful);
+            let session = open(&launcher).await;
+            let _turn = session
+                .start_turn(TurnRequest::new("turn-1", "hold"))
+                .await
+                .expect("expected a turn");
+            wait_for(session.as_ref(), Resumability::Resumable).await;
+
+            session
+                .close(CloseReason::Requested)
+                .await
+                .expect("expected the close to land");
+
+            assert_stopped_by(&launcher, graceful);
+            assert_resumability(
+                session.as_ref(),
+                expected(graceful),
+                if graceful {
+                    "a close that interrupted gracefully"
+                } else {
+                    "a close that had to kill"
+                },
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_host_records_how_it_stopped_the_child() {
+        for graceful in [false, true] {
+            let launcher = stalled(graceful);
+            let token = CancelToken::new();
+            let host: HostContext = HostContext::builder()
+                .launcher(Arc::clone(&launcher) as Arc<dyn mango_external_agents::ProcessLauncher>)
+                .cwd(std::env::temp_dir())
+                .scratch(std::env::temp_dir())
+                .client_info("mea-tests", "0.0.0")
+                .cancel(token.clone())
+                .build()
+                .expect("expected a host");
+            let session = ClaudeHarness::new()
+                .open_session(&host, OpenSession::new("chat-1"))
+                .await
+                .expect("expected a session");
+            let mut turn = session
+                .start_turn(TurnRequest::new("turn-1", "hold"))
+                .await
+                .expect("expected a turn");
+            wait_for(session.as_ref(), Resumability::Resumable).await;
+
+            token.cancel();
+            drain(&mut turn).await;
+            settled(&launcher).await;
+
+            assert_stopped_by(&launcher, graceful);
+            assert_resumability(
+                session.as_ref(),
+                expected(graceful),
+                if graceful {
+                    "a host shutdown that interrupted gracefully"
+                } else {
+                    "a host shutdown that had to kill"
+                },
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_stream_records_how_it_stopped_the_child() {
+        for graceful in [false, true] {
+            let launcher = stalled(graceful);
+            let session = open(&launcher).await;
+            let turn = session
+                .start_turn(TurnRequest::new("turn-1", "hold"))
+                .await
+                .expect("expected a turn");
+            wait_for(session.as_ref(), Resumability::Resumable).await;
+
+            drop(turn);
+            settled(&launcher).await;
+
+            assert_stopped_by(&launcher, graceful);
+            assert_resumability(
+                session.as_ref(),
+                expected(graceful),
+                if graceful {
+                    "a dropped stream that interrupted gracefully"
+                } else {
+                    "a dropped stream that had to kill"
+                },
+            );
+        }
+    }
+}
