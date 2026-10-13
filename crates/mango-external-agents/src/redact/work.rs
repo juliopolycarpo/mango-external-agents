@@ -12,7 +12,7 @@
 //! that is linear only up to some size still fails.
 
 use super::scan::steps;
-use super::{ends_awaiting_value, message_text, stderr_text};
+use super::{ends_awaiting_value, message_text, stderr_tail, stderr_text};
 use crate::ExtensionValue;
 
 /// A short text and one twice its size, both far past what a quadratic rule survives in a test.
@@ -474,6 +474,14 @@ fn message_steps(text: &str) -> usize {
     })
 }
 
+/// The entry point a stderr tail takes: the rules of `stderr_text` and the token pass, and the
+/// read of a private key whose begin line a cut dropped, when the text is handed in whole.
+fn tail_steps(text: &str) -> usize {
+    steps::counted(|| {
+        std::hint::black_box(stderr_tail(std::hint::black_box(text)));
+    })
+}
+
 fn awaiting_steps(text: &str) -> usize {
     steps::counted(|| {
         std::hint::black_box(ends_awaiting_value(std::hint::black_box(text)));
@@ -819,6 +827,99 @@ fn message_redaction_work_is_proportional_to_the_text_for_every_shape() {
         "redact::bounded",
         &[SHAPES, TOKEN_SHAPES],
         message_steps,
+        MESSAGE_STEPS_PER_BYTE,
+    );
+}
+
+/// What a cut key adds: lines of base64 from the first byte of the text with no end marker, blank
+/// lines before one, and end markers one after another, none of which has a begin marker.
+const TAIL_SHAPES: &[Shape] = &[
+    Shape {
+        what: "lines of base64 from the first byte and no end marker",
+        build: |len| {
+            repeated(
+                "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\n",
+                "",
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "blank lines from the first byte and no end marker",
+        build: |len| repeated("\n", "", len),
+    },
+    Shape {
+        what: "end markers of a private key one after another",
+        build: |len| repeated(concat!("-----END PRIV", "ATE KEY-----\n"), "", len),
+    },
+    Shape {
+        what: "lines of base64 and an end marker, over and over",
+        build: |len| {
+            repeated(
+                concat!("QUJDRA==\n-----END PRIV", "ATE KEY-----\n"),
+                "",
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "begin markers of a private key one after another and no end marker",
+        build: |len| repeated(concat!("-----BEGIN PRIV", "ATE KEY-----\n"), "", len),
+    },
+    Shape {
+        what: "begin markers behind a prefix, one after another and no end marker",
+        build: |len| {
+            repeated(
+                concat!("stderr | -----BEGIN PRIV", "ATE KEY-----\n"),
+                "",
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "prefixed lines of base64 from the first byte and an end marker past the distance a block is read",
+        build: |len| {
+            format!(
+                "{}{}",
+                "stderr | MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\n"
+                    .repeat(len / 74),
+                concat!("stderr | -----END PRIV", "ATE KEY-----")
+            )
+        },
+    },
+    Shape {
+        what: "the same long prefix on every line, with an end marker after them",
+        build: |len| {
+            let prefix = "p".repeat(60);
+            format!(
+                "{}{prefix} {}",
+                format!("{prefix} QUJDRA==\n").repeat(len / 70),
+                concat!("-----END PRIV", "ATE KEY-----")
+            )
+        },
+    },
+    Shape {
+        what: "base64 lines with an end marker past the distance a block is read",
+        build: |len| {
+            format!(
+                "{}{}",
+                "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\n"
+                    .repeat(len / 65),
+                concat!("-----END PRIV", "ATE KEY-----")
+            )
+        },
+    },
+];
+
+/// A tail is held to the budget of a message: it reads what the rules of `stderr_text` read, the
+/// token pass and a start-of-text read, over every shape of the rules, of the token pass and of
+/// the cut key.
+#[test]
+fn stderr_tail_work_is_proportional_to_the_text_for_every_shape() {
+    assert_work_is_linear(
+        "redact::stderr_tail",
+        &[SHAPES, TOKEN_SHAPES, TAIL_SHAPES],
+        tail_steps,
         MESSAGE_STEPS_PER_BYTE,
     );
 }
