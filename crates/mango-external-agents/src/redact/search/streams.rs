@@ -56,6 +56,24 @@ const DECORATIONS: [(&str, &str); 5] = [
     ("\u{1b}]0;title\u{7}", ""),
     ("\u{1b}[1m", "\u{1b}[0m"),
 ];
+/// The payload sizes of the string escapes put in front of a marker: well inside the stripper's
+/// bound, at it, and past it (where the stripper keeps the payload as text).
+const ESCAPE_SIZES: [usize; 9] = [0, 200, 300, 600, 2000, 4095, 4096, 4097, 6000];
+
+/// A string escape of `size` payload bytes: an OSC title, an OSC 8 hyperlink, a DCS or an OSC that
+/// is never ended, each written with the terminator it takes (BEL, `ESC \`, 8-bit ST).
+fn string_escape(random: &mut Random, size: usize) -> String {
+    let payload = "t".repeat(size);
+    match random.below(6) {
+        0 => format!("\u{1b}]0;{payload}\u{7}"),
+        1 => format!("\u{1b}]8;;http://e/{payload}\u{1b}\\text\u{1b}]8;;\u{1b}\\"),
+        2 => format!("\u{1b}P{payload}\u{1b}\\"),
+        3 => format!("\u{1b}]0;{payload}"),
+        4 => format!("\u{9d}0;{payload}\u{9c}"),
+        _ => format!("\u{1b}]0;{payload}\u{1b}\\"),
+    }
+}
+
 const PRIVATE_LABELS: [&str; 5] = [
     "PRIVATE KEY",
     "RSA PRIVATE KEY",
@@ -101,12 +119,33 @@ pub(super) fn stream(random: &mut Random) -> Stream {
         text.push_str(after);
         text.push_str(eol);
     };
-    // A marker, sometimes with an escape inside it.
-    let marked = |random: &mut Random, kind: &str, label: &str| {
+    // A marker, sometimes with an escape inside it, behind a long string escape, or with a dash
+    // glued to it.
+    let mut long_escape = false;
+    let mut marked = |random: &mut Random, kind: &str, label: &str| {
         let text = marker(kind, label);
-        match random.below(6) {
+        let text = match random.below(6) {
             0 => text.replacen(' ', " \u{1b}[0m", 1),
             1 => text.replacen("KEY", "\u{1b}[0mKEY", 1),
+            _ => text,
+        };
+        match random.below(40) {
+            0 => {
+                long_escape = true;
+                let size = *random.pick(&ESCAPE_SIZES);
+                format!("{}{text}", string_escape(random, size))
+            }
+            1 => format!("-{text}"),
+            // A long line in front of it, and the marker inside a string escape the line ends.
+            2 => {
+                long_escape = true;
+                format!("{}{text}", "x".repeat(random.below(9000)))
+            }
+            3 => {
+                long_escape = true;
+                let size = *random.pick(&ESCAPE_SIZES);
+                format!("\u{1b}]0;{}{text}\u{7}", "t".repeat(size))
+            }
             _ => text,
         }
     };
@@ -159,6 +198,7 @@ pub(super) fn stream(random: &mut Random) -> Stream {
     let mut left = text.len();
     while left > 0 {
         let size = match random.below(4) {
+            0 if long_escape => 1 + random.below(64),
             0 => 1,
             1 => 2 + random.below(40),
             2 => 28 + random.below(3),

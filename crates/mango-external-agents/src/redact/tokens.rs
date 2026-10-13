@@ -391,55 +391,82 @@ pub(super) const MAX_MARK_BYTES: usize = 11 + MAX_LABEL + 5;
 /// let bytes = b"-----BEGIN PRIVATE KEY-----\nabcd\n";
 /// assert_eq!(last_key_mark(bytes), Some(KeyMark::Begin));
 /// ```
+#[cfg(test)]
 pub(super) fn last_key_mark(bytes: &[u8]) -> Option<KeyMark> {
     last_key_mark_after(bytes, 0)
 }
 
 /// [`last_key_mark`] among the markers that end after `after`: the markers a text gained when
 /// the bytes from `after` were appended to it.
+#[cfg(test)]
 pub(super) fn last_key_mark_after(bytes: &[u8], after: usize) -> Option<KeyMark> {
-    let (mut last, mut at) = (None, after.saturating_sub(MAX_MARK_BYTES));
+    key_marks(bytes, after, usize::MAX).0
+}
+
+/// The last marker that ends after `after` and starts before `split`, and the last one that starts
+/// at or after `split`: the markers of the lines that are over and of the line being written, when
+/// `split` is where that line starts. One pass.
+pub(super) fn key_marks(
+    bytes: &[u8],
+    after: usize,
+    split: usize,
+) -> (Option<KeyMark>, Option<KeyMark>) {
+    let (mut before_split, mut from_split) = (None, None);
+    let mut at = after.saturating_sub(MAX_MARK_BYTES);
     // A marker starts at the last five hyphens of a run of them, and nothing else can: the search
     // skips straight to the next hyphen (valid text with the standard library's byte search, which
-    // reads a word at a time) and then past its run.
-    let text = std::str::from_utf8(bytes).ok();
-    loop {
-        // The place the search starts is a lower bound and a marker is ASCII, so it moves on to a
-        // character boundary when `after` fell inside a multibyte character.
-        if let Some(text) = text {
-            at = text.ceil_char_boundary(at.min(text.len()));
-        }
-        let offset = match text {
-            Some(text) => text.get(at..).and_then(|rest| rest.find('-')),
-            None => bytes
-                .get(at..)
-                .and_then(|rest| rest.iter().position(|byte| *byte == b'-')),
-        };
-        let Some(offset) = offset else {
-            return last;
-        };
-        let run = at + offset;
+    // reads a word at a time) and then past its run. Text that is not valid ends in a character a
+    // cut split, as a rule, and only what follows the valid part is walked.
+    let valid = match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => std::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap_or(""),
+    };
+    while let Some(run) = next_hyphen(bytes, valid, at) {
         let run_end = take_while(bytes, run, |byte| byte == b'-');
-        count_steps(offset);
+        count_steps(run.saturating_sub(at));
         at = run_end;
         let Some(start) = run_end.checked_sub(5).filter(|start| *start >= run) else {
             continue;
         };
         let rest = &bytes[start..];
-        if rest.starts_with(b"-----BEGIN ") {
+        let found = if rest.starts_with(b"-----BEGIN ") {
             let label = start + b"-----BEGIN ".len();
-            let close = closing_dashes(bytes, label, true).filter(|close| {
-                starts_a_run(bytes, start) && is_private_key_label(&bytes[label..close - 5])
-            });
-            if close.is_some_and(|close| close > after) {
-                last = Some(KeyMark::Begin);
-            }
-        } else if rest.starts_with(b"-----END ")
-            && end_marker_close(bytes, start).is_some_and(|close| close > after)
-        {
-            last = Some(KeyMark::End);
+            closing_dashes(bytes, label, true)
+                .filter(|close| {
+                    starts_a_run(bytes, start) && is_private_key_label(&bytes[label..close - 5])
+                })
+                .filter(|close| *close > after)
+                .map(|_| KeyMark::Begin)
+        } else if rest.starts_with(b"-----END ") {
+            end_marker_close(bytes, start)
+                .filter(|close| *close > after)
+                .map(|_| KeyMark::End)
+        } else {
+            None
+        };
+        match found {
+            Some(mark) if start >= split => from_split = Some(mark),
+            Some(mark) => before_split = Some(mark),
+            None => {}
         }
     }
+    (before_split, from_split)
+}
+
+/// The next hyphen at or after `at`: in the valid text `valid`, which is a prefix of `bytes`, with
+/// the standard library's byte search, and past it byte by byte.
+fn next_hyphen(bytes: &[u8], valid: &str, at: usize) -> Option<usize> {
+    if at < valid.len() {
+        // The place the search starts is a lower bound and a marker is ASCII, so it moves on to a
+        // character boundary when it fell inside a multibyte character.
+        let from = valid.ceil_char_boundary(at);
+        if let Some(offset) = valid.get(from..).and_then(|rest| rest.find('-')) {
+            return Some(from + offset);
+        }
+    }
+    let from = at.max(valid.len());
+    let offset = bytes.get(from..)?.iter().position(|byte| *byte == b'-')?;
+    Some(from + offset)
 }
 
 /// The private-key blocks of `text`, found by a search for the begin marker and not a read of

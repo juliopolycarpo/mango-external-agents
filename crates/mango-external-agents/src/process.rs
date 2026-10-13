@@ -2102,6 +2102,33 @@ mod tests {
         }
     }
 
+    /// A string escape of a few hundred bytes in front of the begin marker, on its line: the
+    /// state reads the whole line, so the escape is taken out and the marker is one.
+    #[test]
+    fn a_key_behind_a_long_string_escape_is_hidden_at_every_capacity_and_push_size() {
+        let base64 = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj";
+        for size in [300, 600, 2000, 4090] {
+            let mut stream = String::from("starting\n");
+            stream.push_str(&format!("\u{1b}]0;{}\u{7}", "t".repeat(size)));
+            stream.push_str("-----BEGIN PRIVATE KEY-----\n");
+            for _ in 0..6 {
+                stream.push_str(&format!("{base64}\n"));
+            }
+            stream.push_str("after one\nafter two\n");
+            for (capacity, push) in [(128, 1), (128, 7), (200, 1), (300, 64)] {
+                let (kept, shown) = shown_in_tail(&stream, capacity, push);
+                assert!(
+                    !kept.contains("BEGIN") && kept.contains("MIIEvQ"),
+                    "expected the cut to drop the begin line and keep body lines, escape {size}, capacity {capacity}, push {push} | received {kept:?}"
+                );
+                assert!(
+                    !shown.contains("MIIEvQ"),
+                    "expected the body hidden behind a {size}-byte escape, capacity {capacity}, push {push} | received {shown:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_value_line_dropped_after_a_cut_is_followed_by_an_intact_diagnostic() {
         let tail = StderrTail::with_capacity(32);

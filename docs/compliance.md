@@ -203,10 +203,12 @@ own deployment.
   a token with a prefix is whole in the tail or gone from it, never a back half with no prefix. A
   private key spans lines, and a cut can drop its begin marker and keep the lines under it.
   `StderrTail` therefore remembers the text it dropped (`redact::OpenKey`, fed every byte the tail
-  discards, a flag, a counter and a fixed 256-byte carry of raw bytes, read as the redactor reads
-  text: with the escapes and control characters stripped, so a marker beside a colour code or split
-  by a drop is a marker). When the last private-key marker there is a begin marker no end marker has
-  closed, `read` hides the leading run of key-shaped lines of the tail and nothing else: base64
+  discards: a flag, a counter and the line being written, at most 8,336 bytes, which is read as
+  the redactor reads text, with the escapes and control characters stripped, so a marker beside a
+  colour code, behind a title or a hyperlink of any length the stripper takes out (4 KiB), or split
+  by a drop is a marker, whatever lies in front of it on its line: the state forgets the part of
+  a line before the last 4,168 bytes, farther than any escape the stripper takes out reaches).
+  When the last private-key marker there is a begin marker no end marker has closed, `read` hides the leading run of key-shaped lines of the tail and nothing else: base64
   lines, a PEM or PGP header, blank lines, the PGP checksum, one shorter last line (or a line still
   being written at the end of the tail) and an end marker directly after, behind the one prefix that
   every line carries. No begin line is put back, so the first line that is none of these ends the

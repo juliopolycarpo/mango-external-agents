@@ -149,6 +149,52 @@ fn clean_end(bytes: &[u8], at: usize) -> usize {
     first_match(bytes, at, starts_a_removed_character).unwrap_or(bytes.len())
 }
 
+/// Whether `bytes` hold a character [`strip_control_characters`] removes, or an escape it takes
+/// out: a C0 control other than tab and line feed, DEL, a C1 control, U+061C, the left-to-right and
+/// right-to-left marks, the embeddings and the isolates. Text for which this is false comes out of
+/// the stripper as it went in, whatever it holds besides (multibyte text included).
+///
+/// # Example
+///
+/// ```ignore
+/// assert!(may_strip("a\u{1b}[0m".as_bytes()));
+/// assert!(!may_strip("na\u{ef}ve \u{2713}".as_bytes()));
+/// ```
+pub(super) fn may_strip(bytes: &[u8]) -> bool {
+    // Two scans with no early exit, each of which vectorises: whether any byte starts a removed
+    // character (usual text has none, and stops here), and then the sequences themselves.
+    let starts = bytes.iter().fold(false, |found, byte| {
+        found | starts_a_removed_character(*byte)
+    });
+    if !starts {
+        return false;
+    }
+    let whole = bytes.windows(3).fold(false, |found, at| {
+        found | starts_a_removed_sequence(at[0], at[1], at[2])
+    });
+    // The last two bytes start no window of three.
+    whole
+        || (bytes.len().saturating_sub(2)..bytes.len()).any(|place| {
+            let next = |offset: usize| bytes.get(place + offset).copied().unwrap_or(0);
+            starts_a_removed_sequence(bytes[place], next(1), next(2))
+        })
+}
+
+/// Whether three bytes (the third may be any filler when the sequence is shorter) start a
+/// character [`strip_control_characters`] removes: a C0 control other than tab and line feed, DEL,
+/// a C1 control, U+061C, a left-to-right or right-to-left mark, an embedding or an isolate. No
+/// branch, so a scan over a text vectorises.
+pub(super) fn starts_a_removed_sequence(first: u8, second: u8, third: u8) -> bool {
+    let control = ((first < 0x20) & (first != b'\t') & (first != b'\n')) | (first == 0x7f);
+    let c1 = (first == 0xc2) & ((second & 0xe0) == 0x80);
+    let arabic_mark = (first == 0xd8) & (second == 0x9c);
+    let marks = (first == 0xe2)
+        & (second == 0x80)
+        & ((third == 0x8e) | (third == 0x8f) | ((third >= 0xaa) & (third <= 0xae)));
+    let isolates = (first == 0xe2) & (second == 0x81) & ((third >= 0xa6) & (third <= 0xa9));
+    control | c1 | arabic_mark | marks | isolates
+}
+
 /// Whether a byte can be the first of a character [`strip_control_characters`] removes: a C0
 /// control or DEL as itself, and the lead byte of each multi-byte sequence that holds one (`C2`
 /// for the C1 controls, `D8` for U+061C, `E2` for the marks, embeddings and isolates). Every
@@ -157,7 +203,7 @@ fn clean_end(bytes: &[u8], at: usize) -> usize {
 /// the exact per-character test.
 ///
 /// Comparisons joined by `|` and `&`, as [`first_match`] needs.
-fn starts_a_removed_character(byte: u8) -> bool {
+pub(super) fn starts_a_removed_character(byte: u8) -> bool {
     let control = (byte < 0x20) & (byte != b'\t') & (byte != b'\n');
     control | (byte == 0x7f) | (byte == 0xc2) | (byte == 0xd8) | (byte == 0xe2)
 }
@@ -312,6 +358,33 @@ mod tests {
                 !redacted.contains("secret"),
                 "expected the value redacted after {what} | input {raw:?} received {redacted:?}"
             );
+        }
+    }
+
+    /// `may_strip` is false only for text the stripper leaves as it is: every character is
+    /// checked alone, and in front of text that could join it to a neighbour.
+    #[test]
+    fn text_that_may_not_be_stripped_comes_out_unchanged() {
+        for character in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+            let text = format!("a{character}b-----");
+            let removed = character != '\t' && character != '\n' && {
+                super::is_unsafe_to_render(character)
+                    || super::escape_end(text.as_bytes(), 1, character).is_some()
+            };
+            assert_eq!(
+                super::may_strip(text.as_bytes()),
+                removed,
+                "expected may_strip to be {removed} for U+{:04X} | input {text:?}",
+                u32::from(character)
+            );
+            if !super::may_strip(text.as_bytes()) {
+                assert_eq!(
+                    super::strip_control_characters(&text),
+                    text,
+                    "expected U+{:04X} to pass the stripper unchanged",
+                    u32::from(character)
+                );
+            }
         }
     }
 
