@@ -261,19 +261,19 @@ of the rules, of the token pass and of the cut key).
 
 | Case                            | Base: `stderr_text` (instructions) | Variant: `stderr_tail` (instructions) |   Delta |
 | ------------------------------- | ---------------------------------: | ------------------------------------: | ------: |
-| `stderr_tail-16KiB/plain`       |                         10,038,318 |                            24,357,238 | +142.6% |
-| `stderr_tail-16KiB/secrets`     |                         23,185,873 |                           108,584,296 | +368.3% |
-| `stderr_tail-16KiB/tokens`      |                          5,306,304 |                            36,484,876 | +587.6% |
-| `stderr_tail-16KiB/headers`     |                         25,266,282 |                            96,717,452 | +282.8% |
-| `stderr_tail-1MiB/prefixes`     |                                  - |                            47,332,647 |         |
-| `stderr_tail-1MiB/pem`          |                                  - |                           116,877,366 |         |
-| `stderr_tail-1MiB/web`          |                                  - |                            39,890,237 |         |
-| `stderr_tail-1MiB/one-run`      |                                  - |                            60,153,288 |         |
-| `stderr_tail-1MiB/cut-key`      |                                  - |                            34,538,940 |         |
-| `stderr_tail-1MiB/names`        |                                  - |                            32,192,241 |         |
-| `stderr_tail-1MiB/quoted-names` |                                  - |                            44,874,871 |         |
+| `stderr_tail-16KiB/plain`       |                         10,038,464 |                            24,378,550 | +142.9% |
+| `stderr_tail-16KiB/secrets`     |                         23,186,198 |                           108,629,971 | +368.5% |
+| `stderr_tail-16KiB/tokens`      |                          5,306,342 |                            36,519,311 | +588.2% |
+| `stderr_tail-16KiB/headers`     |                         25,266,344 |                            96,763,465 | +283.0% |
+| `stderr_tail-1MiB/prefixes`     |                                  - |                            57,819,219 |         |
+| `stderr_tail-1MiB/pem`          |                                  - |                           116,878,837 |         |
+| `stderr_tail-1MiB/web`          |                                  - |                            50,376,622 |         |
+| `stderr_tail-1MiB/one-run`      |                                  - |                            70,639,443 |         |
+| `stderr_tail-1MiB/cut-key`      |                                  - |                            34,707,463 |         |
+| `stderr_tail-1MiB/names`        |                                  - |                            42,678,447 |         |
+| `stderr_tail-1MiB/quoted-names` |                                  - |                            55,361,228 |         |
 
-The `stderr_text` rows did not move: Base is `main` at `195a230`, Variant the head of the branch, and the 38 rows of the first table above were counted again. Four rows of about 78,000 instructions (16 KiB `names`, `schemes`, `quoted-names`, `quotes`) are 0.6% to 0.8% lower, and every other row is within 0.2%.
+The `stderr_text` rows did not move: Base is `main` at `195a230`, Variant the head of the branch, and the 38 rows of the first table above were counted again. The largest change in any row is 0.4% (a row of about 79,000 instructions), and every row of 10 million instructions or more is within 0.01%.
 
 Milliseconds for one 256 KiB text of each shape, release, default profile, the rules of the release
 before (`stderr_text` on `main`), `stderr_text` now, `bounded` on `main` and now, and `structured` on
