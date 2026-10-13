@@ -8,23 +8,43 @@ vendor's current documentation before relying on them.
 
 ## The executable and the version gate
 
-|                   |                                                                                                     |
-| ----------------- | --------------------------------------------------------------------------------------------------- |
-| Executable        | `codex`, resolved by the host (`OpenSession::with_executable`) or by name                           |
-| Arguments         | `app-server`, and nothing else                                                                      |
-| Version read from | `codex --version` for discovery; the handshake's own `userAgent` for a session or picker connection |
-| Minimum version   | `0.154.0` (`MINIMUM_CODEX_VERSION`), which is also `vendor/PIN`                                     |
+|                   |                                                                                                                                      |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Executable        | `codex`, resolved by the host (`OpenSession::with_executable`) or by name                                                            |
+| Arguments         | `app-server`, and nothing else                                                                                                       |
+| Version read from | `codex --version` before any app-server starts (discovery, session open, picker); the handshake's own `userAgent` as the second line |
+| Minimum version   | `0.154.0` (`MINIMUM_CODEX_VERSION`), which is also `vendor/PIN`                                                                      |
 
 The floor is the pinned build rather than something older. The app-server's item families and its
 `thread/`–`turn/` method names changed shape inside the 0.15x series, so a lower floor would be a
 claim about builds nothing here was checked against. An older `codex` on `PATH` reports
 `GateVerdict::VersionTooOld` with both numbers and claims no capabilities; it never crashes, and no
-app-server is spawned for it.
+app-server is spawned for it. That holds for a session open and the short-lived picker connection
+too: they apply the same floor before they spawn `codex app-server`, because an older app-server
+creates sqlite state, an installation id and system skills under `CODEX_HOME` merely by starting.
+They refuse with `Error::VersionGate { found, minimum }` and launch nothing but the version command.
 
 A `--version` line nobody can parse is `GateVerdict::Unknown`, not a refusal: a CLI that changed
 the shape of its version output has not stopped working, and the host may still choose to try.
+
+Where the version comes from, in order:
+
+1. The `DiscoveryReceipt` on `OpenSession::discovery`, when the host passed one. It was bound and
+   verified for freshness, identity and executable, so no second process runs. A receipt that
+   carries no version proceeds unprobed, the handshake being the second line.
+2. Otherwise one `codex --version`, run for the executable the session will spawn. That is one extra
+   short process per open and per picker call (two launches instead of one, no more); a silent
+   binary costs at most the host's `request_timeout`. A launcher that cannot start it leaves the
+   app-server launch to report that.
+
+The `--version` probe is the surface discovery already ran, and it starts nothing else: the process
+prints one line and exits, and a build of `codex-cli 0.150.0` was checked to leave an empty
+`CODEX_HOME` empty. The vendor's [CLI reference][cli-reference] (read 2026-10-13) does not list the
+flag, so the behaviour was checked against the binary rather than quoted from the page.
+
 The session and short-lived picker connection also apply that same floor to a parseable handshake
-`userAgent` before they send a thread request, then clean up the child on a refusal.
+`userAgent` before they send a thread request, then clean up the child on a refusal. This is the
+second line, for what `--version` could not say.
 
 ## The documented surface this harness drives
 
@@ -1069,3 +1089,4 @@ Compliance posture: see [compliance.md](compliance.md).
 [thread-protocol]: https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
 [config-reference]: https://developers.openai.com/codex/config-reference
 [app-server]: https://learn.chatgpt.com/docs/app-server
+[cli-reference]: https://learn.chatgpt.com/docs/developer-commands?surface=cli

@@ -13,7 +13,8 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use mango_external_agents::testing::FakeProcess;
+use mango_external_agents::process::{LaunchSpec, ManagedProcess, ProcessLauncher};
+use mango_external_agents::testing::{FakeLauncher, FakeProcess};
 use serde_json::Value;
 
 /// The prefix `mea capture` writes on a line the library sent.
@@ -297,6 +298,39 @@ fn readdress(frame: &Value, id: Option<&Value>) -> Value {
     let mut readdressed = members.clone();
     readdressed.insert(String::from("id"), id.clone());
     Value::Object(readdressed)
+}
+
+/// A launcher that answers `codex --version` itself and hands every other launch to `inner`.
+///
+/// `open_session` and the session listing run `codex --version` before they start an app-server,
+/// and the replay fakes queue one child per launch with no argv to tell them apart. Without this,
+/// the version probe would take the child queued for the app-server. The probe is answered here
+/// with a build that meets the floor and is not recorded in `inner`'s launch log, so a test's own
+/// assertions about the app-server launches stand as they were.
+pub struct VersionAnsweringLauncher {
+    inner: Arc<dyn ProcessLauncher>,
+}
+
+impl VersionAnsweringLauncher {
+    /// Wraps `inner`.
+    pub fn over(inner: Arc<dyn ProcessLauncher>) -> Arc<Self> {
+        Arc::new(Self { inner })
+    }
+}
+
+#[async_trait::async_trait]
+impl ProcessLauncher for VersionAnsweringLauncher {
+    async fn spawn(&self, spec: LaunchSpec) -> mango_external_agents::Result<ManagedProcess> {
+        if spec.argv.get(1).map(String::as_str) != Some("--version") {
+            return self.inner.spawn(spec).await;
+        }
+        let answer = FakeLauncher::new();
+        answer.push(FakeProcess::transcript([format!(
+            "codex-cli {}",
+            mango_agent_codex::MINIMUM_CODEX_VERSION
+        )]));
+        answer.spawn(spec).await
+    }
 }
 
 #[cfg(test)]

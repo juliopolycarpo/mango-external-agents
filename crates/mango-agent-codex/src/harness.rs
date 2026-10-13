@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use mango_external_agents::Dispatch;
 use mango_external_agents::configuration::{Configuration, ConfigurationCatalog};
-use mango_external_agents::discovery::{AuthState, Discovery, GateVerdict, Model, ReasoningEffort};
+use mango_external_agents::discovery::{
+    AuthState, Discovery, DiscoveryReceipt, GateVerdict, Model, ReasoningEffort,
+};
 use mango_external_agents::error::{Error, Result};
 use mango_external_agents::harness::{
     Capabilities, CapabilityCeiling, DiscoveredCapabilities, Harness, HarnessDescriptor, VendorInfo,
@@ -286,6 +288,11 @@ impl Harness for CodexHarness {
             .absolute_cwd()
             .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         let executable = self.program_for(&request);
+        // Before the app-server exists: an older build creates its sqlite state, an installation id
+        // and system skills under `CODEX_HOME` merely by starting, so the handshake's own refusal
+        // would come after the damage.
+        // Returned as the bare `VersionGate`, the shape the handshake's refusal has always had.
+        refuse_outdated_before_spawn(host, &executable, request.discovery.as_ref()).await?;
         let transport = stdio::open(
             host,
             &StdioSpec::new([PROGRAM, "app-server"]),
@@ -348,6 +355,7 @@ impl Harness for CodexHarness {
         query: SessionQuery,
     ) -> Result<SessionPage> {
         crate::session::validate_list_workspace(host, &query)?;
+        refuse_outdated_before_spawn(host, &self.executable, None).await?;
         let connection = ProbeConnection::open(host, &self.executable).await?;
         let page = crate::session::list_threads(&connection.client, host, query).await;
         match connection.close().await {
@@ -521,19 +529,55 @@ async fn open_thread(
 }
 
 /// Refuses an app-server that identified itself below this harness's pinned protocol floor.
+///
+/// The second line of defence: [`refuse_outdated_before_spawn`] has already looked at the build
+/// without starting it, so this catches only what `--version` could not say.
 fn require_supported_handshake_version(handshake: &InitializeResponse) -> Result<()> {
     // The build that is running has just named itself in the handshake, so the gate costs nothing
     // extra here. A user agent nobody could parse is not a refusal — the same reasoning as
     // `GateVerdict::Unknown` — so the connection goes on.
-    if let Some(version) = discovery::parse_user_agent_version(&handshake.user_agent)
-        && discovery::meets_minimum(&version, MINIMUM_CODEX_VERSION) == Some(false)
-    {
+    refuse_below_floor(discovery::parse_user_agent_version(&handshake.user_agent).as_deref())
+}
+
+/// Refuses a version that is parseable and below [`MINIMUM_CODEX_VERSION`].
+///
+/// `None` and a version that cannot be compared both pass: they are
+/// [`GateVerdict::Unknown`], not a refusal.
+fn refuse_below_floor(version: Option<&str>) -> Result<()> {
+    let Some(version) = version else {
+        return Ok(());
+    };
+    if discovery::meets_minimum(version, MINIMUM_CODEX_VERSION) == Some(false) {
         return Err(Error::VersionGate {
-            found: version,
+            found: version.to_owned(),
             minimum: String::from(MINIMUM_CODEX_VERSION),
         });
     }
     Ok(())
+}
+
+/// Applies the version floor before any `codex app-server` is started.
+///
+/// The build's version is taken from the host's [`DiscoveryReceipt`] when it passed one — the host
+/// has already paid for that probe, and `validate_open_session` has already checked the receipt's
+/// freshness, identity and executable — and otherwise from one `codex --version`, the same
+/// short-lived process discovery runs. A receipt that carries no version, a `--version` line nobody
+/// can parse and an executable that will not run all proceed: the first two are
+/// [`GateVerdict::Unknown`], and the third is reported by the launch that follows.
+///
+/// # Errors
+///
+/// [`Error::VersionGate`] when the version is parseable and below the floor.
+async fn refuse_outdated_before_spawn(
+    host: &HostContext,
+    executable: &ExecutablePath,
+    receipt: Option<&DiscoveryReceipt>,
+) -> Result<()> {
+    let version = match receipt {
+        Some(receipt) => receipt.discovery.version.clone(),
+        None => read_version(host, executable).await?,
+    };
+    refuse_below_floor(version.as_deref())
 }
 
 /// The pinned app-server uses this exact invalid-request response when its thread store has no
