@@ -125,6 +125,12 @@ and received value. The session then reaches `Closing` and, once the child is re
 terminal is written, `Closed`. An inbound overflow does not drain what was read before it: an
 agent's own refusal still waiting its turn behind notifications is reported as the overflow.
 
+A host `ProcessControl` that panics while the child is stopped is the host's failure, not the
+agent's. The cleanup error is still `Error::CleanupRequired`, carrying the control for
+reconciliation, and its cause keeps the `acp-link-closed` code, but the message names the party:
+`the host's process control failed: expected the host's process stop to return | received: it
+panicked` (`it was cancelled` when the stop task was cancelled instead).
+
 `AcpSpec::Http` exists in the core and is **not implemented**: `agent-client-protocol-http` 3.3.0 pulls
 `aws-lc-rs` through `reqwest` 0.13's `rustls` feature and through `async-tungstenite`'s
 `tokio-rustls-webpki-roots`, and this workspace's `deny.toml` bans it — TLS is `ring` everywhere.
