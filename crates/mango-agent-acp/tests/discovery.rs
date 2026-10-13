@@ -1,6 +1,8 @@
 //! Discovery and launch routing when installed agents share a command name.
 #![cfg(feature = "testing")]
 
+#[path = "discovery/environment.rs"]
+mod environment;
 #[path = "discovery/policy.rs"]
 mod policy;
 #[path = "discovery/version_probe.rs"]

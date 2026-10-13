@@ -868,6 +868,31 @@ Built-in profiles do not forward API keys or tokens from the host's environment.
 the user's arrangement with the installed CLI. Beyond the core's base allowlist, only `codex-acp`
 adds `NO_BROWSER`, the [adapter's documented switch][p-codex] for suppressing a sign-in page.
 
+The base allowlist carries the four XDG base directories (`XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
+`XDG_STATE_HOME`, `XDG_CACHE_HOME`) beside `HOME`, because Cursor's CLI resolves its account from
+them on Linux. Without them a user who keeps Cursor's configuration under a custom
+`XDG_CONFIG_HOME` saw the default account's state through this library, and a turn ran on that
+account. Evidence for Cursor `2026.09.10-fd3934a`:
+
+- [Cursor's configuration page](https://cursor.com/docs/cli/reference/configuration), read
+  2026-10-13: "Override with environment variables: `CURSOR_CONFIG_DIR`: custom directory path;
+  `XDG_CONFIG_HOME` (Linux/BSD): uses `$XDG_CONFIG_HOME/cursor/cli-config.json`". The page does not
+  say where the login lives.
+- The installed bundle resolves the login file from the same variable. On Linux it joins
+  `process.env.XDG_CONFIG_HOME || ~/.config` with `cursor/auth.json`; on Windows it joins
+  `process.env.APPDATA || ~/AppData/Roaming` with `Cursor/auth.json`. It also reads
+  `XDG_STATE_HOME` and `XDG_RUNTIME_DIR` for its agent stores. Reproduce with
+  `grep -a -o 'XDG_[A-Z_]*' ~/.local/share/cursor-agent/versions/*/*.js | sort | uniq -c`. No token is
+  read to learn this.
+- A maintainer ran `cursor-agent status` with `XDG_CONFIG_HOME` pointing at an empty directory and
+  got "Not logged in", where the same call without the variable reported the signed-in account.
+
+`XDG_RUNTIME_DIR` is not forwarded: it holds the login session's sockets, and Cursor's bundle lists
+it with `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS` and `WAYLAND_DISPLAY` among the variables it
+strips from an environment it hands on. Grok's binary names no XDG base directory (only
+`XDG_RUNTIME_DIR`) and relocates through `GROK_HOME`, so the base change does not alter what it
+sees.
+
 ## Sessions
 
 | Method                  | Behaviour                                                                                                                        |
