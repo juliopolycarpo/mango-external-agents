@@ -453,16 +453,25 @@ async fn a_fallback_resume_reports_why_the_load_failed() {
 
 #[test]
 fn builtin_profiles_do_not_forward_credentials() {
+    const CREDENTIAL_WORDS: [&str; 8] = [
+        "TOKEN",
+        "KEY",
+        "SECRET",
+        "PASSWORD",
+        "PROXY",
+        "COOKIE",
+        "CREDENTIAL",
+        "AUTH",
+    ];
     for profile in mango_agent_acp::builtin_profiles() {
-        assert!(
-            profile
-                .vendor_environment_keys
-                .iter()
-                .all(|key| !key.ends_with("_API_KEY")),
-            "expected no credential forwarding for {}, received {:?}",
-            profile.id,
-            profile.vendor_environment_keys
-        );
+        for key in profile.vendor_environment_keys {
+            let shaped = CREDENTIAL_WORDS.iter().find(|word| key.contains(*word));
+            assert_eq!(
+                shaped, None,
+                "expected no credential forwarding for {} | received {key:?} in {:?}",
+                profile.id, profile.vendor_environment_keys
+            );
+        }
     }
 }
 

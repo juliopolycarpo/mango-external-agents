@@ -17,11 +17,28 @@ use std::collections::BTreeMap;
 /// roots are here because a vendor CLI that shells out to `nvm`/`fnm`/`bun` needs them to agree
 /// with the runtime it was started under; the Windows entries are what ordinary process creation
 /// needs there.
+///
+/// `HOME`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA` and the four XDG base directories
+/// (`XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`) name where the user's
+/// own files live. A CLI resolves its config, auth file and cache from them, so a child that
+/// cannot see the ones the user set reads the default location, which can be another account's
+/// state rather than a missing one. They are paths, not secrets.
+///
+/// Deliberately absent: `XDG_RUNTIME_DIR`, which holds the login session's sockets and which
+/// Cursor's own CLI strips from an environment it hands on; `XDG_DATA_DIRS` and `XDG_CONFIG_DIRS`,
+/// which are system search paths; every token, API key, secret, password, cookie and proxy
+/// variable, because a proxy URL can carry userinfo.
 pub const BASE_ENVIRONMENT_KEYS: &[&str] = &[
     "PATH",
     "Path",
     "HOME",
     "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
     "TMPDIR",
     "TMP",
     "TEMP",
@@ -193,7 +210,7 @@ fn is_allowed(key: &str, vendor_keys: &[&str], case_insensitive: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{EnvSource, allowlist, allowlist_with_case};
+    use super::{BASE_ENVIRONMENT_KEYS, EnvSource, allowlist, allowlist_with_case};
     use std::collections::BTreeMap;
 
     fn pairs(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -255,6 +272,103 @@ mod tests {
             allowlist(&source, &["CLAUDE_CONFIG_DIR"]),
             pairs(&[("CLAUDE_CONFIG_DIR", "/home/ada/.claude")])
         );
+    }
+
+    /// The XDG base directories relocate the user's own config, data, state and cache, exactly as
+    /// `HOME` does. A child that cannot see them resolves `~/.config` and reads another account's
+    /// state than the shell the user started the host from.
+    #[test]
+    fn the_xdg_base_directories_reach_every_child() {
+        let source = EnvSource::from_pairs([
+            ("XDG_CONFIG_HOME", "/home/ada/cfg"),
+            ("XDG_DATA_HOME", "/home/ada/data"),
+            ("XDG_STATE_HOME", "/home/ada/state"),
+            ("XDG_CACHE_HOME", "/home/ada/cache"),
+        ]);
+
+        assert_eq!(
+            allowlist(&source, &[]),
+            pairs(&[
+                ("XDG_CONFIG_HOME", "/home/ada/cfg"),
+                ("XDG_DATA_HOME", "/home/ada/data"),
+                ("XDG_STATE_HOME", "/home/ada/state"),
+                ("XDG_CACHE_HOME", "/home/ada/cache"),
+            ]),
+            "expected the four XDG base directories in the base allowlist | received a child without them"
+        );
+    }
+
+    /// Cursor resolves its Windows `auth.json` from `APPDATA`, and GitHub documents Copilot's
+    /// Windows cache under `LOCALAPPDATA`; both are per-user locations like `USERPROFILE`.
+    #[test]
+    fn the_windows_per_user_locations_reach_every_child() {
+        let source = EnvSource::from_pairs([
+            ("APPDATA", r"D:\Users\ada\Roaming"),
+            ("LOCALAPPDATA", r"D:\Users\ada\Local"),
+        ]);
+
+        assert_eq!(
+            allowlist(&source, &[]),
+            pairs(&[
+                ("APPDATA", r"D:\Users\ada\Roaming"),
+                ("LOCALAPPDATA", r"D:\Users\ada\Local"),
+            ]),
+            "expected APPDATA and LOCALAPPDATA in the base allowlist | received a child without them"
+        );
+    }
+
+    /// Lookalikes stay out: the session runtime directory holds the login session's sockets, the
+    /// search-path lists are not locations of the user's own files, and a proxy URL can carry
+    /// userinfo.
+    #[test]
+    fn xdg_neighbours_proxies_and_credentials_are_still_dropped() {
+        let source = EnvSource::from_pairs([
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("XDG_DATA_DIRS", "/usr/share"),
+            ("XDG_CONFIG_DIRS", "/etc/xdg"),
+            ("XDG_CONFIG_HOME_TOKEN", "never-forward-this"),
+            ("HTTPS_PROXY", "http://user:pass@proxy:3128"),
+            ("ALL_PROXY", "socks5://user:pass@proxy:1080"),
+            ("GITHUB_TOKEN", "never-forward-this"),
+            ("OPENAI_API_KEY", "never-forward-this"),
+            ("PATH", "/bin"),
+        ]);
+
+        assert_eq!(
+            allowlist(&source, &[]),
+            pairs(&[("PATH", "/bin")]),
+            "expected only PATH | received a runtime directory, search path, proxy or credential"
+        );
+    }
+
+    #[test]
+    fn windows_matches_the_xdg_base_directories_without_regard_to_case() {
+        let source = EnvSource::from_pairs([
+            ("xdg_config_home", r"C:\cfg"),
+            ("Xdg_Runtime_Dir", r"C:\run"),
+        ]);
+
+        assert_eq!(
+            allowlist_with_case(&source, &[], true),
+            pairs(&[("xdg_config_home", r"C:\cfg")])
+        );
+        assert!(allowlist_with_case(&source, &[], false).is_empty());
+    }
+
+    #[test]
+    fn no_base_key_is_credential_bearing() {
+        for key in BASE_ENVIRONMENT_KEYS {
+            let upper = key.to_ascii_uppercase();
+            let forbidden = [
+                "TOKEN", "KEY", "SECRET", "PASSWORD", "PROXY", "COOKIE", "AUTH",
+            ]
+            .iter()
+            .find(|word| upper.contains(*word));
+            assert_eq!(
+                forbidden, None,
+                "expected a location or locale key | received credential-shaped {key:?}"
+            );
+        }
     }
 
     #[test]

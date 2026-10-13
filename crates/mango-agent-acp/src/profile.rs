@@ -521,6 +521,9 @@ fn cursor() -> AcpProfile {
         "https://cursor.com/docs/cli/acp",
     )
     .with_login_hint("cursor-agent login")
+    // Documented at <https://cursor.com/docs/cli/reference/configuration>: `CURSOR_CONFIG_DIR`
+    // is "custom directory path". `CURSOR_API_KEY` and `CURSOR_AUTH_TOKEN` are not forwarded.
+    .with_vendor_environment_keys(&["CURSOR_CONFIG_DIR"])
     // A session opened, answered pong and closed. No permission-mode mapping is claimed.
     .with_verification(VerificationEvidence {
         agent_version: "2026.09.10-fd3934a",
@@ -562,6 +565,10 @@ fn grok() -> AcpProfile {
     // initiative, and the session argv disables it for exactly that reason.
     .with_version_argv(["grok", "--no-auto-update", "--version"])
     .with_login_hint("grok login")
+    // `GROK_HOME` is the "home for config, auth, sessions, skills, plugins, and logs", from
+    // <https://docs.x.ai/build/settings/reference>. `XAI_API_KEY` and `GROK_AUTH_PROVIDER_COMMAND`
+    // are not forwarded.
+    .with_vendor_environment_keys(&["GROK_HOME"])
     // The run used the existing local login and sent no ACP `authenticate` request. No
     // permission-mode mapping is claimed.
     .with_verification(VerificationEvidence {
@@ -596,6 +603,10 @@ fn opencode() -> AcpProfile {
         "https://opencode.ai/docs/acp/",
     )
     .with_login_hint("opencode auth login")
+    // <https://opencode.ai/docs/config/>: "Specify a custom config directory using the
+    // `OPENCODE_CONFIG_DIR` environment variable." `OPENCODE_CONFIG_CONTENT` and the
+    // `OPENCODE_SERVER_*` credentials are not forwarded.
+    .with_vendor_environment_keys(&["OPENCODE_CONFIG_DIR"])
     // Captured, not verified. `mea capture --harness acp --profile opencode` sent `initialize`
     // and stopped there — the manifest beside it records `sessionOpened: false` — so this argv is
     // proved to reach an ACP handshake and nothing is claimed about a turn.
@@ -627,6 +638,11 @@ fn gemini() -> AcpProfile {
         &["gemini", "--acp"],
         "https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/acp-mode.md",
     )
+    // `GEMINI_CLI_HOME` "specifies the root directory for Gemini CLI's user-level configuration
+    // and storage", from the CLI's configuration reference
+    // <https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/configuration.md>.
+    // `GEMINI_API_KEY` and `GOOGLE_APPLICATION_CREDENTIALS` are not forwarded.
+    .with_vendor_environment_keys(&["GEMINI_CLI_HOME"])
 }
 
 /// GitHub Copilot CLI in ACP mode.
@@ -648,6 +664,11 @@ fn copilot() -> AcpProfile {
         "https://docs.github.com/copilot/reference/copilot-cli-reference/acp-server",
     )
     .with_login_hint("copilot login")
+    // <https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference>:
+    // "You can change the location of this directory by setting the `COPILOT_HOME` environment
+    // variable to a different path." `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` and `GITHUB_TOKEN` are not
+    // forwarded.
+    .with_vendor_environment_keys(&["COPILOT_HOME"])
 }
 
 /// Goose in ACP mode.
@@ -670,6 +691,11 @@ fn goose() -> AcpProfile {
         "https://block.github.io/goose/docs/advanced/acp-protocol",
     )
     .with_login_hint("goose configure")
+    // `GOOSE_PATH_ROOT` overrides "the root directory for all goose data, config, and state
+    // files", from
+    // <https://github.com/block/goose/blob/main/documentation/docs/guides/environment-variables.md>.
+    // Provider keys such as `GOOSE_PROVIDER__API_KEY` are not forwarded.
+    .with_vendor_environment_keys(&["GOOSE_PATH_ROOT"])
 }
 
 /// The ACP adapter that fronts OpenAI Codex.
@@ -695,7 +721,13 @@ fn codex_acp() -> AcpProfile {
     // `NO_BROWSER` is the adapter's own documented way to stop it opening a sign-in page. The
     // library never opens a browser; letting the variable through is how a host says the adapter
     // must not either.
-    .with_vendor_environment_keys(&["NO_BROWSER"])
+    //
+    // `CODEX_HOME` is where the Codex App Server the adapter starts keeps its state and sign-in:
+    // "Codex stores its local state under `CODEX_HOME` (defaults to `~/.codex`)", from
+    // <https://learn.chatgpt.com/docs/config-file/config-advanced>. Without it the adapter reads
+    // the default-location account. `CODEX_API_KEY`, `OPENAI_API_KEY` and `CODEX_CONFIG` are not
+    // forwarded.
+    .with_vendor_environment_keys(&["NO_BROWSER", "CODEX_HOME"])
 }
 
 /// The ACP adapter that fronts Claude Code.
@@ -718,6 +750,11 @@ fn claude_agent_acp() -> AcpProfile {
         "https://github.com/agentclientprotocol/claude-agent-acp",
     )
     .with_login_hint("claude auth login")
+    // The adapter drives Claude Code through the Claude Agent SDK, so the user's configuration
+    // directory is Claude Code's: "Override the configuration directory (default: `~/.claude`)",
+    // from <https://code.claude.com/docs/en/env-vars>. `ANTHROPIC_API_KEY`,
+    // `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` are not forwarded.
+    .with_vendor_environment_keys(&["CLAUDE_CONFIG_DIR"])
 }
 
 #[cfg(test)]

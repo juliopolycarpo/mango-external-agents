@@ -104,8 +104,39 @@ pub async fn codex(out_dir: &Path, workspace: &Path) -> Result<()> {
     codex_with(&host, out_dir, workspace).await
 }
 
+/// Refuses a `codex` older than the library's floor, before any app-server is started.
+///
+/// An older app-server writes sqlite state, an installation id and system skills under
+/// `CODEX_HOME` merely by starting, and a capture would record a conversation the library cannot
+/// drive. A `--version` line nobody can parse is not a refusal, as in the library.
+///
+/// # Errors
+///
+/// [`Error::VersionGate`] for a build below the floor, and whatever the version command reported
+/// when it could not run.
+async fn require_supported_codex(host: &HostContext) -> Result<()> {
+    let output = contracts::command_output(
+        host,
+        vec![String::from("codex"), String::from("--version")],
+        &["CODEX_HOME"],
+    )
+    .await?;
+    let Some(version) = mango_agent_codex::discovery::parse_version(&output) else {
+        return Ok(());
+    };
+    let minimum = mango_agent_codex::MINIMUM_CODEX_VERSION;
+    if mango_agent_codex::discovery::meets_minimum(&version, minimum) == Some(false) {
+        return Err(Error::VersionGate {
+            found: version,
+            minimum: String::from(minimum),
+        });
+    }
+    Ok(())
+}
+
 /// [`codex`] on a host the caller built, so a test can inject its own launcher.
 async fn codex_with(host: &HostContext, out_dir: &Path, workspace: &Path) -> Result<()> {
+    require_supported_codex(host).await?;
     std::fs::create_dir_all(out_dir).map_err(|error| Error::HostConfiguration {
         expected: "a writable fixture directory",
         received: error.to_string(),
@@ -540,7 +571,11 @@ mod tests {
     #[async_trait::async_trait]
     impl ProcessLauncher for UnreapableLauncher {
         async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
+            let is_version_probe = spec.argv.get(1).map(String::as_str) == Some("--version");
             let process = self.inner.spawn(spec).await?;
+            if is_version_probe {
+                return Ok(process);
+            }
             Ok(ManagedProcess {
                 stdout: process.stdout,
                 stdin: process.stdin,
@@ -658,9 +693,105 @@ mod tests {
         );
     }
 
+    fn succeeded() -> ExitStatus {
+        ExitStatus {
+            code: Some(0),
+            signal: None,
+        }
+    }
+
+    /// What `codex --version` prints for `version`.
+    fn version_line(version: &str) -> FakeProcess {
+        FakeProcess::transcript([format!("codex-cli {version}")]).with_exit(succeeded())
+    }
+
+    fn launched(launcher: &FakeLauncher) -> Vec<String> {
+        launcher
+            .launches()
+            .iter()
+            .map(|launch| launch.argv.join(" "))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_capture_refuses_an_outdated_codex_without_starting_an_app_server() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(version_line("0.150.0"));
+        launcher.push(app_server());
+        let out = std::env::temp_dir().join(format!("mea-capture-outdated-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+
+        let result = codex_with(&host(launcher.clone()), &out, &std::env::temp_dir()).await;
+
+        let launches = launched(&launcher);
+        let wrote_a_directory = out.exists();
+        let _ = std::fs::remove_dir_all(&out);
+        assert_eq!(
+            launches,
+            ["codex --version"],
+            "expected only the version command to launch | received {launches:?}"
+        );
+        assert!(
+            matches!(&result, Err(Error::VersionGate { found, minimum })
+                if found == "0.150.0" && minimum == mango_agent_codex::MINIMUM_CODEX_VERSION),
+            "expected VersionGate for 0.150.0 | received {result:?}"
+        );
+        assert!(
+            !wrote_a_directory,
+            "expected nothing written for a refused capture"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_capture_of_a_current_codex_goes_on_to_start_the_app_server() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(version_line(mango_agent_codex::MINIMUM_CODEX_VERSION));
+        launcher.push(app_server());
+        let out = std::env::temp_dir().join(format!("mea-capture-current-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+
+        let result = codex_with(&host(launcher.clone()), &out, &std::env::temp_dir()).await;
+
+        let launches = launched(&launcher);
+        let _ = std::fs::remove_dir_all(&out);
+        assert_eq!(
+            launches,
+            ["codex --version", "codex app-server"],
+            "expected the version probe, then one app-server | received {launches:?}"
+        );
+        assert!(
+            !matches!(&result, Err(Error::VersionGate { .. })),
+            "expected the gate to pass | received {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_codex_version_does_not_stop_a_capture() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(FakeProcess::transcript(["codex banana"]).with_exit(succeeded()));
+        launcher.push(app_server());
+        let out = std::env::temp_dir().join(format!("mea-capture-unknown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+
+        let result = codex_with(&host(launcher.clone()), &out, &std::env::temp_dir()).await;
+
+        let launches = launched(&launcher);
+        let _ = std::fs::remove_dir_all(&out);
+        assert_eq!(
+            launches,
+            ["codex --version", "codex app-server"],
+            "expected an unreadable version to proceed | received {launches:?}"
+        );
+        assert!(
+            !matches!(&result, Err(Error::VersionGate { .. })),
+            "expected no refusal for an unreadable version | received {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn codex_capture_writes_no_fixture_when_the_child_cannot_be_reaped() {
         let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(version_line(mango_agent_codex::MINIMUM_CODEX_VERSION));
         launcher.push(app_server());
         let out = std::env::temp_dir().join(format!("mea-capture-unreaped-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&out);

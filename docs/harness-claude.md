@@ -83,6 +83,25 @@ recorded rather than gated on:
   unqualified. This harness passes the same working directory on resume either way, so the
   inconsistency cannot bite — but it is a live docs contradiction worth re-checking.
 
+## Environment
+
+Two variables survive the allowlist beyond the base list: `CLAUDE_CONFIG_DIR` and
+`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` (see `pinned::VENDOR_ENVIRONMENT_KEYS`). The document for the
+first is [Claude Code environment variables](https://code.claude.com/docs/en/env-vars), read
+2026-10-13: "Override the configuration directory (default: `~/.claude`). All settings, session
+history, and plugins are stored under this path." `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
+`CLAUDE_CODE_OAUTH_TOKEN` are deliberately absent.
+
+The base allowlist reaches this CLI too: `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`,
+`XDG_CACHE_HOME`, `APPDATA` and `LOCALAPPDATA`, beside `HOME`. Claude Code's documentation names
+none of them. An observation on the installed `2.1.296` binary
+(`strings -a <claude> | grep -o -E '.{100}XDG_CONFIG_HOME.{140}'`) shows it reading
+`XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME` and `XDG_STATE_HOME` in a per-application
+directory resolver, `XDG_CONFIG_HOME` for git's global ignore file (`git/ignore`), and naming them in
+lists of environment variables whose purpose was not determined. Which account a run uses is
+decided by `CLAUDE_CONFIG_DIR` or `~/.claude`, per the document above; whether the resolver feeds
+anything the harness depends on was not determined.
+
 ## Fixture capture
 
 `mea capture --harness claude` runs only `claude --version` and `claude --help`. It writes the raw
