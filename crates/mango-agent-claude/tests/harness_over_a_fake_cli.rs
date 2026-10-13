@@ -1580,6 +1580,11 @@ mod opening_a_session {
             matches!(error.cause(), Error::VersionGate { minimum, .. } if minimum == "2.1.211"),
             "received {error:?}"
         );
+        assert!(
+            launcher.turn_argvs().is_empty(),
+            "expected no turn child before the version gate | received {:?}",
+            launcher.turn_argvs()
+        );
     }
 
     #[tokio::test]

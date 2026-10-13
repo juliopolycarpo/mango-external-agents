@@ -727,7 +727,7 @@ fn host_context(
     clock: Option<Arc<dyn Clock>>,
 ) -> HostContext {
     let mut builder = HostContext::builder()
-        .launcher(launcher)
+        .launcher(support::VersionAnsweringLauncher::over(launcher))
         .cwd(workspace_path())
         .client_info("mango-test", "0.0.1")
         .environment(EnvSource::from_pairs([
@@ -6356,8 +6356,8 @@ async fn an_older_codex_on_the_path_reports_the_gate_verdict() {
 fn probe_host(
     answer: impl Fn(&serde_json::Value) -> Option<Vec<String>> + Send + Sync + 'static,
 ) -> (HostContext, Arc<FakeLauncher>) {
+    // The host's launcher answers `codex --version` itself; see `support::VersionAnsweringLauncher`.
     let launcher = Arc::new(FakeLauncher::new());
-    launcher.push(version_answer());
     launcher.push(
         Transcript::load("handshake")
             .as_process_intercepting(move |frame| answer(frame).or_else(|| last_model_page(frame))),
@@ -6604,7 +6604,8 @@ async fn discovery_keeps_the_declared_matrix_when_the_profiles_cannot_be_read() 
 /// The contract every harness must pass, run against the recorded conversation./// The contract every harness must pass, run against the recorded conversation.
 #[tokio::test]
 async fn the_harness_passes_the_cores_conformance_suite() {
-    // The suite probes before it opens anything, and a probe spawns `codex --version` first.
+    // The suite probes before it opens anything, and a probe spawns `codex --version` first; the
+    // host's launcher answers that itself, see `support::VersionAnsweringLauncher`.
     //
     // `approval` rather than a longer conversation: the suite watches for a session update on a
     // subscription it opens before `check_turn` rather than starting a turn of its own, so it
@@ -6612,7 +6613,6 @@ async fn the_harness_passes_the_cores_conformance_suite() {
     // recorded conversation where the vendor actually asks for an approval, which is the round
     // trip the suite cannot prove anywhere else.
     let launcher = Arc::new(FakeLauncher::new());
-    launcher.push(version_answer());
     launcher.push(
         Transcript::load("handshake").as_process_intercepting(|frame| {
             profiles_answer(

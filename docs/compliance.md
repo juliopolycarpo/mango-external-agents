@@ -400,7 +400,10 @@ own VS Code extension on. JSON-RPC over newline-delimited JSON. `clientInfo.name
 host's name, passed through `HostContext`. Read on 2026-09-13 against `codex-cli 0.154.0`;
 `docs/harness-codex.md` lists every method driven and the document each follows.
 Host-configured MCP servers use the app-server's per-thread `config` override on
-`thread/start` and `thread/resume`; no persistent Codex configuration is edited.
+`thread/start` and `thread/resume`; no persistent Codex configuration is edited. The one other
+process is `codex --version`, the read-only probe discovery runs. A session open and the picker run
+it as well, before the app-server, so a build below the floor is refused without being started; a
+host whose discovery receipt vouches for the exact executable launched skips it.
 
 **Posture:** OpenAI's documentation states a deployment limit on app-server authentication (quoted
 below): it is for local or open-source applications and "has never been permitted for commercial or

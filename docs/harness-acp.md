@@ -865,8 +865,26 @@ invariant, not a default. A profile test asserts no built-in argv names one. A h
 
 ### No version floors
 
-No profile pins a `minimum_version`. A floor nobody has checked would refuse a build that works, and
-`GateVerdict::Unknown` is the honest answer for a version this harness cannot read.
+No built-in profile pins a `minimum_version`. A floor nobody has checked would refuse a build that
+works, and `GateVerdict::Unknown` is the honest answer for a version this harness cannot read.
+
+A host's custom profile may pin one with `AcpProfile::with_minimum_version`. Discovery reports it as
+`GateVerdict::VersionTooOld`, and `open_session` and `list_sessions` apply it before the agent is
+started: they refuse with `Error::VersionGate { found, minimum }` and launch nothing but the profile's
+version argv. ACP has no handshake check behind it, so this is the only gate.
+
+The version comes from the `DiscoveryReceipt` on the request only when the receipt vouches for the
+executable being launched: it names a resolved path, the launch uses that same resolved path, and it
+carries a version. A receipt from a `PATH` lookup, for another path, or without a version vouches for
+nothing and the version argv runs. A profile with no floor pays for no probe, and a version that
+cannot be read proceeds as `Unknown`.
+
+The probe child is owned by a `ProcessCleanupGuard` from the moment it exists, so it is stopped and
+reaped on a timeout, on garbage output and when the open is dropped, and a stop that fails is an
+`Error::CleanupRequired`. A probe that never answers holds the open for at most `request_timeout`
+plus the process stop (two `kill_grace` and two `shutdown_timeout`). The host's cancel token is read
+after the probe, so a shutdown that arrived meanwhile ends the open as `Error::Cancelled` without
+starting the agent.
 
 ### Environment keys
 
