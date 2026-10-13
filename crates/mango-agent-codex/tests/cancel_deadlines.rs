@@ -383,12 +383,14 @@ impl Fixture {
         );
         let kills = Arc::new(AtomicUsize::new(0));
         let host = HostContext::builder()
-            .launcher(Arc::new(CountingLauncher {
-                inner: Arc::clone(&launcher),
-                kills: Arc::clone(&kills),
-                kill,
-                write_gate,
-            }))
+            .launcher(support::VersionAnsweringLauncher::over(Arc::new(
+                CountingLauncher {
+                    inner: Arc::clone(&launcher),
+                    kills: Arc::clone(&kills),
+                    kill,
+                    write_gate,
+                },
+            )))
             .cwd(workspace_path())
             .client_info("mango-test", "0.0.1")
             .environment(EnvSource::from_pairs([

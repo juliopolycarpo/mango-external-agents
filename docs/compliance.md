@@ -25,6 +25,25 @@ own deployment.
   with `AuthRequired` carrying that command as text.
 - **Official CLIs, documented surfaces.** Only the vendor's own executable, only the programmatic
   surface the vendor documents.
+- **The child environment is a positive allowlist of locations and locale, never a credential.** A
+  vendor child receives `BASE_ENVIRONMENT_KEYS`, any `LC_*`, and the keys its harness names, and a
+  host cannot add one. The base list holds `PATH`, the temp directories, the user's home and
+  per-user directories (`HOME`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`), the four XDG base
+  directories (`XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`), locale,
+  `NO_COLOR` and the version-manager roots. These are paths, on the same footing as `HOME`: a CLI
+  resolves its config and auth file from them, so a child that never saw the one the user set would
+  read the default location, which can be another account's state. That is why they are in the base
+  list and not repeated per profile. Never forwarded, by the base list or by any built-in profile:
+  tokens, API keys, secrets and passwords (`*_TOKEN`, `*_API_KEY`, `*_SECRET`, `*PASSWORD*`),
+  cookies and auth headers, proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`; a proxy URL
+  can carry userinfo), cloud credential files (`GOOGLE_APPLICATION_CREDENTIALS`), inline-config
+  variables that may hold keys (`CODEX_CONFIG`, `OPENCODE_CONFIG_CONTENT`), and
+  `XDG_RUNTIME_DIR`, which holds the login session's sockets (Cursor's own CLI strips it from an
+  environment it hands on). `XDG_DATA_DIRS` and `XDG_CONFIG_DIRS` are system search paths and stay out
+  too. Tests assert that the keys arrive and that these do not. The reader of each base location key, and the
+  vendor-specific location variables each profile adds with the document behind each, are in
+  `docs/harness-acp.md`. A host whose own process runs under redirected XDG directories (Flatpak,
+  Snap) now has them honoured by the child; `docs/adopt.md` shows how to filter the source instead.
 - **Vendor tools never enter the host's tool registry.** A vendor-initiated tool call is answered
   with a protocol error, never executed by the host.
 - **Vendor assistant text is never replayed** into the host's own model context by the library.
@@ -444,7 +463,10 @@ own VS Code extension on. JSON-RPC over newline-delimited JSON. `clientInfo.name
 host's name, passed through `HostContext`. Read on 2026-09-13 against `codex-cli 0.154.0`;
 `docs/harness-codex.md` lists every method driven and the document each follows.
 Host-configured MCP servers use the app-server's per-thread `config` override on
-`thread/start` and `thread/resume`; no persistent Codex configuration is edited.
+`thread/start` and `thread/resume`; no persistent Codex configuration is edited. The one other
+process is `codex --version`, the read-only probe discovery runs. A session open and the picker run
+it as well, before the app-server, so a build below the floor is refused without being started; a
+host whose discovery receipt vouches for the exact executable launched skips it.
 
 **Posture:** OpenAI's documentation states a deployment limit on app-server authentication (quoted
 below): it is for local or open-source applications and "has never been permitted for commercial or

@@ -125,6 +125,12 @@ and received value. The session then reaches `Closing` and, once the child is re
 terminal is written, `Closed`. An inbound overflow does not drain what was read before it: an
 agent's own refusal still waiting its turn behind notifications is reported as the overflow.
 
+A host `ProcessControl` that panics while the child is stopped is the host's failure, not the
+agent's. The cleanup error is still `Error::CleanupRequired`, carrying the control for
+reconciliation, and its cause keeps the `acp-link-closed` code, but the message names the party:
+`the host's process control failed: expected the host's process stop to return | received: it
+panicked` (`it was cancelled` when the stop task was cancelled instead).
+
 `AcpSpec::Http` exists in the core and is **not implemented**: `agent-client-protocol-http` 3.3.0 pulls
 `aws-lc-rs` through `reqwest` 0.13's `rustls` feature and through `async-tungstenite`'s
 `tokio-rustls-webpki-roots`, and this workspace's `deny.toml` bans it — TLS is `ring` everywhere.
@@ -859,14 +865,99 @@ invariant, not a default. A profile test asserts no built-in argv names one. A h
 
 ### No version floors
 
-No profile pins a `minimum_version`. A floor nobody has checked would refuse a build that works, and
-`GateVerdict::Unknown` is the honest answer for a version this harness cannot read.
+No built-in profile pins a `minimum_version`. A floor nobody has checked would refuse a build that
+works, and `GateVerdict::Unknown` is the honest answer for a version this harness cannot read.
+
+A host's custom profile may pin one with `AcpProfile::with_minimum_version`. Discovery reports it as
+`GateVerdict::VersionTooOld`, and `open_session` and `list_sessions` apply it before the agent is
+started: they refuse with `Error::VersionGate { found, minimum }` and launch nothing but the profile's
+version argv. ACP has no handshake check behind it, so this is the only gate.
+
+The version comes from the `DiscoveryReceipt` on the request only when the receipt vouches for the
+executable being launched: it names a resolved path, the launch uses that same resolved path, and it
+carries a version. A receipt from a `PATH` lookup, for another path, or without a version vouches for
+nothing and the version argv runs. A profile with no floor pays for no probe, and a version that
+cannot be read proceeds as `Unknown`.
+
+The probe child is owned by a `ProcessCleanupGuard` from the moment it exists, so it is stopped and
+reaped on a timeout, on garbage output and when the open is dropped, and a stop that fails is an
+`Error::CleanupRequired`. A probe that never answers holds the open for at most `request_timeout`
+plus the process stop (two `kill_grace` and two `shutdown_timeout`). The host's cancel token is read
+after the probe, so a shutdown that arrived meanwhile ends the open as `Error::Cancelled` without
+starting the agent.
 
 ### Environment keys
 
 Built-in profiles do not forward API keys or tokens from the host's environment. Sign-in remains
-the user's arrangement with the installed CLI. Beyond the core's base allowlist, only `codex-acp`
-adds `NO_BROWSER`, the [adapter's documented switch][p-codex] for suppressing a sign-in page.
+the user's arrangement with the installed CLI. Beyond the core's base allowlist, a profile adds only
+the location variable its vendor documents for relocating its own home, plus `NO_BROWSER` for
+`codex-acp`, the [adapter's documented switch][p-codex] for suppressing a sign-in page. The
+vendor documents were read on 2026-10-13.
+
+| Profile    | Key added             | What it relocates                                   | Document                                                                                                                                                                                                                    |
+| ---------- | --------------------- | --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cursor`   | `CURSOR_CONFIG_DIR`   | the CLI's config directory                          | [Cursor configuration](https://cursor.com/docs/cli/reference/configuration): "`CURSOR_CONFIG_DIR`: custom directory path"                                                                                                   |
+| `grok`     | `GROK_HOME`           | "config, auth, sessions, skills, plugins, and logs" | [Grok settings reference](https://docs.x.ai/build/settings/reference); the [settings page](https://docs.x.ai/build/settings): "you can set `$GROK_HOME`"                                                                    |
+| `opencode` | `OPENCODE_CONFIG_DIR` | the config directory                                | [OpenCode config](https://opencode.ai/docs/config/): "Specify a custom config directory using the `OPENCODE_CONFIG_DIR` environment variable."                                                                              |
+| `gemini`   | `GEMINI_CLI_HOME`     | "user-level configuration and storage"              | [Gemini CLI configuration](https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/configuration.md)                                                                                                           |
+| `copilot`  | `COPILOT_HOME`        | the whole `~/.copilot` tree                         | [Copilot config directory](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference): "You can change the location of this directory by setting the `COPILOT_HOME` environment variable" |
+| `goose`    | `GOOSE_PATH_ROOT`     | "all goose data, config, and state files"           | [Goose environment variables](https://github.com/block/goose/blob/main/documentation/docs/guides/environment-variables.md)                                                                                                  |
+
+The two adapters forward the variable of the CLI they drive, which the Codex and Claude harnesses
+already forward. Neither adapter's README names it, so the documents are the underlying CLI's:
+
+| Profile            | Key added           | Document                                                                                                                                                                                                                                                                                |
+| ------------------ | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `codex-acp`        | `CODEX_HOME`        | [Codex advanced configuration](https://learn.chatgpt.com/docs/config-file/config-advanced): "Codex stores its local state under `CODEX_HOME` (defaults to `~/.codex`)." The [adapter's README](https://github.com/agentclientprotocol/codex-acp) says it "starts the Codex App Server". |
+| `claude-agent-acp` | `CLAUDE_CONFIG_DIR` | [Claude Code environment variables](https://code.claude.com/docs/en/env-vars): "Override the configuration directory (default: `~/.claude`)." The [adapter's README](https://github.com/agentclientprotocol/claude-agent-acp) says it is built on "the official Claude Agent SDK".      |
+
+Without them the adapter reads the default-location account when the user relocated the home.
+
+Location variables a vendor documents or reads that are **not** forwarded, because they are not
+home locations or can carry a secret: Cursor's `CURSOR_DATA_DIR` (read in the bundle, undocumented),
+`CURSOR_API_KEY`, `CURSOR_AUTH_TOKEN`; Grok's `XAI_API_KEY`, `GROK_AUTH_PROVIDER_COMMAND` and
+`GROK_LOG_FILE`; OpenCode's `OPENCODE_CONFIG` and `OPENCODE_TUI_CONFIG` (single files),
+`OPENCODE_CONFIG_CONTENT` and `OPENCODE_SERVER_PASSWORD`; Gemini's `GEMINI_API_KEY`,
+`GOOGLE_APPLICATION_CREDENTIALS` and the `GEMINI_CLI_*_PATH` file overrides; Copilot's
+`COPILOT_CACHE_HOME` (cache only), `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` and `GITHUB_TOKEN`; Goose's
+`GOOSE_PROVIDER__API_KEY`, `GOOSE_DISABLE_KEYRING` and the Langfuse keys; every `*_PROXY`.
+
+#### Why each base location key is there
+
+The base allowlist carries the four XDG base directories and the two Windows per-user directories
+beside `HOME` and `USERPROFILE`, because a vendor CLI resolves its own files from them. Without
+them a user who keeps a CLI's configuration under a custom `XDG_CONFIG_HOME` saw the default
+account's state through this library, and a Cursor turn ran on that account. Each key has a reader
+that a person can check without logging in; documents were read on 2026-10-13.
+
+| Key               | Reader           | Evidence                                                                                                                                                                                                                                                                                                                                                                |
+| ----------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `XDG_CONFIG_HOME` | Cursor           | Document: [Cursor configuration](https://cursor.com/docs/cli/reference/configuration), "`XDG_CONFIG_HOME` (Linux/BSD): uses `$XDG_CONFIG_HOME/cursor/cli-config.json`". The page does not say where the login lives; the bundle does (below).                                                                                                                           |
+| `XDG_CACHE_HOME`  | Copilot          | Document: [Copilot config directory](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference), Linux cache is "`$XDG_CACHE_HOME/copilot` or `~/.cache/copilot`".                                                                                                                                                                    |
+| `XDG_STATE_HOME`  | Cursor; OpenCode | Observation: Cursor's bundle joins it with `cursor/agent-stores` (command below). OpenCode's source: `const state = process.env.XDG_STATE_HOME \|\| ...` ([`global-roots.ts` L8](https://github.com/anomalyco/opencode/blob/b4a57f6849b9a368439b5fc2511fe167db1a6863/packages/util/src/global-roots.ts#L8)); its docs do not mention it.                                |
+| `XDG_DATA_HOME`   | OpenCode         | Source: `const data = process.env.XDG_DATA_HOME \|\| ...` ([`global-roots.ts` L5](https://github.com/anomalyco/opencode/blob/b4a57f6849b9a368439b5fc2511fe167db1a6863/packages/util/src/global-roots.ts#L5)). [OpenCode providers](https://opencode.ai/docs/providers/) documents the credential file at `~/.local/share/opencode/auth.json`, the default of that root. |
+| `APPDATA`         | Cursor; Goose    | Document: [Goose config files](https://github.com/block/goose/blob/main/documentation/docs/guides/config-files.md), "Windows: `%APPDATA%\Block\goose\config\config.yaml`". Observation: Cursor's bundle joins `process.env.APPDATA \|\| ~/AppData/Roaming` with `Cursor/auth.json`.                                                                                     |
+| `LOCALAPPDATA`    | Copilot          | Document: [Copilot config directory](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference), the Windows cache is `%LOCALAPPDATA%/copilot`.                                                                                                                                                                                       |
+
+Observations, all read-only text searches that read no credential and run no CLI:
+
+- Cursor `2026.09.10-fd3934a`:
+  `grep -a -o -h '.\{80\}XDG_[A-Z_]*.\{80\}' ~/.local/share/cursor-agent/versions/*/*.js` shows
+  `process.env.XDG_CONFIG_HOME || ~/.config` joined with `cursor/auth.json` for the login file on
+  Linux, `XDG_STATE_HOME` joined with `cursor/agent-stores`, and `APPDATA` for the Windows login
+  file. The same bundle lists `XDG_RUNTIME_DIR` among variables it strips from an environment it
+  hands on.
+- OpenCode: `curl -s https://raw.githubusercontent.com/anomalyco/opencode/b4a57f6849b9a368439b5fc2511fe167db1a6863/packages/util/src/global-roots.ts | grep XDG`
+  prints the four `process.env.XDG_*_HOME` reads.
+- A maintainer ran `cursor-agent status` with `XDG_CONFIG_HOME` pointing at an empty directory and
+  got "Not logged in", where the same call without the variable reported the signed-in account. The
+  variable-set side of that run was not repeated for this page.
+
+`XDG_RUNTIME_DIR` is not forwarded: it holds the login session's sockets, and Cursor's bundle lists
+it with `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS` and `WAYLAND_DISPLAY` among the variables it
+strips from an environment it hands on. Grok's binary names no XDG base directory (only
+`XDG_RUNTIME_DIR`) and relocates through `GROK_HOME`, so the base change does not alter what it
+sees.
 
 ## Sessions
 

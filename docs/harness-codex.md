@@ -8,23 +8,55 @@ vendor's current documentation before relying on them.
 
 ## The executable and the version gate
 
-|                   |                                                                                                     |
-| ----------------- | --------------------------------------------------------------------------------------------------- |
-| Executable        | `codex`, resolved by the host (`OpenSession::with_executable`) or by name                           |
-| Arguments         | `app-server`, and nothing else                                                                      |
-| Version read from | `codex --version` for discovery; the handshake's own `userAgent` for a session or picker connection |
-| Minimum version   | `0.154.0` (`MINIMUM_CODEX_VERSION`), which is also `vendor/PIN`                                     |
+|                   |                                                                                                                                      |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Executable        | `codex`, resolved by the host (`OpenSession::with_executable`) or by name                                                            |
+| Arguments         | `app-server`, and nothing else                                                                                                       |
+| Version read from | `codex --version` before any app-server starts (discovery, session open, picker); the handshake's own `userAgent` as the second line |
+| Minimum version   | `0.154.0` (`MINIMUM_CODEX_VERSION`), which is also `vendor/PIN`                                                                      |
 
 The floor is the pinned build rather than something older. The app-server's item families and its
 `thread/`–`turn/` method names changed shape inside the 0.15x series, so a lower floor would be a
 claim about builds nothing here was checked against. An older `codex` on `PATH` reports
 `GateVerdict::VersionTooOld` with both numbers and claims no capabilities; it never crashes, and no
-app-server is spawned for it.
+app-server is spawned for it. That holds for a session open and the short-lived picker connection
+too: they apply the same floor before they spawn `codex app-server`, because an older app-server
+creates sqlite state, an installation id and system skills under `CODEX_HOME` merely by starting.
+They refuse with `Error::VersionGate { found, minimum }` and launch nothing but the version command.
 
 A `--version` line nobody can parse is `GateVerdict::Unknown`, not a refusal: a CLI that changed
 the shape of its version output has not stopped working, and the host may still choose to try.
+
+Where the version comes from, in order:
+
+1. The `DiscoveryReceipt` on `OpenSession::discovery`, when it vouches for the executable that will
+   be launched. A receipt is the host's word about one exact executable, so it counts only when it
+   names a resolved path, the launch uses that same resolved path (the request's, or the harness's
+   own), and it carries a version. The core has already checked its freshness, identity and the
+   host-measured fingerprints, so nothing is run twice. A receipt that fails any of those tests,
+   including one taken from a `PATH` lookup (which names no file, and `PATH` can resolve to another
+   one inside the receipt's 300 s window), vouches for nothing and the probe below runs.
+2. Otherwise one `codex --version`, run for the executable the session will spawn. That is one extra
+   short process per open and per picker call (two launches instead of one, no more). A launcher
+   that cannot start it leaves the app-server launch to report that.
+
+A probe that never answers is bounded: at most the host's `request_timeout` for the read, then the
+process stop (`kill_grace` + `kill_grace` + `shutdown_timeout` + `shutdown_timeout`, which is
+`Deadlines::process_stop`) that reaps it. At the defaults that is 120 s + 14 s = 134 s, and then the
+open goes on as `Unknown`. The host's cancel token is read after the probe and before the
+app-server is spawned, so a shutdown that arrived meanwhile ends the open as `Error::Cancelled`
+with nothing started; the probe itself is not interrupted by it and still runs to its bound.
+`Deadlines` models no open stage (it has no row or method for opening a session), so this bound
+is stated here and in the table below rather than computed by it.
+
+The `--version` probe is the surface discovery already ran, and it starts nothing else: the process
+prints one line and exits, and a build of `codex-cli 0.150.0` was checked to leave an empty
+`CODEX_HOME` empty. The vendor's [CLI reference][cli-reference] (read 2026-10-13) does not list the
+flag, so the behaviour was checked against the binary rather than quoted from the page.
+
 The session and short-lived picker connection also apply that same floor to a parseable handshake
-`userAgent` before they send a thread request, then clean up the child on a refusal.
+`userAgent` before they send a thread request, then clean up the child on a refusal. This is the
+second line, for what `--version` could not say.
 
 ## The documented surface this harness drives
 
@@ -338,6 +370,7 @@ answers `turn/interrupt` with an empty result and later ends the turn with `turn
 | Interrupt error during steer | `request_timeout`, from the interrupt's failure                  | The error is judged as it stands: process shutdown if the turn is still admitted |
 | Turn settle after ack        | `cancel_settle_timeout` (60 s default), from the acknowledgement | Process shutdown                                                                 |
 | Shutdown escalation          | `kill_grace`, then `shutdown_timeout` per teardown stage         | `Error::CleanupRequired` carrying the host's process control                     |
+| Open, version probe          | `request_timeout` for the read, then the process stop            | The open goes on as `Unknown`; a failed stop is `Error::CleanupRequired`         |
 
 The pending-start bound has two clocks. The start request's own deadline returns
 `Dispatch::AcceptanceUnknown` to its caller. The stop worker also bounds its own wait by
@@ -356,6 +389,7 @@ the method for the row, and each method's documentation says where its clock sta
 | Path                                   | Clock starts at     | Worst case                      | At the defaults | `Deadlines` method          |
 | -------------------------------------- | ------------------- | ------------------------------- | --------------- | --------------------------- |
 | Process stop `S`                       | the stop            | `kg` + `kg` + `st` + `st`       | 14 s            | `process_stop`              |
+| Open, version probe, worst case        | the call to open    | `rt` + `S`                      | 134 s           | none: not modelled          |
 | Teardown `T`                           | the teardown        | `kg` + `st` + 3 `st` + `S`      | 36 s            | `teardown`                  |
 | `close`, whichever teardown it joins   | the call to `close` | `T`                             | 36 s            | `close`, `close_worst_case` |
 | Inbound overflow, to the child's reap  | the overflow        | `st` + `T`                      | 41 s            | `overflow_to_closed`        |
@@ -940,6 +974,19 @@ render as `ActivityKind::Mcp`.
 One variable survives the allowlist: `CODEX_HOME`, the directory the user's own CLI keeps its
 configuration in. A child that could not find it would run under a configuration the user never
 chose. `OPENAI_API_KEY` is deliberately absent — this library does no API-key plumbing of any kind.
+The document is [Codex advanced configuration](https://learn.chatgpt.com/docs/config-file/config-advanced),
+read 2026-10-13: "Codex stores its local state under `CODEX_HOME` (defaults to `~/.codex`)."
+
+The base allowlist reaches this CLI too: `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`,
+`XDG_CACHE_HOME`, `APPDATA` and `LOCALAPPDATA`, beside `HOME`. No Codex document found names an
+XDG variable; the state this harness depends on, the account and the sessions, lives under
+`CODEX_HOME`. An observation on the installed `0.162.1` standalone binary
+(`strings -a <codex> | grep -o -E 'XDG_[A-Z_]+|APPDATA|LOCALAPPDATA|CODEX_HOME' | sort | uniq -c`)
+finds `CODEX_HOME` 56 times and `XDG_CONFIG_HOME`, truncated fragments of the data, cache and
+runtime-directory names, `APPDATA` and `LOCALAPPDATA` a few times each, the shape of a directories
+library bundled into the binary. Whether the CLI calls it for
+anything the harness uses was not determined, so the XDG variables reaching Codex are a
+consequence of the shared base list, not something this harness relies on.
 
 ## Why the protocol types are hand-written
 
@@ -1071,3 +1118,4 @@ Compliance posture: see [compliance.md](compliance.md).
 [thread-protocol]: https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
 [config-reference]: https://developers.openai.com/codex/config-reference
 [app-server]: https://learn.chatgpt.com/docs/app-server
+[cli-reference]: https://learn.chatgpt.com/docs/developer-commands?surface=cli

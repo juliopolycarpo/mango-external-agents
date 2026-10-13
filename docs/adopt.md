@@ -93,6 +93,17 @@ let host = HostContext::builder()
    On Windows, duplicate environment names that differ only by case are canonicalized once with
    the first lexical spelling winning. Hosts should avoid conflicting `PATH` and `Path` values.
 
+   After 0.7.0 the base list also carries `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`,
+   `XDG_CACHE_HOME`, `APPDATA` and `LOCALAPPDATA`, and the ACP profiles add each vendor's home
+   variable (`docs/harness-acp.md`). That changes what a child sees when the host's own process
+   runs under redirected directories, as in a Flatpak or Snap sandbox: a 0.7.0 child ignored the
+   redirect, fell back to `~/.config` and found the user's login; it now reads the application-private
+   directory and may report signed out. A host that wants the old behaviour filters its
+   `EnvSource` before building the context, for example
+   `EnvSource::from_pairs(EnvSource::from_process().iter().filter(|(key, _)| !key.starts_with("XDG_")))`,
+   and a host that wants a specific directory sets the key in the source it builds. Credentials and
+   proxies stay out whatever the source holds.
+
 5. **Client identity.** `ClientInfo { name, version }`, sent to vendors that ask for it (Codex's
    `clientInfo`, ACP's `initialize`). It is the host's own name: a vendor reading its logs should
    see which product launched it.

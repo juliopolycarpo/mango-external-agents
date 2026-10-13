@@ -41,9 +41,10 @@ use mango_external_agents::session::{
 use mango_external_agents::state::{SessionSnapshot, TransportSelection};
 use mango_external_agents::transport::TransportKind;
 use mango_external_agents::{
-    AcpSpec, AuthState, Capabilities, CapabilityCeiling, DiscoveredCapabilities, Discovery, Error,
-    ExecutablePath, GateVerdict, Harness, HarnessDescriptor, HarnessIdentity, HostContext,
-    LaunchSpec, LineLimits, LineStream, Result, SessionId, StdioSpec,
+    AcpSpec, AuthState, Capabilities, CapabilityCeiling, DiscoveredCapabilities, Discovery,
+    DiscoveryReceipt, Error, ExecutablePath, GateVerdict, Harness, HarnessDescriptor,
+    HarnessIdentity, HostContext, LaunchSpec, LineLimits, LineStream, Result, SessionId, StdioSpec,
+    process::ProcessCleanupGuard,
 };
 
 use crate::client::{self, SessionState};
@@ -481,6 +482,11 @@ impl Harness for AcpHarness {
             }
             .with_dispatch(mango_external_agents::Dispatch::NotSubmitted));
         }
+        // A floor the profile pinned is applied before the agent exists: starting a build the
+        // profile refuses is already running it against the user's own configuration.
+        // Returned as the bare `VersionGate`, as the Codex and Claude harnesses return theirs.
+        self.refuse_below_floor_before_spawn(host, executable, request.discovery.as_ref())
+            .await?;
         let spec = AcpSpec::ChildPipes(StdioSpec::new(self.profile.resolved_argv(executable)));
         let launched =
             transport::connect(host, &spec, self.descriptor.vendor_environment_keys).await?;
@@ -728,6 +734,8 @@ impl Harness for AcpHarness {
     ) -> Result<SessionPage> {
         host.absolute_cwd()?;
         validate_listing_workspace(host, &query)?;
+        self.refuse_below_floor_before_spawn(host, &self.executable, None)
+            .await?;
         let spec =
             AcpSpec::ChildPipes(StdioSpec::new(self.profile.resolved_argv(&self.executable)));
         let launched =
@@ -791,6 +799,60 @@ struct Opened {
 }
 
 impl AcpHarness {
+    /// Applies the profile's `minimum_version`, and the host's cancellation, before any agent
+    /// process is started.
+    ///
+    /// Nothing is probed for a profile that pins no floor, which is every built-in one. Otherwise
+    /// the version is the host's receipt when it vouches for the executable being launched (see
+    /// [`vouched_version`]) and one run of the profile's version argv when it does not. A version
+    /// that cannot be read or compared is `Unknown` and proceeds; an executable that cannot be
+    /// launched is left for the agent launch that follows to report. ACP has no handshake check to
+    /// fall back on, so this is the only gate.
+    ///
+    /// The cancel token is read after the probe, so a shutdown that arrived while a silent binary
+    /// held the probe open does not go on to start the agent.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Cancelled`] when the host was shut down, and [`Error::VersionGate`] when the
+    /// version is readable and below the floor.
+    async fn refuse_below_floor_before_spawn(
+        &self,
+        host: &HostContext,
+        executable: &ExecutablePath,
+        receipt: Option<&DiscoveryReceipt>,
+    ) -> Result<()> {
+        let Some(minimum) = self.profile.minimum_version.as_deref() else {
+            return Ok(());
+        };
+        let version = match vouched_version(receipt, executable) {
+            Some(version) => Some(version),
+            None => {
+                let argv = self.profile.resolved_version_argv(executable);
+                if argv.is_empty() {
+                    return Ok(());
+                }
+                match run_version(host, &self.descriptor, argv).await {
+                    Ok(version) => version,
+                    Err(Error::Launch { .. }) => return Ok(()),
+                    Err(error) => return Err(error),
+                }
+            }
+        };
+        if host.cancel().is_cancelled() {
+            return Err(Error::Cancelled {
+                reason: mango_external_agents::CancelReason::Shutdown,
+            }
+            .with_dispatch(mango_external_agents::Dispatch::NotSubmitted));
+        }
+        match gate(version.as_deref(), Some(minimum)) {
+            GateVerdict::VersionTooOld { found, minimum } => {
+                Err(Error::VersionGate { found, minimum })
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The handshake and the session, as one fallible step the caller can tear down after.
     async fn handshake_and_open(
         &self,
@@ -1085,8 +1147,33 @@ fn resume_failure_is_conclusive(error: &Error) -> bool {
 /// prints. Past it the probe reports no version rather than reading for the whole request timeout.
 const VERSION_PROBE_MAX_BYTES: usize = 64 * 1024;
 
+/// The version a host's receipt vouches for, when it vouches for the executable that will launch.
+///
+/// A receipt is the host's word about one exact executable, so it is believed only when the
+/// receipt names a resolved path, the launch uses that same resolved path, and the receipt carries
+/// a version. The core has already checked the receipt's freshness and its host-measured
+/// fingerprints. A receipt without a path (a `PATH` lookup, which can resolve to a different file
+/// within the receipt's window), for another path, or without a version vouches for nothing here
+/// and the caller probes.
+fn vouched_version(
+    receipt: Option<&DiscoveryReceipt>,
+    executable: &ExecutablePath,
+) -> Option<String> {
+    let receipt = receipt?;
+    let launched = executable.get()?;
+    if receipt.discovery.executable.as_ref() != Some(launched) {
+        return None;
+    }
+    receipt.discovery.version.clone()
+}
+
 /// Runs the profile's version argv and returns the version it printed, if it printed one within
 /// [`VERSION_PROBE_MAX_BYTES`].
+///
+/// The child is owned by a [`ProcessCleanupGuard`] from the moment it exists: it is stopped and
+/// reaped on every way out, including this future being dropped, and a stop that fails comes back
+/// as [`Error::CleanupRequired`] carrying the host's process control. The whole probe is bounded by
+/// the host's `request_timeout` plus that stop.
 async fn run_version(
     host: &HostContext,
     descriptor: &HarnessDescriptor,
@@ -1104,6 +1191,11 @@ async fn run_version(
             hide_window: true,
         })
         .await?;
+    let cleanup = ProcessCleanupGuard::new(
+        process.control,
+        *host.limits(),
+        mango_external_agents::CancelReason::Shutdown,
+    );
 
     let mut lines = LineStream::new(process.stdout, probe_line_limits(host.limits().line));
     // Bounded by the host's own request timeout: an agent that prints nothing and does not exit must
@@ -1115,10 +1207,7 @@ async fn run_version(
     .await;
 
     // The child is ended either way: a probe that left one running would leak a process per probe.
-    let _ = process
-        .control
-        .kill(mango_external_agents::CancelReason::Requested)
-        .await;
+    cleanup.finish().await?;
     match read {
         Ok(result) => result,
         Err(_) => Ok(None),
@@ -1429,6 +1518,56 @@ mod tests {
         assert!(
             advertised.get("elicitation").is_none_or(Value::is_null),
             "expected the wire frame to carry no elicitation member, received {advertised}"
+        );
+    }
+
+    fn receipt(
+        executable: Option<&str>,
+        version: Option<&str>,
+    ) -> mango_external_agents::DiscoveryReceipt {
+        mango_external_agents::DiscoveryReceipt::new(
+            mango_external_agents::HarnessId::new("acp:fake").expect("expected a harness id"),
+            mango_external_agents::Discovery {
+                executable: executable.map(std::path::PathBuf::from),
+                version: version.map(str::to_owned),
+                ..mango_external_agents::Discovery::not_installed()
+            },
+            std::time::SystemTime::now(),
+        )
+    }
+
+    #[test]
+    fn a_receipt_vouches_only_for_the_resolved_path_it_probed() {
+        let launched = mango_external_agents::ExecutablePath::resolved("/opt/fake/bin/fake");
+        let cases = [
+            (Some("/opt/fake/bin/fake"), Some("2.1.0"), Some("2.1.0")),
+            (Some("/opt/fake/bin/fake"), None, None),
+            (Some("/usr/bin/fake"), Some("2.1.0"), None),
+            (None, Some("2.1.0"), None),
+        ];
+        for (path, version, expected) in cases {
+            let received = super::vouched_version(Some(&receipt(path, version)), &launched);
+            assert_eq!(
+                received.as_deref(),
+                expected,
+                "expected {expected:?} for a receipt of {path:?} at {version:?} | received {received:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_launch_by_program_name_is_never_vouched_for() {
+        let received = super::vouched_version(
+            Some(&receipt(Some("/opt/fake/bin/fake"), Some("2.1.0"))),
+            &mango_external_agents::ExecutablePath::default(),
+        );
+        assert_eq!(
+            received, None,
+            "expected no vouched version for a PATH lookup | received {received:?}"
+        );
+        assert_eq!(
+            super::vouched_version(None, &mango_external_agents::ExecutablePath::resolved("/x")),
+            None
         );
     }
 }
