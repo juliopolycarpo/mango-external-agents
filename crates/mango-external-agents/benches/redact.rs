@@ -352,6 +352,26 @@ fn tails(bench: &Bench) {
             |()| stderr_tail(std::hint::black_box(&raw)).len(),
         );
     }
+    // The worst shape of the key read, begin markers with no end marker, at four and sixteen times
+    // the size: the cost per byte stays where it is at 1 MiB.
+    for mib in [4, 16] {
+        let name = format!("redact/stderr_tail-{mib}MiB/pem");
+        if !bench.selected(&name) {
+            continue;
+        }
+        let raw = repeated(
+            concat!("-----BEGIN ", "PRIVATE KEY-----\n"),
+            "",
+            mib * KIB * KIB,
+        );
+        assert_tail("pem", &raw, &stderr_tail(&raw));
+        bench.run(
+            &name,
+            Unit::new(raw.len() as u64, "byte"),
+            || (),
+            |()| stderr_tail(std::hint::black_box(&raw)).len(),
+        );
+    }
 }
 
 /// Fails the run when a tail case did not do the work its name claims.

@@ -31,6 +31,7 @@
 //! replays it.
 
 mod generate;
+mod streams;
 
 use serde_json::Value;
 
@@ -451,6 +452,39 @@ family!(
     every_property_holds_on_a_little_soup,
     soup
 );
+
+#[test]
+#[ignore = "a long search; see the module docs"]
+fn the_tail_never_shows_what_the_whole_stream_hides() {
+    let (seed, count) = (seed(), count());
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..THREADS)
+            .map(|thread| {
+                scope.spawn(move || {
+                    let mut random = Random::new(seed, 100 + thread);
+                    for _ in 0..count / THREADS {
+                        streams::assert_the_tail_hides_what_the_stream_hides(&streams::stream(
+                            &mut random,
+                        ));
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            if let Err(panic) = worker.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    });
+}
+
+#[test]
+fn the_tail_never_shows_what_the_whole_stream_hides_on_a_few_streams() {
+    let mut random = Random::new(3, 0);
+    for _ in 0..DEFAULT_COUNT {
+        streams::assert_the_tail_hides_what_the_stream_hides(&streams::stream(&mut random));
+    }
+}
 
 #[test]
 #[ignore = "a long search; see the module docs"]

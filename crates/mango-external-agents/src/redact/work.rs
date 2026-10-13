@@ -863,6 +863,42 @@ const TAIL_SHAPES: &[Shape] = &[
         },
     },
     Shape {
+        what: "begin markers of a private key one after another and no end marker",
+        build: |len| repeated(concat!("-----BEGIN PRIV", "ATE KEY-----\n"), "", len),
+    },
+    Shape {
+        what: "begin markers behind a prefix, one after another and no end marker",
+        build: |len| {
+            repeated(
+                concat!("stderr | -----BEGIN PRIV", "ATE KEY-----\n"),
+                "",
+                len,
+            )
+        },
+    },
+    Shape {
+        what: "prefixed lines of base64 from the first byte and an end marker past the distance a block is read",
+        build: |len| {
+            format!(
+                "{}{}",
+                "stderr | MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\n"
+                    .repeat(len / 74),
+                concat!("stderr | -----END PRIV", "ATE KEY-----")
+            )
+        },
+    },
+    Shape {
+        what: "the same long prefix on every line, with an end marker after them",
+        build: |len| {
+            let prefix = "p".repeat(60);
+            format!(
+                "{}{prefix} {}",
+                format!("{prefix} QUJDRA==\n").repeat(len / 70),
+                concat!("-----END PRIV", "ATE KEY-----")
+            )
+        },
+    },
+    Shape {
         what: "base64 lines with an end marker past the distance a block is read",
         build: |len| {
             format!(
