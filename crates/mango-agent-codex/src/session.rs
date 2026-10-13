@@ -3693,7 +3693,14 @@ impl CodexSession {
                 after: close_backstop,
             })
             .and_then(|result| result);
-        let stop = stop_process_with_limits(&*control, reason, &limits).await;
+        // On a task of its own, so a host control that panics is told apart from the teardown
+        // worker failing: the join error below names the host's control, not the app-server.
+        let stop = tokio::spawn({
+            let control = Arc::clone(&control);
+            async move { stop_process_with_limits(control.as_ref(), reason, &limits).await }
+        })
+        .await
+        .unwrap_or_else(|joined| Err(control_stop_lost(&joined)));
         // Reaping the app-server is the terminal lifetime fact. A blocked JSON-RPC writer can
         // make closing its connection report an error after the child is gone, but leaving the
         // observable session `Ready` then invites a host to submit work to a reaped process.
@@ -4686,6 +4693,28 @@ impl Drop for CodexSession {
         runtime.spawn(async move {
             Self::request_shutdown(shared, client, control, state, CancelReason::Shutdown);
         });
+    }
+}
+
+/// Names the host's `ProcessControl` as the peer of an error about a stop it never answered.
+const HOST_CONTROL: &str = "the host's process control";
+
+/// What a stop task that never answered says about itself: the host's control panicked or its
+/// task was cancelled. The app-server is not the peer that failed.
+///
+/// ```ignore
+/// let error = control_stop_lost(&join_error);
+/// assert!(matches!(error, Error::Link { peer, .. } if peer == "the host's process control"));
+/// ```
+fn control_stop_lost(joined: &tokio::task::JoinError) -> Error {
+    let shape = if joined.is_panic() {
+        "panicked"
+    } else {
+        "was cancelled"
+    };
+    Error::Link {
+        peer: String::from(HOST_CONTROL),
+        message: format!("expected the host's process stop to return | received: it {shape}"),
     }
 }
 
@@ -6847,6 +6876,36 @@ mod tests {
             error.to_string().contains("panicked"),
             "expected an error naming the panic | received: {error}"
         );
+    }
+
+    /// A stop task the runtime lost, by a panic or by an abort, is told as the host's control
+    /// failing, never as the app-server failing.
+    #[tokio::test]
+    async fn a_lost_control_stop_names_the_host_control_and_how_it_was_lost() {
+        let panicked = tokio::spawn(async { panic!("test control stop panicked") });
+        let panic_error = panicked
+            .await
+            .expect_err("expected the panicking task to fail its join");
+        let aborted = tokio::spawn(std::future::pending::<()>());
+        aborted.abort();
+        let abort_error = aborted
+            .await
+            .expect_err("expected the aborted task to fail its join");
+
+        for (joined, shape) in [(panic_error, "panicked"), (abort_error, "was cancelled")] {
+            let lost = super::control_stop_lost(&joined);
+            let mango_external_agents::Error::Link { peer, message } = &lost else {
+                panic!("expected Error::Link | received: {lost:?}");
+            };
+            assert_eq!(
+                peer, "the host's process control",
+                "expected the Link peer: the host's process control | received: {peer}"
+            );
+            assert!(
+                message.ends_with(&format!("received: it {shape}")),
+                "expected the Link message ending in `received: it {shape}` | received: {message}"
+            );
+        }
     }
 
     /// On a multi-thread runtime the pump can name a lost start while the stop worker is between
