@@ -865,8 +865,37 @@ No profile pins a `minimum_version`. A floor nobody has checked would refuse a b
 ### Environment keys
 
 Built-in profiles do not forward API keys or tokens from the host's environment. Sign-in remains
-the user's arrangement with the installed CLI. Beyond the core's base allowlist, only `codex-acp`
-adds `NO_BROWSER`, the [adapter's documented switch][p-codex] for suppressing a sign-in page.
+the user's arrangement with the installed CLI. Beyond the core's base allowlist, a profile adds only
+the location variable its vendor documents for relocating its own home, plus `NO_BROWSER` for
+`codex-acp`, the [adapter's documented switch][p-codex] for suppressing a sign-in page. The
+vendor documents were read on 2026-10-13.
+
+| Profile    | Key added             | What it relocates                                   | Document                                                                                                                                                                                                                    |
+| ---------- | --------------------- | --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cursor`   | `CURSOR_CONFIG_DIR`   | the CLI's config directory                          | [Cursor configuration](https://cursor.com/docs/cli/reference/configuration): "`CURSOR_CONFIG_DIR`: custom directory path"                                                                                                   |
+| `grok`     | `GROK_HOME`           | "config, auth, sessions, skills, plugins, and logs" | [Grok settings reference](https://docs.x.ai/build/settings/reference); the [settings page](https://docs.x.ai/build/settings): "you can set `$GROK_HOME`"                                                                    |
+| `opencode` | `OPENCODE_CONFIG_DIR` | the config directory                                | [OpenCode config](https://opencode.ai/docs/config/): "Specify a custom config directory using the `OPENCODE_CONFIG_DIR` environment variable."                                                                              |
+| `gemini`   | `GEMINI_CLI_HOME`     | "user-level configuration and storage"              | [Gemini CLI configuration](https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/configuration.md)                                                                                                           |
+| `copilot`  | `COPILOT_HOME`        | the whole `~/.copilot` tree                         | [Copilot config directory](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference): "You can change the location of this directory by setting the `COPILOT_HOME` environment variable" |
+| `goose`    | `GOOSE_PATH_ROOT`     | "all goose data, config, and state files"           | [Goose environment variables](https://github.com/block/goose/blob/main/documentation/docs/guides/environment-variables.md)                                                                                                  |
+
+`codex-acp` and `claude-agent-acp` add no location variable: their READMEs name none. The CLIs they
+wrap document `CODEX_HOME` and `CLAUDE_CONFIG_DIR`, which the Codex and Claude harnesses forward;
+carrying them across to an adapter that does not state them is left for a capture that proves it.
+
+Location variables a vendor documents or reads that are **not** forwarded, because they are not
+home locations or can carry a secret: Cursor's `CURSOR_DATA_DIR` (read in the bundle, undocumented),
+`CURSOR_API_KEY`, `CURSOR_AUTH_TOKEN`; Grok's `XAI_API_KEY`, `GROK_AUTH_PROVIDER_COMMAND` and
+`GROK_LOG_FILE`; OpenCode's `OPENCODE_CONFIG` and `OPENCODE_TUI_CONFIG` (single files),
+`OPENCODE_CONFIG_CONTENT` and `OPENCODE_SERVER_PASSWORD`; Gemini's `GEMINI_API_KEY`,
+`GOOGLE_APPLICATION_CREDENTIALS` and the `GEMINI_CLI_*_PATH` file overrides; Copilot's
+`COPILOT_CACHE_HOME` (cache only), `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` and `GITHUB_TOKEN`; Goose's
+`GOOSE_PROVIDER__API_KEY`, `GOOSE_DISABLE_KEYRING` and the Langfuse keys; every `*_PROXY`.
+
+OpenCode keeps `auth.json` under its data directory
+([providers](https://opencode.ai/docs/providers/) documents `~/.local/share/opencode/auth.json`) and
+its source resolves that directory from `XDG_DATA_HOME`, which the base list now carries. Its docs do
+not say so.
 
 The base allowlist carries the four XDG base directories (`XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
 `XDG_STATE_HOME`, `XDG_CACHE_HOME`) beside `HOME`, because Cursor's CLI resolves its account from

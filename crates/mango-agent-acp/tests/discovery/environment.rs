@@ -17,16 +17,38 @@ const BASE_LOCATIONS: [(&str, &str); 4] = [
 
 /// Variables no child may receive: a session directory, credentials, and proxies that can carry
 /// userinfo.
-const NEVER_FORWARDED: [(&str, &str); 9] = [
+const NEVER_FORWARDED: [(&str, &str); 15] = [
     ("XDG_RUNTIME_DIR", "/run/user/1000"),
     ("CURSOR_API_KEY", "canary-cursor-api-key"),
     ("CURSOR_AUTH_TOKEN", "canary-cursor-token"),
     ("XAI_API_KEY", "canary-xai-key"),
     ("OPENAI_API_KEY", "canary-openai-key"),
     ("GITHUB_TOKEN", "canary-github-token"),
+    ("COPILOT_GITHUB_TOKEN", "canary-copilot-token"),
     ("GEMINI_API_KEY", "canary-gemini-key"),
+    (
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "/work/canary-credentials.json",
+    ),
+    ("GOOSE_PROVIDER__API_KEY", "canary-goose-key"),
+    ("OPENCODE_SERVER_PASSWORD", "canary-opencode-password"),
+    ("OPENCODE_CONFIG_CONTENT", "{\"canary\":true}"),
+    ("CODEX_CONFIG", "{\"canary\":true}"),
     ("HTTPS_PROXY", "http://user:canary-pass@proxy.example:3128"),
     ("ALL_PROXY", "socks5://user:canary-pass@proxy.example:1080"),
+];
+
+/// The location variable each vendor documents for relocating its own home, by profile id.
+///
+/// Each is cited in `docs/harness-acp.md`. `codex-acp` and `claude-agent-acp` are absent on
+/// purpose: their adapters' READMEs name no location variable.
+const PROFILE_LOCATIONS: [(&str, &str, &str); 6] = [
+    ("cursor", "CURSOR_CONFIG_DIR", "/work/cursor"),
+    ("grok", "GROK_HOME", "/work/grok"),
+    ("opencode", "OPENCODE_CONFIG_DIR", "/work/opencode"),
+    ("gemini", "GEMINI_CLI_HOME", "/work/gemini"),
+    ("copilot", "COPILOT_HOME", "/work/copilot"),
+    ("goose", "GOOSE_PATH_ROOT", "/work/goose"),
 ];
 
 fn host_offering(
@@ -132,6 +154,47 @@ async fn no_profile_child_receives_a_credential_proxy_or_session_directory() {
                 received(environment, names),
                 Vec::<(String, String)>::new(),
                 "expected no credential, proxy or session directory for {id} launch #{launch} | received {environment:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn each_profile_child_receives_the_location_its_vendor_documents() {
+    for (profile, key, value) in PROFILE_LOCATIONS {
+        let environments = child_environments(profile, &[(key, value)]).await;
+        for (launch, environment) in environments.iter().enumerate() {
+            assert_eq!(
+                environment.get(key).map(String::as_str),
+                Some(value),
+                "expected {key}={value} to reach {profile} launch #{launch} | received {environment:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_profile_location_is_not_a_wildcard_for_the_other_profiles() {
+    let offered: Vec<(&'static str, &'static str)> = PROFILE_LOCATIONS
+        .iter()
+        .map(|(_, key, value)| (*key, *value))
+        .collect();
+    for profile in mango_agent_acp::builtin_profiles() {
+        let id = profile.id.to_string();
+        let own = PROFILE_LOCATIONS
+            .iter()
+            .find(|(candidate, _, _)| *candidate == id)
+            .map(|(_, key, _)| *key);
+        for environment in child_environments(&id, &offered).await {
+            let names = PROFILE_LOCATIONS.iter().map(|(_, key, _)| *key);
+            let keys: Vec<String> = received(&environment, names)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            let expected: Vec<String> = own.map(str::to_owned).into_iter().collect();
+            assert_eq!(
+                keys, expected,
+                "expected only {id}'s own location variable | received {environment:?}"
             );
         }
     }
