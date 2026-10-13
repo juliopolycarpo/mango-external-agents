@@ -74,34 +74,78 @@ pub(super) fn tail_hides(text: &str) -> Vec<Hide> {
 ///
 /// Only the start of the text is read this way. A key with its begin marker is the block read's;
 /// a line of base64 anywhere else, with no begin marker, is as likely a hash or an attachment as a
-/// key. Every line before the marker has to be a line a key's body has (see [`is_key_body_line`]),
-/// so a sentence, a path or an assignment above it is not a key's body, and the read stops at
-/// [`MAX_BLOCK_BYTES`], the farthest a block is searched for its end marker. Spaces and tabs in
-/// front of a line, as an indented log writes it, are allowed.
+/// key. The first end marker of a private key within [`MAX_BLOCK_BYTES`], the farthest a block is
+/// searched for its end, closes it, and every line before it has to be a line a key's body has (see
+/// [`is_key_body_line`]), so a sentence, a path or an assignment above it is not a key's body.
+///
+/// A log that writes each line behind a tag (`stderr | `, a timestamp and an agent's name) writes
+/// the key that way, so what stands in front of the marker on its line is the prefix, and every
+/// line above it carries the same one: at most [`MAX_PREFIX`] bytes, identical on each line, after
+/// the blanks a log may indent them with. A prefix of blanks alone is an indented key.
 fn orphaned_end_hides(text: &str) -> Vec<Hide> {
     let bytes = text.as_bytes();
-    let mut at = 0;
-    while at <= MAX_BLOCK_BYTES {
-        let start = take_while(bytes, at, is_blank);
-        if bytes[start..].starts_with(b"-----END ") {
-            return end_marker_close(bytes, start)
-                .map(|close| Hide::marker(0, close))
-                .into_iter()
-                .collect();
-        }
-        // A backslash ends the line's content too: it may be the `\n` of a JSON string.
-        let end = take_while(bytes, start, |byte| !matches!(byte, b'\n' | b'\r' | b'\\'));
+    let Some((line, marker, close)) = first_end_line(text) else {
+        return Vec::new();
+    };
+    let core = bytes[line..marker].trim_ascii();
+    if core.len() > MAX_PREFIX {
+        return Vec::new();
+    }
+    let (mut at, mut start) = (0, None);
+    while at < line {
+        let end = take_while(bytes, at, |byte| !matches!(byte, b'\n' | b'\r' | b'\\'));
         count_steps(end - at + 1);
-        if !is_key_body_line(&bytes[start..end]) {
+        let content = bytes[at..end].trim_ascii_start();
+        let lead = end - at - content.len();
+        let rest = match content.strip_prefix(core) {
+            Some(rest) => rest,
+            None if content.trim_ascii().is_empty() => &[],
+            None => return Vec::new(),
+        };
+        if !is_key_body_line(rest.trim_ascii_start()) {
             return Vec::new();
+        }
+        if start.is_none() && !content.trim_ascii().is_empty() {
+            // What the marker takes over starts after the prefix of the first line that has one.
+            let after = at + lead + core.len();
+            start = Some(after + take_while(bytes, after, is_blank) - after);
         }
         match line_break(bytes, end) {
             Some(after) => at = after,
             None => return Vec::new(),
         }
     }
-    Vec::new()
+    // A prefix of blanks leaves nothing in front of the span: the whole of the lines is the key's.
+    let from = if core.is_empty() {
+        0
+    } else {
+        start.unwrap_or(marker)
+    };
+    vec![Hide::marker(from, close)]
 }
+
+/// The start of the first line within [`MAX_BLOCK_BYTES`] that holds the end marker of a private
+/// key, where the marker starts and where it closes.
+fn first_end_line(text: &str) -> Option<(usize, usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    while at <= MAX_BLOCK_BYTES {
+        let end = take_while(bytes, at, |byte| !matches!(byte, b'\n' | b'\r' | b'\\'));
+        count_steps(end - at + 1);
+        if let Some(offset) = text[at..end].find("-----END ") {
+            let marker = at + offset;
+            if let Some(close) = end_marker_close(bytes, marker) {
+                return Some((at, marker, close));
+            }
+        }
+        at = line_break(bytes, end)?;
+    }
+    None
+}
+
+/// The longest prefix a log line may carry in front of a key's line: a timestamp, a level and an
+/// agent's name, with room to spare.
+const MAX_PREFIX: usize = 64;
 
 fn is_blank(byte: u8) -> bool {
     (byte == b' ') | (byte == b'\t')
@@ -138,6 +182,50 @@ fn end_marker_close(bytes: &[u8], start: usize) -> Option<usize> {
     let label = start + b"-----END ".len();
     let close = closing_dashes(bytes, label, true)?;
     is_private_key_label(&bytes[label..close - 5]).then_some(close)
+}
+
+/// A private key's marker line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum KeyMark {
+    /// `-----BEGIN ... PRIVATE KEY-----`, where a block starts.
+    Begin,
+    /// `-----END ... PRIVATE KEY-----`, which closes it.
+    End,
+}
+
+/// The longest a private key's marker can be: `-----BEGIN `, the longest label and the dashes.
+pub(super) const MAX_MARK_BYTES: usize = 11 + MAX_LABEL + 5;
+
+/// The last private-key marker in `bytes`, read as the block read reads one: a begin marker that
+/// starts a run, and an end marker of a private key. A certificate's and a public key's are not
+/// markers. Linear in `bytes`, with no allocation.
+///
+/// # Example
+///
+/// ```ignore
+/// let bytes = b"-----BEGIN PRIVATE KEY-----\nabcd\n";
+/// assert_eq!(last_key_mark(bytes), Some(KeyMark::Begin));
+/// ```
+pub(super) fn last_key_mark(bytes: &[u8]) -> Option<KeyMark> {
+    let (mut last, mut at) = (None, 0);
+    while let Some(offset) = bytes[at..].iter().position(|byte| *byte == b'-') {
+        let start = at + offset;
+        at = start + 1;
+        count_steps(offset + 1);
+        let rest = &bytes[start..];
+        if rest.starts_with(b"-----BEGIN ") {
+            let label = start + b"-----BEGIN ".len();
+            let marked = starts_a_run(bytes, start)
+                && closing_dashes(bytes, label, true)
+                    .is_some_and(|close| is_private_key_label(&bytes[label..close - 5]));
+            if marked {
+                last = Some(KeyMark::Begin);
+            }
+        } else if rest.starts_with(b"-----END ") && end_marker_close(bytes, start).is_some() {
+            last = Some(KeyMark::End);
+        }
+    }
+    last
 }
 
 /// The private-key blocks of `text`, found by a search for the begin marker and not a read of

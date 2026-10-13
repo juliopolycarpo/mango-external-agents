@@ -920,3 +920,102 @@ fn a_stderr_tail_hides_what_stderr_text_hides_after_a_key_and_a_url_under_a_name
         "expected a stderr tail to hide what stderr_text hides | received: {tail:?}, stderr_text: {text_form:?}"
     );
 }
+
+/// A key a log writes behind a tag on every line (`stderr | `, a timestamp and an agent's name) is
+/// the same key: the end marker's prefix is the prefix of the lines above it.
+#[test]
+fn a_cut_key_is_read_behind_the_prefix_every_line_carries() {
+    for prefix in ["stderr | ", "2026-10-13T10:00:00Z [agent] ", "> ", "[err] "] {
+        let text = format!("{prefix}{KEY_LINE}\n{prefix}{KEY_LINE}\n{prefix}{END}\nafter");
+        let hidden = stderr_tail(&text);
+        let expected = format!("{}[REDACTED]\nafter", prefix.trim_end().to_owned() + " ");
+        let expected = if prefix.ends_with(' ') {
+            expected
+        } else {
+            format!("{prefix}[REDACTED]\nafter")
+        };
+        assert!(
+            !hidden.contains(KEY_LINE) && !hidden.contains("END"),
+            "expected the key behind `{prefix}` hidden to its end marker | received {hidden:?}"
+        );
+        assert_eq!(
+            hidden, expected,
+            "expected the prefix kept and the key hidden | input {text:?}"
+        );
+    }
+}
+
+/// Lines that do not share the end marker's prefix are not one key's: a sentence above it stays.
+#[test]
+fn lines_with_another_prefix_than_the_end_markers_are_not_read_as_a_cut_key() {
+    for text in [
+        format!("[a] {KEY_LINE}\n[b] {END}\nafter"),
+        format!("note: {KEY_LINE}\nstderr | {END}\nafter"),
+        format!("plain words here\nstderr | {END}\nafter"),
+    ] {
+        let hidden = stderr_tail(&text);
+        assert!(
+            hidden.contains("after") && hidden.contains(&text[..text.find('\n').unwrap_or(0)]),
+            "expected the first line, which is not the key's, kept | received {hidden:?}"
+        );
+    }
+}
+
+/// A prefix longer than a log tag is a sentence, not a prefix.
+#[test]
+fn a_prefix_longer_than_the_most_a_log_writes_is_not_read_as_one() {
+    let long = "x".repeat(65);
+    let text = format!("{long} {KEY_LINE}\n{long} {END}\nafter");
+    let hidden = stderr_tail(&text);
+    assert!(
+        hidden.contains(KEY_LINE),
+        "expected a 65-byte prefix not to be one | received {hidden:?}"
+    );
+}
+
+/// A block fully inside the text, behind a prefix, is hidden to its end marker by the block read,
+/// on every entry point that reads tokens, whatever the lines hold.
+#[test]
+fn a_prefixed_key_inside_the_text_is_hidden_the_same_by_bounded_and_the_tail() {
+    let prefix = "stderr | ";
+    let text = format!(
+        "before\n{prefix}{BEGIN}\n{prefix}{KEY_LINE}\n{prefix}{KEY_LINE}\n{prefix}{END}\nafter"
+    );
+    for (name, hidden) in [
+        ("stderr_tail", stderr_tail(&text)),
+        ("bounded", bounded(&text, TextLimit::ErrorMessage).text),
+    ] {
+        assert!(
+            !hidden.contains(KEY_LINE) && hidden.contains("before") && hidden.contains("after"),
+            "expected {name} to hide the prefixed block and keep what is around it | received {hidden:?}"
+        );
+    }
+}
+
+/// The markers that open and close a private key, and the ones that do not.
+#[test]
+fn a_private_key_mark_is_a_begin_or_end_marker_of_a_private_key_and_nothing_else() {
+    use super::tokens::{KeyMark, last_key_mark};
+    let public = concat!("-----BEGIN PUB", "LIC KEY-----");
+    let cert = "-----BEGIN CERTIFICATE-----";
+    let cert_end = "-----END CERTIFICATE-----";
+    let other = "-----END PASSWORD-----";
+    for (text, expected) in [
+        (format!("{BEGIN}\nQUJD"), Some(KeyMark::Begin)),
+        (format!("{BEGIN}\nQUJD\n{END}\n"), Some(KeyMark::End)),
+        (format!("{END}\n{BEGIN}\n"), Some(KeyMark::Begin)),
+        (format!("stderr | {BEGIN}"), Some(KeyMark::Begin)),
+        (format!("x{BEGIN}"), None),
+        (format!("{public}\nQUJD\n"), None),
+        (format!("{cert}\nQUJD\n{cert_end}\n"), None),
+        (format!("{BEGIN}\n{other}"), Some(KeyMark::Begin)),
+        ("-----BEGIN PRIVATE KEY----".to_owned(), None),
+        ("-".repeat(1000), None),
+    ] {
+        assert_eq!(
+            last_key_mark(text.as_bytes()),
+            expected,
+            "expected the last mark of {text:?}"
+        );
+    }
+}

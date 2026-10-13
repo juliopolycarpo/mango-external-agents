@@ -1,9 +1,9 @@
 //! Credential-shaped text removed before stderr crosses a diagnostic boundary.
 //!
 //! A vendor CLI that fails while printing the request it was making prints the header it sent.
-//! The unredacted tail is never handed out: [`stderr_text`] is what
-//! [`StderrTail::read`](crate::StderrTail::read) returns, so a host that logs the tail logs this
-//! form or nothing.
+//! The unredacted tail is never handed out: [`stderr_tail`], which reads what [`stderr_text`]
+//! reads and the well-known tokens, is what [`StderrTail::read`](crate::StderrTail::read)
+//! returns, so a host that logs the tail logs this form or nothing.
 //!
 //! Written as a scanner rather than as regular expressions. Three passes, in the same order and
 //! with the same shapes as the patterns they replace, so each rule can be read on its own:
@@ -54,6 +54,7 @@ mod boundaries;
 mod differential;
 mod embedded;
 mod floor;
+mod open_key;
 #[cfg(test)]
 mod reference;
 mod rules;
@@ -73,6 +74,7 @@ mod work;
 
 use std::borrow::Cow;
 
+pub(crate) use open_key::{BEGIN_LINE, OpenKey};
 use scan::{Anchor, Candidates, count_steps};
 pub(crate) use strip::{MAX_ESCAPE_BYTES, holds_string_terminator};
 pub use structured::structured;
