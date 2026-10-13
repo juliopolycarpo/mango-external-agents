@@ -92,8 +92,8 @@ pub use session::{
     resume_fallback_reason,
 };
 pub use state::{
-    SessionRevision, SessionSnapshot, SessionState, SessionStatus, SessionSubscription,
-    TransportSelection,
+    Resumability, SessionRevision, SessionSnapshot, SessionState, SessionStatus,
+    SessionSubscription, TransportSelection,
 };
 pub use stream::{EventReceiver, EventSink, ReviewStream, TerminalStatus, TurnStream};
 pub use transport::{AcpSpec, ExecutablePath, StdioSpec, TransportKind, TransportSpec, WsSpec};

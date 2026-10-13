@@ -172,6 +172,84 @@ impl TransportSelection {
     }
 }
 
+/// Whether the vendor's stored conversation is safe to resume with a strict resume.
+///
+/// A fact about the conversation on the vendor's disk, published on
+/// [`SessionSnapshot::resumability`] so a host that loses a session can decide, when it reopens
+/// one, whether to continue the stored conversation or to start a new one. The library never
+/// persists anything: the host reads this off the snapshot (or a [`SessionSubscription`] wake) and
+/// stores it beside the vendor handle.
+///
+/// `Unknown` is the default and is not a verdict. A harness that cannot say reports it, and a
+/// host reads it as "no evidence either way", never as "safe".
+///
+/// - **Claude Code** reports all four values. `Resumable` once the conversation exists and every
+///   stop since was a graceful interrupt or a normal finish; `TaintedByKill` after the child had
+///   to be force-terminated; `Unverified` after a strict resume that could not be confirmed.
+///   `Unknown` before the first `system/init`.
+/// - **Codex** and **ACP** always report `Unknown`. Codex resumes a thread by id regardless of how
+///   a turn ended, and an ACP agent decides per profile whether it can load a session, so neither
+///   has a stop outcome this library can turn into a verdict.
+///
+/// # Example
+///
+/// ```
+/// use mango_external_agents::Resumability;
+///
+/// // A host stores the value with the vendor handle and checks it before a strict resume.
+/// let stored = Resumability::TaintedByKill;
+/// assert!(!stored.allows_strict_resume());
+/// assert_eq!(stored.as_str(), "tainted-by-kill");
+/// ```
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum Resumability {
+    /// No evidence either way. The default, and all a Codex or ACP session ever reports.
+    #[default]
+    Unknown,
+    /// The conversation was written and every stop since ended it gracefully or not at all.
+    Resumable,
+    /// The vendor child had to be force-terminated, so the conversation may end at a prompt the
+    /// vendor left unfinished. Permanent for the session.
+    TaintedByKill,
+    /// A strict resume could not be confirmed: the vendor did not identify the requested
+    /// conversation, or ended before it started. Permanent for the session.
+    Unverified,
+}
+
+impl Resumability {
+    /// Whether a host may strict-resume this conversation on this value alone.
+    ///
+    /// True only for [`Resumability::Resumable`]; `Unknown` is deliberately false.
+    pub const fn allows_strict_resume(self) -> bool {
+        matches!(self, Self::Resumable)
+    }
+
+    /// Whether the conversation was found unsafe to resume. Once true it never changes back.
+    pub const fn is_tainted(self) -> bool {
+        matches!(self, Self::TaintedByKill | Self::Unverified)
+    }
+
+    /// The stable kebab-case name, the same one the serde form uses.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Resumable => "resumable",
+            Self::TaintedByKill => "tainted-by-kill",
+            Self::Unverified => "unverified",
+        }
+    }
+}
+
+impl fmt::Display for Resumability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Everything true about a session at one instant.
 ///
 /// A value, not a view: reading two fields off one snapshot reads them from the same instant,
@@ -204,6 +282,11 @@ pub struct SessionSnapshot {
     pub resumed: bool,
     /// Why a requested resume did not happen, when one was asked for and did not.
     pub fallback_reason: Option<String>,
+    /// Whether the vendor's stored conversation is safe to strict-resume.
+    ///
+    /// Published before a stop completes, so a host that reads it after
+    /// [`Session::cancel`](crate::Session::cancel) returns sees the outcome of that stop.
+    pub resumability: Resumability,
     /// When this picture was taken, from the host's clock.
     ///
     /// Re-stamped on every published change, so two snapshots of one session carry two instants.
@@ -235,6 +318,7 @@ impl fmt::Debug for SessionSnapshot {
             .field("command_count", &self.commands.len())
             .field("resumed", &self.resumed)
             .field("has_fallback_reason", &self.fallback_reason.is_some())
+            .field("resumability", &self.resumability)
             .field("observed_at", &self.observed_at)
             .finish_non_exhaustive()
     }
@@ -282,6 +366,7 @@ impl SessionSnapshot {
             commands: Vec::new(),
             resumed: false,
             fallback_reason: None,
+            resumability: Resumability::Unknown,
             observed_at,
         }
     }
@@ -438,6 +523,55 @@ impl SessionState {
         self.update(|snapshot| snapshot.commands = commands);
     }
 
+    /// Records whether the stored conversation is safe to strict-resume.
+    ///
+    /// Sticky for a tainted value: once [`Resumability::is_tainted`] is published nothing replaces
+    /// it, because a forced termination or an unconfirmed resume is not undone by a later calm
+    /// turn. The comparison happens inside the write, for the reason
+    /// [`set_status`](Self::set_status) gives, and a value equal to the current one leaves the
+    /// revision alone.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::{
+    ///     Clock, HarnessIdentity, Resumability, SessionId, SessionIds, SessionSnapshot,
+    ///     SessionState, SystemClock, TransportKind, TransportSelection,
+    /// };
+    ///
+    /// let clock = std::sync::Arc::new(SystemClock);
+    /// let state = SessionState::new(
+    ///     clock.clone(),
+    ///     SessionSnapshot::opening(
+    ///         SessionIds {
+    ///             session_id: SessionId::new("chat-1"),
+    ///             native_session_id: String::from("native-1"),
+    ///         },
+    ///         HarnessIdentity::claude(),
+    ///         TransportSelection::new(None, TransportKind::Stdio),
+    ///         clock.now(),
+    ///     ),
+    /// );
+    ///
+    /// state.set_resumability(Resumability::TaintedByKill);
+    /// state.set_resumability(Resumability::Resumable);
+    /// assert_eq!(state.snapshot().resumability, Resumability::TaintedByKill);
+    /// ```
+    pub fn set_resumability(&self, resumability: Resumability) {
+        let now = self.clock.now();
+        self.sender.send_if_modified(|current| {
+            if current.resumability == resumability || current.resumability.is_tainted() {
+                return false;
+            }
+            let mut next = SessionSnapshot::clone(current);
+            next.resumability = resumability;
+            next.revision = current.revision.next();
+            next.observed_at = now;
+            *current = Arc::new(next);
+            true
+        });
+    }
+
     /// Records what the session is now set to, bounded on the way in.
     ///
     /// The `observed` half is filled straight from whatever a vendor said about itself, and this
@@ -547,8 +681,8 @@ mod tests {
     }
 
     use super::{
-        SessionRevision, SessionSnapshot, SessionState, SessionStatus, SessionSubscription,
-        TransportSelection,
+        Resumability, SessionRevision, SessionSnapshot, SessionState, SessionStatus,
+        SessionSubscription, TransportSelection,
     };
     use crate::configuration::{Configuration, ConfigurationState};
     use crate::event::{Command, SessionId};
@@ -759,5 +893,84 @@ mod tests {
         assert!(!SessionStatus::Closing.is_usable());
         assert!(!SessionStatus::Closed.is_usable());
         assert_eq!(SessionStatus::Closing.to_string(), "closing");
+    }
+
+    /// A session opens with no evidence about its conversation, and a host must not read that as
+    /// safe.
+    #[test]
+    fn a_session_opens_with_unknown_resumability_that_does_not_allow_resume() {
+        let opened = state().snapshot().resumability;
+        assert_eq!(
+            opened,
+            Resumability::Unknown,
+            "expected opening resumability: unknown | received: {opened}"
+        );
+        assert!(!opened.allows_strict_resume());
+        assert_eq!(Resumability::default(), Resumability::Unknown);
+    }
+
+    #[test]
+    fn a_published_resumability_reaches_the_snapshot_and_bumps_the_revision() {
+        let state = state();
+        let before = state.snapshot().revision;
+        state.set_resumability(Resumability::Resumable);
+        let after = state.snapshot();
+        assert_eq!(
+            after.resumability,
+            Resumability::Resumable,
+            "expected published resumability: resumable | received: {}",
+            after.resumability
+        );
+        assert!(after.revision > before);
+        assert!(after.resumability.allows_strict_resume());
+    }
+
+    /// A tainted conversation stays tainted: a later calm turn does not make a killed prompt safe.
+    #[test]
+    fn a_tainted_resumability_is_never_replaced() {
+        for tainted in [Resumability::TaintedByKill, Resumability::Unverified] {
+            let state = state();
+            state.set_resumability(tainted);
+            let settled = state.snapshot().revision;
+            state.set_resumability(Resumability::Resumable);
+            state.set_resumability(Resumability::Unverified);
+            state.set_resumability(Resumability::TaintedByKill);
+            let received = state.snapshot();
+            assert_eq!(
+                received.resumability, tainted,
+                "expected resumability to stay: {tainted} | received: {}",
+                received.resumability
+            );
+            assert_eq!(received.revision, settled);
+            assert!(received.resumability.is_tainted());
+        }
+    }
+
+    #[test]
+    fn an_unchanged_resumability_publishes_nothing() {
+        let state = state();
+        state.set_resumability(Resumability::Resumable);
+        let settled = state.snapshot().revision;
+        state.set_resumability(Resumability::Resumable);
+        assert_eq!(state.snapshot().revision, settled);
+    }
+
+    #[test]
+    fn resumability_names_are_stable_and_round_trip_through_serde() {
+        let all = [
+            (Resumability::Unknown, "unknown"),
+            (Resumability::Resumable, "resumable"),
+            (Resumability::TaintedByKill, "tainted-by-kill"),
+            (Resumability::Unverified, "unverified"),
+        ];
+        for (value, name) in all {
+            assert_eq!(value.as_str(), name);
+            assert_eq!(value.to_string(), name);
+            let json = serde_json::to_string(&value).expect("expected a serialisable value");
+            assert_eq!(json, format!("\"{name}\""), "expected the kebab-case form");
+            let back: Resumability =
+                serde_json::from_str(&json).expect("expected the stored form to parse");
+            assert_eq!(back, value);
+        }
     }
 }
