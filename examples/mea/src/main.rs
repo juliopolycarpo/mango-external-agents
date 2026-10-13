@@ -450,8 +450,35 @@ fn refusal(error: &mango_external_agents::Error) -> String {
         mango_external_agents::Error::VersionGate { found, minimum } => {
             format!("expected version {minimum} or newer, received {found}")
         }
+        mango_external_agents::Error::Vendor(vendor) => vendor_refusal(vendor),
         other => other.to_string(),
     }
+}
+
+/// A vendor's refusal with the vendor's own words, which the library's formatter leaves out.
+///
+/// An operator running a smoke turn needs the reason: a service that is degraded, a model that
+/// does not exist and a child that died at launch all read `<code>: vendor failure` otherwise.
+/// The message is read for credential names and the well-known token prefixes again here, and
+/// bounded, whatever built the error.
+fn vendor_refusal(vendor: &mango_external_agents::VendorError) -> String {
+    let message = mango_external_agents::redact::bounded(
+        &vendor.message,
+        mango_external_agents::normalize::TextLimit::ErrorMessage,
+    )
+    .text;
+    let mut line = vendor.to_string();
+    if !message.trim().is_empty() {
+        line.push_str(": ");
+        line.push_str(message.trim());
+    }
+    if let Some(code) = &vendor.vendor_code {
+        line.push_str(&format!(" (vendor code {code})"));
+    }
+    if let Some(request) = &vendor.request_id {
+        line.push_str(&format!(" (request {request})"));
+    }
+    line
 }
 
 /// `mea` is not a host that retries, so the only requirement is that two runs do not collide.
@@ -522,6 +549,44 @@ mod tests {
             !refusal(&protocol).contains("payload-secret"),
             "expected the vendor payload to stay out, received {}",
             refusal(&protocol)
+        );
+    }
+
+    /// A vendor's refusal at open carries the vendor's reason, which the library's own formatter
+    /// leaves out. Without it an operator cannot tell a degraded service from a dead child.
+    #[test]
+    fn a_vendor_refusal_carries_the_vendors_reason_code_and_request() {
+        let vendor = Error::Vendor(
+            mango_external_agents::VendorError::new(
+                mango_external_agents::ErrorCode::from_static("acp-request-failed"),
+                "service degraded, try again later",
+            )
+            .with_vendor_code("-32603", true)
+            .with_request_id("req-7"),
+        );
+        let shown = refusal(&vendor);
+        assert_eq!(
+            shown,
+            "acp-request-failed: vendor failure: service degraded, try again later (vendor code -32603) (request req-7)",
+            "expected the vendor's reason, code and request | received: {shown}"
+        );
+    }
+
+    /// The reason is read for credentials where it is printed, whatever built the error.
+    #[test]
+    fn a_vendor_refusal_hides_a_credential_in_the_vendors_reason() {
+        let vendor = Error::Vendor(mango_external_agents::VendorError::new(
+            mango_external_agents::ErrorCode::from_static("acp-link-closed"),
+            "the agent's stderr: password=hunter2 retry with ghp_Canary4Abc9Def2Ghi7Jkl3Mno8Pqr5Stu1V",
+        ));
+        let shown = refusal(&vendor);
+        assert!(
+            !shown.contains("hunter2") && !shown.contains("ghp_Canary"),
+            "expected no credential in the printed reason | received: {shown}"
+        );
+        assert!(
+            shown.contains("the agent's stderr"),
+            "expected the reason's own words to stay | received: {shown}"
         );
     }
 
