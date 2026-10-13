@@ -29,13 +29,25 @@ the shape of its version output has not stopped working, and the host may still 
 
 Where the version comes from, in order:
 
-1. The `DiscoveryReceipt` on `OpenSession::discovery`, when the host passed one. It was bound and
-   verified for freshness, identity and executable, so no second process runs. A receipt that
-   carries no version proceeds unprobed, the handshake being the second line.
+1. The `DiscoveryReceipt` on `OpenSession::discovery`, when it vouches for the executable that will
+   be launched. A receipt is the host's word about one exact executable, so it counts only when it
+   names a resolved path, the launch uses that same resolved path (the request's, or the harness's
+   own), and it carries a version. The core has already checked its freshness, identity and the
+   host-measured fingerprints, so nothing is run twice. A receipt that fails any of those tests,
+   including one taken from a `PATH` lookup (which names no file, and `PATH` can resolve to another
+   one inside the receipt's 300 s window), vouches for nothing and the probe below runs.
 2. Otherwise one `codex --version`, run for the executable the session will spawn. That is one extra
-   short process per open and per picker call (two launches instead of one, no more); a silent
-   binary costs at most the host's `request_timeout`. A launcher that cannot start it leaves the
-   app-server launch to report that.
+   short process per open and per picker call (two launches instead of one, no more). A launcher
+   that cannot start it leaves the app-server launch to report that.
+
+A probe that never answers is bounded: at most the host's `request_timeout` for the read, then the
+process stop (`kill_grace` + `kill_grace` + `shutdown_timeout` + `shutdown_timeout`, which is
+`Deadlines::process_stop`) that reaps it. At the defaults that is 120 s + 14 s = 134 s, and then the
+open goes on as `Unknown`. The host's cancel token is read after the probe and before the
+app-server is spawned, so a shutdown that arrived meanwhile ends the open as `Error::Cancelled`
+with nothing started; the probe itself is not interrupted by it and still runs to its bound.
+`Deadlines` models no open stage (it has no row or method for opening a session), so this bound
+is stated here and in the table below rather than computed by it.
 
 The `--version` probe is the surface discovery already ran, and it starts nothing else: the process
 prints one line and exits, and a build of `codex-cli 0.150.0` was checked to leave an empty
@@ -356,6 +368,7 @@ answers `turn/interrupt` with an empty result and later ends the turn with `turn
 | Interrupt error during steer | `request_timeout`, from the interrupt's failure                  | The error is judged as it stands: process shutdown if the turn is still admitted |
 | Turn settle after ack        | `cancel_settle_timeout` (60 s default), from the acknowledgement | Process shutdown                                                                 |
 | Shutdown escalation          | `kill_grace`, then `shutdown_timeout` per teardown stage         | `Error::CleanupRequired` carrying the host's process control                     |
+| Open, version probe          | `request_timeout` for the read, then the process stop            | The open goes on as `Unknown`; a failed stop is `Error::CleanupRequired`         |
 
 The pending-start bound has two clocks. The start request's own deadline returns
 `Dispatch::AcceptanceUnknown` to its caller. The stop worker also bounds its own wait by
@@ -374,6 +387,7 @@ the method for the row, and each method's documentation says where its clock sta
 | Path                                   | Clock starts at     | Worst case                      | At the defaults | `Deadlines` method          |
 | -------------------------------------- | ------------------- | ------------------------------- | --------------- | --------------------------- |
 | Process stop `S`                       | the stop            | `kg` + `kg` + `st` + `st`       | 14 s            | `process_stop`              |
+| Open, version probe, worst case        | the call to open    | `rt` + `S`                      | 134 s           | none: not modelled          |
 | Teardown `T`                           | the teardown        | `kg` + `st` + 3 `st` + `S`      | 36 s            | `teardown`                  |
 | `close`, whichever teardown it joins   | the call to `close` | `T`                             | 36 s            | `close`, `close_worst_case` |
 | Inbound overflow, to the child's reap  | the overflow        | `st` + `T`                      | 41 s            | `overflow_to_closed`        |

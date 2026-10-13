@@ -556,27 +556,55 @@ fn refuse_below_floor(version: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Applies the version floor before any `codex app-server` is started.
+/// The version a host's receipt vouches for, when it vouches for the executable that will launch.
 ///
-/// The build's version is taken from the host's [`DiscoveryReceipt`] when it passed one — the host
-/// has already paid for that probe, and `validate_open_session` has already checked the receipt's
-/// freshness, identity and executable — and otherwise from one `codex --version`, the same
-/// short-lived process discovery runs. A receipt that carries no version, a `--version` line nobody
-/// can parse and an executable that will not run all proceed: the first two are
-/// [`GateVerdict::Unknown`], and the third is reported by the launch that follows.
+/// A receipt is the host's word about one exact executable, so it is believed only when the
+/// receipt names a resolved path, the launch uses that same resolved path, and the receipt carries
+/// a version. `validate_open_session` has already checked the receipt's freshness and its
+/// host-measured fingerprints. A receipt without a path (a `PATH` lookup, which can resolve to a
+/// different file within the receipt's window), for another path, or without a version vouches for
+/// nothing here and the caller probes.
+fn vouched_version(
+    receipt: Option<&DiscoveryReceipt>,
+    executable: &ExecutablePath,
+) -> Option<String> {
+    let receipt = receipt?;
+    let launched = executable.get()?;
+    if receipt.discovery.executable.as_ref() != Some(launched) {
+        return None;
+    }
+    receipt.discovery.version.clone()
+}
+
+/// Applies the version floor, and the host's cancellation, before any `codex app-server` starts.
+///
+/// The build's version is the host's [`DiscoveryReceipt`] when it vouches for the executable being
+/// launched (see [`vouched_version`]), and otherwise one `codex --version`, the same short-lived
+/// process discovery runs. A `--version` line nobody can parse and an executable that will not run
+/// both proceed: the first is [`GateVerdict::Unknown`], and the second is reported by the launch
+/// that follows.
+///
+/// The host's cancel token is read after the probe, so a shutdown that arrived while a silent
+/// binary held the probe open does not go on to start an app-server.
 ///
 /// # Errors
 ///
-/// [`Error::VersionGate`] when the version is parseable and below the floor.
+/// [`Error::Cancelled`] when the host was shut down, and [`Error::VersionGate`] when the version is
+/// parseable and below the floor.
 async fn refuse_outdated_before_spawn(
     host: &HostContext,
     executable: &ExecutablePath,
     receipt: Option<&DiscoveryReceipt>,
 ) -> Result<()> {
-    let version = match receipt {
-        Some(receipt) => receipt.discovery.version.clone(),
+    let version = match vouched_version(receipt, executable) {
+        Some(version) => Some(version),
         None => read_version(host, executable).await?,
     };
+    if host.cancel().is_cancelled() {
+        return Err(Error::Cancelled {
+            reason: mango_external_agents::CancelReason::Shutdown,
+        });
+    }
     refuse_below_floor(version.as_deref())
 }
 
@@ -982,3 +1010,77 @@ impl mango_external_agents::jsonrpc::PeerHandler for Silent {
 
 /// The vendor's own login command, re-exported where a host looking at the harness will find it.
 pub const CODEX_LOGIN_HINT: &str = LOGIN_HINT;
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::SystemTime;
+
+    use mango_external_agents::discovery::{Discovery, DiscoveryReceipt};
+    use mango_external_agents::identity::HarnessId;
+    use mango_external_agents::transport::ExecutablePath;
+
+    use super::{refuse_below_floor, vouched_version};
+    use crate::protocol::schema::MINIMUM_CODEX_VERSION;
+
+    fn receipt(executable: Option<&str>, version: Option<&str>) -> DiscoveryReceipt {
+        DiscoveryReceipt::new(
+            HarnessId::codex(),
+            Discovery {
+                executable: executable.map(PathBuf::from),
+                version: version.map(str::to_owned),
+                ..Discovery::not_installed()
+            },
+            SystemTime::now(),
+        )
+    }
+
+    #[test]
+    fn a_receipt_vouches_only_for_the_resolved_path_it_probed() {
+        let launched = ExecutablePath::resolved("/opt/codex/bin/codex");
+        let cases = [
+            (
+                Some("/opt/codex/bin/codex"),
+                Some("0.154.0"),
+                Some("0.154.0"),
+            ),
+            (Some("/opt/codex/bin/codex"), None, None),
+            (Some("/usr/bin/codex"), Some("0.154.0"), None),
+            (None, Some("0.154.0"), None),
+        ];
+        for (path, version, expected) in cases {
+            let received = vouched_version(Some(&receipt(path, version)), &launched);
+            assert_eq!(
+                received.as_deref(),
+                expected,
+                "expected {expected:?} for a receipt of {path:?} at {version:?} | received {received:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_launch_by_program_name_is_never_vouched_for() {
+        let received = vouched_version(
+            Some(&receipt(Some("/opt/codex/bin/codex"), Some("0.154.0"))),
+            &ExecutablePath::default(),
+        );
+        assert_eq!(
+            received, None,
+            "expected no vouched version for a PATH lookup | received {received:?}"
+        );
+        assert_eq!(vouched_version(None, &ExecutablePath::resolved("/x")), None);
+    }
+
+    #[test]
+    fn the_floor_refuses_only_a_parseable_older_version() {
+        assert!(refuse_below_floor(None).is_ok());
+        assert!(refuse_below_floor(Some("banana")).is_ok());
+        assert!(refuse_below_floor(Some(MINIMUM_CODEX_VERSION)).is_ok());
+        let refused = refuse_below_floor(Some("0.150.0"));
+        assert!(
+            matches!(&refused, Err(mango_external_agents::error::Error::VersionGate { found, minimum })
+                if found == "0.150.0" && minimum == MINIMUM_CODEX_VERSION),
+            "expected VersionGate for 0.150.0 | received {refused:?}"
+        );
+    }
+}
