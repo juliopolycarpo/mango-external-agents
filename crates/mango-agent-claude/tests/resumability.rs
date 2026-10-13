@@ -779,6 +779,85 @@ async fn a_later_finished_turn_clears_an_unfinished_one() {
     );
 }
 
+/// A child that had already exited when the interrupt was asked for did not end because of it,
+/// whatever the host's control answers about delivering one to a dead process (this fake says
+/// `Delivered`, as a control that signals a recycled or lingering pid can). The vendor's `result`
+/// never came, so the turn is unfinished.
+#[tokio::test]
+async fn an_interrupt_after_the_child_already_exited_does_not_read_resumable() {
+    for code in [143, 1, 0] {
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_graceful_interrupt()
+                .with_turn(Run::stalling([init(NATIVE_ID), ASSISTANT.to_owned()])),
+        );
+        let session = open(&launcher).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "work"))
+            .await
+            .expect("expected a turn");
+        wait_for_init(session.as_ref()).await;
+        launcher.exit_turn_holding_its_output(code);
+
+        session
+            .cancel(CancelReason::Requested)
+            .await
+            .expect("expected the cancel to land");
+        drain(session.as_ref(), &mut turn).await;
+        assert_resumability(
+            session.as_ref(),
+            Resumability::UnfinishedTurn,
+            &format!("cancel returned after the child exited {code}"),
+        );
+
+        session
+            .close(CloseReason::Requested)
+            .await
+            .expect("expected the close to land");
+        assert_resumability(
+            session.as_ref(),
+            Resumability::UnfinishedTurn,
+            &format!("after close, child exited {code}"),
+        );
+    }
+}
+
+/// The verdict is conservative, the session is not refused: a later turn the vendor finishes
+/// settles it, as after a child that died on its own.
+#[tokio::test]
+async fn an_interrupt_after_the_child_exited_leaves_the_session_usable() {
+    let launcher = Arc::new(
+        FakeClaudeCli::new()
+            .with_graceful_interrupt()
+            .with_turn(Run::stalling([init(NATIVE_ID), ASSISTANT.to_owned()]))
+            .with_turn(Run::replaying(&format!("{}\n{RESULT}", init(NATIVE_ID)))),
+    );
+    let session = open(&launcher).await;
+    let mut first = session
+        .start_turn(TurnRequest::new("turn-1", "work"))
+        .await
+        .expect("expected a turn");
+    wait_for_init(session.as_ref()).await;
+    launcher.exit_turn_holding_its_output(143);
+    session
+        .cancel(CancelReason::Requested)
+        .await
+        .expect("expected the cancel to land");
+    drain(session.as_ref(), &mut first).await;
+    assert_resumability(
+        session.as_ref(),
+        Resumability::UnfinishedTurn,
+        "cancel returned after the child exited",
+    );
+
+    let mut second = session
+        .start_turn(TurnRequest::new("turn-2", "again"))
+        .await
+        .expect("expected a session that stays usable after an interrupt that ended nothing");
+    let (_, finished) = drain(session.as_ref(), &mut second).await;
+    assert_is(finished, Resumability::Resumable, "on the later terminal");
+}
+
 // ---- Strict resume ---------------------------------------------------------------------------
 
 #[tokio::test]

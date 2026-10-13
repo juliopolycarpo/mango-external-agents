@@ -382,6 +382,15 @@ fn taint_unfinished(shared: &Shared) {
     publish_resumability(shared, &state);
 }
 
+/// [`taint_unfinished`] for a conversation the vendor has written to.
+fn taint_established_unfinished(shared: &Shared) {
+    let mut state = shared.lock();
+    if state.established {
+        state.mark_unfinished();
+        publish_resumability(shared, &state);
+    }
+}
+
 /// Publishes the verdict of [`Mutable::resumability`] while the caller still holds the lock.
 fn publish_resumability(shared: &Shared, state: &Mutable) {
     shared.core_state.set_resumability(state.resumability());
@@ -707,13 +716,23 @@ async fn run_teardown(
     )
     .await;
     match outcome {
-        Ok(outcome) => record_stop(
-            shared,
-            &taken.end,
-            taint_continuation && !matches!(outcome, Some(StopOutcome::Interrupted)),
-            reason,
-            settled,
-        ),
+        Ok(outcome) => {
+            let interrupted = matches!(outcome, Some((StopOutcome::Interrupted, _)));
+            let exited_first = outcome.is_some_and(|(_, exited)| exited);
+            // An interrupt that ended nothing leaves the verdict conservative and the session
+            // usable, as a child that dies on its own does. Nothing was written to a
+            // conversation that never reached `system/init`.
+            if taint_continuation && interrupted && exited_first {
+                taint_established_unfinished(shared);
+            }
+            record_stop(
+                shared,
+                &taken.end,
+                taint_continuation && !interrupted,
+                reason,
+                settled,
+            );
+        }
         // A stop that did not complete leaves a child that may still be mid-turn. Published
         // before the failure reaches any `cancel` or `close` waiting on it.
         // A turn the vendor finished leaves a conversation that is resumable whatever happens to
@@ -721,7 +740,7 @@ async fn run_teardown(
         Err(_) if taint_continuation => taint_unfinished(shared),
         Err(_) => {}
     }
-    teardown.finish(outcome.map(drop));
+    teardown.finish(outcome.map(|_| ()));
 }
 
 /// Releases a close waiting on a launcher that failed before it returned a child. No native work
@@ -1047,6 +1066,10 @@ impl Drop for AbandonedStart {
 
 /// Ends a child requested through [`request_stop`], if it had one yet. The pump writes events.
 ///
+/// The flag says whether the child had already exited when the stop began. The control may answer
+/// `Delivered` for a process that was not there to receive the interrupt, so an `Interrupted`
+/// outcome with that flag set ended nothing: the child left on its own, with no `result`.
+///
 /// A stop that did not prove the child gone, whether a stage ran out of time, the host's control
 /// answered with an error or its code panicked, comes back as [`Error::CleanupRequired`] carrying
 /// that control, as the Codex and ACP harnesses do. This is the one place a Claude stop failure is
@@ -1057,7 +1080,7 @@ async fn end_turn(
     reason: CancelReason,
     limits: &mango_external_agents::Limits,
     proven_gone: Arc<AtomicBool>,
-) -> Result<Option<StopOutcome>> {
+) -> Result<Option<(StopOutcome, bool)>> {
     let Some(control) = control else {
         return Ok(None);
     };
@@ -1068,11 +1091,28 @@ async fn end_turn(
     let stop = tokio::spawn({
         let control = Arc::clone(&control);
         async move {
+            // Asked before the interrupt, because afterwards a child that was already gone and a
+            // child the interrupt ended look the same. One poll: a `wait` that is ready has seen
+            // the exit, and one that is not has not.
+            // The poll is dropped before the stop starts: a control that serialises its calls
+            // would otherwise keep the interrupt and the kill waiting on it.
+            let had_exited = {
+                let mut exit = Box::pin(control.wait());
+                let seen = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(matches!(
+                        exit.as_mut().poll(cx),
+                        std::task::Poll::Ready(Ok(_))
+                    ))
+                })
+                .await;
+                drop(exit);
+                seen
+            };
             let stopped = stop_process_with_limits(control.as_ref(), reason, &limits).await;
             if stopped.is_ok() {
                 proven_gone.store(true, Ordering::Release);
             }
-            stopped
+            stopped.map(|outcome| (outcome, had_exited))
         }
     });
     match stop.await {
