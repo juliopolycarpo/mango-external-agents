@@ -615,6 +615,54 @@ async fn codex_teardown_a_panicking_cleanup_fails_every_close_waiter() {
     );
 }
 
+/// A panic in the host's process control is the host's failure, not the app-server's: the close
+/// error names the host's control as the peer, and still carries that control for reconciliation.
+#[tokio::test]
+async fn codex_teardown_a_panicking_control_is_named_as_the_peer() {
+    let inner = Arc::new(FakeLauncher::new());
+    inner.push(Transcript::load("turn").as_process());
+    let host = host_context(
+        Arc::new(PanickingKillLauncher {
+            inner: Arc::clone(&inner),
+        }),
+        None,
+        teardown_limits(),
+        mango_external_agents::CancelToken::new(),
+        None,
+    );
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("panicking-control-peer"))
+        .await
+        .expect("expected a session");
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        session.close(CloseReason::Requested),
+    )
+    .await
+    .expect("expected close: settled after a panicking control | received: still pending")
+    .expect_err("expected close result: Err(CleanupRequired) | received: Ok");
+
+    assert!(
+        error.cleanup_control().is_some(),
+        "expected a cleanup-required error carrying the host's control | received: {error:?}"
+    );
+    let mango_external_agents::Error::Link { peer, message } = error.cause() else {
+        panic!(
+            "expected the cause: Error::Link | received: {:?}",
+            error.cause()
+        );
+    };
+    assert_eq!(
+        peer, "the host's process control",
+        "expected the Link peer: the host's process control | received: {peer} ({message})"
+    );
+    assert!(
+        message.ends_with("received: it panicked"),
+        "expected the Link message ending in `received: it panicked` | received: {message}"
+    );
+}
+
 /// A session dropped on a thread with no Tokio runtime still reaps its child, through the runtime
 /// it was opened on, instead of silently skipping cleanup.
 #[tokio::test(flavor = "multi_thread")]
