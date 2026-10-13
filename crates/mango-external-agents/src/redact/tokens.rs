@@ -69,35 +69,68 @@ pub(super) fn tail_hides(text: &str) -> Vec<Hide> {
     union(vec![orphaned_end_hides(text), hides(text)])
 }
 
-/// The lines of base64 at the start of `text` and the private key's end marker that closes them:
-/// the part of a key a cut left, when the cut dropped the begin marker and the lines above it.
+/// The lines of a key's body at the start of `text` and the private key's end marker that closes
+/// them: the part of a key a cut left, when the cut dropped the begin marker and the lines above it.
 ///
 /// Only the start of the text is read this way. A key with its begin marker is the block read's;
 /// a line of base64 anywhere else, with no begin marker, is as likely a hash or an attachment as a
-/// key. Every line before the marker must be base64 (padded, with no `=` inside it), so a sentence,
-/// a path or an assignment above it is not a key's body, and the read stops at
-/// [`MAX_BLOCK_BYTES`], the farthest a block is searched for its end marker.
+/// key. Every line before the marker has to be a line a key's body has (see [`is_key_body_line`]),
+/// so a sentence, a path or an assignment above it is not a key's body, and the read stops at
+/// [`MAX_BLOCK_BYTES`], the farthest a block is searched for its end marker. Spaces and tabs in
+/// front of a line, as an indented log writes it, are allowed.
 fn orphaned_end_hides(text: &str) -> Vec<Hide> {
     let bytes = text.as_bytes();
     let mut at = 0;
     while at <= MAX_BLOCK_BYTES {
-        let run_end = take_while(bytes, at, is_base64);
-        count_steps(run_end - at + 1);
-        if !is_padded_base64(&bytes[at..run_end]) {
-            return Vec::new();
-        }
-        if bytes[run_end..].starts_with(b"-----END ") {
-            return end_marker_close(bytes, run_end)
+        let start = take_while(bytes, at, is_blank);
+        if bytes[start..].starts_with(b"-----END ") {
+            return end_marker_close(bytes, start)
                 .map(|close| Hide::marker(0, close))
                 .into_iter()
                 .collect();
         }
-        match line_break(bytes, run_end) {
+        // A backslash ends the line's content too: it may be the `\n` of a JSON string.
+        let end = take_while(bytes, start, |byte| !matches!(byte, b'\n' | b'\r' | b'\\'));
+        count_steps(end - at + 1);
+        if !is_key_body_line(&bytes[start..end]) {
+            return Vec::new();
+        }
+        match line_break(bytes, end) {
             Some(after) => at = after,
             None => return Vec::new(),
         }
     }
     Vec::new()
+}
+
+fn is_blank(byte: u8) -> bool {
+    (byte == b' ') | (byte == b'\t')
+}
+
+/// The headers an encrypted PEM key carries between its begin marker and its base64 (RFC 1421), and
+/// the armor headers of a PGP key block (RFC 4880).
+const BODY_HEADERS: [&[u8]; 6] = [
+    b"Proc-Type:",
+    b"DEK-Info:",
+    b"Version:",
+    b"Comment:",
+    b"Charset:",
+    b"Hash:",
+];
+
+/// Whether `line`, without the blanks around it, is a line the body of a private key has: nothing,
+/// a line of padded base64, one of its headers, or the checksum line of a PGP block (`=` and four
+/// base64 characters).
+fn is_key_body_line(line: &[u8]) -> bool {
+    let line = line.trim_ascii_end();
+    if line.is_empty() || (line.iter().all(|byte| is_base64(*byte)) && is_padded_base64(line)) {
+        return true;
+    }
+    if BODY_HEADERS.iter().any(|header| line.starts_with(header)) {
+        return true;
+    }
+    matches!(line, [b'=', checksum @ ..]
+        if checksum.len() == 4 && checksum.iter().all(|byte| is_base64(*byte) && *byte != b'='))
 }
 
 /// Where the end marker of a private key that starts at `start` closes, when it is one.

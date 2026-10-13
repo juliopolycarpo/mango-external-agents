@@ -1749,6 +1749,9 @@ mod tests {
         ]
     }
 
+    /// A pin, not a regression: the cut drops whole lines, which is why a token with a prefix needs
+    /// nothing more than the token read. It holds with `stderr_text` as well; it fails if the cut
+    /// ever keeps the back half of a line.
     #[test]
     fn a_token_in_a_line_the_cut_drops_leaves_no_half_of_it_behind() {
         for token in synthetic_tokens() {

@@ -229,6 +229,11 @@ own deployment.
     (the child died mid-key): what is left is base64 lines with nothing to recognise them by;
   - a bare token outside the closed list, and any credential with no prefix: an AWS secret access
     key (40 characters of base64) or an Azure key has nothing to recognise it by;
+  - a key's body after a cut when the lines above the end marker are not a key's (a timestamp or an
+    agent's tag in front of each line): only blanks in front, base64, the headers of an encrypted
+    key and a PGP checksum line are read;
+  - a token a control byte the stripper removes glues to the word next to it (`progress\rghp_...`
+    reads as one run, in `stderr_text` as in `stderr_tail`);
   - a token glued to other name characters (`_ghp_..._`, `ghp_...-`), behind an encoding (`%20ghp_...`,
     `\u003cghp_...`), or with a prefix the list does not hold; a pagination cursor made of two base64
     JSON parts and a word is a web token to the rule;

@@ -794,6 +794,46 @@ fn a_key_whose_begin_line_was_cut_loses_its_lines_and_its_end_marker() {
     assert_eq!(stderr_tail(&json), "[REDACTED]\\n\",\"id\":7}");
 }
 
+/// Found by the review of the branch: a key written by an indented log, an encrypted PEM key with
+/// its headers, and a PGP block with its checksum line are a key's body too.
+#[test]
+fn a_cut_key_is_read_through_indentation_headers_and_a_checksum_line() {
+    let pgp_end = concat!("-----END PGP PRIV", "ATE KEY BLOCK-----");
+    for (what, text, expected) in [
+        (
+            "indented lines",
+            format!("  {KEY_LINE}\n  {END}\nafter"),
+            "[REDACTED]\nafter",
+        ),
+        (
+            "tab indent and a trailing space",
+            format!("\t{KEY_LINE} \n\t{END}\nafter"),
+            "[REDACTED]\nafter",
+        ),
+        (
+            "a PGP checksum line",
+            format!("{KEY_LINE}\n=AbCd\n{pgp_end}\nafter"),
+            "[REDACTED]\nafter",
+        ),
+        (
+            "the headers of an encrypted key",
+            format!("DEK-Info: AES-128-CBC,0123456789ABCDEF\n\n{KEY_LINE}\n{END}\nafter"),
+            "[REDACTED]\nafter",
+        ),
+        (
+            "blank lines between",
+            format!("{KEY_LINE}\n\n{KEY_LINE}\n{END}\nafter"),
+            "[REDACTED]\nafter",
+        ),
+    ] {
+        let received = stderr_tail(&text);
+        assert_eq!(
+            received, expected,
+            "expected {what} read as the body of a cut key | input {text:?}"
+        );
+    }
+}
+
 #[test]
 fn only_base64_lines_at_the_start_and_a_private_keys_end_marker_are_read_as_a_cut_key() {
     let certificate_end = "-----END CERTIFICATE-----";
