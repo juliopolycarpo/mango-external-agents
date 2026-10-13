@@ -55,7 +55,7 @@ pub(super) fn stream(random: &mut Random) -> Stream {
     let eol = if random.below(4) == 0 { "\r\n" } else { "\n" };
     let mut text = String::new();
     let mut canary = 0;
-    let mut line = |text: &mut String, with: &str| {
+    let line = |text: &mut String, with: &str| {
         text.push_str(prefix);
         text.push_str(with);
         text.push_str(eol);
