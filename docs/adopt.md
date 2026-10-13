@@ -184,7 +184,9 @@ match a failure on its `code` and `vendor_code`, never on its message.
   It is not a cache and nothing in the library stores one.
 - `Session::snapshot()` → a `SessionSnapshot`: the two ids, the harness identity, the transport
   selection, the lifecycle status, this session's capabilities, the configuration state, the
-  configuration catalog, the slash commands, and whether the vendor resumed. It is a value, so two
+  configuration catalog, the slash commands, whether the vendor resumed, and `resumability` (whether
+  the stored conversation is safe to strict-resume; see
+  [Resumability after a stop](harness-claude.md#resumability-after-a-stop)). It is a value, so two
   fields read off one snapshot were read at one instant.
 - `Session::subscribe()` → a `SessionSubscription` that cannot miss a change made after it was
   opened: subscribing *is* reading, so there is no window between the read and the subscription.

@@ -180,6 +180,11 @@ impl TransportSelection {
 /// persists anything: the host reads this off the snapshot (or a [`SessionSubscription`] wake) and
 /// stores it beside the vendor handle.
 ///
+/// `Resumable` describes a conversation at rest. It is published as soon as the vendor proves the
+/// conversation exists, while the first turn may still be running, so a host that loses the
+/// session mid-turn must not trust a stored `Resumable`: when its own `RecoveryRecord` shows a turn
+/// with no terminal at that moment, treat the conversation as `TaintedByKill`.
+///
 /// `Unknown` is the default and is not a verdict. A harness that cannot say reports it, and a
 /// host reads it as "no evidence either way", never as "safe".
 ///

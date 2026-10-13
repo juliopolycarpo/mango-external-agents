@@ -285,9 +285,18 @@ returns, and a `SessionSubscription` wakes for it.
 | `Unverified`    | A strict resume was not confirmed: another handle, or the CLI ended before `system/init`.           | do not; open a new one |
 
 A tainted value is permanent for the session and equals the refusal `start_turn` gives
-(`Error::Cancelled` with the recorded reason); the first cause wins. A host that persists the
-vendor handle stores the value beside it whenever it changes, and strict-resumes a stored
-conversation only when it reads `Resumable`. `Resumability::allows_strict_resume` is that test.
+(`Error::Cancelled` with the recorded reason); the first cause wins. Every way the harness stops a
+child records it the same way: `cancel`, `close`, a cancelled host `CancelToken` and a dropped
+`TurnStream` each read `Resumable` after a graceful interrupt and `TaintedByKill` after a kill.
+A host that persists the vendor handle stores the value beside it whenever it changes, and
+strict-resumes a stored conversation only when it reads `Resumable`.
+`Resumability::allows_strict_resume` is that test.
+
+**`Resumable` describes a conversation at rest.** It turns true when `system/init` arrives, while
+the first turn is still running. A host that loses the session mid-turn (a crash, a dropped
+connection) never sees a stop recorded, and the child may have died without one. If the host's own
+`RecoveryRecord` shows a turn with no terminal when the session was lost, treat the conversation as
+`TaintedByKill` whatever value was stored.
 
 ```rust,ignore
 session.cancel(CancelReason::Requested).await?;
