@@ -343,6 +343,20 @@ impl Layer for Tail {
     }
 }
 
+/// A stderr tail whose first byte is inside a private key: [`Tail`], and the lines of the key that
+/// the cut left at its start (`tokens::leading_key_run_hides`).
+pub(super) struct TailInsideKey;
+
+impl Layer for TailInsideKey {
+    fn own_spans(&self, plain: &str, marked: bool) -> Option<Vec<Hide>> {
+        Some(union(vec![
+            floor::current_hides(plain, marked),
+            tokens::tail_hides(plain),
+            tokens::leading_key_run_hides(plain),
+        ]))
+    }
+}
+
 /// The spans of `plain`, the text the stripper left, that every reader and `layer` hide.
 ///
 /// The readers are the rules of the release before (`floor`), the reads added since

@@ -591,7 +591,13 @@ impl StderrTail {
     /// assert_eq!(tail.read(), "Authorization: Bearer [REDACTED]");
     /// ```
     pub fn read(&self) -> String {
-        self.read_with(redact::stderr_tail)
+        self.read_with(|text, inside_key| {
+            if inside_key {
+                redact::stderr_tail_inside_key(text)
+            } else {
+                redact::stderr_tail(text)
+            }
+        })
     }
 
     /// [`read`](Self::read) with the redactor injected, so a test can stand inside the window
@@ -603,18 +609,12 @@ impl StderrTail {
     /// concurrent reader runs the same function on its own copy. A push that lands after the copy
     /// is not part of this read and is part of the next, so the tail is read as one snapshot, in
     /// push order.
-    fn read_with(&self, reader: impl FnOnce(&str) -> String) -> String {
+    fn read_with(&self, reader: impl FnOnce(&str, bool) -> String) -> String {
         let (copy, inside_key) = {
             let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             (state.buffer.clone(), state.key.is_open())
         };
-        let text = String::from_utf8_lossy(&copy);
-        if inside_key && !copy.is_empty() {
-            // The cut dropped the begin line of a key: put one back, so the lines of the key that
-            // were kept are read as the body of a block and hidden up to its end marker.
-            return reader(&format!("{}{text}", redact::BEGIN_LINE));
-        }
-        reader(&text)
+        reader(&String::from_utf8_lossy(&copy), inside_key)
     }
 }
 
@@ -1895,7 +1895,7 @@ mod tests {
             "expected the body and the end marker hidden | received {shown:?}"
         );
         assert_eq!(
-            shown, "[REDACTED]\n",
+            shown, "stderr | [REDACTED]\n",
             "expected the key hidden whole | received {shown:?}"
         );
     }
@@ -2001,6 +2001,80 @@ mod tests {
         );
     }
 
+    /// The reviewer's first repro: a begin marker that touches an escape is a begin marker to the
+    /// redactor, so the tail must know the key was open.
+    #[test]
+    fn a_key_behind_colour_codes_is_hidden_when_the_cut_drops_its_begin_line() {
+        let base64 = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj";
+        let mut stream = String::from("filler one\nfiller two\n");
+        stream.push_str("\u{1b}[36m-----BEGIN PRIVATE KEY-----\n");
+        for n in 0..8 {
+            stream.push_str(&format!("\u{1b}[36m{}{n}\n", &base64[..base64.len() - 1]));
+        }
+        stream.push_str("filler three\n");
+        let (kept, shown) = shown_in_tail(&stream, 128, usize::MAX);
+        assert!(
+            !kept.contains("BEGIN") && kept.contains("MIIEvQ"),
+            "expected the cut to drop the begin line and keep body lines | received {kept:?}"
+        );
+        assert!(
+            !shown.contains("MIIEvQ"),
+            "expected the body behind the colour codes hidden | received {shown:?}"
+        );
+    }
+
+    /// The third: a line of the key that is still being written is the tail's last line.
+    #[test]
+    fn a_key_line_still_being_written_is_hidden_with_the_lines_before_it() {
+        let stream = format!("{}\nW1tsfzv+rEektzs", prefixed_key("", 3, false).trim_end());
+        let (kept, shown) = shown_in_tail(&stream, 24, usize::MAX);
+        assert!(
+            !kept.contains("BEGIN") && kept.ends_with("W1tsfzv+rEektzs"),
+            "expected the cut to drop the begin line and keep the fragment | received {kept:?}"
+        );
+        assert!(
+            !shown.contains("W1tsfzv"),
+            "expected the line being written hidden | received {shown:?}"
+        );
+    }
+
+    /// A begin marker in prose, and an end marker in prose three hundred lines later, hide nothing
+    /// ordinary on any read of a long log in between: the tail starts inside a key for as long as
+    /// the state is open, and reads only the leading run of key-shaped lines as a key's.
+    #[test]
+    fn prose_that_mentions_the_markers_hides_no_ordinary_line_of_a_long_log() {
+        let (begin, end) = (
+            ["-----BEGIN PRIV", "ATE KEY-----"].concat(),
+            ["-----END PRIV", "ATE KEY-----"].concat(),
+        );
+        let tail = StderrTail::with_capacity(16 * 1024);
+        let mut checked = 0;
+        for n in 0..6000 {
+            let line = match n {
+                1000 => format!("note: a PEM file starts with {begin} on a line of its own\n"),
+                1300 => format!("note: and it ends with {end} on another\n"),
+                _ => format!("INFO request {n} finished in 12ms status=200 path=/v1/items\n"),
+            };
+            tail.push(line.as_bytes());
+            if n % 7 != 0 {
+                continue;
+            }
+            let (kept, shown) = (raw(&tail), tail.read());
+            if kept.contains("note: ") {
+                continue;
+            }
+            checked += 1;
+            assert_eq!(
+                shown, kept,
+                "expected an ordinary log read unchanged after line {n} | received {shown:?}"
+            );
+        }
+        assert!(
+            checked > 700,
+            "expected most reads checked | received {checked}"
+        );
+    }
+
     #[test]
     fn a_value_line_dropped_after_a_cut_is_followed_by_an_intact_diagnostic() {
         let tail = StderrTail::with_capacity(32);
@@ -2082,7 +2156,7 @@ mod tests {
         tail.push(b"first line\nAPI_KEY=first-secret\n");
         let mid = MidRedaction::new(&tail, b"later line\nAPI_KEY=later-secret\n");
 
-        let read = tail.read_with(|text| mid.redact(text));
+        let read = tail.read_with(|text, _| mid.redact(text));
 
         let observed = mid.observed.into_inner();
         assert_eq!(

@@ -3,26 +3,36 @@
 //! A tail is cut on a line, so a key written over many lines can lose its begin line and keep the
 //! lines under it. The block read starts from the begin marker, and the tail no longer has it:
 //! [`OpenKey`] remembers that the bytes dropped before the tail's first byte opened a key and did
-//! not close it, so the reader can be told the tail starts inside one.
+//! not close it, so the reader can be told the tail starts inside one
+//! (`redact::stderr_tail_inside_key`).
+//!
+//! The markers are looked for in the text as the redactor reads it, with the escapes and the
+//! control characters the stripper takes out removed: `ESC[36m-----BEGIN PRIVATE KEY-----` is a
+//! begin marker to the redactor, so it is one here.
 
-use super::tokens::{KeyMark, MAX_MARK_BYTES, last_key_mark};
+use super::strip::strip_marking;
+use super::tokens::{KeyMark, MAX_BLOCK_BYTES, MAX_MARK_BYTES, last_key_mark, last_key_mark_after};
 
-/// The bytes of the dropped text kept to find a marker that a drop splits in two.
-const CARRY: usize = MAX_MARK_BYTES;
+/// The raw bytes kept from what was fed, so that a marker, or an escape in front of or inside one,
+/// that a drop splits is read whole.
+const CARRY: usize = 256;
 
-/// How many bytes after a begin marker an open key stays open. A block is closed by an end marker
-/// at most 16 KiB after its begin marker, and a key's lines of base64 are 64 or 76 characters, so a
-/// key that is still open after this much was a sentence that mentioned a marker, not a key.
-const REACH: usize = 64 * 1024;
+/// How many bytes of the carry a marker split by a drop can be in.
+const WINDOW: usize = MAX_MARK_BYTES;
 
-/// The begin line to put in front of a tail that starts inside a key, so the block read hides the
-/// lines under it, up to the end marker, as it would have with the begin line the cut dropped.
-pub(crate) const BEGIN_LINE: &str = "-----BEGIN PRIVATE KEY-----\n";
+/// How many bytes of a drop are read at a time.
+const BLOCK: usize = 4096;
+
+/// How many bytes after a begin marker an open key stays open: as far as an end marker closes a
+/// block. A key that is still open after this much was a sentence that mentioned a marker.
+const REACH: usize = MAX_BLOCK_BYTES;
 
 /// The state of the private-key markers in the text dropped so far.
 ///
-/// Fed every byte the tail drops, in order. Its state is two integers, a flag and a fixed carry of
-/// [`CARRY`] bytes whatever is fed to it, and feeding it costs a read of the bytes fed.
+/// Fed every byte the tail drops, in order. Its state is a flag, a counter and a fixed carry of
+/// [`CARRY`] bytes whatever is fed to it. Text of printable ASCII is searched for `-----` and
+/// nothing else; text with anything the stripper takes out is stripped first, with the carry in
+/// front of it.
 ///
 /// # Example
 ///
@@ -36,7 +46,7 @@ pub(crate) const BEGIN_LINE: &str = "-----BEGIN PRIVATE KEY-----\n";
 #[derive(Debug)]
 pub(crate) struct OpenKey {
     open: bool,
-    /// Bytes fed since the begin marker that opened the key.
+    /// Bytes fed since the marker that set the state.
     since: usize,
     carry: [u8; CARRY],
     carried: usize,
@@ -53,6 +63,43 @@ impl Default for OpenKey {
     }
 }
 
+/// Whether `bytes` are printable ASCII and line breaks: text the stripper would leave as it is.
+fn is_plain(bytes: &[u8]) -> bool {
+    // Not `all`: a scan with no early exit is the one the compiler turns into vector code.
+    bytes.iter().fold(true, |plain, byte| {
+        plain & matches!(byte, b' '..=b'~' | b'\n' | b'\t')
+    })
+}
+
+/// Whether a drop can end a marker. A marker ends in a hyphen, so a drop with none is skipped by the
+/// standard library's byte search. Otherwise, in one pass that the compiler turns into vector code: the
+/// closing dashes of a marker are five hyphens after a capital or a space (a label's last
+/// character), a byte the stripper takes out can sit inside the dashes or in front of them, and
+/// a hyphen first can be the rest of dashes the carry ends with. Without one, no marker ends in
+/// the drop. A line of dashes and nothing else is none of these.
+fn may_end_a_marker(dropped: &[u8]) -> bool {
+    if !dropped.contains(&b'-') {
+        return false;
+    }
+    let plain_byte = |byte: u8| matches!(byte, b' '..=b'~' | b'\n' | b'\t');
+    let (dashes, stripped) = dropped
+        .windows(6)
+        .fold((false, false), |(dashes, stripped), at| {
+            let after_label = at[0].is_ascii_uppercase() | (at[0] == b' ');
+            let five = (at[1] == b'-') & (at[2] == b'-') & (at[3] == b'-') & (at[4] == b'-');
+            (
+                dashes | (after_label & five & (at[5] == b'-')),
+                stripped | !plain_byte(at[0]),
+            )
+        });
+    // The last five bytes start no window.
+    let end = dropped.len().saturating_sub(5);
+    dashes
+        || stripped
+        || dropped.first() == Some(&b'-')
+        || !dropped[end..].iter().all(|byte| plain_byte(*byte))
+}
+
 impl OpenKey {
     /// Whether the text fed ends inside a private key: its last marker is a begin marker, which
     /// no end marker has closed and [`REACH`] has not passed.
@@ -60,40 +107,52 @@ impl OpenKey {
         self.open
     }
 
-    /// The marker the state is the result of.
-    fn state(&self) -> KeyMark {
-        if self.open {
-            KeyMark::Begin
-        } else {
-            KeyMark::End
+    /// Reads the next bytes the tail dropped.
+    ///
+    /// A long drop is read a block at a time, so that a block with nothing that can end a marker
+    /// costs one pass and a marker costs the read of its block and no more.
+    pub(crate) fn feed(&mut self, dropped: &[u8]) {
+        for block in dropped.chunks(BLOCK) {
+            self.feed_block(block);
         }
     }
 
-    /// Reads the next bytes the tail dropped.
-    pub(crate) fn feed(&mut self, dropped: &[u8]) {
-        if dropped.is_empty() {
-            return;
-        }
-        // A marker the drop splits is read in a window over the end of what was fed and the start
-        // of what is fed now; the markers inside `dropped` are read in `dropped` itself.
-        let head = dropped.len().min(CARRY);
-        let mut window = [0u8; 2 * CARRY];
-        window[..self.carried].copy_from_slice(&self.carry[..self.carried]);
-        window[self.carried..self.carried + head].copy_from_slice(&dropped[..head]);
-        let joined = last_key_mark(&window[..self.carried + head]);
-        // The marker the window finds is new only when it is not the state the carry already left.
-        let marker = last_key_mark(dropped).or(joined.filter(|mark| *mark != self.state()));
+    fn feed_block(&mut self, dropped: &[u8]) {
+        let kept = &self.carry[..self.carried];
+        let marker = if !may_end_a_marker(dropped) {
+            None
+        } else if is_plain(dropped) && is_plain(kept) {
+            // A marker inside `dropped` is read there; one that the drop splits is read in a
+            // window over the end of the carry and the start of the drop.
+            let tail = &kept[kept.len().saturating_sub(WINDOW)..];
+            let mut window = [0u8; 2 * WINDOW];
+            let head = dropped.len().min(WINDOW);
+            window[..tail.len()].copy_from_slice(tail);
+            window[tail.len()..tail.len() + head].copy_from_slice(&dropped[..head]);
+            let split = last_key_mark_after(&window[..tail.len() + head], tail.len());
+            last_key_mark(dropped).or(split)
+        } else if dropped.contains(&b'-') {
+            // A marker is dashes, and the stripper adds none: a drop with no hyphen in it ends
+            // no marker, whatever the carry holds.
+            let joined = [kept, dropped].concat();
+            let (plain, _) = strip_marking(&String::from_utf8_lossy(&joined));
+            let (before, _) = strip_marking(&String::from_utf8_lossy(kept));
+            last_key_mark_after(plain.as_bytes(), before.len())
+        } else {
+            None
+        };
         match marker {
             Some(KeyMark::Begin) => (self.open, self.since) = (true, 0),
             Some(KeyMark::End) => (self.open, self.since) = (false, 0),
-            None => self.since = self.since.saturating_add(dropped.len()),
+            None => {}
         }
+        self.since = self.since.saturating_add(dropped.len());
+        self.keep(dropped);
         if self.since > REACH {
             // A key this old was a sentence that mentioned a marker. What the carry holds is not
             // read again, or the marker in it would open the key once more.
             (self.open, self.since, self.carried) = (false, 0, 0);
         }
-        self.keep(dropped);
     }
 
     /// The last [`CARRY`] bytes of everything fed.
@@ -177,6 +236,72 @@ mod tests {
         assert!(
             !fed(&one_byte).is_open(),
             "expected closed with one-byte drops"
+        );
+    }
+
+    #[test]
+    fn a_marker_behind_an_escape_or_with_one_inside_is_a_marker() {
+        for text in [
+            "\u{1b}[36m-----BEGIN PRIVATE KEY-----\n",
+            "\u{1b}[1m-----BEGIN PRIVATE KEY-----\u{1b}[0m\n",
+            "-----BEGIN \u{1b}[0mPRIVATE KEY-----\n",
+            "-----BEGIN PRIVATE\u{1b}[0m KEY-----\n",
+            "\u{1b}]0;title\u{7}-----BEGIN PRIVATE KEY-----\n",
+            "\u{0}-----BEGIN PRIVATE KEY-----\n",
+        ] {
+            assert!(
+                fed(&[text.as_bytes()]).is_open(),
+                "expected {text:?} to open a key | received closed"
+            );
+            let one_piece = [text.as_bytes(), b"QUJD\n", b"\x1b[36m", END].concat();
+            assert!(
+                !fed(&[&one_piece]).is_open(),
+                "expected the end marker behind an escape to close it | received open"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_drop_that_can_end_a_marker_is_read() {
+        for (drop, expected) in [
+            ("2026-10-13T10:00:00Z request 7 finished in 12ms\n", false),
+            ("a-b -c d- e--f ---- g\n", false),
+            ("x\n-----\n", false),
+            ("x\n----------------------------------------\n", false),
+            ("-----BEGIN PRIVATE KEY-----\n", true),
+            ("PRIVATE KEY-----", true),
+            ("stderr | -----", true),
+            ("-- and the rest of the dashes", true),
+            ("text\u{1b}[0m---", true),
+            ("text\u{7}-", true),
+            ("text\u{7}\u{1b}[0m", false),
+            ("-----", true),
+            ("abc", false),
+            ("", false),
+        ] {
+            assert_eq!(
+                may_end_a_marker(drop.as_bytes()),
+                expected,
+                "expected {drop:?} to be {}",
+                if expected { "read" } else { "skipped" }
+            );
+        }
+    }
+
+    #[test]
+    fn an_escape_split_by_a_drop_does_not_hide_the_marker_behind_it() {
+        let all = "\u{1b}[36m-----BEGIN PRIVATE \u{1b}[0mKEY-----\nQUJD\n".as_bytes();
+        for cut in 0..=all.len() {
+            let key = fed(&[&all[..cut], &all[cut..]]);
+            assert!(
+                key.is_open(),
+                "expected open when the drop splits at {cut} of {all:?} | received closed"
+            );
+        }
+        let one_byte: Vec<&[u8]> = all.chunks(1).collect();
+        assert!(
+            fed(&one_byte).is_open(),
+            "expected open with one-byte drops"
         );
     }
 

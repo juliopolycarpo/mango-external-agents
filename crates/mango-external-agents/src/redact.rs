@@ -74,7 +74,7 @@ mod work;
 
 use std::borrow::Cow;
 
-pub(crate) use open_key::{BEGIN_LINE, OpenKey};
+pub(crate) use open_key::OpenKey;
 use scan::{Anchor, Candidates, count_steps};
 pub(crate) use strip::{MAX_ESCAPE_BYTES, holds_string_terminator};
 pub use structured::structured;
@@ -157,6 +157,13 @@ pub fn stderr_text(raw: &str) -> String {
 /// ```
 pub fn stderr_tail(raw: &str) -> String {
     read_until_stable(raw, &union::Tail)
+}
+
+/// [`stderr_tail`] for a tail whose first byte is inside a private key, because the begin marker
+/// was in the text the tail's cut dropped: the lines of the key at the start of the text are hidden
+/// too (`tokens::leading_key_run_hides`).
+pub(crate) fn stderr_tail_inside_key(raw: &str) -> String {
+    read_until_stable(raw, &union::TailInsideKey)
 }
 
 /// What a vendor's message is shown as: everything [`stderr_text`] hides, and the well-known tokens

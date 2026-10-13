@@ -476,6 +476,10 @@ fn the_tail_never_shows_what_the_whole_stream_hides() {
             }
         }
     });
+    eprintln!(
+        "reads held to the whole stream: {}",
+        streams::READS.load(std::sync::atomic::Ordering::Relaxed)
+    );
 }
 
 #[test]

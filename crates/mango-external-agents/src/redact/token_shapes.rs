@@ -1019,3 +1019,86 @@ fn a_private_key_mark_is_a_begin_or_end_marker_of_a_private_key_and_nothing_else
         );
     }
 }
+
+/// A tail that starts inside a private key hides the leading run of the key's lines and what ends
+/// it, and the first line that is not a key's line ends the run.
+#[test]
+fn a_tail_inside_a_key_hides_the_leading_run_of_the_keys_lines_and_no_more() {
+    use super::stderr_tail_inside_key as inside;
+    let long = KEY_LINE;
+    let shorter = "c2hvcnRlci1saW5l";
+    for (what, text, expected) in [
+        (
+            "base64 lines then ordinary text",
+            format!("{long}\n{long}\nINFO request 7 finished\n"),
+            "[REDACTED]\nINFO request 7 finished\n".to_owned(),
+        ),
+        (
+            "base64 lines, the shorter last line and the end marker",
+            format!("{long}\n{long}\n{shorter}\n{END}\nafter\n"),
+            "[REDACTED]\nafter\n".to_owned(),
+        ),
+        (
+            "the end marker alone",
+            format!("{END}\nafter\n"),
+            "[REDACTED]\nafter\n".to_owned(),
+        ),
+        (
+            "a prefix on every line",
+            format!("stderr | {long}\nstderr | {long}\nstderr | {END}\nafter\n"),
+            "stderr | [REDACTED]\nafter\n".to_owned(),
+        ),
+        (
+            "a prefix with an escape and CRLF",
+            format!("\u{1b}[36m{long}\r\n\u{1b}[36m{long}\r\nINFO ok\r\n"),
+            "[REDACTED]\nINFO ok\n".to_owned(),
+        ),
+        (
+            "PEM headers, a blank line and the body",
+            format!(
+                "Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0123456789ABCDEF\n\n{long}\nINFO ok\n"
+            ),
+            "[REDACTED]\nINFO ok\n".to_owned(),
+        ),
+        (
+            "a PGP checksum line",
+            format!("{long}\n=AbCd\n{END}\nafter\n"),
+            "[REDACTED]\nafter\n".to_owned(),
+        ),
+        (
+            "a line still being written at the end of the tail",
+            format!("{long}\n{long}\nW1tsfzv+rEektzs"),
+            "[REDACTED]".to_owned(),
+        ),
+        (
+            "a prose line first",
+            format!("expected the header to be present\n{long}\n"),
+            format!("expected the header to be present\n{long}\n"),
+        ),
+        (
+            "base64 lines with another prefix than the first line's",
+            format!("[a] {long}\n[b] {long}\n"),
+            format!("[a] [REDACTED]\n[b] {long}\n"),
+        ),
+        (
+            "an ordinary line after one short line of base64",
+            format!("{long}\nok\nINFO request 7 finished\n"),
+            "[REDACTED]\nok\nINFO request 7 finished\n".to_owned(),
+        ),
+    ] {
+        let hidden = inside(&text);
+        assert_eq!(
+            hidden, expected,
+            "expected {what} read as the start of a key | input {text:?}"
+        );
+    }
+}
+
+/// Ordinary text at the start of a tail is not a key, whether or not the tail is inside one.
+#[test]
+fn a_tail_inside_a_key_leaves_ordinary_lines_alone() {
+    let text =
+        "INFO request 7 finished in 12ms\nWARN retrying the connection\ndeadbeef is a word\n";
+    assert_eq!(super::stderr_tail_inside_key(text), text);
+    assert_eq!(super::stderr_tail(text), text);
+}
