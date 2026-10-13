@@ -237,3 +237,124 @@ async fn a_strict_resume_the_vendor_did_not_confirm_is_unverified() {
         assert_resumability(session.as_ref(), Resumability::Unverified, label);
     }
 }
+
+/// What `claude -p --resume <unknown uuid> --output-format stream-json --verbose` printed on
+/// stdout with an empty `CLAUDE_CONFIG_DIR` (Claude Code 2.1.296, signed out): this one record,
+/// before any `system/init`, then exit 1. Its stderr was the same sentence as `errors[0]`.
+const MISSING_CONVERSATION_RESULT: &str = r#"{"type":"result","subtype":"error_during_execution","duration_ms":0,"duration_api_ms":0,"is_error":true,"num_turns":0,"stop_reason":null,"session_id":"3f2c1a90-1b2c-4d3e-8f4a-5b6c7d8e9f01","total_cost_usd":0,"usage":{"output_tokens_details":{"thinking_tokens":0},"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard","fallback_credit":null},"modelUsage":{},"permission_denials":[],"uuid":"cda4c431-888f-4a71-8740-1f03574505ac","errors":["No conversation found with session ID: 3f2c1a90-1b2c-4d3e-8f4a-5b6c7d8e9f01"],"result_index":0}"#;
+const MISSING_ID: &str = "3f2c1a90-1b2c-4d3e-8f4a-5b6c7d8e9f01";
+
+fn failure_of(events: &[EventKind]) -> mango_external_agents::VendorError {
+    match events.last() {
+        Some(EventKind::Error { error }) => error.clone(),
+        other => panic!("expected a terminal error event | received: {other:?}"),
+    }
+}
+
+/// The CLI ended a strict resume with an errored `result` before it announced the session. That
+/// shape — not the vendor's wording — is what the harness reads, so a host can tell a conversation
+/// the CLI would not start from a transport failure (`claude-stream-broken`).
+#[tokio::test]
+async fn a_strict_resume_the_cli_ends_before_init_fails_with_its_own_code() {
+    let launcher = Arc::new(
+        FakeClaudeCli::new()
+            .with_graceful_interrupt()
+            .with_turn(Run::replaying(MISSING_CONVERSATION_RESULT)),
+    );
+    let session = open_resuming(&launcher, MISSING_ID).await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "continue"))
+        .await
+        .expect("expected the deferred resume to start");
+    let error = failure_of(&drain(&mut turn).await);
+
+    assert_eq!(
+        error.code.as_str(),
+        "claude-resume-failed",
+        "expected error code: claude-resume-failed | received: {}",
+        error.code
+    );
+    assert!(!error.retryable, "expected a non-retryable failure");
+    assert_resumability(
+        session.as_ref(),
+        Resumability::Unverified,
+        "a resume the CLI ended before init",
+    );
+}
+
+/// The code must not depend on the sentence. The same structure with other words, or with none,
+/// is the same failure.
+#[tokio::test]
+async fn the_resume_failure_code_does_not_depend_on_the_vendors_wording() {
+    let wordings = [
+        r#""errors":["Failed to resume session: transcript unreadable"]"#,
+        r#""errors":[]"#,
+        r#""result":"something else entirely""#,
+    ];
+    for wording in wordings {
+        let record = format!(
+            r#"{{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,{wording}}}"#
+        );
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::replaying(&record)));
+        let session = open_resuming(&launcher, MISSING_ID).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "continue"))
+            .await
+            .expect("expected the deferred resume to start");
+        let error = failure_of(&drain(&mut turn).await);
+        assert_eq!(
+            error.code.as_str(),
+            "claude-resume-failed",
+            "expected error code for {wording}: claude-resume-failed | received: {}",
+            error.code
+        );
+    }
+}
+
+/// A failure after `system/init` is a failure of the turn, not of the resume: the conversation was
+/// found, so the code stays the result's own and the conversation stays resumable.
+#[tokio::test]
+async fn an_errored_result_after_a_confirmed_resume_keeps_the_results_own_code() {
+    let failed = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1,"errors":["overloaded"]}"#;
+    let launcher = Arc::new(
+        FakeClaudeCli::new().with_turn(Run::replaying(&format!("{}\n{failed}", init(NATIVE_ID)))),
+    );
+    let session = open_resuming(&launcher, NATIVE_ID).await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "continue"))
+        .await
+        .expect("expected the deferred resume to start");
+    let error = failure_of(&drain(&mut turn).await);
+
+    assert_eq!(
+        error.code.as_str(),
+        "claude-error_during_execution",
+        "expected error code: claude-error_during_execution | received: {}",
+        error.code
+    );
+    assert_resumability(
+        session.as_ref(),
+        Resumability::Resumable,
+        "a failed turn on a confirmed resume",
+    );
+}
+
+/// A fresh session has no resume to fail, so an errored result with no init stays what it was.
+#[tokio::test]
+async fn an_errored_result_on_a_fresh_session_is_not_a_resume_failure() {
+    let launcher =
+        Arc::new(FakeClaudeCli::new().with_turn(Run::replaying(MISSING_CONVERSATION_RESULT)));
+    let session = open(&launcher).await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "hello"))
+        .await
+        .expect("expected a turn");
+    let error = failure_of(&drain(&mut turn).await);
+
+    assert_eq!(
+        error.code.as_str(),
+        "claude-error_during_execution",
+        "expected error code: claude-error_during_execution | received: {}",
+        error.code
+    );
+}

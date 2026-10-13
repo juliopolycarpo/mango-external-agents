@@ -161,8 +161,11 @@ id, and each turn spawns, streams and reaps its own child.
 - **Strict resume is lazy and confirmed.** Opening does not launch a process, so the requested UUID
   remains an unverified candidate in `Session::ids()` while `SessionSnapshot::resumed` is false.
   The first turn passes it to `--resume`; only `system/init` echoing that exact UUID confirms the
-  resumed snapshot. A missing, invalid or different id ends that turn with a protocol error instead
-  of presenting another conversation as the requested history. Conversation content or a result
+  resumed snapshot. A missing, invalid or different id ends that turn with a failure instead
+  of presenting another conversation as the requested history; an errored `result` the CLI prints
+  before any `system/init` is `claude-resume-failed` (see
+  [A strict resume the CLI refuses](#a-strict-resume-the-cli-refuses)), and the other cases stay
+  `claude-stream-broken` carrying a protocol message. Conversation content or a result
   before that confirmation is refused without emitting it. A later turn is held to the same handle.
   When its `system/init` supplies an id, the [documented `--resume <uuid>` form](https://code.claude.com/docs/en/headless.md)
   requires it to be UUID-shaped and this harness requires it to match the persisted handle. A
@@ -293,6 +296,53 @@ database.save(session.ids().native_session_id, stored); // serde: "tainted-by-ki
 ```
 
 Codex and ACP sessions report `Unknown` always; see their guides for what a host does there.
+
+### A strict resume the CLI refuses
+
+A strict resume is lazy, so a conversation the vendor no longer has surfaces only on the first
+turn. What `claude` 2.1.296 does for `claude -p --resume <unknown uuid> --input-format stream-json
+--output-format stream-json --verbose`, run with an empty `CLAUDE_CONFIG_DIR` so nothing is signed
+in and no model is reached:
+
+- it fails **before authentication**: the same invocation against a conversation that exists
+  prints `system/init` and fails later at the API, so the missing-conversation check comes first;
+- stderr is `No conversation found with session ID: <uuid>`, the exit code is 1, and stdout is one
+  record: `{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,…,
+  "errors":["No conversation found with session ID: <uuid>"]}` with zero usage and **no
+  `system/init`**.
+
+The vendor documents the message and the exit code
+([errors.md](https://code.claude.com/docs/en/errors.md), "No conversation found with the session
+ID"), and that `system/init` is the first event and an in-run failure is printed as the `result`
+([headless.md](https://code.claude.com/docs/en/headless.md)). It documents **no field** that
+says the conversation is missing: `error_during_execution` is the generic subtype, exit 1 is the
+generic failure code, and the only specific part is prose. The same page documents other resume
+failures (`Failed to resume the conversation`, an unreadable transcript) with the same shape. So the
+harness does not claim "not found", and it never matches the wording.
+
+What it reads is the shape. An errored `result` while a strict resume is still unconfirmed, before
+any `system/init`, ends the turn with the code **`claude-resume-failed`**, carrying the vendor's
+`errors` text for a person to read (redacted like any vendor message). It is not retryable, the
+session's `resumability` becomes `Unverified`, and the next `start_turn` is refused as before.
+A transport or authentication failure on a conversation that exists arrives after `system/init`
+and keeps its own code, so `claude-resume-failed` is distinguishable from it.
+
+What a host does:
+
+1. After a failed first strict-resume turn, read `error.code`. `claude-resume-failed` means the CLI
+   ended the resume before starting the conversation; the stored conversation is not usable through
+   this handle. Stop persisting it as resumable.
+2. It does not say why. Missing, expired, copied to another machine or unreadable all look alike
+   here; the vendor's text says which, to a person. Opening a new session and resending is a
+   product decision, not one the library authorises, and `claude-stream-broken` or any other code
+   gives no such licence.
+3. The stream error carries no `Dispatch`, and the CLI's zero usage and `num_turns: 0` are the
+   vendor's own report, not something the library proves. The host's `RecoveryRecord` for the turn
+   still decides replay.
+
+Not captured with `mea capture`: that command records `--version` and `--help` for Claude and runs
+no turn, so there is no fixture for this record. The tests replay the observed line through the
+fake CLI.
 
 Closing stdin is also what the vendor documents as cancelling a pending prompt, and this harness
 closes it immediately after the prompt — so a run that would otherwise wait for an answer nobody

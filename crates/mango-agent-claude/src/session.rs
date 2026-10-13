@@ -2071,12 +2071,19 @@ async fn pump(
             match record.kind() {
                 Some(kind @ ("stream_event" | "assistant" | "user" | "result")) => {
                     taint_unconfirmed_resume(&shared, &end);
-                    failure = Some(Error::Protocol {
-                        expected: String::from(
-                            "a system/init record confirming the requested Claude resume handle before conversation content or result",
-                        ),
-                        received: format!("a {kind} record before resume confirmation"),
-                    });
+                    failure = Some(
+                        crate::reducer::resume_failure(&record)
+                            .filter(|_| kind == "result")
+                            .map_or_else(
+                                || Error::Protocol {
+                                    expected: String::from(
+                                        "a system/init record confirming the requested Claude resume handle before conversation content or result",
+                                    ),
+                                    received: format!("a {kind} record before resume confirmation"),
+                                },
+                                Error::Vendor,
+                            ),
+                    );
                     break;
                 }
                 // Non-conversation notices say nothing about which history this process loaded.
@@ -2467,6 +2474,13 @@ fn no_result_error(
     exit: Option<mango_external_agents::ExitStatus>,
     stderr_tail: String,
 ) -> VendorError {
+    // The one vendor failure the pump hands over whole: a resume the CLI ended before it started,
+    // already carrying its own code and the vendor's text.
+    if let Some(Error::Vendor(vendor)) = &failure
+        && vendor.code.as_str() == crate::reducer::RESUME_FAILED_CODE
+    {
+        return vendor.clone();
+    }
     if let Some(failure) = failure {
         return VendorError::new(
             ErrorCode::from_static("claude-stream-broken"),
