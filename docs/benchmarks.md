@@ -292,23 +292,22 @@ medians, in ns per byte (`main` / head), by the size of each push:
 
 | Log                                                        |           1 B |          64 B |       4 KiB |      16 KiB |      64 KiB |
 | ---------------------------------------------------------- | ------------: | ------------: | ----------: | ----------: | ----------: |
-| `no-hyphen`, no hyphen in the text                         | 40.15 / 40.05 | 20.67 / 20.91 | 1.74 / 1.96 | 0.54 / 0.67 | 0.23 / 0.34 |
-| `plain`, an ISO date (two hyphens) per line                | 50.86 / 43.17 | 19.97 / 21.75 | 1.86 / 2.89 | 0.58 / 1.29 | 0.24 / 0.77 |
-| `cjk`, an ISO date and CJK text per line                   | 41.04 / 40.54 | 21.98 / 22.21 | 1.89 / 3.10 | 0.57 / 1.54 | 0.24 / 0.94 |
-| `check-and-dash`, an ISO date, a check mark and an em dash | 39.93 / 56.70 | 23.64 / 27.52 | 2.75 / 3.18 | 0.67 / 1.59 | 0.31 / 1.22 |
-| `with-keys`, a 24-line key every 200 lines                 | 40.56 / 54.16 | 20.23 / 23.22 | 1.98 / 2.47 | 0.72 / 1.06 | 0.28 / 0.72 |
-| `hyphens`, a 40-dash line and `-----` per line             | 44.33 / 44.05 | 20.55 / 23.44 | 2.18 / 3.45 | 0.64 / 1.62 | 0.25 / 1.12 |
-| `candidates`, `-----BEGIN-----` lines                      | 42.19 / 45.46 | 20.02 / 22.32 | 1.79 / 2.87 | 0.57 / 1.69 | 0.23 / 1.40 |
+| `no-hyphen`, no hyphen in the text                         | 36.93 / 35.89 | 16.98 / 17.19 | 1.57 / 1.72 | 0.51 / 0.59 | 0.20 / 0.30 |
+| `plain`, an ISO date (two hyphens) per line                | 35.79 / 38.07 | 16.27 / 18.71 | 1.64 / 2.01 | 0.51 / 0.92 | 0.22 / 0.54 |
+| `cjk`, an ISO date and CJK text per line                   | 35.32 / 35.78 | 17.13 / 18.46 | 1.81 / 2.00 | 0.60 / 1.05 | 0.22 / 0.66 |
+| `check-and-dash`, an ISO date, a check mark and an em dash | 37.14 / 39.98 | 18.28 / 20.62 | 1.98 / 2.48 | 0.59 / 1.37 | 0.23 / 1.11 |
+| `with-keys`, a 24-line key every 200 lines                 | 37.65 / 36.38 | 16.94 / 18.47 | 1.69 / 2.29 | 0.50 / 0.96 | 0.21 / 0.70 |
+| `hyphens`, a 40-dash line and `-----` per line             | 38.05 / 39.41 | 16.30 / 18.74 | 1.56 / 2.62 | 0.50 / 1.12 | 0.21 / 0.78 |
+| `candidates`, `-----BEGIN-----` lines                      | 37.12 / 40.59 | 16.39 / 18.82 | 1.72 / 2.66 | 0.50 / 1.49 | 0.21 / 1.22 |
 
-A push the size of a line or smaller costs the same within the noise of the runs (the 1 B column
-moves by 10 ns between two runs of the same binary). A push of 16 KiB or more drops nearly all of
-what it carries, and that drop is what is read: a log with no hyphen costs 0.13 ns per byte more at
-64 KiB, a log with dates 0.5, the same log in CJK text or with a check mark and an em dash 0.7 to
-1.0 (before the gate looked for what the stripper acts on, any hyphen and any byte of 0x80 or more
-in a block sent it through the stripper, 5.1 ns per byte at 16 KiB), and the worst shapes (every
-line carrying runs of dashes, or marker candidates) 0.9 and 1.2. At 64 KiB, 0.3 to 1.4 ns per byte
-is 20 to 90 microseconds for a push of that size, and the child's pipe delivers far less than that
-per second.
+A push the size of a line or smaller costs the same within the noise of the runs. A push of 16 KiB
+or more drops nearly all of what it carries, and that drop is what is read: a log with no hyphen
+costs 0.10 ns per byte more at 64 KiB, a log with dates 0.32, the same log in CJK text 0.44 or with
+a check mark and an em dash 0.88 (before the gate looked for what the stripper acts on, any hyphen
+and any byte of 0x80 or more in a block sent it through the stripper, 5.1 ns per byte at 16 KiB),
+and the worst shapes (every line carrying runs of dashes, or marker candidates) 0.57 and 1.01. At
+64 KiB, 0.3 to 1.2 ns per byte is 20 to 80 microseconds for a push of that size, and the child's
+pipe delivers far less than that per second.
 
 Milliseconds for one 256 KiB text of each shape, release, default profile, the rules of the release
 before (`stderr_text` on `main`), `stderr_text` now, `bounded` on `main` and now, and `structured` on

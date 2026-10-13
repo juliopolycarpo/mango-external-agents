@@ -190,8 +190,8 @@ pub(super) fn starts_a_removed_sequence(first: u8, second: u8, third: u8) -> boo
     let arabic_mark = (first == 0xd8) & (second == 0x9c);
     let marks = (first == 0xe2)
         & (second == 0x80)
-        & ((third == 0x8e) | (third == 0x8f) | ((third >= 0xaa) & (third <= 0xae)));
-    let isolates = (first == 0xe2) & (second == 0x81) & ((third >= 0xa6) & (third <= 0xa9));
+        & ((third == 0x8e) | (third == 0x8f) | (0xaa..=0xae).contains(&third));
+    let isolates = (first == 0xe2) & (second == 0x81) & (0xa6..=0xa9).contains(&third);
     control | c1 | arabic_mark | marks | isolates
 }
 
