@@ -20,9 +20,10 @@
 //! so the work is linear. A private-key block with no end marker takes the rest of the text, which
 //! is read once. See `redact::work` for the shapes that hold this.
 //!
-//! The pass costs a byte-wise read of the whole text, so `stderr_text`, the hot path of a stderr
-//! tail, does not run it; `redact::bounded` and `redact::structured`, which carry a vendor's
-//! messages, do (see `docs/benchmarks.md`).
+//! The pass costs a byte-wise read of the whole text, so `stderr_text`, which a host may run over
+//! every line of a stream, does not run it; `redact::bounded` and `redact::structured`, which carry
+//! a vendor's messages, do, and so does `redact::stderr_tail`, which reads a tail once, when a
+//! failure is reported (see `docs/benchmarks.md`).
 
 use super::scan::count_steps;
 use super::take_while;
@@ -51,6 +52,59 @@ fn is_escape_letter(byte: u8) -> bool {
 /// ```
 pub(super) fn hides(text: &str) -> Vec<Hide> {
     union(vec![block_hides(text), prefix_hides(text)])
+}
+
+/// [`hides`] and the end of a private key whose begin marker is not in `text`: what a stderr tail
+/// is read with. A tail is cut on a line (`StderrTail::push`), so a key written over many lines can
+/// lose its begin line and keep the lines of base64 under it, which have no marker for the block
+/// read to start from.
+///
+/// # Example
+///
+/// ```ignore
+/// let found = tail_hides("c3ludGhldGljLWtleS1ib2R5\n-----END PRIVATE KEY-----\nnext");
+/// assert_eq!(found, [Hide::marker(0, 54)]);
+/// ```
+pub(super) fn tail_hides(text: &str) -> Vec<Hide> {
+    union(vec![orphaned_end_hides(text), hides(text)])
+}
+
+/// The lines of base64 at the start of `text` and the private key's end marker that closes them:
+/// the part of a key a cut left, when the cut dropped the begin marker and the lines above it.
+///
+/// Only the start of the text is read this way. A key with its begin marker is the block read's;
+/// a line of base64 anywhere else, with no begin marker, is as likely a hash or an attachment as a
+/// key. Every line before the marker must be base64 (padded, with no `=` inside it), so a sentence,
+/// a path or an assignment above it is not a key's body, and the read stops at
+/// [`MAX_BLOCK_BYTES`], the farthest a block is searched for its end marker.
+fn orphaned_end_hides(text: &str) -> Vec<Hide> {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    while at <= MAX_BLOCK_BYTES {
+        let run_end = take_while(bytes, at, is_base64);
+        count_steps(run_end - at + 1);
+        if !is_padded_base64(&bytes[at..run_end]) {
+            return Vec::new();
+        }
+        if bytes[run_end..].starts_with(b"-----END ") {
+            return end_marker_close(bytes, run_end)
+                .map(|close| Hide::marker(0, close))
+                .into_iter()
+                .collect();
+        }
+        match line_break(bytes, run_end) {
+            Some(after) => at = after,
+            None => return Vec::new(),
+        }
+    }
+    Vec::new()
+}
+
+/// Where the end marker of a private key that starts at `start` closes, when it is one.
+fn end_marker_close(bytes: &[u8], start: usize) -> Option<usize> {
+    let label = start + b"-----END ".len();
+    let close = closing_dashes(bytes, label, true)?;
+    is_private_key_label(&bytes[label..close - 5]).then_some(close)
 }
 
 /// The private-key blocks of `text`, found by a search for the begin marker and not a read of
@@ -413,11 +467,7 @@ fn private_key_block(text: &str, start: usize, ends: &mut Ends) -> Option<usize>
     let closing = ends
         .after(text, after_begin)
         .filter(|at| at - after_begin <= MAX_BLOCK_BYTES)
-        .and_then(|at| {
-            let label = at + b"-----END ".len();
-            let close = closing_dashes(bytes, label, true)?;
-            is_private_key_label(&bytes[label..close - 5]).then_some(close)
-        });
+        .and_then(|at| end_marker_close(bytes, at));
     Some(closing.unwrap_or_else(|| body_lines(text, after_begin)))
 }
 

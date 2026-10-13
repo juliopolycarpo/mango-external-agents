@@ -310,6 +310,12 @@ pub(super) trait Layer {
     fn whole(&self, _raw: &str) -> String {
         String::from(REDACTED)
     }
+
+    /// The readers other than the floor, over the stripped text: the reads added since the release
+    /// before this one and the well-known tokens, in the union.
+    fn reads(&self, plain: &str) -> Vec<Hide> {
+        union(vec![super::read_hides(plain), tokens::hides(plain)])
+    }
 }
 
 /// No layer: text that is read as text.
@@ -317,14 +323,29 @@ pub(super) struct Plain;
 
 impl Layer for Plain {}
 
+/// A stderr tail: the floor and the well-known tokens, and none of the newer reads.
+///
+/// The tail is read once, when a failure is being reported, and it is a child's diagnostic
+/// output, so the reads that cross lines, sequences and block scalars, which would hide more of
+/// ordinary output than a diagnostic can spare, are left out. What it adds to the floor is what
+/// has a shape of its own: a token with a known prefix, and a private key whose begin marker the
+/// tail's cut dropped (`tokens::tail_hides`).
+pub(super) struct Tail;
+
+impl Layer for Tail {
+    fn reads(&self, plain: &str) -> Vec<Hide> {
+        tokens::tail_hides(plain)
+    }
+}
+
 /// The spans of `plain`, the text the stripper left, that every reader and `layer` hide.
 ///
 /// The readers are the rules of the release before (`floor`), the reads added since
-/// (`read_hides`), and the well-known tokens. None of them sees what another has changed, so none
-/// of them can make another miss its place.
+/// (`read_hides`), and the well-known tokens, or the ones `layer` names in [`Layer::reads`]. None
+/// of them sees what another has changed, so none of them can make another miss its place.
 pub(super) fn hides(plain: &str, marked: bool, layer: &dyn Layer) -> Vec<Hide> {
     let floor = floor::hides(plain, marked);
-    let others = union(vec![super::read_hides(plain), tokens::hides(plain)]);
+    let others = layer.reads(plain);
     layer.layer(plain, floor, others)
 }
 

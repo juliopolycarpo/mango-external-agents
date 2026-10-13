@@ -34,20 +34,21 @@ own deployment.
 - **Redaction.** A vendor's own diagnostic text is redacted for credential-shaped text before it is
   bounded, wherever it enters, and a vendor's transcript content is not. What is redacted where:
 
-  | Text                                                                                        | Redacted | By                                                              |
-  | ------------------------------------------------------------------------------------------- | -------- | --------------------------------------------------------------- |
-  | stderr crossing a diagnostic boundary                                                       | yes      | `redact::stderr_text` (the previous release's rules, see below) |
-  | an `EventKind::Error` message and its vendor code                                           | yes      | the core, whichever harness produced it                         |
-  | the title, description and unknown severity of an `EventKind::Notice`                       | yes      | `EventKind::notice`                                             |
-  | a JSON-RPC peer's error message, when it is an error object                                 | yes      | `JsonRpcError::into_vendor_error`                               |
-  | a setup `Error::Vendor` message                                                             | yes      | the core, then bounded                                          |
-  | the version a probe printed, a `VersionTooOld` `found`, an unsupported option's explanation | yes      | `redact::bounded`, in `Discovery::normalized` and the matrix    |
-  | a session's title and preview (the conversation's own words), a login hint, an account plan | no       | content or host text, bounded only                              |
-  | an ACP agent's error message and its `data`, a JSON value read as structure                 | yes      | `redact::structured`, then the text rules and the token pass    |
-  | an ACP compaction error                                                                     | yes      | `redact::bounded`                                               |
-  | a malformed JSON-RPC `error` member                                                         | n/a      | a fixed description; the member is never quoted                 |
-  | `CallFailureCause::Peer`, the peer's message exactly as sent                                | **no**   | exact by design, so a harness may compare it; never show it raw |
-  | assistant text, reasoning, tool output and tool errors (`is_error`, denial reasons)         | no       | the answer, not a diagnostic                                    |
+  | Text                                                                                        | Redacted | By                                                                                 |
+  | ------------------------------------------------------------------------------------------- | -------- | ---------------------------------------------------------------------------------- |
+  | a stderr tail (`StderrTail::read`, and the stderr in a harness's failure)                   | yes      | `redact::stderr_tail` (the previous release's rules and the token pass, see below) |
+  | stderr read line after line                                                                 | yes      | `redact::stderr_text` (the previous release's rules, see below)                    |
+  | an `EventKind::Error` message and its vendor code                                           | yes      | the core, whichever harness produced it                                            |
+  | the title, description and unknown severity of an `EventKind::Notice`                       | yes      | `EventKind::notice`                                                                |
+  | a JSON-RPC peer's error message, when it is an error object                                 | yes      | `JsonRpcError::into_vendor_error`                                                  |
+  | a setup `Error::Vendor` message                                                             | yes      | the core, then bounded                                                             |
+  | the version a probe printed, a `VersionTooOld` `found`, an unsupported option's explanation | yes      | `redact::bounded`, in `Discovery::normalized` and the matrix                       |
+  | a session's title and preview (the conversation's own words), a login hint, an account plan | no       | content or host text, bounded only                                                 |
+  | an ACP agent's error message and its `data`, a JSON value read as structure                 | yes      | `redact::structured`, then the text rules and the token pass                       |
+  | an ACP compaction error                                                                     | yes      | `redact::bounded`                                                                  |
+  | a malformed JSON-RPC `error` member                                                         | n/a      | a fixed description; the member is never quoted                                    |
+  | `CallFailureCause::Peer`, the peer's message exactly as sent                                | **no**   | exact by design, so a harness may compare it; never show it raw                    |
+  | assistant text, reasoning, tool output and tool errors (`is_error`, denial reasons)         | no       | the answer, not a diagnostic                                                       |
 
   `CallFailureCause::Peer` holds the peer's error exactly as sent, because the caller of a request
   may need its words and its data. A harness must not show it to a host raw: it converts it with
@@ -74,9 +75,10 @@ own deployment.
 
   **No entry point shows what the release before hid.** The rules above are the ones the previous
   release (0.6.1 and the fixes merged after it) shipped, and `redact::floor` holds them to the
-  letter. `stderr_text` is exactly that: the stream of a stderr tail never shows what 0.6.1 hid,
+  letter. `stderr_text` is exactly that: a stderr stream read with it never shows what 0.6.1 hid,
   and a plain line pays what it paid. Everything newer is read beside them, by the paths that carry
-  a vendor's messages (`redact::bounded`, `redact::structured`, and the text they share): each
+  a vendor's messages (`redact::bounded`, `redact::structured`, and the text they share) and, for the
+  well-known tokens only, by `redact::stderr_tail`: each
   reader reads the same stripped text and says which spans it hides, the spans are joined, and
   the join is applied once (`redact::union`). A reader that hides less than another therefore
   cannot make the answer hide less than that other, whatever order they ran in or what a newer
@@ -134,8 +136,9 @@ own deployment.
     An object under a count name is `[REDACTED]` as it was, so Claude's `output_tokens_details`
     object is hidden; showing it is a decision of its own.
   - **Well-known tokens with no name beside them**, by `redact::bounded` and `redact::structured`
-    (the paths that carry a vendor's messages, errors, notices, `data` and discovery text) and not
-    by `stderr_text`: `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` and `github_pat_` GitHub tokens
+    (the paths that carry a vendor's messages, errors, notices, `data` and discovery text), by
+    `redact::stderr_tail` (a stderr tail, read once when a failure is reported) and not by
+    `stderr_text`: `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` and `github_pat_` GitHub tokens
     ([token formats][github-tokens]); GitLab `glpat-` ([token overview][gitlab-tokens]); Slack
     `xox[bpasr]-` ([token types][slack-tokens]); Stripe `sk_`, `rk_` and `pk_` with `live_` or `test_`
     ([API keys][stripe-keys]; `pk_` keys are the publishable half and no secret); AWS `AKIA` and `ASIA` access key ids, exactly 20 characters
@@ -161,12 +164,27 @@ own deployment.
 
   The token pass reads the whole text a byte at a time, which costs plain stderr lines 120% more
   instructions, and a byte-class gate does not help because plain tails are full of `_` and `-`.
-  Stderr tails are read line after line on the hot path, so `stderr_text` runs neither it nor the
+  `stderr_text` can be run over every line of a stream, so it runs neither the token pass nor the
   newer reads: its cost against the previous release is within 1% on plain lines and 3% on lines
   that carry a credential. `redact::bounded` and `redact::structured` run all of them, over the
   rules of the release before, and read the text again when the first reading changed it, which
   is several times the instructions of a tail; the text a vendor sends in a message is short and
-  rare. The measurements are in `docs/benchmarks.md`.
+  rare. A stderr tail is in between: `StderrTail::read` and the three harnesses read a bounded tail
+  once, when a failure is being reported, never per line, so they use `redact::stderr_tail`, which
+  runs the rules of the release before and the token pass and none of the newer reads (they would
+  hide more of a child's diagnostic output than a diagnostic can spare). The measurements are in
+  `docs/benchmarks.md`.
+
+  **`stderr_tail` hides at least what `stderr_text` hides** (the same union, of the spans of the
+  rules of the release before and of the token pass), and is `stderr_text` itself wherever the token
+  pass finds nothing. It is read again until a reading changes nothing, with the bound the message
+  path uses, so it is a fixed point where `stderr_text` is not; text that does not settle within
+  eight readings (written to defeat it) is returned as `[REDACTED]` whole, which `stderr_text` never
+  does. Two properties of a cut tail matter to it. A tail is cut on a line (`StderrTail::push`), so
+  a token with a prefix is whole in the tail or gone from it, never a back half with no prefix. A
+  private key spans lines, and a cut can drop its begin marker and keep the base64 lines under
+  it, so the start of the text `stderr_tail` reads is read as the possible end of a key: lines of
+  base64 and then a private key's end marker, at the very start, are hidden with the marker.
 
   The answers differ from the release before's in two ways. `stderr_text` differs only by the
   extra reading above, which can only hide more. `redact::bounded` and `redact::structured` hide
@@ -185,24 +203,30 @@ own deployment.
   generators (statements, JSON structures, random fragments, a soup of bytes) and the findings of
   the reviews put in a text are hidden by every entry point if the release before hid them,
   the spans the release before hides are inside the spans of the first reading, one pass is a
-  fixed point on `stderr_text`, `bounded` and `structured`, `structured` keeps a JSON text JSON, no
-  entry point panics, and `stderr_text` is the release before's answer wherever that is a fixed
-  point. A long search runs 4,000,000 inputs per family and seed
+  fixed point on `stderr_text`, `stderr_tail`, `bounded` and `structured` (`stderr_tail` with no
+  exception), `structured` keeps a JSON text JSON, no entry point panics, `stderr_text` is the
+  release before's answer wherever that is a fixed point, and `stderr_tail` hides at least what
+  `stderr_text` hides and is `stderr_text` wherever the token pass finds nothing. A long search runs 4,000,000 inputs per family and seed
   (`MEA_REDACT_SEARCH_COUNT=4000000 MEA_REDACT_SEARCH_SEED=n cargo nextest run -p
   mango-external-agents --release --lib --run-ignored only -E 'test(redact::search)'`).
 
   What the rules do not read, and a host should not rely on them for:
 
-  - a bare token in a line of stderr: `stderr_text` reads names and values, not prefixes, so
-    `token: expired (ghp_...)` passes through the stderr tails of the three harnesses and
-    `StderrTail::read`. Every other path reads prefixes too: vendor messages, errors, notices and
-    discovery text (`bounded`, `structured`), an `ExtensionValue`'s text, the WebSocket peer label
-    and the probe failures `mea` prints. A version banner is parsed from the raw line and only the
-    token it yields is stored, and `Discovery::normalized` reads that with `bounded`;
+  - a bare token in a line of stderr read with `stderr_text`: it reads names and values, not
+    prefixes, so `token: expired (ghp_...)` passes through it. A stderr tail is read with
+    `stderr_tail`, which reads prefixes: `StderrTail::read` and the stderr the three harnesses put
+    in a failure hide it. A host that redacts stderr line after line with `stderr_text` does not get
+    the token pass, and one that wants it on a tail calls `stderr_tail` on the tail. Every other
+    path reads prefixes too: vendor messages, errors, notices and discovery text (`bounded`,
+    `structured`), an `ExtensionValue`'s text, the WebSocket peer label and the probe failures `mea`
+    prints. A version banner is parsed from the raw line and only the token it yields is stored, and
+    `Discovery::normalized` reads that with `bounded`;
   - a pretty-printed multi-line array, a YAML sequence, a block scalar, an escape deeper than the
     release before read, a number of twelve digits under a count name, in a stderr tail:
-    `stderr_text` reads a line at a time, as the release before did, and a tail is cut on a line.
-    The paths that carry a vendor's messages read all of these;
+    `stderr_text` and `stderr_tail` read a line at a time, as the release before did, and a tail is
+    cut on a line. The paths that carry a vendor's messages read all of these;
+  - a private key whose begin line a tail's cut dropped and whose end marker the tail does not hold
+    (the child died mid-key): what is left is base64 lines with nothing to recognise them by;
   - a bare token outside the closed list, and any credential with no prefix: an AWS secret access
     key (40 characters of base64) or an Azure key has nothing to recognise it by;
   - a token glued to other name characters (`_ghp_..._`, `ghp_...-`), behind an encoding (`%20ghp_...`,

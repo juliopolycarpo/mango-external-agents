@@ -427,7 +427,7 @@ struct TailState {
     buffer: Vec<u8>,
     /// Set while a cut is unfinished: the bytes that follow are the rest of a line, or the value
     /// of a credential whose name was dropped, and a continuation kept on its own has lost the
-    /// name that lets [`redact::stderr_text`] recognise it.
+    /// name that lets [`redact::stderr_tail`] recognise it.
     discard: Option<Discard>,
 }
 
@@ -456,7 +456,9 @@ impl StderrTail {
     ///   open also keeps a window of the stderr it dropped, so the next bytes can be judged
     ///   against the name that preceded them: a few KiB at most, whatever the capacity,
     ///   so `0` returns nothing from `read` but does not hold nothing.
-    /// - Time. Redaction is linear in the tail, so a read costs in proportion to `max_bytes`. It
+    /// - Time. Redaction is linear in the tail (the rules of [`redact::stderr_text`] and the token
+    ///   pass, about three times the instructions of the rules alone on plain lines, read again
+    ///   when the first reading changed the text), so a read costs in proportion to `max_bytes`. It
     ///   runs after the tail's lock is released, so it delays the caller of `read` and never the
     ///   writer calling `push`.
     ///
@@ -553,7 +555,10 @@ impl StderrTail {
         }
     }
 
-    /// The tail, redacted for credential-shaped text.
+    /// The tail, redacted for credential-shaped text: [`redact::stderr_tail`], which reads the
+    /// names and values [`redact::stderr_text`] reads and the well-known tokens with no name
+    /// beside them. A tail is read once, when a failure is reported, so it can afford the token
+    /// pass that a per-line read cannot.
     ///
     /// # Example
     ///
@@ -565,7 +570,7 @@ impl StderrTail {
     /// assert_eq!(tail.read(), "Authorization: Bearer [REDACTED]");
     /// ```
     pub fn read(&self) -> String {
-        self.read_with(redact::stderr_text)
+        self.read_with(redact::stderr_tail)
     }
 
     /// [`read`](Self::read) with the redactor injected, so a test can stand inside the window
@@ -1689,7 +1694,7 @@ mod tests {
     #[test]
     fn a_cut_that_drops_a_name_behind_a_removed_byte_drops_its_value_line_too() {
         let text = b"aaaaaaaa xyz\rtoken=\nVALUE\nok\n";
-        let whole = crate::redact::stderr_text(&String::from_utf8_lossy(text));
+        let whole = crate::redact::stderr_tail(&String::from_utf8_lossy(text));
         assert!(
             !whole.contains("VALUE"),
             "expected whole-text redaction to hide the value | received {whole:?}"
@@ -1712,7 +1717,7 @@ mod tests {
         let mut text = b"API_KEY \x1b]0;".to_vec();
         text.extend(std::iter::repeat_n(b'x', 600));
         text.extend_from_slice(b"\x07 =\nVALUE\nok\n");
-        let whole = crate::redact::stderr_text(&String::from_utf8_lossy(&text));
+        let whole = crate::redact::stderr_tail(&String::from_utf8_lossy(&text));
         assert!(
             !whole.contains("VALUE"),
             "expected whole-text redaction to hide the value | received {whole:?}"
@@ -1725,6 +1730,93 @@ mod tests {
             read, "ok\n",
             "expected the value line dropped as whole-text redaction hides it | received {read:?}"
         );
+    }
+
+    /// The tail as the cut left it, before it is redacted.
+    fn raw(tail: &StderrTail) -> String {
+        tail.read_with(str::to_owned)
+    }
+
+    /// A synthetic GitHub token and a synthetic web token, each written in pieces.
+    fn synthetic_tokens() -> [String; 2] {
+        [
+            ["gh", "p_0123456789abcdefghijklmnopqrstuvwxyz"].concat(),
+            [
+                "ey",
+                "JhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzeW50aGV0aWMifQ.c3ludGhldGljc2lnbmF0dXJl",
+            ]
+            .concat(),
+        ]
+    }
+
+    #[test]
+    fn a_token_in_a_line_the_cut_drops_leaves_no_half_of_it_behind() {
+        for token in synthetic_tokens() {
+            let (head, rest) = token.split_at(token.len() / 2);
+            // A line that outgrows the cap, with the token across two reads of the pipe.
+            let tail = StderrTail::with_capacity(24);
+            tail.push(format!("noise noise {head}").as_bytes());
+            tail.push(format!("{rest} after it\nnext: ordinary line\n").as_bytes());
+            assert_eq!(
+                tail.read(),
+                "next: ordinary line\n",
+                "expected a token cut by the tail to leave neither half | received {:?}",
+                tail.read()
+            );
+            // A line the overflow lands in the middle of, with the token across the cap.
+            let tail = StderrTail::with_capacity(60);
+            tail.push(
+                format!("old line\nnoise {head}{rest} tail\nnext: ordinary line\n").as_bytes(),
+            );
+            let shown = tail.read();
+            assert!(
+                !shown.contains(head) && !shown.contains(rest),
+                "expected neither half of a token across the cut | received {shown:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_token_the_tail_keeps_is_hidden_whole() {
+        for token in synthetic_tokens() {
+            let tail = StderrTail::with_capacity(1024);
+            tail.push(format!("push rejected for {token} by the remote\n").as_bytes());
+            let shown = tail.read();
+            assert_eq!(
+                shown, "push rejected for [REDACTED] by the remote\n",
+                "expected a bare token in a stderr tail hidden | received {shown:?}"
+            );
+        }
+    }
+
+    /// A private key is many lines, so a cut that drops its begin line keeps lines of base64 that
+    /// have no marker above them to recognise.
+    #[test]
+    fn a_private_key_whose_begin_line_the_cut_dropped_is_hidden() {
+        let line = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj";
+        let (begin, end) = (
+            ["-----BEGIN PRIV", "ATE KEY-----"].concat(),
+            ["-----END PRIV", "ATE KEY-----"].concat(),
+        );
+        let tail = StderrTail::with_capacity(230);
+        tail.push(
+            format!("prefix line\n{begin}\n{line}\n{line}\n{line}\n{end}\nafter\n").as_bytes(),
+        );
+        let kept = raw(&tail);
+        assert!(
+            !kept.contains("BEGIN") && kept.starts_with(line),
+            "expected the cut to drop the begin line and keep the key's lines | received {kept:?}"
+        );
+        let shown = tail.read();
+        assert_eq!(
+            shown, "[REDACTED]\nafter\n",
+            "expected the key's lines hidden with its end marker | received {shown:?}"
+        );
+        // The same key, cut in two reads of the pipe.
+        let tail = StderrTail::with_capacity(230);
+        tail.push(format!("prefix line\n{begin}\n{line}\n").as_bytes());
+        tail.push(format!("{line}\n{line}\n{end}\nafter\n").as_bytes());
+        assert_eq!(tail.read(), "[REDACTED]\nafter\n");
     }
 
     #[test]
@@ -1798,7 +1890,7 @@ mod tests {
                 self.tail.push(self.late_chunk);
                 observed.concurrent_read = Some(self.tail.read());
             }
-            crate::redact::stderr_text(text)
+            crate::redact::stderr_tail(text)
         }
     }
 

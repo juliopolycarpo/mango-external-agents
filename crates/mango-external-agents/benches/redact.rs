@@ -10,8 +10,12 @@
 //! square. `stderr_text` reads what the release before it read and nothing more, so a tail costs
 //! what it did. `redact::bounded` is the entry point for a vendor's messages and reads the rest:
 //! JSON inside a string at three levels of escaping, a container that spans lines, a YAML
-//! sequence and the unnamed-token pass. It is run over the same texts, beside `stderr_text`. The
-//! fixtures are synthetic; no vendor wrote them. Run with:
+//! sequence and the unnamed-token pass. It is run over the same texts, beside `stderr_text`.
+//! `redact::stderr_tail` is the entry point for a tail read once, when a failure is reported: the
+//! rules of `stderr_text` and the token pass and nothing else. It is run over 16 KiB tails of plain
+//! lines, credentials, tokens and headers, each beside `stderr_text` over the same text, and over
+//! five 1 MiB shapes built to make the token pass or the cut-key read look again. The fixtures
+//! are synthetic; no vendor wrote them. Run with:
 //!
 //! ```sh
 //! cargo bench -p mango-external-agents --bench redact
@@ -20,7 +24,7 @@
 mod support;
 
 use mango_external_agents::normalize::TextLimit;
-use mango_external_agents::redact::{bounded, stderr_text};
+use mango_external_agents::redact::{bounded, stderr_tail, stderr_text};
 use support::{Bench, Unit};
 
 const KIB: usize = 1024;
@@ -143,6 +147,16 @@ const BARE_TOKEN_LINES: &str = concat!(
     "see sk-learn and task-ant-lines and npm_config_cache for details\n",
 );
 
+/// Lines dense in headers: nearly every line is a name the rules have to look at and redact.
+const HEADER_LINES: &str = concat!(
+    "  Authorization: Bearer abcdef0123456789\n",
+    "  Proxy-Authorization: Basic dXNlcjpodW50ZXIy\n",
+    "  Cookie: session=abc123; theme=dark\n",
+    "  X-Api-Key: 0123456789abcdef\n",
+    "  Set-Cookie: sid=hunter2; Path=/; HttpOnly\n",
+    "  Content-Type: application/json\n",
+);
+
 /// A keyword repeated in a credential name that never gets a value: every word start in the name
 /// reaches the same separator, and the redactor has to learn once that nothing follows it.
 const NAME_UNIT: &str = "token_";
@@ -261,6 +275,112 @@ fn main() {
     pathological(&bench);
     messages(&bench);
     token_shapes(&bench);
+    tails(&bench);
+}
+
+/// `redact::stderr_tail` over 16 KiB tails, 320 KiB per sample, and `stderr_text` over the same
+/// text for the cases `main` has no row for: the rules of the release before and the token pass.
+fn tails(bench: &Bench) {
+    let len = 16 * KIB;
+    let per_byte = Unit::new(BYTES_PER_SAMPLE as u64, "byte");
+    let calls = BYTES_PER_SAMPLE / len;
+    for (label, lines, text_too) in [
+        ("plain", PLAIN_LINES, false),
+        ("secrets", SECRET_LINES, false),
+        ("tokens", BARE_TOKEN_LINES, true),
+        ("headers", HEADER_LINES, true),
+    ] {
+        let raw = tail(lines, len);
+        let first = stderr_tail(&raw);
+        assert_tail(label, &raw, &first);
+        bench.run(
+            &format!("redact/stderr_tail-16KiB/{label}"),
+            per_byte,
+            || (),
+            |()| {
+                (0..calls)
+                    .map(|_| stderr_tail(std::hint::black_box(&raw)).len())
+                    .sum::<usize>()
+            },
+        );
+        if text_too {
+            bench.run(
+                &format!("redact/stderr_text-16KiB/{label}"),
+                per_byte,
+                || (),
+                |()| {
+                    (0..calls)
+                        .map(|_| stderr_text(std::hint::black_box(&raw)).len())
+                        .sum::<usize>()
+                },
+            );
+        }
+    }
+    let len = KIB * KIB;
+    let key_line = concat!(
+        "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj",
+        "\n"
+    );
+    for (label, raw) in [
+        ("prefixes", repeated(concat!("gh", "p_abc "), "", len)),
+        (
+            "pem",
+            repeated(concat!("-----BEGIN ", "PRIVATE KEY-----\n"), "", len),
+        ),
+        (
+            "web",
+            repeated(concat!("ey", "Jhbgcioijiuzi1nir. "), "", len),
+        ),
+        (
+            "one-run",
+            format!("{}{}", concat!("sk", "-"), "a".repeat(len)),
+        ),
+        // A cut key that never reaches its end marker: lines of base64 from the first byte.
+        ("cut-key", repeated(key_line, "", len)),
+        ("names", repeated(NAME_UNIT, "=", len)),
+        ("quoted-names", repeated("\"token_", "\":", len)),
+    ] {
+        let name = format!("redact/stderr_tail-1MiB/{label}");
+        if !bench.selected(&name) {
+            continue;
+        }
+        assert_tail(label, &raw, &stderr_tail(&raw));
+        bench.run(
+            &name,
+            Unit::new(raw.len() as u64, "byte"),
+            || (),
+            |()| stderr_tail(std::hint::black_box(&raw)).len(),
+        );
+    }
+}
+
+/// Fails the run when a tail case did not do the work its name claims.
+fn assert_tail(label: &str, raw: &str, shown: &str) {
+    match label {
+        "plain" | "cut-key" | "names" | "quoted-names" => assert!(
+            shown == raw,
+            "expected a {label} tail of {} bytes returned unchanged | received {} bytes",
+            raw.len(),
+            shown.len()
+        ),
+        "secrets" | "headers" => assert!(
+            shown.contains("[REDACTED]")
+                && !shown.contains("hunter2")
+                && !shown.contains("0123456789abcdef"),
+            "expected every credential in a {} byte {label} tail redacted | received {shown:?}",
+            raw.len()
+        ),
+        "tokens" => assert!(
+            shown.contains("[REDACTED]") && !shown.contains("0123456789abcdefghijklmnopqrstuvwxyz"),
+            "expected every token in a {} byte tail redacted | received {shown:?}",
+            raw.len()
+        ),
+        _ => assert!(
+            !shown.is_empty(),
+            "expected a {} byte {label} tail to come back",
+            raw.len()
+        ),
+    }
 }
 
 /// `redact::bounded`, which also reads the unnamed tokens and the reads added since the release

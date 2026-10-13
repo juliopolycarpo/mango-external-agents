@@ -6,11 +6,12 @@
 //! drifts from the table, fails with the row it drifted on. The corpus in `testing::redaction` holds
 //! the tokens as vendors print them and the ordinary text that comes close.
 //!
-//! The prefixes are read by `redact::bounded` and `redact::structured`, and not by `stderr_text`.
+//! The prefixes are read by `redact::bounded`, `redact::structured` and `redact::stderr_tail`, and
+//! not by `stderr_text`.
 
 use serde_json::json;
 
-use super::{bounded, stderr_text, structured};
+use super::{bounded, stderr_tail, stderr_text, structured};
 use crate::normalize::TextLimit;
 use crate::testing::redaction::{BARE_TOKENS, BENIGN, BENIGN_NEAR_TOKENS, LEAKS};
 
@@ -639,4 +640,226 @@ fn an_anthropic_key_has_its_type_two_digits_and_a_long_body() {
             assert_kept(what, &text);
         }
     }
+}
+
+/// The private-key markers, split so that no line of this file holds a whole one.
+const BEGIN: &str = concat!("-----BEGIN PRIV", "ATE KEY-----");
+const END: &str = concat!("-----END PRIV", "ATE KEY-----");
+
+/// Fails, naming the row and the text, unless a stderr tail of `text` has `token` gone.
+fn assert_tail_redacted(what: &str, text: &str, token: &str) {
+    let received = stderr_tail(text);
+    assert!(
+        !received.contains(token) && received.contains("[REDACTED]"),
+        "expected {what} redacted in a stderr tail | input {text:?} received: {received:?}"
+    );
+}
+
+/// Fails, naming the row and the text, unless a stderr tail of `text` is `text`.
+fn assert_tail_kept(what: &str, text: &str) {
+    let received = stderr_tail(text);
+    assert_eq!(
+        received, text,
+        "expected {what} left alone by a stderr tail | input {text:?} received: {received:?}"
+    );
+}
+
+#[test]
+fn a_stderr_tail_reads_every_prefix_at_its_length_and_not_below_it() {
+    for row in rows() {
+        let token = format!("{}{}", row.prefix, body(row.alphabet, row.min));
+        for (before, after) in [
+            ("failed with ", " today"),
+            ("(", ")"),
+            ("", ""),
+            ("\n", "\n"),
+        ] {
+            assert_tail_redacted(
+                &format!("{} at its length of {}", row.prefix, row.min),
+                &format!("{before}{token}{after}"),
+                &token,
+            );
+        }
+        let short = format!("{}{}", row.prefix, body(row.alphabet, row.min - 1));
+        assert_tail_kept(
+            &format!("{} one character short", row.prefix),
+            &format!("failed with {short} today"),
+        );
+        let inside = format!("see x{token} here");
+        assert_tail_kept(&format!("{} inside a word", row.prefix), &inside);
+    }
+}
+
+#[test]
+fn a_stderr_tail_hides_every_token_of_the_corpus_that_is_not_a_number() {
+    for leak in BARE_TOKENS {
+        if leak.secret.bytes().all(|byte| byte.is_ascii_digit()) {
+            // A count of twelve digits under a name that counts tokens is a newer read than the
+            // tail runs: the message entry points have it, and the tail does not.
+            assert_eq!(
+                stderr_tail(leak.text),
+                stderr_text(leak.text),
+                "expected the number row left to the message entry points | input {:?}",
+                leak.text
+            );
+            continue;
+        }
+        let received = stderr_tail(leak.text);
+        assert!(
+            !received.contains(leak.secret),
+            "expected {:?} without {:?} in a stderr tail | received: {received:?}",
+            leak.text,
+            leak.secret
+        );
+        for kept in leak.keeps {
+            assert!(
+                received.contains(kept),
+                "expected a stderr tail of {:?} to keep {kept:?} | received: {received:?}",
+                leak.text
+            );
+        }
+    }
+}
+
+#[test]
+fn nothing_near_a_token_or_in_ordinary_stderr_changes_in_a_stderr_tail() {
+    for text in BENIGN_NEAR_TOKENS.iter().chain(BENIGN) {
+        assert_tail_kept("ordinary text", text);
+    }
+}
+
+#[test]
+fn a_stderr_tail_is_stderr_text_where_it_finds_no_token() {
+    for text in LEAKS
+        .iter()
+        .map(|leak| leak.text)
+        .chain(BENIGN.iter().copied())
+        .chain(BENIGN_NEAR_TOKENS.iter().copied())
+    {
+        let (tail, text_form) = (stderr_tail(text), stderr_text(text));
+        assert_eq!(
+            tail, text_form,
+            "expected a stderr tail to be stderr_text where no token is read | input {text:?}"
+        );
+    }
+}
+
+#[test]
+fn a_stderr_tail_hides_what_stderr_text_hides_beside_a_token() {
+    let token = format!("{}{}", concat!("gh", "p_"), body(ALNUM, 36));
+    let text = format!("Authorization: Bearer top-secret {token} API_KEY=hunter2 redis://:pw@db/0");
+    let received = stderr_tail(&text);
+    assert_eq!(
+        received,
+        "Authorization: Bearer [REDACTED] [REDACTED] API_KEY=[REDACTED] redis://:[REDACTED]@db/0",
+        "expected the names and the token hidden together"
+    );
+    assert!(stderr_text(&text).contains(&token));
+}
+
+#[test]
+fn a_second_stderr_tail_pass_changes_nothing_in_either_corpus() {
+    for text in BARE_TOKENS
+        .iter()
+        .map(|leak| leak.text)
+        .chain(LEAKS.iter().map(|leak| leak.text))
+        .chain(BENIGN_NEAR_TOKENS.iter().copied())
+        .chain(BENIGN.iter().copied())
+    {
+        let once = stderr_tail(text);
+        let twice = stderr_tail(&once);
+        assert_eq!(
+            once, twice,
+            "expected one stderr tail pass over {text:?} to be a fixed point | received: {twice:?}"
+        );
+    }
+}
+
+/// A tail is cut on a line, so a private key can lose its begin marker and the lines above the
+/// last ones it kept. What is left of it is lines of base64 and the end marker.
+#[test]
+fn a_key_whose_begin_line_was_cut_loses_its_lines_and_its_end_marker() {
+    let cut = format!("{KEY_LINE}\n{KEY_LINE}\nQUJDRA==\n{END}\nnext: ordinary line\n");
+    assert_eq!(stderr_tail(&cut), "[REDACTED]\nnext: ordinary line\n");
+    // The same with the end marker the first thing the tail has.
+    assert_eq!(stderr_tail(&format!("{END}\nnext\n")), "[REDACTED]\nnext\n");
+    // A key with its begin marker is the block read's, and gives the same.
+    let whole = format!("{BEGIN}\n{KEY_LINE}\n{END}\nnext: ordinary line\n");
+    assert_eq!(stderr_tail(&whole), "[REDACTED]\nnext: ordinary line\n");
+    // Windows line breaks, and a JSON string's.
+    let crlf = format!("{KEY_LINE}\r\n{END}\r\nnext");
+    // The stripper takes a carriage return out of every text it reads.
+    assert_eq!(stderr_tail(&crlf), "[REDACTED]\nnext");
+    let json = format!("{KEY_LINE}\\n{END}\\n\",\"id\":7}}");
+    assert_eq!(stderr_tail(&json), "[REDACTED]\\n\",\"id\":7}");
+}
+
+#[test]
+fn only_base64_lines_at_the_start_and_a_private_keys_end_marker_are_read_as_a_cut_key() {
+    let certificate_end = "-----END CERTIFICATE-----";
+    let public_end = "-----END PUBLIC KEY-----";
+    let password_end = "-----END PASSWORD-----";
+    for (what, text) in [
+        (
+            "a certificate's end marker",
+            format!("{KEY_LINE}\n{certificate_end}\n"),
+        ),
+        (
+            "a public key's end marker",
+            format!("{KEY_LINE}\n{public_end}\n"),
+        ),
+        (
+            "a credential's name as the label",
+            format!("{KEY_LINE}\n{password_end}\n"),
+        ),
+        (
+            "a sentence above the marker",
+            format!("loaded the key\n{KEY_LINE}\n{END}\n"),
+        ),
+        (
+            "a path above the marker",
+            format!("/home/u/.ssh/id\n{END}\n"),
+        ),
+        (
+            "an assignment above the marker",
+            format!("{KEY_LINE}\nA=B\n{END}\n"),
+        ),
+        (
+            "a line that is not padded base64",
+            format!("{KEY_LINE}==x\n{END}\n"),
+        ),
+        (
+            "a marker in the middle of a line",
+            format!("{KEY_LINE} {END}\n"),
+        ),
+        (
+            "a label that only ends like one",
+            format!("{KEY_LINE}\n-----END PRIVATE KEYS-----\n"),
+        ),
+    ] {
+        let received = stderr_tail(&text);
+        assert!(
+            received.contains(KEY_LINE)
+                || received.contains("loaded")
+                || received.contains("/home"),
+            "expected {what} not read as a cut key | input {text:?} received: {received:?}"
+        );
+    }
+    // A key's body lines below an ordinary line, with no begin marker, are not read either: the
+    // start of the tail is the only place a cut can have left them.
+    let below = format!("the build failed\n{KEY_LINE}\n{END}\n");
+    assert_eq!(stderr_tail(&below).lines().next(), Some("the build failed"));
+}
+
+#[test]
+fn a_cut_key_is_read_within_the_distance_a_block_is() {
+    let line = format!("{KEY_LINE}\n");
+    let near = format!("{}{END}", line.repeat(200));
+    assert_eq!(stderr_tail(&near), "[REDACTED]");
+    // Past 16 KiB of base64 the marker is too far for a block, and a cut key.
+    let far = format!("{}{END}", line.repeat(300));
+    assert!(
+        stderr_tail(&far).contains(KEY_LINE),
+        "expected an end marker past the 16 KiB a block is searched not to close a cut key"
+    );
 }

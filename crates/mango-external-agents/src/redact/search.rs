@@ -1,18 +1,22 @@
 //! Searches over generated text, too long for the default run: `cargo nextest run --release
 //! --run-ignored only redact::search`.
 //!
-//! Five properties hold for every input, with no exemption of any kind:
+//! Six properties hold for every input, with no exemption of any kind:
 //!
 //! 1. **Nothing main hid is shown.** Every entry point hides at least what the rules of the
 //!    release before this one (`redact::floor`, `main`'s rules to the letter) hide: a canary that
 //!    is not in their answer is not in ours. The first reading is held to it at the level of
-//!    spans as well: each span the floor hides is inside a span the union hides.
-//! 2. **One pass is a fixed point**, on `stderr_text`, `message_text`, `bounded` and `structured`.
+//!    spans as well: each span the floor hides is inside a span the union hides, for the message
+//!    readers and for the tail's.
+//! 2. **One pass is a fixed point**, on `stderr_text`, `stderr_tail`, `message_text`, `bounded`
+//!    and `structured`. `stderr_tail` has no exception: what it reads is read until it settles.
 //! 3. **No entry point panics.**
 //! 4. **`structured` keeps a JSON text JSON**: a string that parses as an object or an array is
 //!    one after it is redacted.
 //! 5. **`stderr_text` is `main`'s answer** wherever `main`'s answer is a fixed point. Where it is
 //!    not, `stderr_text` reads it again until it is (the one place the two differ).
+//! 6. **`stderr_tail` hides at least what `stderr_text` hides**, as `stderr_text` answers today (not
+//!    only as `main` did), and is `stderr_text` itself wherever the token read finds nothing.
 //!
 //! Two ignored probes feed other generators through the same entry points: `probe_batch` answers a
 //! file of texts with what each entry point makes of them and whether that is a fixed point, beside
@@ -33,7 +37,9 @@ use serde_json::Value;
 use self::generate::{SECRET, findings, fragments, soup, statements, structures};
 use super::differential::{FRAGMENTS, SHAPES, assert_matches_the_replaced_scan};
 use super::structured::structured_by_the_floor;
-use super::{bounded, floor, message_text, stderr_text, strip, structured, union};
+use super::{
+    bounded, floor, message_text, stderr_tail, stderr_text, strip, structured, tokens, union,
+};
 use crate::normalize::TextLimit;
 use crate::testing::redaction::{BARE_TOKENS, BENIGN, BENIGN_NEAR_TOKENS, LEAKS};
 
@@ -194,6 +200,7 @@ fn assert_nothing_main_hid_is_shown(raw: &str) {
     let (by_walk, by_floor_walk) = walked(&text);
     let mut entries = vec![
         ("stderr_text", stderr_text(&text), main.clone()),
+        ("stderr_tail", stderr_tail(&text), main.clone()),
         ("message_text", message_text(&text), main.clone()),
         ("bounded", bounded_text(&text), main.clone()),
         ("structured (a string)", by_walk, by_floor_walk),
@@ -224,25 +231,31 @@ fn assert_nothing_main_hid_is_shown(raw: &str) {
 fn assert_the_first_reading_covers_the_floor(text: &str) {
     let (plain, marked) = strip::strip_marking(text);
     let floors = floor::hides(&plain, marked);
-    let all = union::hides(&plain, marked, &union::Plain);
-    for hide in &floors {
-        let covered = all
-            .iter()
-            .any(|span| span.start <= hide.start && hide.end <= span.end);
-        if !covered {
-            fail(
-                &format!(
-                    "expected the span {}..{} the release before hides inside a span of the union",
-                    hide.start, hide.end
-                ),
-                text,
-                format!(
-                    "union: {:?}",
-                    all.iter()
-                        .map(|span| (span.start, span.end))
-                        .collect::<Vec<_>>()
-                ),
-            );
+    let readers: [(&str, &dyn union::Layer); 2] = [
+        ("the union", &union::Plain),
+        ("the tail's union", &union::Tail),
+    ];
+    for (name, layer) in readers {
+        let all = union::hides(&plain, marked, layer);
+        for hide in &floors {
+            let covered = all
+                .iter()
+                .any(|span| span.start <= hide.start && hide.end <= span.end);
+            if !covered {
+                fail(
+                    &format!(
+                        "expected the span {}..{} the release before hides inside a span of {name}",
+                        hide.start, hide.end
+                    ),
+                    text,
+                    format!(
+                        "{name}: {:?}",
+                        all.iter()
+                            .map(|span| (span.start, span.end))
+                            .collect::<Vec<_>>()
+                    ),
+                );
+            }
         }
     }
     let applied = union::finish(&plain, &floors);
@@ -261,6 +274,7 @@ fn assert_every_entry_point_is_a_fixed_point(raw: &str) {
     let text = labelled(raw);
     for (name, pass) in [
         ("stderr_text", stderr_text as fn(&str) -> String),
+        ("stderr_tail", stderr_tail),
         ("message_text", message_text),
         ("bounded", bounded_text),
         ("structured (a string)", |text| walked(text).0),
@@ -301,6 +315,7 @@ fn assert_every_entry_point_is_a_fixed_point(raw: &str) {
 /// Property 3.
 fn assert_nothing_panics(raw: &str) {
     let _ = stderr_text(raw);
+    let _ = stderr_tail(raw);
     let _ = message_text(raw);
     let _ = bounded(raw, TextLimit::ErrorMessage);
     let _ = structured(&Value::String(raw.to_owned()));
@@ -348,6 +363,35 @@ fn assert_stderr_text_is_main_where_main_is_stable(raw: &str) {
     }
 }
 
+/// Property 6: a label `stderr_text` hides is hidden by `stderr_tail`, and where the token read
+/// finds nothing and the release before's answer is settled the two answers are one.
+fn assert_stderr_tail_hides_what_stderr_text_hides(raw: &str) {
+    let text = labelled(raw);
+    let tail = stderr_tail(&text);
+    let shown = stderr_text(&text);
+    for label in all_labels(&text) {
+        if !shown.contains(label.as_str()) && tail.contains(label.as_str()) {
+            fail(
+                &format!("expected {label} hidden by stderr_tail, as stderr_text hides it"),
+                &text,
+                format!("received: {tail:?}, stderr_text: {shown:?}"),
+            );
+        }
+    }
+    let main = floor::stderr_text(&text);
+    if floor::stderr_text(&main) != main {
+        return;
+    }
+    let reads_tokens = |text: &str| !tokens::tail_hides(&strip::strip_marking(text).0).is_empty();
+    if tail != shown && !reads_tokens(&text) && !reads_tokens(&main) {
+        fail(
+            "expected stderr_tail to be stderr_text where no token is read",
+            &text,
+            format!("received: {tail:?}, stderr_text: {shown:?}"),
+        );
+    }
+}
+
 /// Every property, on one text.
 fn assert_every_property(raw: &str) {
     assert_nothing_main_hid_is_shown(raw);
@@ -355,6 +399,7 @@ fn assert_every_property(raw: &str) {
     assert_nothing_panics(raw);
     assert_json_stays_json(raw);
     assert_stderr_text_is_main_where_main_is_stable(raw);
+    assert_stderr_tail_hides_what_stderr_text_hides(raw);
 }
 
 macro_rules! family {
@@ -424,6 +469,7 @@ fn every_property_holds_on_both_corpora_the_findings_and_their_pieces() {
         // Every prefix and suffix of it: a stderr tail starts and ends anywhere.
         for (at, _) in text.char_indices() {
             assert_nothing_main_hid_is_shown(&text[at..]);
+            assert_stderr_tail_hides_what_stderr_text_hides(&text[at..]);
             assert_every_entry_point_is_a_fixed_point(&text[at..]);
             assert_nothing_panics(&text[..at]);
         }

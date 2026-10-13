@@ -112,6 +112,46 @@ pub fn stderr_text(raw: &str) -> String {
     redacted
 }
 
+/// A stderr tail read once, when a failure is reported: everything [`stderr_text`] hides, and the
+/// well-known tokens with no name beside them (`ghp_...`, `AKIA...`, a web token, a private-key
+/// block).
+///
+/// [`StderrTail::read`](crate::StderrTail::read) returns this, and so do the Claude, Codex and ACP
+/// harnesses when they put a child's stderr in an error. It is the rules of [`stderr_text`] and the
+/// token read of [`bounded`] and nothing else: the reads that cross lines (containers, sequences,
+/// block scalars) and the deeper levels of escaping are not run, so a diagnostic is shown with
+/// as much of its own text as [`stderr_text`] leaves. The text is read by both over the same text
+/// and the answer hides what either hides (`redact::union`), so it hides at least what
+/// [`stderr_text`] hides. It is then read again until a reading changes nothing, so the text a
+/// call returns is one a second call leaves alone; text that never settles is hidden whole.
+///
+/// A tail is cut on a line, so a token with a prefix is either whole in it or gone. A private key
+/// loses its begin line to a cut and keeps the base64 lines under it: a tail that starts with
+/// lines of base64 and then a private key's end marker has them hidden, which makes the start of
+/// any text this reads a place where a key may have been cut.
+///
+/// Costs a byte-wise read of the whole text more than [`stderr_text`] (about double on plain
+/// lines, see `docs/benchmarks.md`), which is why [`stderr_text`] does not run it: a host that
+/// redacts every line of a stream keeps using that, and one that redacts a tail once uses this.
+/// What stays unread: a token with no known prefix, and a token a host's own cut split across
+/// lines.
+///
+/// # Example
+///
+/// ```
+/// use mango_external_agents::redact;
+///
+/// // Written in two pieces so that no source line holds a whole token.
+/// let token = ["gh", "p_0123456789abcdefghijklmnopqrstuv"].concat();
+/// let tail = redact::stderr_tail(&format!("push rejected for {token}\nAPI_KEY=hunter2"));
+/// assert_eq!(tail, "push rejected for [REDACTED]\nAPI_KEY=[REDACTED]");
+/// // `stderr_text` reads names and values, not prefixes.
+/// assert!(redact::stderr_text(&format!("push rejected for {token}")).contains(&token));
+/// ```
+pub fn stderr_tail(raw: &str) -> String {
+    read_until_stable(raw, &union::Tail)
+}
+
 /// What a vendor's message is shown as: everything [`stderr_text`] hides, and the well-known tokens
 /// with no name beside them (`ghp_...`, `AKIA...`, a web token, a private-key block), the reads
 /// that cross lines (containers, sequences, block scalars) and the deeper levels of escaping
