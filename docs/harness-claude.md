@@ -289,6 +289,19 @@ strict session, and it never resumes the killed prompt. SIGINT is what the vendo
 ending a turn cleanly. A launcher reports that graceful interruption separately from forced
 termination, which preserves the existing native continuation.
 
+**`Resumable` after an interrupt is an inference.** It rests on one vendor sentence, the one
+quoted above: "To end the turn instead, send SIGINT"
+([headless.md](https://code.claude.com/docs/en/headless.md)). The vendor documents neither a
+`result` record for an interrupted turn nor what the stored conversation holds afterwards. The
+harness reads the verdict off what it observed: the child was still running when the interrupt was
+asked for, it left after the interrupt and within the grace, and no `result` followed. It
+does not take the host's control at its word: a control may answer `Delivered` for a process that
+was not there to receive the signal, so a child the harness finds already exited before the
+interrupt is `UnfinishedTurn`, whatever the control answered. That check is a single look at the
+control's `wait` before the interrupt; an exit in the instant between the look and the signal
+cannot be told from an interrupt that ended the turn. The SIGINT path has not been verified on a
+live turn, because that needs a signed-in account and this library never logs in.
+
 ### Resumability after a stop
 
 `Session::cancel` returns `Ok(())` for a clean interrupt and for a kill alike, and the
@@ -336,6 +349,7 @@ while a stop is pending the value is `Unknown`, never a `Resumable` the stop may
 | Child died mid-turn after `system/init` (exit 143, 1, 0)              | `UnfinishedTurn`              | n/a              | `UnfinishedTurn` |
 | Idle timeout or unreadable stream after `system/init`                 | `UnfinishedTurn`              | n/a              | `UnfinishedTurn` |
 | Child died before any `system/init` (control with graceful interrupt) | `Unknown`                     | n/a              | `Unknown`        |
+| `cancel` after the child had already exited (control said delivered)  | `Unknown` or `UnfinishedTurn` | `UnfinishedTurn` | `UnfinishedTurn` |
 | `cancel` that interrupted gracefully                                  | `Unknown` or `Resumable`      | `Resumable`      | `Resumable`      |
 | `cancel` that had to kill                                             | `Unknown` or `UnfinishedTurn` | `UnfinishedTurn` | `UnfinishedTurn` |
 | `close`, host `CancelToken`, dropped stream, dropped session          | as `cancel`                   | as `cancel`      | as `cancel`      |
