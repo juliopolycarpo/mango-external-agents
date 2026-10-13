@@ -219,7 +219,7 @@ fn capture_host(workspace: &Path) -> Result<HostContext> {
         .build()
 }
 
-async fn command_output(
+pub(super) async fn command_output(
     host: &HostContext,
     argv: Vec<String>,
     vendor_environment_keys: &[&str],
