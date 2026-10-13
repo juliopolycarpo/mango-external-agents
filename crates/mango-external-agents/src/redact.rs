@@ -130,8 +130,10 @@ pub fn stderr_text(raw: &str) -> String {
 /// lines of base64 and then a private key's end marker has them hidden, which makes the start of
 /// any text this reads a place where a key may have been cut.
 ///
-/// Costs a byte-wise read of the whole text more than [`stderr_text`] (about double on plain
-/// lines, see `docs/benchmarks.md`), which is why [`stderr_text`] does not run it: a host that
+/// Costs a byte-wise read of the whole text more than [`stderr_text`] (2.4 times the instructions
+/// on plain lines, and about 4.7 times on lines that carry credentials, which are read a second
+/// time because the first reading changed them; see `docs/benchmarks.md`), which is why
+/// [`stderr_text`] does not run it: a host that
 /// redacts every line of a stream keeps using that, and one that redacts a tail once uses this.
 /// What stays unread: a token with no known prefix, and a token a host's own cut split across
 /// lines.

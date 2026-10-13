@@ -457,8 +457,8 @@ impl StderrTail {
     ///   against the name that preceded them: a few KiB at most, whatever the capacity,
     ///   so `0` returns nothing from `read` but does not hold nothing.
     /// - Time. Redaction is linear in the tail (the rules of [`redact::stderr_text`] and the token
-    ///   pass, about three times the instructions of the rules alone on plain lines, read again
-    ///   when the first reading changed the text), so a read costs in proportion to `max_bytes`. It
+    ///   pass: 2.4 times the instructions of the rules alone on plain lines, and the text is read
+    ///   again when the first reading changed it), so a read costs in proportion to `max_bytes`. It
     ///   runs after the tail's lock is released, so it delays the caller of `read` and never the
     ///   writer calling `push`.
     ///
