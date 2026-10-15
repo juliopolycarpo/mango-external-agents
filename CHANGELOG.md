@@ -4,6 +4,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.7.1] - 2026-10-15
+
+### 🚀 Features
+
+- **(claude)** Report resumability and tag a refused resume (#196)
+
+### 🐛 Bug Fixes
+
+- **(deps)** Require rustls 0.23.46 for its four TLS advisories (#197)
+- **(core)** Read well-known bare tokens in a stderr tail (#193)
+- **(core)** Forward the XDG base directories to the agents that read them (#192)
+- **(codex)** Refuse an outdated app-server before it is started (#194)
+- **(acp)** Name the host's process control when it panics (#195)
+- **(codex)** Name the host's process control when it panics (#191)
+- **(mea)** Print the vendor's reason when a smoke turn cannot open (#190)
+
+### 🧪 Testing
+
+- **(core)** Pin the registry consumer to the published 0.7.0 (#189)
+
 ## [0.7.0] - 2026-10-12
 
 ### 🐛 Bug Fixes
