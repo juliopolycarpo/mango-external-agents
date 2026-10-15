@@ -47,7 +47,7 @@ tokio = { version = "1.53.1", default-features = false, features = ["macros", "r
 futures-util = { version = "0.3.34", default-features = false, features = ["sink"], optional = true }
 # TLS is `ring` everywhere: named here with no default features, so the provider is this crate's
 # choice rather than whatever a transitive default would have picked.
-rustls = { version = "0.23.35", default-features = false, features = ["logging", "ring", "std", "tls12"], optional = true }
+rustls = { version = "0.23.46", default-features = false, features = ["logging", "ring", "std", "tls12"], optional = true }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"], optional = true }
 
 # Signals for the default launcher's escalation. `unsafe_code` is forbidden in this workspace, so
