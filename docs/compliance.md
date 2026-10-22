@@ -517,9 +517,11 @@ is the library's own allowlist, and the only vendor variable on it is `CODEX_HOM
 in a host's environment is not forwarded. The sentence quoted above does not address that, and this
 page draws no conclusion.
 
-**Interface quotes**, read against `rust-v0.154.0`, from
-[`codex-rs/app-server/README.md`](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/app-server/README.md)
-at that tag:
+**Interface quotes**, re-read on 2026-10-22 from
+[`codex-rs/app-server/README.md`](https://github.com/openai/codex/blob/41e22fee981a63b3698df7ed36bad393cda24715/codex-rs/app-server/README.md)
+at commit `41e22fee981a63b3698df7ed36bad393cda24715` (`rust-v0.153.0`). This is the
+document revision for these quotations, not the tested CLI pin (`rust-v0.154.0`), whose tree
+does not contain that README:
 
 - "`codex app-server` is the interface Codex uses to power rich interfaces such as the Codex VS
   Code extension."
@@ -610,7 +612,7 @@ about third-party harnesses found either way — "not found" is the finding, not
 | OpenCode           | Anomaly Innovations           | [opencode.ai/docs/acp][opencode-acp]               |
 | Gemini CLI         | Google                        | [gemini-cli/docs/cli/acp-mode.md][gemini-acp]      |
 | GitHub Copilot CLI | GitHub                        | [ACP server reference][copilot-acp]                |
-| Goose              | Block                         | [block.github.io/goose ACP protocol][goose-acp]    |
+| Goose              | Block                         | [Goose ACP guide source][goose-acp]                |
 | `codex-acp`        | OpenAI's CLI, via the adapter | [agentclientprotocol/codex-acp][codex-acp]         |
 | `claude-agent-acp` | Claude Code, via the adapter  | [agentclientprotocol/claude-agent-acp][claude-acp] |
 
@@ -619,7 +621,7 @@ about third-party harnesses found either way — "not found" is the finding, not
 [opencode-acp]: https://opencode.ai/docs/acp/
 [gemini-acp]: https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/acp-mode.md
 [copilot-acp]: https://docs.github.com/copilot/reference/copilot-cli-reference/acp-server
-[goose-acp]: https://block.github.io/goose/docs/advanced/acp-protocol
+[goose-acp]: https://github.com/block/goose/blob/main/documentation/docs/gdk/acp/index.md
 [codex-acp]: https://github.com/agentclientprotocol/codex-acp
 [claude-acp]: https://github.com/agentclientprotocol/claude-agent-acp
 [github-tokens]: https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/about-authentication-to-github#githubs-token-formats
@@ -647,11 +649,18 @@ Some profiles need a note beyond the link:
   `--no-auto-update` flag. A smoke turn passed against Grok 1.0.30 on 2026-09-13 without
   `authenticate`; that is an observation of this build, not a documented promise about other builds.
 
-- **Goose has no corporate terms of service.** It is Apache-2.0 and brings the user's own model
-  credentials, and Block publishes no page covering it — only product-specific terms for unrelated
-  products. Its `terms_url` therefore points at the project's own
-  [acceptable-usage document](https://github.com/block/goose/blob/main/ACCEPTABLE_USAGE.md), which is
-  the document that does govern the tool, rather than at a page that does not.
+- **Goose's software license is Apache-2.0.** On 2026-10-22, the project's
+  [LICENSE](https://github.com/block/goose/blob/7ba1b1625d9002f8e66230313c5ab772e35c4c1f/LICENSE)
+  and published documentation were checked; no separate applicable Goose terms-of-service
+  page was found. The project
+  [removed its Acceptable Usage Policy](https://github.com/block/goose/commit/42bc7b9a7388aa0836329ee572da43cd5378f018)
+  on 2026-01-26. The existing string field `terms_url` therefore links to the project's
+  [LICENSE](https://github.com/block/goose/blob/main/LICENSE): it identifies the software
+  license, not subscription terms or permission from model providers. Provider terms still
+  depend on the provider the user configures; absence of a terms page is not permission.
+  The [ACP guide][goose-acp], whose
+  [source was read at this revision](https://github.com/block/goose/blob/7ba1b1625d9002f8e66230313c5ab772e35c4c1f/documentation/docs/gdk/acp/index.md),
+  documents `goose acp` over stdio. This source check is not live CLI qualification.
 - **Gemini's terms and privacy vary by the authentication method the user chose.** The profile links
   Google's general pages; a host whose disclosure has to be exact should read Gemini CLI's own
   terms-and-privacy index.

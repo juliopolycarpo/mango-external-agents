@@ -61,7 +61,9 @@ second line, for what `--version` could not say.
 ## The documented surface this harness drives
 
 Every method below follows the [official app-server documentation][app-server] and the
-[`codex-rs/app-server/README.md`][readme] at `rust-v0.154.0`. JSON-RPC
+[`codex-rs/app-server/README.md`][readme] at document revision
+`41e22fee981a63b3698df7ed36bad393cda24715` (`rust-v0.153.0`), re-read on 2026-10-22.
+The tested CLI and schema pin remain `rust-v0.154.0`. JSON-RPC
 2.0 over newline-delimited JSON, **without** the `"jsonrpc"` member — the README's own words:
 "bidirectional communication using JSON-RPC 2.0 messages (with the `"jsonrpc":"2.0"` header omitted
 on the wire)".
@@ -364,7 +366,7 @@ control`, as in the Claude harness, and `codex app-server` stays the peer of the
 only. `Closed` is published only after the reap succeeds.
 
 Stopping a turn has four deadlines, and none of them borrows another's meaning. The
-[app-server protocol](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md)
+[app-server protocol][readme]
 answers `turn/interrupt` with an empty result and later ends the turn with `turn/completed` status
 `interrupted`; neither step has a vendor deadline, so each is bounded by the host's `Limits`:
 
@@ -1118,7 +1120,14 @@ id renders nothing because no completion could address it. The item families are
 
 Compliance posture: see [compliance.md](compliance.md).
 
-[readme]: https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/app-server/README.md
+The [interface README][readme] is pinned to document revision
+`41e22fee981a63b3698df7ed36bad393cda24715` (`rust-v0.153.0`), re-read on 2026-10-22.
+Its rich-client, `clientInfo` and WebSocket statements match the quotations in
+[compliance.md](compliance.md#openai-codex-mango-agent-codex). The tested CLI remains
+`rust-v0.154.0`; that tag does not contain the README. This citation repair does not
+requalify a vendor build.
+
+[readme]: https://github.com/openai/codex/blob/41e22fee981a63b3698df7ed36bad393cda24715/codex-rs/app-server/README.md
 [resume-error]: https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/app-server/src/request_processors/thread_processor.rs
 [thread-protocol]: https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
 [config-reference]: https://developers.openai.com/codex/config-reference
