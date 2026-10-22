@@ -28,9 +28,10 @@ use crate::identity::{HarnessId, HarnessIdentity};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VendorInfo {
-    /// The company behind the CLI, which is who the terms are with.
+    /// The company behind the CLI.
     pub company: &'static str,
-    /// The consumer-facing terms, which is what a subscription-backed sign-in is under.
+    /// The consumer-facing terms, or the software license for a project without a published
+    /// applicable terms page (Goose). This link does not establish model-provider permissions.
     pub terms_url: &'static str,
     /// The vendor's privacy policy.
     pub privacy_url: &'static str,

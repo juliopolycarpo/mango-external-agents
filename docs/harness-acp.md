@@ -784,7 +784,15 @@ held back.
 [p-opencode]: https://opencode.ai/docs/acp/
 [p-gemini]: https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/acp-mode.md
 [p-copilot]: https://docs.github.com/copilot/reference/copilot-cli-reference/acp-server
-[p-goose]: https://block.github.io/goose/docs/advanced/acp-protocol
+
+Goose's ACP guide was re-read on 2026-10-22 at
+[revision `7ba1b162`](https://github.com/block/goose/blob/7ba1b1625d9002f8e66230313c5ab772e35c4c1f/documentation/docs/gdk/acp/index.md).
+It documents stdio via `goose acp`; this is documentation evidence, not a live smoke run.
+The Goose profile's `terms_url` points to its Apache-2.0 software license because no separate
+applicable terms page was found; it does not describe model-provider terms. See the
+[compliance rationale](compliance.md#agent-client-protocol-agents-mango-agent-acp).
+
+[p-goose]: https://github.com/block/goose/blob/main/documentation/docs/gdk/acp/index.md
 [p-codex]: https://github.com/agentclientprotocol/codex-acp
 [p-claude]: https://github.com/agentclientprotocol/claude-agent-acp
 [p-powershell-file]: https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_powershell_exe?view=powershell-5.1

@@ -673,22 +673,22 @@ fn copilot() -> AcpProfile {
 
 /// Goose in ACP mode.
 ///
-/// `terms_url` is the project's own acceptable-usage document rather than a corporate page: Goose
-/// is Apache-2.0 and brings its own model credentials, and Block publishes no single terms of
-/// service covering it. Pointing at a page that does not govern this tool would be worse than
-/// pointing at the one that does.
+/// `terms_url` links to the Apache-2.0 software license, not subscription terms. No separate
+/// applicable Goose terms page was found on 2026-10-22; the project removed ACCEPTABLE_USAGE.md
+/// in commit 42bc7b9a7388aa0836329ee572da43cd5378f018. This preserves the existing URL-shaped
+/// metadata without inventing terms or implying permission from the user's model provider.
 fn goose() -> AcpProfile {
     profile(
         "goose",
         "Goose",
         VendorInfo {
             company: "Block",
-            terms_url: "https://github.com/block/goose/blob/main/ACCEPTABLE_USAGE.md",
+            terms_url: "https://github.com/block/goose/blob/main/LICENSE",
             privacy_url: "https://block.xyz/legal/privacy-notice",
             skills_are_slash_commands: false,
         },
         &["goose", "acp", "--with-builtin", "developer"],
-        "https://block.github.io/goose/docs/advanced/acp-protocol",
+        "https://github.com/block/goose/blob/main/documentation/docs/gdk/acp/index.md",
     )
     .with_login_hint("goose configure")
     // `GOOSE_PATH_ROOT` overrides "the root directory for all goose data, config, and state
