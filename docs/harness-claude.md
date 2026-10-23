@@ -189,8 +189,7 @@ id, and each turn spawns, streams and reaps its own child.
   When its `system/init` supplies an id, the [documented `--resume <uuid>` form](https://code.claude.com/docs/en/headless.md)
   requires it to be UUID-shaped and this harness requires it to match the persisted handle. A
   missing id remains tolerated because it makes no competing identity assertion. A malformed or
-  different id fails that turn rather than replacing the handle a host persisted — see
-  [Session model](#session-model). Only the *first*
+  different id fails that turn rather than replacing the handle a host persisted. Only the *first*
   turn's echo may replace the minted id, because that turn proposes one rather than naming an
   existing conversation.
 
