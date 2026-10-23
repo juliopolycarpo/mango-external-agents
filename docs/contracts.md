@@ -302,15 +302,16 @@ of them is still reachable.
 | `PlanStep`, `FileChange`                                                                     | structured content grows                                        |
 | `ActivityUpdate`, `ActivityResult`                                                           | structured activity content and result metadata can grow        |
 
-Left **open** on purpose:
+Currently **open**:
 
-| Open                                                                | Why                                                                                                                                                        |
-| ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Discovery`                                                         | constructed by a harness, which recompiles against this crate anyway; closing it buys a compile error in place of a field nobody had to think about        |
-| `HarnessDescriptor`                                                 | same                                                                                                                                                       |
-| `SessionQuery`                                                      | hosts can construct the current `cursor`, `limit` and `workspace_path` fields with a struct literal or `Default`; adding a field would break full literals |
-| `SessionIds`, `Resume`, `McpServer`, `SessionPage`, `NativeSession` | small, stable, and constructed by implementors rather than hosts                                                                                           |
-| `Capabilities`                                                      | exhaustively destructured in `Capabilities::beyond`, so a new flag is already a compile error where it matters                                             |
+| Open                                         | Why                                                                                                                                                        |
+| -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Discovery`                                  | constructed by a harness, which recompiles against this crate anyway; closing it buys a compile error in place of a field nobody had to think about        |
+| `HarnessDescriptor`                          | same                                                                                                                                                       |
+| `SessionQuery`                               | hosts can construct the current `cursor`, `limit` and `workspace_path` fields with a struct literal or `Default`; adding a field would break full literals |
+| `Resume`, `McpServer`                        | host-supplied records with public fields, accepted by `OpenSession` for resume and MCP configuration                                                       |
+| `SessionIds`, `SessionPage`, `NativeSession` | small, stable records constructed by harness implementors                                                                                                  |
+| `Capabilities`                               | exhaustively destructured in `Capabilities::beyond`, so a new flag is already a compile error where it matters                                             |
 
 Enums are `#[non_exhaustive]` nearly everywhere, because a new arm is the ordinary way a vocabulary
 grows and a host matching on one should be made to say what it does with the rest.
