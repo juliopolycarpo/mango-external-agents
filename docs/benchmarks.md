@@ -138,6 +138,9 @@ the repository.
 
 ## Receipt: the redactor's newer reads
 
+In this historical receipt, "release before" means Base `e172b8a`: the 0.6.1 rules with the fixes
+merged after that release. The measurements below keep their original comparison points.
+
 The redactor change that added the token pass, escaped-JSON reads, multi-line containers, sequences,
 block scalars, counts and the URL settle was measured with user-space instructions, which do not move
 with the load of a shared machine the way wall time does. One sample is the call or calls the case

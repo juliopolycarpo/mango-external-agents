@@ -1,11 +1,11 @@
-//! The redactor of the release before this one, kept as the floor under the reads added since.
+//! The 0.6.1 redaction rules and subsequent fixes, kept as the floor under the newer reads.
 //!
 //! These are the rules and the three passes of `redact::stderr_text` as `main` had them before the
 //! well-known tokens, the deeper escaping, the containers across lines, the sequences and the block
 //! scalars were added, copied rather than shared. The reads added since live in `redact::rules`
 //! and change as the redactor does; this copy does not, so a change to a rule there cannot make the
-//! answer here, or the answer of [`message_text`](super::message_text), hide less than the release
-//! before. Only the list of credential words (`structured::CREDENTIAL_WORDS`) and the scanner
+//! answer here, or the answer of [`message_text`](super::message_text), hide less than that baseline.
+//! Only the list of credential words (`structured::CREDENTIAL_WORDS`) and the scanner
 //! (`scan`) are the live ones, as the stripper (`strip`) is; they are the vocabulary of every
 //! reader, and a word added to the list is a word every reader gains.
 //!
@@ -56,7 +56,7 @@ pub(in crate::redact) fn single_round(raw: &str) -> String {
     unsettled_round(&strip::strip_control_characters(raw))
 }
 
-/// `main`'s `stderr_text`, to the letter: what the release before this one answered.
+/// The 0.6.1 baseline's `stderr_text`, to the letter.
 #[cfg(test)]
 pub(super) fn stderr_text(raw: &str) -> String {
     let (plain, marked) = strip::strip_marking(raw);
@@ -121,7 +121,7 @@ fn round_hides(plain: &str) -> (Vec<Hide>, String) {
 /// ([`rules_round`]), and the extra rounds that text gets when that happened or the stripper took
 /// a byte out. Applying them to `plain` gives `stderr_text`'s answer.
 ///
-/// New beside [`hides`] and called by no other path: [`hides`] is the rules of the release before,
+/// New beside [`hides`] and called by no other path: [`hides`] is the 0.6.1 baseline's rules,
 /// to the letter, and it has no such reading, so it cannot be widened to carry this one.
 pub(super) fn current_hides(plain: &str, marked: bool) -> Vec<Hide> {
     let (mut all, mut text, reread) = current_round_hides(plain);
