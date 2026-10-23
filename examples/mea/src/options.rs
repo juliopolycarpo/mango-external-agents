@@ -31,10 +31,9 @@ struct Arguments {
 
 /// What this CLI's own `--harness` flag selected.
 ///
-/// The library dropped its `HarnessKind` enum for [`HarnessId`], a validated string a host
-/// dispatches on — but a `match` over a string prefix (`"acp:"`) is worse than the enum it
-/// replaced. This is `mea`'s own three-way vocabulary for `claude`, `codex` and `acp:<profile>`;
-/// [`HarnessChoice::id`] is the one place it is translated into the registry's own key.
+/// The library registry uses [`HarnessId`], a validated string. This enum makes `mea`'s three
+/// supported selections exhaustive: `claude`, `codex` and `acp:<profile>`.
+/// [`HarnessChoice::id`] translates the CLI selection into the registry key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HarnessChoice {
     Claude,
