@@ -5,7 +5,7 @@ deliberately left open, and how the identifiers a host persists map onto the one
 speaks. Read it alongside [`adopt.md`](adopt.md), which is the walkthrough; this file is the
 rationale and the compatibility surface.
 
-## Identity: three facts, not one enum
+## Identity and carrier: four facts
 
 | Fact              | Type             | Example                                                    | Who decides it                     |
 | ----------------- | ---------------- | ---------------------------------------------------------- | ---------------------------------- |
@@ -26,18 +26,8 @@ They are map keys, log fields, and path components in a host's own storage, so a
 sometimes round-trips is worse than one that is refused. Construction and deserialization go
 through the same rules, and a refusal names the offending value.
 
-**Compatibility.** `HarnessId` serializes as the bare string, which is exactly what the previous
-`HarnessKind` printed through `Display`:
-
-| Previously                                      | Now                                               | Wire value     |
-| ----------------------------------------------- | ------------------------------------------------- | -------------- |
-| `HarnessKind::Claude`                           | `HarnessIdentity::claude()`                       | `"claude"`     |
-| `HarnessKind::Codex`                            | `HarnessIdentity::codex()`                        | `"codex"`      |
-| `HarnessKind::Acp(AcpProfileId::new("cursor"))` | `HarnessIdentity::acp(ProfileId::new("cursor")?)` | `"acp:cursor"` |
-
-A host that persisted the old `Display` form reads it back unchanged. The JSON *shape* changed for
-anyone who serialized the enum itself — `{"acp":"cursor"}` became `"acp:cursor"` — which is the
-point: the new form is the one a host can store in a single column and hand back as a key.
+`HarnessId` serializes as a bare string, such as `"claude"`, `"codex"` or `"acp:cursor"`.
+A host can persist that string in a single column and hand it back as a registry key.
 
 A host with a native harness of its own builds `HarnessIdentity::custom(id, protocol, profile)` and
 registers it in `HarnessRegistry` next to the built-in ones. Nothing in this crate needs an arm for
@@ -299,27 +289,29 @@ or builder that keeps the cost at zero. `crates/mango-external-agents/tests/down
 is compiled as its own crate — the only place the attribute means anything — and proves every one
 of them is still reachable.
 
-| Protected                                                                                    | Why                                                                          |
-| -------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| `OpenSession`, `TurnRequest`, `SessionQuery`                                                 | the host-facing request surface; it gained three fields in this change alone |
-| `ConfigurationPatch`, `Configuration`, `ConfigurationState`, `ConfigurationOutcome`          | axes are added as vendors expose them                                        |
-| `ConfigurationOption`, `ConfigurationOptionValue`, `RejectedSetting`                         | vendor metadata grows                                                        |
-| `Interaction`, `QuestionRequest`, `Question`, `QuestionOption`, `QuestionResponse`, `Answer` | the interaction vocabulary is the youngest surface here                      |
-| `PermissionRequest`, `PermissionOption`, `PermissionResponse`, `ApprovalDecision`            | scope and risk arrived in this change; more will                             |
-| `Activity`, `AgentEvent`                                                                     | the event vocabulary grows with every vendor inventoried                     |
-| `SessionSnapshot`, `TransportSelection`, `HarnessIdentity`                                   | session facts accumulate                                                     |
-| `DiscoveryReceipt`                                                                           | identity and freshness metadata will grow                                    |
-| `PlanStep`, `FileChange`                                                                     | structured content grows                                                     |
-| `ActivityUpdate`, `ActivityResult`                                                           | both just gained `content`; a third field should not break a host again      |
+| Protected                                                                                    | Why                                                             |
+| -------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| `OpenSession`, `TurnRequest`                                                                 | the host-facing request surface grows as vendors expose options |
+| `ConfigurationPatch`, `Configuration`, `ConfigurationState`, `ConfigurationOutcome`          | axes are added as vendors expose them                           |
+| `ConfigurationOption`, `ConfigurationOptionValue`, `RejectedSetting`                         | vendor metadata grows                                           |
+| `Interaction`, `QuestionRequest`, `Question`, `QuestionOption`, `QuestionResponse`, `Answer` | the interaction vocabulary is the youngest surface here         |
+| `PermissionRequest`, `PermissionOption`, `PermissionResponse`, `ApprovalDecision`            | permission scope, risk and response metadata can grow           |
+| `Activity`, `AgentEvent`                                                                     | the event vocabulary grows with every vendor inventoried        |
+| `SessionSnapshot`, `TransportSelection`, `HarnessIdentity`                                   | session facts accumulate                                        |
+| `DiscoveryReceipt`                                                                           | identity and freshness metadata will grow                       |
+| `PlanStep`, `FileChange`                                                                     | structured content grows                                        |
+| `ActivityUpdate`, `ActivityResult`                                                           | structured activity content and result metadata can grow        |
 
-Left **open** on purpose:
+Currently **open**:
 
-| Open                                                                | Why                                                                                                                                                 |
-| ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Discovery`                                                         | constructed by a harness, which recompiles against this crate anyway; closing it buys a compile error in place of a field nobody had to think about |
-| `HarnessDescriptor`                                                 | same                                                                                                                                                |
-| `SessionIds`, `Resume`, `McpServer`, `SessionPage`, `NativeSession` | small, stable, and constructed by implementors rather than hosts                                                                                    |
-| `Capabilities`                                                      | exhaustively destructured in `Capabilities::beyond`, so a new flag is already a compile error where it matters                                      |
+| Open                                         | Why                                                                                                                                                        |
+| -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Discovery`                                  | constructed by a harness, which recompiles against this crate anyway; closing it buys a compile error in place of a field nobody had to think about        |
+| `HarnessDescriptor`                          | same                                                                                                                                                       |
+| `SessionQuery`                               | hosts can construct the current `cursor`, `limit` and `workspace_path` fields with a struct literal or `Default`; adding a field would break full literals |
+| `Resume`, `McpServer`                        | host-supplied records with public fields, accepted by `OpenSession` for resume and MCP configuration                                                       |
+| `SessionIds`, `SessionPage`, `NativeSession` | small, stable records constructed by harness implementors                                                                                                  |
+| `Capabilities`                               | exhaustively destructured in `Capabilities::beyond`, so a new flag is already a compile error where it matters                                             |
 
 Enums are `#[non_exhaustive]` nearly everywhere, because a new arm is the ordinary way a vocabulary
 grows and a host matching on one should be made to say what it does with the rest.

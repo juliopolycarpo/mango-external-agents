@@ -32,7 +32,7 @@ const REACH: usize = MAX_BLOCK_BYTES;
 
 /// The state of the private-key markers in the text dropped so far.
 ///
-/// Fed every byte the tail drops, in order. Its state is two flags, a counter and the line being
+/// Fed every byte the tail drops, in order. Its state is four flags, a counter and the line being
 /// written, of at most twice [`CARRY`] bytes whatever is fed to it. A drop with nothing in it that
 /// can end a marker costs one pass; one that can is read together with the line it continues.
 ///

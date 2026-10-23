@@ -138,6 +138,9 @@ the repository.
 
 ## Receipt: the redactor's newer reads
 
+In this historical receipt, "release before" means Base `e172b8a`: the 0.6.1 rules with the fixes
+merged after that release. The measurements below keep their original comparison points.
+
 The redactor change that added the token pass, escaped-JSON reads, multi-line containers, sequences,
 block scalars, counts and the URL settle was measured with user-space instructions, which do not move
 with the load of a shared machine the way wall time does. One sample is the call or calls the case
@@ -278,7 +281,7 @@ of the rules, of the token pass and of the cut key).
 Every row of this bench that `main` has was counted again on the head of the branch against `main` at `5fb3302`: 69 rows, the `stderr_text`, `bounded` and 1 MiB token-pass rows, both built at one codegen unit. None moved: the 53 rows of a million instructions or more are within 0.04%, and the 16 KiB rows of about 79,000 instructions, the smallest, are within 0.5% (all lower on the head, a difference of layout and not of work). The twelve `bounded-16KiB` rows are within 0.05%, the four that last under 0.1 ms (`names`, `quoted-names`, `quotes`, `slashes`) included, so a wall-clock ratio of 1.2 on one of them in a single run is the machine and not the code: the same `main` binary measured 0.052 and 0.082 ms for `quotes` in two of five alternating runs. `redact::message_text` is what `bounded` runs before it bounds the text, and `structured` runs the same union per string leaf; a one-off count of `bounded` over 16 KiB and 1 MiB of plain, credential and token lines and of `structured` over a nested value with credential leaves gave the same instructions on `main` and on the head to within 0.02%. The worst shape of the key read, begin markers with no end marker, is linear: 117,001,718 instructions at 1 MiB, 467,551,378 at 4 MiB (4.00 times) and 1,887,858,358 at 16 MiB (16.14 times).
 
 `StderrTail::push` also reads what the tail drops, to know whether the dropped text ended inside a
-private key (`redact::OpenKey`: a flag, a counter and the line being written, at most 2 x 4,168
+private key (`redact::OpenKey`: four flags, a byte counter and a line buffer holding at most 2 x 4,168
 bytes, no allocation on the usual path, and the lock is held for it as it is for the drain). A drop
 is read in blocks of 4 KiB. A block with no hyphen is skipped by one byte search
 (`<[u8]>::contains`, the standard library's memchr), and one with a hyphen is gated by a single
