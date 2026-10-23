@@ -54,10 +54,13 @@ These are different observations:
 `ProcessControl::interrupt` distinguishes a delivered graceful interrupt, no delivery to an already
 exited or stopping child, and an unsupported operation. The Tokio launcher uses SIGINT on Unix and
 reports unsupported on Windows. Hosts can
-implement their platform's interruption mechanism. `stop_process_with_limits` waits for
-`kill_grace`, then uses `shutdown_timeout` for each cleanup stage. In the Codex harness those two
-limits bound process teardown only. There, a turn being cancelled on a live session is bounded by
-`cancel_settle_timeout` once its protocol stop is acknowledged, and expiry escalates to that
+implement their platform's interruption mechanism. `stop_process_with_limits` bounds the
+interrupt call by `kill_grace` and, if it reports delivery, separately bounds the following wait
+by `kill_grace`. It then bounds the process-tree kill and the final wait by `shutdown_timeout`
+each, even after a graceful leader exit. These are per-call budgets: the full sequence can take
+up to `2 * kill_grace + 2 * shutdown_timeout`, rather than one shared deadline. In the Codex
+harness those two limits bound process teardown only. There, a turn being cancelled on a live
+session is bounded by `cancel_settle_timeout` once its protocol stop is acknowledged, and expiry escalates to that
 teardown. See `docs/harness-codex.md` for the stages. The Claude and ACP harnesses still bound
 their cancellation with `kill_grace` and `shutdown_timeout`. Tree cleanup still runs after a
 leader exits because descendants may hold the workspace. SIGTERM or forced termination does not

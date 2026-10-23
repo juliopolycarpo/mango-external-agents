@@ -53,21 +53,21 @@ own deployment.
 - **Redaction.** A vendor's own diagnostic text is redacted for credential-shaped text before it is
   bounded, wherever it enters, and a vendor's transcript content is not. What is redacted where:
 
-  | Text                                                                                        | Redacted | By                                                                                 |
-  | ------------------------------------------------------------------------------------------- | -------- | ---------------------------------------------------------------------------------- |
-  | a stderr tail (`StderrTail::read`, and the stderr in a harness's failure)                   | yes      | `redact::stderr_tail` (the previous release's rules and the token pass, see below) |
-  | stderr read line after line                                                                 | yes      | `redact::stderr_text` (the previous release's rules, see below)                    |
-  | an `EventKind::Error` message and its vendor code                                           | yes      | the core, whichever harness produced it                                            |
-  | the title, description and unknown severity of an `EventKind::Notice`                       | yes      | `EventKind::notice`                                                                |
-  | a JSON-RPC peer's error message, when it is an error object                                 | yes      | `JsonRpcError::into_vendor_error`                                                  |
-  | a setup `Error::Vendor` message                                                             | yes      | the core, then bounded                                                             |
-  | the version a probe printed, a `VersionTooOld` `found`, an unsupported option's explanation | yes      | `redact::bounded`, in `Discovery::normalized` and the matrix                       |
-  | a session's title and preview (the conversation's own words), a login hint, an account plan | no       | content or host text, bounded only                                                 |
-  | an ACP agent's error message and its `data`, a JSON value read as structure                 | yes      | `redact::structured`, then the text rules and the token pass                       |
-  | an ACP compaction error                                                                     | yes      | `redact::bounded`                                                                  |
-  | a malformed JSON-RPC `error` member                                                         | n/a      | a fixed description; the member is never quoted                                    |
-  | `CallFailureCause::Peer`, the peer's message exactly as sent                                | **no**   | exact by design, so a harness may compare it; never show it raw                    |
-  | assistant text, reasoning, tool output and tool errors (`is_error`, denial reasons)         | no       | the answer, not a diagnostic                                                       |
+  | Text                                                                                        | Redacted | By                                                                    |
+  | ------------------------------------------------------------------------------------------- | -------- | --------------------------------------------------------------------- |
+  | a stderr tail (`StderrTail::read`, and the stderr in a harness's failure)                   | yes      | `redact::stderr_tail` (the 0.6.1 rules and the token pass, see below) |
+  | stderr read line after line                                                                 | yes      | `redact::stderr_text` (the 0.6.1 rules, see below)                    |
+  | an `EventKind::Error` message and its vendor code                                           | yes      | the core, whichever harness produced it                               |
+  | the title, description and unknown severity of an `EventKind::Notice`                       | yes      | `EventKind::notice`                                                   |
+  | a JSON-RPC peer's error message, when it is an error object                                 | yes      | `JsonRpcError::into_vendor_error`                                     |
+  | a setup `Error::Vendor` message                                                             | yes      | the core, then bounded                                                |
+  | the version a probe printed, a `VersionTooOld` `found`, an unsupported option's explanation | yes      | `redact::bounded`, in `Discovery::normalized` and the matrix          |
+  | a session's title and preview (the conversation's own words), a login hint, an account plan | no       | content or host text, bounded only                                    |
+  | an ACP agent's error message and its `data`, a JSON value read as structure                 | yes      | `redact::structured`, then the text rules and the token pass          |
+  | an ACP compaction error                                                                     | yes      | `redact::bounded`                                                     |
+  | a malformed JSON-RPC `error` member                                                         | n/a      | a fixed description; the member is never quoted                       |
+  | `CallFailureCause::Peer`, the peer's message exactly as sent                                | **no**   | exact by design, so a harness may compare it; never show it raw       |
+  | assistant text, reasoning, tool output and tool errors (`is_error`, denial reasons)         | no       | the answer, not a diagnostic                                          |
 
   `CallFailureCause::Peer` holds the peer's error exactly as sent, because the caller of a request
   may need its words and its data. A harness must not show it to a host raw: it converts it with
@@ -92,9 +92,9 @@ own deployment.
   could be a credential is redacted, and a second credential word in the name
   (`session_token_cookie: expired`) vetoes a keep. `testing::redaction` holds the corpus of both kinds.
 
-  **No entry point shows what the release before hid.** The rules above are the ones the previous
-  release (0.6.1 and the fixes merged after it) shipped, and `redact::floor` holds them to the
-  letter. `stderr_text` is exactly that: a stderr stream read with it never shows what 0.6.1 hid,
+  **No entry point shows what the 0.6.1 rules hid.** The rules above are the 0.6.1 rules,
+  including fixes merged after that release, and `redact::floor` holds them to the letter.
+  `stderr_text` is exactly that: a stderr stream read with it never shows what 0.6.1 hid,
   and a plain line pays what it paid. Everything newer is read beside them, by the paths that carry
   a vendor's messages (`redact::bounded`, `redact::structured`, and the text they share) and, for the
   well-known tokens only, by `redact::stderr_tail`: each
@@ -123,7 +123,7 @@ own deployment.
     inside a string (`\u00e9` stays `\u00e9`) come back byte for byte. A span that would break the
     JSON (it starts in one string and ends in the next, or inside an escape) becomes the keys and
     values it touches, each written `"[REDACTED]"`, so the answer parses whenever the input did.
-    The rules of the release before read a `[REDACTED]` marker that stands directly before a
+    The 0.6.1 rules read a `[REDACTED]` marker that stands directly before a
     closing quote as a list and take the quote with it, so a string that holds a credential comes
     out as `"[REDACTED]"` once it has been read twice. Any other string comes back as it was.
     Behind five or more strings of escape (more than 31 backslashes in front of a quote) a container
@@ -140,7 +140,7 @@ own deployment.
     the same 64 lines and 16 KiB; a header with nothing indented under it, or text after the
     indicator on its line (`password: |abc`), is read as before. An item that holds the name of
     another credential (`tokens: - abc password:` and then `hunter2` on the next line) is hidden
-    with that name's value, since the release before reads the name and its value and these reads
+    with that name's value, since the 0.6.1 rules read the name and its value and these reads
     the item, and the join of the two is everything.
   - **Counts.** Twelve or more digits (not counting `,` and `_`) under a name that counts tokens are
     a secret, in the text rules and in `redact::structured`; ten digits is the largest 32-bit
@@ -184,13 +184,13 @@ own deployment.
   The token pass reads the whole text a byte at a time, which costs plain stderr lines 120% more
   instructions, and a byte-class gate does not help because plain tails are full of `_` and `-`.
   `stderr_text` can be run over every line of a stream, so it runs neither the token pass nor the
-  newer reads: its cost against the previous release is within 1% on plain lines and 3% on lines
+  newer reads: its cost against the 0.6.1 baseline is within 1% on plain lines and 3% on lines
   that carry a credential. `redact::bounded` and `redact::structured` run all of them, over the
-  rules of the release before, and read the text again when the first reading changed it, which
+  0.6.1 rules, and read the text again when the first reading changed it, which
   is several times the instructions of a tail; the text a vendor sends in a message is short and
   rare. A stderr tail is in between: `StderrTail::read` and the three harnesses read a bounded tail
   once, when a failure is being reported, never per line, so they use `redact::stderr_tail`, which
-  runs the rules of the release before and the token pass and none of the newer reads (they would
+  runs the 0.6.1 rules and the token pass and none of the newer reads (they would
   hide more of a child's diagnostic output than a diagnostic can spare). The measurements are in
   `docs/benchmarks.md`.
 
@@ -203,7 +203,7 @@ own deployment.
   a token with a prefix is whole in the tail or gone from it, never a back half with no prefix. A
   private key spans lines, and a cut can drop its begin marker and keep the lines under it.
   `StderrTail` therefore remembers the text it dropped (`redact::OpenKey`, fed every byte the tail
-  discards: a flag, a counter and the line being written, at most 8,336 bytes, which is read as
+  discards: four flags, a byte counter and a line buffer holding at most 8,336 bytes, read as
   the redactor reads text, with the escapes and control characters stripped, so a marker beside a
   colour code, behind a title or a hyperlink of any length the stripper takes out (4 KiB), or split
   by a drop is a marker, whatever lies in front of it on its line: the state forgets the part of
@@ -217,35 +217,35 @@ own deployment.
   whole stream hides everything from the begin marker to the end marker, and the tail hides
   everything from its first key line to that marker, a line another writer put between the key's
   lines included: a sentence that mentions the begin marker, with
-  ordinary log lines after it, hides nothing ordinary. The state expires 64 KiB after the begin
-  marker, farther than any block reaches, and a public key or a certificate opens nothing. A text
-  that is handed to `stderr_tail` without the stream behind it (the tail a host's own
+  ordinary log lines after it, hides nothing ordinary. The open state expires when its
+  bytes-since-marker counter exceeds the 16 KiB block reach (`REACH = MAX_BLOCK_BYTES`). A public
+  key or a certificate opens nothing. A text that is handed to `stderr_tail` without the stream behind it (the tail a host's own
   `ProcessControl` returns) has only the start of the text to go by: lines of a key's body at the
   very start (base64, a PEM header, a PGP checksum line; after the blanks of an indented log, or
   behind one prefix of up to 64 bytes that is the same on every line and on the end marker's line)
   and then a private key's end marker are hidden
   with the marker.
 
-  The answers differ from the release before's in two ways. `stderr_text` differs only by the
+  The answers differ from the 0.6.1 baseline in two ways. `stderr_text` differs only by the
   extra reading above, which can only hide more. `redact::bounded` and `redact::structured` hide
-  everything the release before hid and what the readers above add, and can hide more than the
+  everything the 0.6.1 rules hid and what the readers above add, and can hide more than the
   sum where a span would otherwise cut a JSON string in two. Nothing is kept on purpose that the
-  release before hid.
+  0.6.1 rules hid.
 
-  One property of the release before is inherited and not repaired: `stderr_text` is a fixed point
-  wherever the release before is, and not elsewhere. A `?` that puts a later `&passwd=&` in a
-  query string, where an empty value is kept, is redacted away by the first pass (`apikey:?;&passwd=&`
+  One property of the 0.6.1 rules is inherited and not repaired: `stderr_text` is a fixed point
+  wherever the 0.6.1 rules already produce a fixed point, and not elsewhere. A `?` that puts a later
+  `&passwd=&` in a query string, where an empty value is kept, is redacted away by the first pass (`apikey:?;&passwd=&`
   gives `apikey=[REDACTED];&passwd=&`), and a second pass reads the rest as a plain assignment and
   redacts it. Settling that would read every tail that redacted something twice; a host that wants
   a fixed point reads a message with `redact::bounded`, which is one.
 
   `redact::search` holds that with generated text and no exemption: the canaries a reviewer's
   generators (statements, JSON structures, random fragments, a soup of bytes) and the findings of
-  the reviews put in a text are hidden by every entry point if the release before hid them,
-  the spans the release before hides are inside the spans of the first reading, one pass is a
+  the reviews put in a text are hidden by every entry point if the 0.6.1 rules hid them,
+  the spans the 0.6.1 rules hide are inside the spans of the first reading, one pass is a
   fixed point on `stderr_text`, `stderr_tail`, `bounded` and `structured` (`stderr_tail` with no
   exception), `structured` keeps a JSON text JSON, no entry point panics, `stderr_text` is the
-  release before's answer wherever that is a fixed point, and `stderr_tail` hides at least what
+  0.6.1 floor's answer wherever that is a fixed point, and `stderr_tail` hides at least what
   `stderr_text` hides and is `stderr_text` wherever the token pass finds nothing. A second search
   pushes generated streams (filler, tokens, assignments and private keys with every label, with
   and without an end marker, behind a prefix or not, LF or CRLF) into a `StderrTail` in pieces of
@@ -267,8 +267,8 @@ own deployment.
     prints. A version banner is parsed from the raw line and only the token it yields is stored, and
     `Discovery::normalized` reads that with `bounded`;
   - a pretty-printed multi-line array, a YAML sequence, a block scalar, an escape deeper than the
-    release before read, a number of twelve digits under a count name, in a stderr tail:
-    `stderr_text` and `stderr_tail` read a line at a time, as the release before did, and a tail is
+    0.6.1 rules read, a number of twelve digits under a count name, in a stderr tail:
+    `stderr_text` and `stderr_tail` read a line at a time, as the 0.6.1 rules did, and a tail is
     cut on a line. The paths that carry a vendor's messages read all of these;
   - a text handed to `stderr_tail` whose private key lost its begin line and whose end marker is
     not in it either: `StderrTail::read` hides the leading run of the key's lines from what it
