@@ -190,7 +190,7 @@ id, and each turn spawns, streams and reaps its own child.
   requires it to be UUID-shaped and this harness requires it to match the persisted handle. A
   missing id remains tolerated because it makes no competing identity assertion. A malformed or
   different id fails that turn rather than replacing the handle a host persisted — see
-  [A later turn may not answer from another conversation](#the-event-stream). Only the *first*
+  [Session model](#session-model). Only the *first*
   turn's echo may replace the minted id, because that turn proposes one rather than naming an
   existing conversation.
 
@@ -236,16 +236,6 @@ id, and each turn spawns, streams and reaps its own child.
   the vendor would otherwise terminate about five seconds later itself.
 
   <https://code.claude.com/docs/en/headless.md>
-
-**A later turn may not answer from another conversation.** Every turn after the first is spawned
-with `--resume <handle>`. When `system/init` supplies a handle, it must be a UUID and equal that
-handle. A missing field leaves the persisted handle unchanged, but a malformed or different handle
-means the CLI may have answered from history this session has never seen. That turn fails with
-`Error::Protocol` and the handle the host persisted stays in force; adopting a supplied replacement
-would switch to a conversation nobody read, silently and with no event to notice. The first turn
-stays lenient on purpose: it *proposes* a handle with `--session-id`, and a CLI that started a
-different conversation anyway has made that one the real one, so following its id is the better
-guess. A strict resume is stricter still — see [Session model](#session-model).
 
 ## Cancellation, and what the vendor actually does
 
@@ -904,8 +894,11 @@ fails there rather than as a row that quietly stops appearing. A closing `tool_r
 reason, which still wins the one-line `detail`.
 
 `MultiEdit`, `NotebookEdit`, `TodoWrite` and `ExitPlanMode` are **not** mapped: no captured
-transcript in this repo exercises them, and the pinned build's own `system/init.tools` list does not
-even enumerate the last three. `TodoWrite` is the expensive one — it is where a plan's steps live,
+transcript in this repo exercises them. The historical 2.1.226 transcripts
+([read turn](../fixtures/claude/transcripts/read-turn.jsonl) and
+[denied write](../fixtures/claude/transcripts/denied-write-turn.jsonl)) enumerate `NotebookEdit`
+in `system/init.tools` but omit `TodoWrite` and `ExitPlanMode`. Those observations do not
+qualify the 2.1.270 pin. `TodoWrite` is the expensive one — it is where a plan's steps live,
 so until it is captured a Claude plan reaches a host as an activity title rather than as
 `ActivityContent::Plan`, which is the one place this harness is behind the other two. A `mea
 capture` of a turn that drives these tools is what unblocks it; guessing their input keys from a

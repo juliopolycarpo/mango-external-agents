@@ -3,8 +3,10 @@
 Drives the `codex` CLI a user already installed, through `codex app-server` — the interface OpenAI
 documents for rich clients and uses for its own VS Code extension.
 
-Facts on this page were read on 2026-09-17 against `codex-cli 0.154.0`. Re-verify against the
-vendor's current documentation before relying on them.
+The implementation targets `codex-cli 0.154.0`; `vendor/PIN` records the tag
+`rust-v0.154.0`. Evidence dates belong to the sections below: the interface README
+was re-read on 2026-10-22, and the version-probe documentation on 2026-10-13.
+These documentation dates do not establish a new live qualification of the CLI.
 
 ## The executable and the version gate
 
@@ -13,7 +15,7 @@ vendor's current documentation before relying on them.
 | Executable        | `codex`, resolved by the host (`OpenSession::with_executable`) or by name                                                            |
 | Arguments         | `app-server`, and nothing else                                                                                                       |
 | Version read from | `codex --version` before any app-server starts (discovery, session open, picker); the handshake's own `userAgent` as the second line |
-| Minimum version   | `0.154.0` (`MINIMUM_CODEX_VERSION`), which is also `vendor/PIN`                                                                      |
+| Minimum version   | `0.154.0` (`MINIMUM_CODEX_VERSION`), recorded as `rust-v0.154.0` in `vendor/PIN`                                                     |
 
 The floor is the pinned build rather than something older. The app-server's item families and its
 `thread/`–`turn/` method names changed shape inside the 0.15x series, so a lower floor would be a
@@ -113,7 +115,8 @@ Notifications acted on: `turn/started`, `turn/completed`, `item/started`, `item/
 `item/agentMessage/delta`, `item/reasoning/textDelta`, `item/reasoning/summaryTextDelta`,
 `item/commandExecution/outputDelta`, `item/mcpToolCall/progress`, `item/fileChange/patchUpdated`,
 `thread/tokenUsage/updated`, `account/rateLimits/updated`, `serverRequest/resolved`, `error`.
-Everything else is dropped by name.
+`thread/started` is also decoded, then ignored by the reducer; it emits no host event.
+Other unmodeled notification names collapse to `Notification::Other` and are ignored.
 
 **A failed turn keeps the vendor's classification.** The app-server documents failures as an
 `error` notification with `{ error: { message, codexErrorInfo?, additionalDetails? } }` followed by
@@ -1112,8 +1115,9 @@ id renders nothing because no completion could address it. The item families are
 - No websocket or unix-socket transport (see above).
 - A subagent item's thread id is unmappable: see above.
 - Claude-style plan structure has no counterpart; `plan` is freeform text at this pin.
-- `PermissionLevel` maps to the three plain `AskForApproval` values; the vendor's `granular`
-  variant is neither sent nor modelled.
+- `PermissionLevel` sends `AskForApproval::Never` (`never`) for read-only/full access and
+  `AskForApproval::OnRequest` (`on-request`) for default access. `Untrusted` is modeled but
+  never sent by this mapping; the vendor's `granular` variant is neither sent nor modeled.
 - `thread/fork`, thread archival, the queue and the realtime families are not driven.
 - Vendor steering refusals other than "no active turn" and "cannot steer a review/compact turn"
   retain the vendor error; native reviews are rejected locally as `TurnNotSteerable`.
