@@ -6,7 +6,9 @@ library's own JSON-RPC 2.0 peer, the one the Codex harness uses. What differs be
 the argv, the version string, the login command and the documents a host's disclosure links, and those
 live in a **profile**. Adding an agent is a table entry, not a new harness.
 
-Facts here were read on 2026-09-17 against the pages linked inline. Re-verify before relying on them.
+Evidence is dated per section below: profile live checks, committed captures and vendor
+documentation reads are separate receipts. Later documentation reads do not requalify
+a vendor binary. Re-verify the linked pages before relying on them.
 
 [acp]: https://agentclientprotocol.com/protocol/overview
 [schema]: https://crates.io/crates/agent-client-protocol-schema
@@ -766,17 +768,17 @@ held back.
 
 ## Profiles
 
-| Profile                        | ACP argv                             | Login                 | Evidence                       |
-| ------------------------------ | ------------------------------------ | --------------------- | ------------------------------ |
-| [`cursor`][p-cursor]           | `cursor-agent acp`                   | `cursor-agent login`  | **verified**, live, 2026-09-13 |
-| [`grok`][p-grok]               | `grok --no-auto-update agent stdio`  | `grok login`          | **verified**, live, 2026-09-13 |
-| [`opencode`][p-opencode]       | `opencode acp`                       | `opencode auth login` | captured handshake, 2026-09-17 |
-| [`gemini`][p-gemini]           | `gemini --acp`                       | none; inside `gemini` | none                           |
-| [`copilot`][p-copilot]         | `copilot --acp`                      | `copilot login`       | none                           |
-| [`goose`][p-goose]             | `goose acp --with-builtin developer` | `goose configure`     | none                           |
-| [`codex-acp`][p-codex]         | `codex-acp`                          | `codex login`         | none                           |
-| [`claude-agent-acp`][p-claude] | `claude-agent-acp`                   | `claude auth login`   | none                           |
-| `custom`                       | the host's own argv                  | the host's own        | whatever the host records      |
+| Profile                        | ACP argv                             | Login                 | Evidence                            |
+| ------------------------------ | ------------------------------------ | --------------------- | ----------------------------------- |
+| [`cursor`][p-cursor]           | `cursor-agent acp`                   | `cursor-agent login`  | live 2026-09-13; capture 2026-09-19 |
+| [`grok`][p-grok]               | `grok --no-auto-update agent stdio`  | `grok login`          | live 2026-09-13; capture 2026-09-19 |
+| [`opencode`][p-opencode]       | `opencode acp`                       | `opencode auth login` | captured handshake, 2026-09-17      |
+| [`gemini`][p-gemini]           | `gemini --acp`                       | none; inside `gemini` | none                                |
+| [`copilot`][p-copilot]         | `copilot --acp`                      | `copilot login`       | none                                |
+| [`goose`][p-goose]             | `goose acp --with-builtin developer` | `goose configure`     | none                                |
+| [`codex-acp`][p-codex]         | `codex-acp`                          | `codex login`         | none                                |
+| [`claude-agent-acp`][p-claude] | `claude-agent-acp`                   | `claude auth login`   | none                                |
+| `custom`                       | the host's own argv                  | the host's own        | whatever the host records           |
 
 [p-cursor]: https://cursor.com/docs/cli/acp
 [p-cursor-install]: https://cursor.com/docs/cli/installation
@@ -817,7 +819,8 @@ Two methods, and they are not degrees of the same thing:
   profile's argv produces, and nothing past it.
 
 `cursor` and `grok` carry one of each: the live run that earned verification, and the handshake
-captured beside it, so the capability set they are driven under is a file rather than a memory.
+captured on 2026-09-19 under `fixtures/acp/cursor/contract` and
+`fixtures/acp/grok/contract` (see their manifests and `AcpProfile::evidence`), so the capability set they are driven under is a file rather than a memory.
 `opencode` carries the second kind alone and is deliberately **not** verified. Its committed capture
 is an `initialize` probe whose manifest records `sessionOpened: false`; calling that verified would
 claim a session nobody opened. A profile with no evidence at all is a documented entry nobody has
@@ -841,8 +844,8 @@ its [installation guide][p-cursor-install]. When its native entrypoint resolves 
 <args>`. PowerShell documents that `-File` passes the following values as script arguments, while
 `-NoProfile` skips user profiles and `-NonInteractive` turns a prompt into a failure rather than a
 hang in [about_PowerShell_exe][p-powershell-file]. The launcher regression tests cover that
-invocation. A native Windows smoke turn completed against Cursor `2026.08.04-aaa8809`,
-with the expected text and a terminal completion event.
+invocation. No identifiable dated native Windows smoke receipt is committed for
+Cursor `2026.08.04-aaa8809`; native Windows live qualification remains unverified here.
 
 The Grok command is `grok --no-auto-update agent stdio`, using the ACP invocation and update control
 documented in [Headless & Scripting][p-grok]. Its version argv carries the same flag —

@@ -474,7 +474,9 @@ and byte sizes, never a value, a call id or a denial's message.
 
 **Surface used:** `codex app-server`, the interface OpenAI documents for rich clients and ships its
 own VS Code extension on. JSON-RPC over newline-delimited JSON. `clientInfo.name` is always the
-host's name, passed through `HostContext`. Read on 2026-09-13 against `codex-cli 0.154.0`;
+host's name, passed through `HostContext`. The CLI/schema target is `codex-cli 0.154.0`
+(`rust-v0.154.0` in `vendor/PIN`); interface-document quotations were re-read on
+2026-10-22 at the immutable revision cited below. That read is not a new live CLI check;
 `docs/harness-codex.md` lists every method driven and the document each follows.
 Host-configured MCP servers use the app-server's per-thread `config` override on
 `thread/start` and `thread/resume`; no persistent Codex configuration is edited. The one other
@@ -568,7 +570,8 @@ and nothing implying an official or endorsed integration.
 
 **Surface used:** ACP v1, with the wire types of the official `agent-client-protocol-schema` crate
 (every `unstable_*` feature off) carried by this library's own JSON-RPC 2.0 peer. Every method driven is listed with its specification page in
-[harness-acp.md](harness-acp.md#the-surface-driven). Profile facts were read on 2026-09-13.
+[harness-acp.md](harness-acp.md#the-surface-driven). Profile live evidence is dated 2026-09-13; Cursor/Grok handshake captures are dated
+2026-09-19 in their manifests. Vendor-document reads are dated individually below.
 
 The client advertises three session capabilities, all of which only let an agent report more:
 `configOptions.boolean`, `notices` and `compaction`. The last two follow the
