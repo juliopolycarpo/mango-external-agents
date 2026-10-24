@@ -32,10 +32,10 @@ ring = "0.17.14"
 
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
 tempfile = "3.27.0"
-tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.53.3", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
 
 [dev-dependencies]
 # `mea turn --cancel-after` is driven end to end against the scripted ACP agent.
 mango-agent-acp = { workspace = true, features = ["testing"] }
 mango-external-agents = { workspace = true, features = ["testing"] }
-tokio = { version = "1.53.1", default-features = false, features = ["test-util"] }
+tokio = { version = "1.53.3", default-features = false, features = ["test-util"] }

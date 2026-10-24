@@ -42,7 +42,7 @@ async-trait = "0.1.92"
 ring = { version = "0.17.14", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
-tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
+tokio = { version = "1.53.3", default-features = false, features = ["macros", "rt", "sync", "time"] }
 
 futures-util = { version = "0.3.34", default-features = false, features = ["sink"], optional = true }
 # TLS is `ring` everywhere: named here with no default features, so the provider is this crate's
@@ -64,7 +64,7 @@ win32job = { version = "2.0.3", default-features = false, optional = true }
 windows = { version = "0.62.2", default-features = false, features = ["Win32_System_Threading"], optional = true }
 
 [dev-dependencies]
-tokio = { version = "1.53.1", default-features = false, features = ["macros", "net", "rt-multi-thread", "test-util"] }
+tokio = { version = "1.53.3", default-features = false, features = ["macros", "net", "rt-multi-thread", "test-util"] }
 
 # Non-gating benchmarks: plain `harness = false` binaries with no extra dependencies. Run them with
 # `cargo bench -p mango-external-agents`; see docs/benchmarks.md.

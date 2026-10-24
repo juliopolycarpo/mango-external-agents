@@ -49,12 +49,12 @@ serde = { version = "1.0.229", default-features = false, features = ["std"] }
 # The fake agent composes the v1 wire as JSON rather than as Rust values, so a schema reshape shows
 # up as a test that stops matching rather than one that compiles against a wire nobody speaks.
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
-tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
+tokio = { version = "1.53.3", default-features = false, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
 async-trait = "0.1.92"
 mango-external-agents = { workspace = true, features = ["launcher-tokio", "testing"] }
-tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "test-util"] }
+tokio = { version = "1.53.3", default-features = false, features = ["macros", "rt-multi-thread", "test-util"] }
 
 # Non-gating benchmarks: a plain `harness = false` binary with no extra dependencies. Run it with
 # `cargo bench -p mango-agent-acp`; see docs/benchmarks.md.
