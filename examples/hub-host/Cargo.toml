@@ -20,11 +20,11 @@ bench = false
 async-trait = "0.1.92"
 mango-external-agents.workspace = true
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
-tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
+tokio = { version = "1.53.3", default-features = false, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
 mango-external-agents = { workspace = true, features = ["testing"] }
-tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "test-util"] }
+tokio = { version = "1.53.3", default-features = false, features = ["rt-multi-thread", "test-util"] }
 
 # Non-gating benchmark: a plain `harness = false` binary; see docs/benchmarks.md.
 [[bench]]
