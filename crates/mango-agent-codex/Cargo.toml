@@ -28,11 +28,11 @@ mango-external-agents = { workspace = true, features = ["stdio"] }
 ring = { version = "0.17.14", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
-tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
+tokio = { version = "1.53.3", default-features = false, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
 mango-external-agents = { workspace = true, features = ["launcher-tokio", "stdio", "testing"] }
-tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "test-util"] }
+tokio = { version = "1.53.3", default-features = false, features = ["macros", "rt-multi-thread", "test-util"] }
 
 # Non-gating benchmarks: a plain `harness = false` binary with no extra dependencies. Run it with
 # `cargo bench -p mango-agent-codex`; see docs/benchmarks.md.
