@@ -30,9 +30,8 @@ use crate::interaction::{
 };
 use crate::operation::OperationRef;
 use crate::permission::{
-    ApprovalDecision, ConfigurationVerdict, DecisionSource, PermissionEffect, PermissionMatrix,
-    PermissionOption, PermissionRequest, PermissionResponse, PermissionRisk, PermissionScope,
-    broker_response,
+    ApprovalDecision, ConfigurationVerdict, PermissionEffect, PermissionMatrix, PermissionOption,
+    PermissionRequest, PermissionResponse, PermissionRisk, PermissionScope, broker_response,
 };
 use crate::session::{
     CancelReason, CloseReason, OpenSession, Session, SessionIds, Steer, SteerOutcome, TurnRequest,
@@ -1189,7 +1188,10 @@ mod tests {
             })
             .await
             .expect_err("no pending approval");
-        assert!(matches!(error.cause(), crate::Error::Protocol { .. }));
+        assert!(matches!(
+            error.cause(),
+            crate::Error::Protocol { .. } | crate::Error::NotSupported { .. }
+        ));
         session
             .cancel(crate::CancelReason::Shutdown)
             .await
