@@ -374,3 +374,44 @@ async fn an_expired_hub_hint_does_not_collapse_the_backoff_to_a_spin() {
         "expected the run to have waited out every backoff, received {total:?}"
     );
 }
+
+/// Exponential growth uses Duration's range rather than stopping at a u32 multiplier.
+#[test]
+fn high_ratio_backoff_keeps_doubling_until_the_duration_cap() {
+    let policy = RetryPolicy::new(
+        Duration::from_nanos(1),
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+        Arc::new(ScriptedJitter::maximum()),
+    );
+    for (failures, nanos) in [
+        (32, 2_147_483_648),
+        (33, 4_294_967_296),
+        (36, 30_000_000_000),
+        (u32::MAX, 30_000_000_000),
+    ] {
+        assert_eq!(
+            policy.delay_for(failures, None),
+            Duration::from_nanos(nanos),
+            "failure {failures}"
+        );
+    }
+    for (base, cap, expected) in [
+        (Duration::ZERO, Duration::MAX, Duration::ZERO),
+        (Duration::from_nanos(1), Duration::ZERO, Duration::ZERO),
+        (Duration::from_nanos(1), Duration::MAX, Duration::MAX),
+        (
+            Duration::MAX,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ),
+    ] {
+        let policy = RetryPolicy::new(
+            base,
+            cap,
+            Duration::from_secs(1),
+            Arc::new(ScriptedJitter::maximum()),
+        );
+        assert_eq!(policy.delay_for(u32::MAX, None), expected);
+    }
+}
