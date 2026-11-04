@@ -1162,47 +1162,89 @@ mod tests {
         }
     }
 
-    /// The approval surface cannot consume a pending question that authorises nothing.
+    /// Exercise both the capability refusal and the pending-question guard inside `finish`.
     #[tokio::test]
     async fn an_approval_answer_cannot_consume_a_pending_question() {
-        let session = FakeHarness::new()
-            .asking_a_question()
-            .open_session(&host(), OpenSession::new("chat"))
-            .await
-            .expect("session");
-        let mut turn = session
-            .start_turn(TurnRequest::new("turn", "work"))
-            .await
-            .expect("turn");
-        let request = loop {
-            if let EventKind::QuestionAsked { request } = turn.recv().await.expect("question").kind
-            {
-                break request;
+        for advertises_approvals in [false, true] {
+            let harness = if advertises_approvals {
+                // Keep both capabilities declared while the question builder raises only a
+                // question. This public builder composition lets `respond` reach `finish`.
+                FakeHarness::new().advertising_an_interaction_it_never_raises()
+            } else {
+                FakeHarness::new()
             }
-        };
-        let error = session
-            .respond(crate::PermissionResponse {
-                interaction_id: request.interaction.id.clone(),
-                option_id: String::from("allow"),
-                source: crate::DecisionSource::User,
+            .asking_a_question();
+            let session = harness
+                .open_session(&host(), OpenSession::new("chat"))
+                .await
+                .expect("session");
+            assert_eq!(
+                session
+                    .capabilities()
+                    .has(crate::Capability::InteractiveApprovals),
+                advertises_approvals
+            );
+            assert!(session.capabilities().has(crate::Capability::Questions));
+            let mut turn = session
+                .start_turn(TurnRequest::new("turn", "work"))
+                .await
+                .expect("turn");
+            let request = loop {
+                if let EventKind::QuestionAsked { request } =
+                    turn.recv().await.expect("question").kind
+                {
+                    break request;
+                }
+            };
+            let error = session
+                .respond(crate::PermissionResponse {
+                    interaction_id: request.interaction.id.clone(),
+                    option_id: String::from("allow"),
+                    source: crate::DecisionSource::User,
+                })
+                .await
+                .expect_err("no pending approval");
+            if advertises_approvals {
+                assert!(
+                    matches!(error.cause(), crate::Error::Protocol { expected, received }
+                    if expected == "an outstanding approval" && received == "a pending question"),
+                    "expected finish's pending-question guard, received {error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(error.cause(), crate::Error::NotSupported { capability }
+                    if *capability == crate::Capability::InteractiveApprovals)
+                );
+            }
+            session
+                .cancel(crate::CancelReason::Shutdown)
+                .await
+                .expect("cancel retained question");
+            let events = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                let mut events = Vec::new();
+                while let Some(event) = turn.recv().await {
+                    events.push(event.kind);
+                }
+                events
             })
             .await
-            .expect_err("no pending approval");
-        assert!(matches!(
-            error.cause(),
-            crate::Error::Protocol { .. } | crate::Error::NotSupported { .. }
-        ));
-        session
-            .cancel(crate::CancelReason::Shutdown)
-            .await
-            .expect("cancel retained question");
-        let mut withdrawn = false;
-        while let Some(event) = turn.recv().await {
-            if matches!(event.kind, EventKind::QuestionResolved { .. }) {
-                withdrawn = true;
-            }
+            .expect("cancel must settle the retained question and turn");
+            assert_eq!(events.iter().filter(|event| matches!(event,
+                EventKind::QuestionResolved { interaction_id, outcome: crate::QuestionOutcome::Cancelled }
+                    if interaction_id == &request.interaction.id)).count(), 1);
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, EventKind::ApprovalResolved { .. }))
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, EventKind::Completed))
+                    .count(),
+                1
+            );
         }
-        assert!(withdrawn, "question remained owned until cancellation");
     }
 
     /// An approval that a person chose reaches the host's audit trail carrying how far the choice
