@@ -199,6 +199,21 @@ impl Clone for EventSink {
 
 impl Drop for EventSink {
     fn drop(&mut self) {
+        #[cfg(test)]
+        {
+            let gate = self
+                .buffer
+                .drop_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(gate) = gate {
+                gate.wait();
+            }
+        }
+        if self.buffer.release_nonfinal_sender() {
+            return;
+        }
         // A close was dropped for room and nobody committed a terminal: the host would otherwise
         // see the stream simply stop, with an activity still open and no reason.
         if self.buffer.owes_overflow_terminal() {
@@ -1166,6 +1181,24 @@ mod tests {
             matches!(kinds.last(), Some(EventKind::Error { error }) if error.code.as_str() == "stream-overflow"),
             "expected a stream-overflow terminal instead of a silent end | received {kinds:?}"
         );
+    }
+
+    /// Force both final releases through the same boundary before either can finish.
+    #[tokio::test]
+    async fn concurrent_final_sender_drops_commit_one_overflow_terminal() {
+        let (first, mut events) = sink(1);
+        first.emit(queued_text()).await.expect("payload");
+        let _ = first.emit_close(activity_close("a")).await;
+        let second = first.clone();
+        *first.buffer.drop_gate.lock().expect("drop gate") =
+            Some(std::sync::Arc::new(std::sync::Barrier::new(2)));
+        std::thread::scope(|scope| {
+            scope.spawn(move || drop(first));
+            scope.spawn(move || drop(second));
+        });
+        let kinds = drained(&mut events).await;
+        assert_eq!(kinds.iter().filter(|kind| matches!(kind, EventKind::Error { error } if error.code.as_str() == "stream-overflow")).count(), 1,
+            "expected exactly one overflow terminal after both senders released, received {kinds:?}");
     }
 
     #[tokio::test]

@@ -68,6 +68,9 @@ pub(super) struct Buffer {
     abandoned: CancelToken,
     terminated: CancelToken,
     senders: AtomicUsize,
+    /// Forces the final two releases to overlap without changing other buffers' scheduling.
+    #[cfg(test)]
+    pub(super) drop_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
 impl Buffer {
@@ -79,12 +82,33 @@ impl Buffer {
             abandoned: CancelToken::new(),
             terminated: CancelToken::new(),
             senders: AtomicUsize::new(1),
+            #[cfg(test)]
+            drop_gate: Mutex::new(None),
         });
         (Arc::clone(&buffer), EventReceiver { buffer })
     }
 
     pub(super) fn add_sender(&self) {
         self.senders.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Releases a nonfinal sender, or elects the final owner while keeping its count live.
+    ///
+    /// The final owner still owes terminal publication before a reader may see disconnect.
+    pub(super) fn release_nonfinal_sender(&self) -> bool {
+        let mut count = self.senders.load(Ordering::Acquire);
+        while count > 1 {
+            match self.senders.compare_exchange_weak(
+                count,
+                count - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => count = current,
+            }
+        }
+        false
     }
 
     pub(super) fn remove_sender(&self) {
