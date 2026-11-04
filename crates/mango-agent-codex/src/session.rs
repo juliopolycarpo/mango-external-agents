@@ -256,7 +256,7 @@ pub(crate) struct Shared {
     /// Notifications held, in arrival order, while a steer's answer is being adopted.
     steer_hold: std::sync::Mutex<SteerHold>,
     /// The account's quota: the last full reading, and what arrived while a read was in flight.
-    quota: Mutex<QuotaState>,
+    quota: std::sync::Mutex<QuotaState>,
     /// Whether an update already asked for the missing baseline.
     baseline_requested: AtomicBool,
     #[cfg(test)]
@@ -302,7 +302,7 @@ impl Shared {
             resolution_markers: Mutex::new(ResolutionMarkers::default()),
             steering: Mutex::new(()),
             steer_hold: std::sync::Mutex::new(SteerHold::default()),
-            quota: Mutex::new(QuotaState::default()),
+            quota: std::sync::Mutex::new(QuotaState::default()),
             baseline_requested: AtomicBool::new(false),
             #[cfg(test)]
             resolution_marker_gate: Mutex::new(None),
@@ -781,6 +781,33 @@ struct QuotaState {
     next_read: u64,
     /// The newest read whose answer became the baseline; an older one answering later is stale.
     adopted_read: u64,
+}
+
+/// Owns a registered quota read until its answer is merged or its caller is dropped.
+///
+/// All bookkeeping is synchronous under the quota-only mutex; Drop needs no runtime and cannot
+/// strand a registration between the counter increment and the ownership transfer.
+struct QuotaReadGuard<'a> {
+    shared: &'a Shared,
+    sequence: u64,
+    settled: bool,
+}
+
+impl QuotaReadGuard<'_> {
+    /// Settles the one registration exactly once with the current generation ordering.
+    fn finish(mut self, response: Option<&RateLimitsReadResponse>) -> QuotaRead {
+        let settled = self.shared.finish_quota_read(self.sequence, response);
+        self.settled = true;
+        settled
+    }
+}
+
+impl Drop for QuotaReadGuard<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            let _ = self.shared.finish_quota_read(self.sequence, None);
+        }
+    }
 }
 
 /// One quota reading, kept whole so windows and resets are always reported together.
@@ -1414,7 +1441,10 @@ impl Shared {
     /// in flight may not be, and are laid over its answer.
     async fn rate_limits_updated(self: &Arc<Self>, update: &RateLimitSnapshot) {
         let merged = {
-            let mut quota = self.quota.lock().await;
+            let mut quota = self
+                .quota
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if quota.reads_in_flight > 0 {
                 quota.pending = Some(match quota.pending.as_ref() {
                     Some(earlier) => crate::rate_limits::merge(earlier, update),
@@ -1440,11 +1470,18 @@ impl Shared {
     }
 
     /// Records that a full read is about to be sent, and the sequence number it is sent under.
-    async fn begin_quota_read(&self) -> u64 {
-        let mut quota = self.quota.lock().await;
+    fn begin_quota_read(&self) -> QuotaReadGuard<'_> {
+        let mut quota = self
+            .quota
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         quota.reads_in_flight += 1;
         quota.next_read += 1;
-        quota.next_read
+        QuotaReadGuard {
+            shared: self,
+            sequence: quota.next_read,
+            settled: false,
+        }
     }
 
     /// Settles the full read sent as `read`, and returns the baseline it leaves behind.
@@ -1453,18 +1490,17 @@ impl Shared {
     /// baseline — unless a read sent after it was already adopted, in which case this answer is
     /// older than the baseline and is dropped. Pending updates are kept while another read is
     /// still in flight, so the last one to answer sees them too, and dropped with the last read.
-    async fn finish_quota_read(
-        &self,
-        read: u64,
-        response: Option<&RateLimitsReadResponse>,
-    ) -> QuotaRead {
+    fn finish_quota_read(&self, read: u64, response: Option<&RateLimitsReadResponse>) -> QuotaRead {
         // The snapshot and the resets are independently optional: a read with resets and no
         // snapshot is still a reading, with no windows.
         let resets = response.and_then(|response| response.rate_limit_reset_credits.clone());
         let answer = response
             .and_then(|response| response.rate_limits.clone())
             .or_else(|| resets.as_ref().map(|_| RateLimitSnapshot::default()));
-        let mut quota = self.quota.lock().await;
+        let mut quota = self
+            .quota
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         quota.reads_in_flight = quota.reads_in_flight.saturating_sub(1);
         let adopted = match &answer {
             Some(answer) if read > quota.adopted_read => {
@@ -1506,14 +1542,14 @@ impl Shared {
         // would hold every later notification and question in the bounded queue behind it, and
         // a slow answer could fill that queue, which ends the connection.
         tokio::spawn(async move {
-            let sequence = shared.begin_quota_read().await;
+            let registered = shared.begin_quota_read();
             let read = client
                 .request::<_, RateLimitsReadResponse>(
                     method::ACCOUNT_RATE_LIMITS_READ,
                     empty_params(),
                 )
                 .await;
-            let settled = shared.finish_quota_read(sequence, read.ok().as_ref()).await;
+            let settled = registered.finish(read.ok().as_ref());
             // A later update may ask again, whether this one answered or not.
             shared.baseline_requested.store(false, Ordering::Release);
             // Only a newly adopted reading is news to the turn; a stale answer changed nothing.
@@ -4602,16 +4638,12 @@ impl Session for CodexSession {
     async fn refresh_account_usage(&self) -> Result<AccountUsage> {
         // The same bookkeeping as the session's own read: an update that lands while this is in
         // flight is laid over the answer rather than lost to it.
-        let sequence = self.shared.begin_quota_read().await;
+        let registered = self.shared.begin_quota_read();
         let response = self
             .client
             .request::<_, RateLimitsReadResponse>(method::ACCOUNT_RATE_LIMITS_READ, empty_params())
             .await;
-        let merged = self
-            .shared
-            .finish_quota_read(sequence, response.as_ref().ok())
-            .await
-            .baseline();
+        let merged = registered.finish(response.as_ref().ok()).baseline();
         response?;
         // Absence is unknown, never an empty quota: a server that answered without a snapshot
         // has not told us the account is unmetered.
@@ -4863,6 +4895,26 @@ mod tests {
             host,
             mango_external_agents::SessionId::new("chat-1"),
         ))
+    }
+
+    /// Abandonment before submission needs no executor and must not retire a sibling read.
+    #[test]
+    fn quota_read_registration_releases_synchronously_without_a_runtime() {
+        let shared = shared();
+        let first = shared.begin_quota_read();
+        let second = shared.begin_quota_read();
+        shared.quota.lock().expect("quota").pending =
+            Some(crate::protocol::RateLimitSnapshot::default());
+        drop(first);
+        {
+            let quota = shared.quota.lock().expect("quota");
+            assert_eq!(quota.reads_in_flight, 1);
+            assert!(quota.pending.is_some());
+        }
+        let _ = second.finish(None);
+        let quota = shared.quota.lock().expect("quota");
+        assert_eq!(quota.reads_in_flight, 0);
+        assert!(quota.pending.is_none());
     }
 
     /// A direct-handler host with a deliberately tight request budget.
