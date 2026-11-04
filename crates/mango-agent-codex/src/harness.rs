@@ -200,13 +200,10 @@ impl CodexHarness {
         host: &HostContext,
         key: Option<&AccountFingerprintKey>,
     ) -> Result<(Discovery, Option<CodexAccount>)> {
-        let version = match read_version(host, &self.executable).await? {
-            Some(version) => version,
-            // Nothing answered `--version`, so nothing is installed as far as a probe can tell. An
-            // executable the host resolved but cannot run is the same fact to a caller.
-            None => return Ok((Discovery::not_installed(), None)),
+        let VersionProbe::Started(version) = read_version(host, &self.executable).await? else {
+            return Ok((Discovery::not_installed(), None));
         };
-        let gate = discovery::gate(Some(&version), MINIMUM_CODEX_VERSION);
+        let gate = discovery::gate(version.as_deref(), MINIMUM_CODEX_VERSION);
 
         // A build that would be refused is not worth a handshake: the app-server is a process, and
         // spawning one to ask an account question whose answer cannot be acted on is a cost with
@@ -214,7 +211,7 @@ impl CodexHarness {
         if !matches!(gate, GateVerdict::Usable) {
             let discovery = Discovery {
                 executable: self.executable.get().cloned(),
-                version: Some(version),
+                version,
                 gate,
                 auth: AuthState::Unknown,
                 capabilities: DiscoveredCapabilities::none(),
@@ -228,7 +225,7 @@ impl CodexHarness {
         let probed = probe_app_server(host, &self.executable, key).await?;
         let discovery = Discovery {
             executable: self.executable.get().cloned(),
-            version: Some(version),
+            version,
             gate,
             auth: probed.auth,
             capabilities: DiscoveredCapabilities::new(CAPABILITIES),
@@ -603,7 +600,10 @@ async fn refuse_outdated_before_spawn(
 ) -> Result<()> {
     let version = match vouched_version(receipt, executable) {
         Some(version) => Some(version),
-        None => read_version(host, executable).await?,
+        None => match read_version(host, executable).await? {
+            VersionProbe::Started(version) => version,
+            VersionProbe::NotStarted => None,
+        },
     };
     if host.cancel().is_cancelled() {
         // No agent was started, so nothing was submitted: the caller may open again.
@@ -722,8 +722,14 @@ fn client_info(host: &HostClientInfo) -> ClientInfo {
     }
 }
 
-/// Whatever `codex --version` printed, or nothing when it would not run.
-async fn read_version(host: &HostContext, executable: &ExecutablePath) -> Result<Option<String>> {
+/// Whether the probe actually started an installed executable, independently of parsing its banner.
+enum VersionProbe {
+    NotStarted,
+    Started(Option<String>),
+}
+
+/// The probe's launch observation and any recognised version. Cleanup failures still propagate.
+async fn read_version(host: &HostContext, executable: &ExecutablePath) -> Result<VersionProbe> {
     host.absolute_cwd()?;
     let mut child = match host
         .launcher()
@@ -741,7 +747,7 @@ async fn read_version(host: &HostContext, executable: &ExecutablePath) -> Result
     {
         Ok(child) => child,
         Err(error) if error.cleanup_control().is_some() => return Err(error),
-        Err(_) => return Ok(None),
+        Err(_) => return Ok(VersionProbe::NotStarted),
     };
 
     let mut lines = mango_external_agents::process::LineStream::new(
@@ -758,10 +764,12 @@ async fn read_version(host: &HostContext, executable: &ExecutablePath) -> Result
     // probe that waited on it would hang whatever called it, with no turn to cancel.
     let first = tokio::time::timeout(host.limits().request_timeout, lines.next_line()).await;
     cleanup.finish().await?;
-    Ok(first
-        .ok()
-        .and_then(|line| line.ok().flatten())
-        .and_then(|line| discovery::parse_version(&line)))
+    Ok(VersionProbe::Started(
+        first
+            .ok()
+            .and_then(|line| line.ok().flatten())
+            .and_then(|line| discovery::parse_version(&line)),
+    ))
 }
 
 /// A stand-in for a byte source that has been taken, so the child struct stays whole.

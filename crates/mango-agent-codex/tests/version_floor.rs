@@ -506,3 +506,83 @@ async fn the_picker_on_a_current_build_costs_one_version_probe_and_one_app_serve
 
     assert_launched(&launcher, &["codex --version", "codex app-server"]);
 }
+
+/// Starting an executable establishes its presence even if its banner cannot establish a version.
+#[tokio::test]
+async fn an_installed_unparseable_or_empty_version_is_unknown_not_absent() {
+    for banner in ["codex-cli unknown", "", "a changed banner"] {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(FakeProcess::transcript([banner]));
+        let found = CodexHarness::new()
+            .discover(&host(&launcher))
+            .await
+            .expect("discovery");
+        assert_eq!(
+            found.gate,
+            GateVerdict::Unknown,
+            "installed banner {banner:?}"
+        );
+        assert_eq!(found.version, None);
+        assert_eq!(launcher.live_children(), 0);
+        assert_launched(&launcher, &["codex --version"]);
+    }
+    let launcher = Arc::new(FakeLauncher::new());
+    let found = CodexHarness::new()
+        .discover(&host(&launcher))
+        .await
+        .expect("discovery");
+    assert_eq!(found.gate, GateVerdict::NotInstalled);
+}
+
+/// A named source whose installed process cannot supply a readable version stream.
+struct UnreadableVersion;
+#[async_trait::async_trait]
+impl mango_external_agents::ByteSource for UnreadableVersion {
+    async fn next_chunk(&mut self) -> mango_external_agents::Result<Option<Vec<u8>>> {
+        Err(Error::Link {
+            peer: String::from("version stdout"),
+            message: String::from("a read failure (BrokenPipe)"),
+        })
+    }
+}
+struct UnreadableVersionLauncher(Arc<FakeLauncher>);
+#[async_trait::async_trait]
+impl mango_external_agents::ProcessLauncher for UnreadableVersionLauncher {
+    async fn spawn(
+        &self,
+        spec: mango_external_agents::LaunchSpec,
+    ) -> mango_external_agents::Result<mango_external_agents::ManagedProcess> {
+        let mut child = self.0.spawn(spec).await?;
+        child.stdout = Box::new(UnreadableVersion);
+        Ok(child)
+    }
+}
+
+#[tokio::test]
+async fn an_installed_unreadable_or_silent_probe_is_unknown_and_reaped() {
+    for unreadable in [true, false] {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(FakeProcess::responding(|_| Vec::new()));
+        let port: Arc<dyn mango_external_agents::ProcessLauncher> = if unreadable {
+            Arc::new(UnreadableVersionLauncher(Arc::clone(&launcher)))
+        } else {
+            launcher.clone()
+        };
+        let host = HostContext::builder()
+            .launcher(port)
+            .cwd(workspace_path())
+            .client_info("test", "0.0.1")
+            .limits(mango_external_agents::Limits {
+                request_timeout: Duration::from_millis(1),
+                ..Default::default()
+            })
+            .build()
+            .expect("host");
+        let found = CodexHarness::new()
+            .discover(&host)
+            .await
+            .expect("discovery");
+        assert_eq!(found.gate, GateVerdict::Unknown);
+        assert_eq!(launcher.live_children(), 0);
+    }
+}
