@@ -4192,13 +4192,14 @@ fn supports_image_mime_type(mime_type: &str) -> bool {
 
 /// Bytes as the `data:` URL the app-server's image input takes.
 fn data_url(mime_type: &str, bytes: &[u8]) -> String {
-    format!("data:{mime_type};base64,{}", base64(bytes))
-}
-
-/// Standard base64, without a dependency for sixty-four characters.
-fn base64(bytes: &[u8]) -> String {
+    // Reserve the final prefix and payload together: no intermediate Base64 String.
+    let mut encoded = String::with_capacity(
+        "data:".len() + mime_type.len() + ";base64,".len() + bytes.len().div_ceil(3) * 4,
+    );
+    encoded.push_str("data:");
+    encoded.push_str(mime_type);
+    encoded.push_str(";base64,");
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let mut block = [0_u8; 3];
         block[..chunk.len()].copy_from_slice(chunk);
@@ -4807,8 +4808,8 @@ mod tests {
     };
 
     use super::{
-        ActiveTurn, Answer, CodexHandler, ResolutionMarkerGate, Shared, StopState, base64,
-        data_url, supports_image_mime_type,
+        ActiveTurn, Answer, CodexHandler, ResolutionMarkerGate, Shared, StopState, data_url,
+        supports_image_mime_type,
     };
     use crate::reducer::Outcome;
     use mango_external_agents::jsonrpc::PeerHandler;
@@ -6825,22 +6826,70 @@ mod tests {
     }
 
     #[test]
-    fn base64_pads_every_length_the_way_the_standard_does() {
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foo"), "Zm9v");
-        assert_eq!(base64(b"foob"), "Zm9vYg==");
-        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
-        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    fn image_data_urls_pad_every_length_the_way_the_standard_does() {
+        assert_eq!(data_url("image/png", b""), "data:image/png;base64,");
+        assert_eq!(data_url("image/png", b"f"), "data:image/png;base64,Zg==");
+        assert_eq!(data_url("image/png", b"fo"), "data:image/png;base64,Zm8=");
+        assert_eq!(data_url("image/png", b"foo"), "data:image/png;base64,Zm9v");
+        assert_eq!(
+            data_url("image/png", b"foob"),
+            "data:image/png;base64,Zm9vYg=="
+        );
+        assert_eq!(
+            data_url("image/png", b"fooba"),
+            "data:image/png;base64,Zm9vYmE="
+        );
+        assert_eq!(
+            data_url("image/png", b"foobar"),
+            "data:image/png;base64,Zm9vYmFy"
+        );
     }
 
     /// The bytes that break a hand-rolled encoder: the top bit set, and a length that pads.
     #[test]
-    fn base64_encodes_bytes_above_the_ascii_range() {
-        assert_eq!(base64(&[0xff, 0xfe, 0xfd]), "//79");
-        assert_eq!(base64(&[0x00, 0x00, 0x00]), "AAAA");
-        assert_eq!(base64(&[0xff]), "/w==");
+    fn image_data_urls_encode_bytes_above_the_ascii_range() {
+        assert_eq!(
+            data_url("image/png", &[0xff, 0xfe, 0xfd]),
+            "data:image/png;base64,//79"
+        );
+        assert_eq!(
+            data_url("image/png", &[0x00, 0x00, 0x00]),
+            "data:image/png;base64,AAAA"
+        );
+        assert_eq!(data_url("image/png", &[0xff]), "data:image/png;base64,/w==");
+    }
+
+    #[test]
+    fn image_data_urls_keep_mime_case_and_padding_at_the_attachment_boundary() {
+        use mango_external_agents::session::ATTACHMENT_MAX_BYTES;
+        for size in [
+            0,
+            1,
+            2,
+            3,
+            255,
+            256,
+            ATTACHMENT_MAX_BYTES - 2,
+            ATTACHMENT_MAX_BYTES - 1,
+            ATTACHMENT_MAX_BYTES,
+        ] {
+            let bytes = vec![0xff; size];
+            let tail = match size % 3 {
+                0 => "",
+                1 => "/w==",
+                _ => "//8=",
+            };
+            for mime in [
+                "image/png",
+                "image/jpeg",
+                "image/gif",
+                "image/webp",
+                "IMAGE/PNG",
+            ] {
+                let expected = format!("data:{mime};base64,{}{tail}", "////".repeat(size / 3));
+                assert_eq!(data_url(mime, &bytes), expected, "size={size}, MIME={mime}");
+            }
+        }
     }
 
     /// A teardown worker that panicked becomes a cleanup-required error naming the panic, so a
