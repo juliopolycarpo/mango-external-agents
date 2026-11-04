@@ -6618,3 +6618,34 @@ mod redacted_failure {
         );
     }
 }
+
+/// An event refused at the core boundary is a failed turn, even when later native output claims
+/// success. Keep malformed activity identity out of diagnostics and reap the owned child.
+#[tokio::test]
+async fn a_refused_activity_event_cannot_turn_into_success() {
+    for id in ["x".repeat(129), String::from(" "), String::from("\u{1}")] {
+        let transcript = [
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":id,"name":"Bash","input":{"command":"pwd"}}]}}).to_string(),
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"later payload must be ignored"}]}}).to_string(),
+            serde_json::json!({"type":"result","subtype":"success","is_error":false}).to_string(),
+        ].join("\n");
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::replaying(&transcript)));
+        let session = open(&launcher).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("bad-activity", "work"))
+            .await
+            .expect("turn");
+        let events = drain(&mut turn).await;
+        assert!(
+            matches!(events.last(), Some(EventKind::Error { error }) if error.code.as_str() == "claude-event-refused"),
+            "expected a refused event to fail, received {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EventKind::Completed | EventKind::TextDelta { .. }))
+        );
+        session.close(CloseReason::Shutdown).await.expect("close");
+        assert!(!launcher.a_child_is_running());
+    }
+}

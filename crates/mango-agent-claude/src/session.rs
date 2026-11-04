@@ -2221,7 +2221,26 @@ async fn pump(
                     settle_owner(&shared, &end);
                     return;
                 }
-                Err(_) => {}
+                Err(error) => {
+                    // Normalisation refused this event without committing a terminal. Continuing
+                    // would silently drop transcript data and could report native success later.
+                    // Error Display contains safe shape metadata, never the refused vendor id.
+                    let refused = VendorError::new(
+                        ErrorCode::from_static("claude-event-refused"),
+                        error.to_string(),
+                    );
+                    exit.release();
+                    let mut room = true;
+                    for close in reducer.abort(refused.clone()) {
+                        let _ = emit_run_end(&sink, close, &mut room).await;
+                    }
+                    // A reducer already ended by this record owes no abort events, but the sink
+                    // must still report the refusal rather than disconnect without a terminal.
+                    let _ = sink.fail(refused).await;
+                    stop_pump(&shared, &end, CancelReason::Requested, true).await;
+                    settle_owner(&shared, &end);
+                    return;
+                }
             }
         }
         if native_finished {

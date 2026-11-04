@@ -856,6 +856,11 @@ tools somebody configured and report success.
 
 ## The event stream
 
+An event the core refuses during normalisation fails the turn with `claude-event-refused`.
+The pump ignores later vendor payload, stops the owned child and settles admission; it does not
+turn a dropped activity into a successful transcript. Existing receiver abandonment and bounded
+stream overflow keep their own terminal behavior.
+
 The reducer holds three properties, exercised by replay and reducer tests:
 
 - **Text is delivered once.** `--include-partial-messages` carries the same output twice — as
