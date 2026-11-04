@@ -6,36 +6,40 @@ stored in the repository or in CI.
 
 ## Cut a release
 
+Use `RELEASE_VERSION` for the intended new version throughout the procedure. For example,
+`RELEASE_VERSION=0.8.0` is illustrative, not a statement of the latest release. For a prerelease,
+set the full suffix too. These commands belong to the reviewed release process, not to an
+ordinary documentation PR.
+
 1. Make sure `main` is green and the changelog preview reads well:
 
    ```sh
-   scripts/changelog.sh v0.2.0
+   scripts/changelog.sh "v$RELEASE_VERSION"
    git diff CHANGELOG.md
    ```
 
 2. Move the workspace to the new version: `version` under `[workspace.package]` and the four
    `version = "…"` entries under `[workspace.dependencies]` in `Cargo.toml`. Set the install
-   snippet in each of the four `crates/*/README.md` files to the new `major.minor` (`"0.3"` for
-   0.3.x): a published README is immutable, and 0.3.0 shipped `"0.1"`, which a caret requirement
+   snippet in each of the four `crates/*/README.md` files to the new `major.minor` (`"0.8"` for
+   the illustrative 0.8.x release): a published README is immutable, and 0.3.0 shipped `"0.1"`, which a caret requirement
    never resolves to 0.3. For a pre-release, write the full version with its suffix instead
-   (`"0.4.0-rc.1"`), because no caret requirement resolves to one. Then refresh the lockfile and
+   (`"0.8.0-rc.1"`), because no caret requirement resolves to one. Then refresh the lockfile and
    prove the lockstep; the same script refuses a README snippet that breaks this rule:
 
    ```sh
    cargo update --workspace
-   scripts/check-versions.sh 0.2.0
+   scripts/check-versions.sh "$RELEASE_VERSION"
    ```
 
-3. Review the diff, commit, tag and push. The tag must be an annotated, signed tag: the `Release`
+3. Review and merge the release PR after the pre-publication requirements below pass.
+   On the resulting clean release commit, tag and push. The tag must be an annotated, signed tag: the `Release`
    workflow refuses one that GitHub does not report as verified, so add your signing key to your
    GitHub account as a signing key first. This checks that GitHub verified the signature, not which
    maintainer made it.
 
    ```sh
-   git add Cargo.toml Cargo.lock CHANGELOG.md crates/*/README.md
-   git commit -m "chore(release): v0.2.0" -m "Release the four crates at the same version."
-   git tag -s v0.2.0 -m "v0.2.0"
-   git push origin main v0.2.0
+   git tag -s "v$RELEASE_VERSION" -m "v$RELEASE_VERSION"
+   git push origin main "v$RELEASE_VERSION"
    ```
 
 4. Watch the `Release` workflow. It verifies the tag signature and that the manifests match the tag, runs `scripts/check.sh`,
@@ -51,7 +55,8 @@ stored in the repository or in CI.
    pull request, change the four `=` pins in `tests/standalone-current/Cargo.toml` to the new
    version, set its `rust-version` (and "Rust … or newer" in its README) to the minimum the
    published release declares, update only those four lock entries with that compiler, and test
-   it. `scripts/check-standalone.sh` fails if the consumer's `rust-version` differs from the one the
+   it. Update the literal published pin in `docs/adopt.md` in that same follow-up.
+   `scripts/check-standalone.sh` fails if the consumer's `rust-version` differs from the one the
    pinned crates declare:
 
    ```sh
@@ -61,102 +66,80 @@ stored in the repository or in CI.
    scripts/check-standalone.sh --test-only current
    ```
 
-   `scripts/check-versions.sh` allows the pin to be the workspace version, the release just before
-   it, or a pre-release of the same version, and fails when it falls further behind, so the next
-   release pull request cannot merge before this bump.
-   `tests/standalone-historical` stays at `=0.3.1`; never bump it.
+   `scripts/check-versions.sh` delegates the pin policy to `scripts/check-consumer-pin.sh`.
+   That script accepts these states (numeric comparisons refer to `major.minor.patch`):
 
-## First release checklist
+   - The exact workspace version, including its suffix if present.
+   - A stable pin at the previous patch in the same major/minor when the workspace patch is
+     greater than zero.
+   - When the workspace patch is zero and its minor is greater than zero, any stable patch in
+     the previous minor of the same major.
+   - When the workspace minor and patch are zero and its major is greater than zero, any stable
+     release in the previous major.
+   - A prerelease pin with the same numeric major/minor/patch as the workspace. The script does
+     not order prerelease suffixes; registry availability is checked separately by the consumer.
 
-Before publishing 0.1.0, run `scripts/check.sh` and `scripts/check-publish.sh`, and verify each
-crate's docs with `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
---locked`.
+   Older or unrelated pins fail this policy. Update the current consumer after each publication;
+   the allowance accommodates the release PR before the registry upload, not a reason to leave
+   the consumer behind. `tests/standalone-historical` stays at `=0.3.1`; never bump it.
 
-`scripts/check-publish.sh` is the same gate the release workflow runs on the tag, brought forward
-to any head. It wraps `cargo publish --workspace --dry-run --locked` — the workspace dry run stages
-local crate dependencies, so it verifies all four packages before any of their names exist on
-crates.io — and adds the two questions a dry run does not answer:
+## Pre-publication requirements
 
-- **Is the publishable set still exactly four?** A new workspace member that forgets
-  `publish = false` would otherwise join the lockstep release the first time somebody tags.
-- **Does each tarball carry what it owes and nothing else?** A crate is immutable once it lands, so
-  a missing README or licence, or a scratch directory that joined the package, costs a version
-  number rather than an edit. Pass `--list` to read each crate's packaged files in full.
+For every release, run `scripts/check.sh`, `scripts/check-publish.sh --list` and
+`scripts/check-msrv-features.sh --locked` on the intended release sources. Verify crate docs with
+`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked`.
+The isolated feature check needs the declared minimum Rust toolchain installed.
 
-Run it on a clean tree: `cargo package --list` refuses to describe a package whose sources have
-uncommitted changes, and the script surfaces that refusal rather than reporting an empty package.
+`scripts/check-publish.sh` wraps `cargo publish --workspace --dry-run --locked`. The workspace dry
+run stages local crate dependencies, so it verifies the four packages together. It also verifies
+that the publishable set is exactly the four library crates and that each package carries its
+README and licence without build, scratch or environment files. Run it on a clean tree:
+`cargo package --list` refuses sources with uncommitted changes. Inspect the packaged files before
+publishing; a registry artifact is immutable.
 
-**The three harness crates' tarballs are not standalone test packages.** The library build from any
-tarball is unaffected, but the tests of `mango-agent-claude`, `mango-agent-codex` and
-`mango-agent-acp` are not self-contained: they read the repository's `fixtures/` directory, which
-sits outside every crate and so cannot be packaged. The fixtures come from `mea capture`, and the capture
-directories that carry a `manifest.json` are held to the digests in it; a copy inside a crate would
-be a second, unguarded record, so none is bundled.
-
-Observed on the four crates as `cargo package` produced them from `main` after 0.3.0 (the 0.3.0
-sources plus unreleased changes, so counts differ from the published 0.3.0 tarballs; the
-published `mango-agent-claude` 0.3.0 fails in the same way), each unpacked and run with
-`cargo test --all-features`. Re-check after a version bump:
-
-- `mango-external-agents`: every unit, integration and doc test passes, so its packaged tests can
-  be run. Only its `framing` bench reads `fixtures/`, at run time.
-- `mango-agent-claude`: the tests do not compile. `src/cli_surface.rs`, `src/models.rs`,
-  `src/probe.rs` and `src/auth.rs` use `include_str!` on `../../../fixtures/...` in test code, as do
-  `tests/support/mod.rs` and `tests/reducer_replay.rs` (with `../` counts that fit their own
-  directories), and the build stops with
-  `couldn't read src/../../../fixtures/claude/contract/cli-surface.json`.
-- `mango-agent-codex`: the tests compile. The unit and doc tests pass, but the three integration
-  test binaries open `fixtures/codex` at run time through `CARGO_MANIFEST_DIR`, and 147 of the
-  tests in them fail: 14 in `cancel_deadlines`, 1 in `notification_decode` and 132 in `replay`, so
-  the rest of those binaries still pass.
-- `mango-agent-acp`: the tests compile, because the dev-dependency on the core crate is declared
-  with `workspace = true` and so keeps its `launcher-tokio` and `testing` features in the published
-  manifest (`scripts/check-dev-dependencies.sh` guards that; a path-only entry would be dropped).
-  `tests/discovery.rs` and `tests/session.rs` pass, and of the unit tests one profile test fails at
-  run time because it reads the repository root.
-
-Whoever needs to run the harness crates' tests, such as a distribution packager, should use a
-checkout of the release tag, not the `.crate`. Excluding `tests/` and `benches/` from the packages would not change
-this, because the test-only includes in `src/` would remain.
+**The three harness crates' tarballs are not standalone test packages.** Their tests read the
+repository's `fixtures/` directory, outside every crate. Some includes are compiled only for tests;
+other fixtures are opened at run time. A packaged library build can pass while those tests fail to
+compile or run outside the checkout. Fixtures produced by `mea capture` remain in their canonical,
+digest-guarded directories; do not copy them into packages. Excluding `tests/` and `benches/` would
+not fix test-only includes in `src/`. Distribution packagers running harness tests should use a
+checkout of the release tag. The original investigation is preserved in
+[the packaged-test documentation change](https://github.com/juliopolycarpo/mango-external-agents/pull/74);
+its failure counts are historical, not release gates.
 
 Run `mea doctor` and a harmless `mea turn` against Claude, Codex and Cursor on the maintainer's
 Linux and Windows installations. Pinned CI covers Linux, macOS and Windows public contracts;
 authenticated turns require the maintainer's existing vendor login and are not a PR CI job.
+Documentation or fixture-provenance corrections do not establish a fresh authenticated turn or
+native Windows qualification. Record which versions and platforms were actually tested.
 
-After the first manual publish, check all four crate pages and docs.rs builds. Configure trusted
-publishing before relying on an automatic later release. Publishing and tagging happen only after
-the release PR is reviewed and merged; a passing PR does not prove a registry upload.
+After publication, check all four crate pages, registry artifacts and docs.rs builds. A passing
+PR or a skipped already-published crate does not prove a new upload or an OIDC exchange.
 
 **The tag must point at the commit the tarballs name.** Every published `.crate` carries a
-`.cargo_vcs_info.json` recording the commit it was packaged from. That value is immutable once the
-version lands, so tagging a later head — even one whose `crates/` tree is byte-identical — leaves
-the artifact pointing at a commit that is not the release. Read it back from the registry before
-tagging, not from `target/package/`: the local tarball only says what this working tree would
-upload, and the question is what the registry received.
+`.cargo_vcs_info.json` recording its packaging commit. Compare each registry artifact with the
+release tag's commit, not just a byte-identical `crates/` tree. For the manual first-publication
+bootstrap described below, verify the uploaded artifacts before tagging. Read registry artifacts
+rather than `target/package/`, which only describes a local candidate:
 
 ```sh
-crate=mango-external-agents version=0.1.0
-curl -sSL "https://static.crates.io/crates/$crate/$crate-$version.crate" |
-  tar xzO "$crate-$version/.cargo_vcs_info.json"
+crate=mango-external-agents
+curl -sSL "https://static.crates.io/crates/$crate/$crate-$RELEASE_VERSION.crate" |
+  tar xzO "$crate-$RELEASE_VERSION/.cargo_vcs_info.json"
 ```
 
-`mea` remains source-only and unpublished. No binaries are attached to v0.1 releases.
+`mea` remains source-only and unpublished. GitHub releases distribute the library release notes,
+with no downloadable `mea` binaries.
 
-### 0.1.0, as executed
-
-Recorded because the order differed from the numbered procedure above and a later reader should not
-have to infer it. On 2026-09-19 the four crates were published by hand from `3ddd25e` — the merged
-release-gate head — and `v0.1.0` was tagged on that same commit afterwards, once the artifacts were
-verified: identical sources, README and licence in every tarball, all four resolving into a fresh
-downstream build, docs.rs green, `ring`-only TLS in the resolved graph. Trusted publishing was
-configured after the crates existed, which is the only order crates.io allows.
-
-Two checklist items above were not satisfied before that publish: no authenticated Claude or Codex
-turn, and no Windows lane. Both were run afterwards rather than before.
+The [first-release correction](https://github.com/juliopolycarpo/mango-external-agents/pull/19)
+and [its dated procedure](https://github.com/juliopolycarpo/mango-external-agents/blob/9cb630869c98de48c3589a142bfaf06133632a42/docs/releasing.md#010-as-executed)
+record the manual 0.1.0 publication on 2026-09-19, its artifact/tag identity and the authenticated
+turns and Windows checks performed afterwards. That bootstrap receipt does not qualify a later
+release.
 
 ## Pre-releases
 
-A pre-release tag (`v0.2.0-rc.1`) publishes to crates.io as a pre-release version, which Cargo
+A pre-release tag (`v$RELEASE_VERSION` with a suffix such as `-rc.1`) publishes to crates.io as a pre-release version, which Cargo
 does not resolve from a caret requirement, and marks the GitHub release as a pre-release. Canary
 tags (`v*-canary*`) are ignored by the workflow.
 
