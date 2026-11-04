@@ -119,6 +119,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn child_thread_identity_belongs_to_the_subagent_variant() {
+        let items = definition("ThreadItem");
+        let variants = items["variants"]
+            .as_object()
+            .expect("expected per-variant evidence");
+        assert_eq!(variants.len(), values("ThreadItem").len());
+        let child = &variants["subAgentActivity"];
+        for key in ["properties", "required"] {
+            let fields = child[key].as_array().expect("expected variant fields");
+            assert!(fields.contains(&serde_json::json!("agentThreadId")));
+            assert!(!fields.contains(&serde_json::json!("senderThreadId")));
+            assert!(!fields.contains(&serde_json::json!("receiverThreadIds")));
+        }
+        let collab = variants["collabAgentToolCall"]["properties"]
+            .as_array()
+            .expect("expected collaboration fields");
+        assert!(!collab.contains(&serde_json::json!("agentThreadId")));
+        assert!(collab.contains(&serde_json::json!("senderThreadId")));
+        assert!(collab.contains(&serde_json::json!("receiverThreadIds")));
+    }
+
     /// The gate and the pin are one number. Two would drift, and the one that drifted would be the
     /// one a host reads out of `GateVerdict::VersionTooOld`.
     #[test]

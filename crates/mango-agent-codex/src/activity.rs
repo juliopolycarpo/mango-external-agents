@@ -95,6 +95,13 @@ pub fn started(item: &ThreadItem) -> Option<Activity> {
         }
     };
     let activity = Activity::new(name, kind, title);
+    let activity = match item {
+        ThreadItem::SubAgentActivity {
+            agent_thread_id: Some(id),
+            ..
+        } if !id.is_empty() => activity.by_subagent(id),
+        _ => activity,
+    };
     let activity = match detail {
         Some(detail) => activity.with_detail(detail),
         None => activity,
@@ -223,6 +230,41 @@ mod tests {
 
     fn item(raw: serde_json::Value) -> ThreadItem {
         serde_json::from_value(raw).expect("expected an item")
+    }
+
+    // Schema-shaped wire values, not authenticated vendor captures. Ownership is
+    // checked separately against the regenerated pinned inventory.
+    #[test]
+    fn a_subagent_item_preserves_only_its_own_thread_identity() {
+        let activity = started(&item(json!({
+            "type": "subAgentActivity", "id": "child-item", "kind": "started",
+            "agentPath": "root/child", "agentThreadId": "child-thread",
+            "senderThreadId": "wrong-sender", "receiverThreadIds": ["wrong-receiver"]
+        })))
+        .expect("expected a subagent activity");
+        assert_eq!(activity.subagent_id.as_deref(), Some("child-thread"));
+        assert_eq!(activity.item_id.as_deref(), Some("child-item"));
+        assert_eq!(activity.parent_id, None);
+        assert_eq!(activity.kind, ActivityKind::Subagent);
+    }
+
+    #[test]
+    fn missing_child_identity_is_never_inferred_from_other_fields() {
+        for agent_thread_id in [serde_json::Value::Null, json!("")] {
+            let activity = started(&item(json!({
+                "type": "subAgentActivity", "id": "child-item", "kind": "child-thread",
+                "agentThreadId": agent_thread_id, "agentPath": "root/child",
+                "senderThreadId": "wrong-sender", "receiverThreadIds": ["wrong-receiver"]
+            })))
+            .expect("expected a subagent activity");
+            assert_eq!(activity.subagent_id, None);
+        }
+        let activity = started(&item(json!({
+            "type": "collabAgentToolCall", "id": "collab", "agentThreadId": "wrong-child",
+            "senderThreadId": "sender", "receiverThreadIds": ["receiver"]
+        })))
+        .expect("expected an observational unmodelled activity");
+        assert_eq!(activity.subagent_id, None);
     }
 
     #[test]

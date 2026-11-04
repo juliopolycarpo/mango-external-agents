@@ -110,8 +110,8 @@ fn every_item_family_hides_what_it_carries() {
         ),
         (
             "subAgentActivity",
-            json!({"type": "subAgentActivity", "id": "CANARY-id", "kind": "CANARY-kind"}),
-            vec![("kind", "CANARY-kind")],
+            json!({"type": "subAgentActivity", "id": "CANARY-id", "kind": "CANARY-kind", "agentThreadId": "CANARY-child"}),
+            vec![("kind", "CANARY-kind"), ("agent_thread_id", "CANARY-child")],
         ),
         (
             "enteredReviewMode",
