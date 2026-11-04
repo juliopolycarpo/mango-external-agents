@@ -69,37 +69,26 @@ impl StdinFailure {
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct Announcer {
-    state: Arc<AnnouncerState>,
+    state: Arc<Mutex<AnnouncerState>>,
+    /// Pauses immediately before publication so attachment can cross that boundary in a test.
+    #[cfg(test)]
+    before_publish: Option<Arc<(std::sync::Barrier, std::sync::Barrier)>>,
 }
 
 #[derive(Default)]
 struct AnnouncerState {
     /// The child to speak through, once one has been launched.
-    child: Mutex<Option<Arc<ChildState>>>,
+    child: Option<Arc<ChildState>>,
     /// What was announced before that, in order.
-    pending: Mutex<Vec<String>>,
+    pending: Vec<String>,
 }
 
 impl std::fmt::Debug for AnnouncerState {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("AnnouncerState")
-            .field(
-                "attached",
-                &self
-                    .child
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .is_some(),
-            )
-            .field(
-                "pending",
-                &self
-                    .pending
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .len(),
-            )
+            .field("attached", &self.child.is_some())
+            .field("pending", &self.pending.len())
             .finish()
     }
 }
@@ -114,37 +103,24 @@ impl Announcer {
     /// Puts one line on the child's stdout, as a peer announcing something would.
     pub fn announce(&self, line: impl Into<String>) {
         let line = line.into();
-        let child = self
-            .state
-            .child
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        let Some(child) = child else {
-            self.state
-                .pending
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(line);
-            return;
-        };
-        child.announce([line]);
+        #[cfg(test)]
+        if let Some(gate) = &self.before_publish {
+            gate.0.wait();
+            gate.1.wait();
+        }
+        // Attachment and delivery are one publication: a child cannot drain the pending queue
+        // between the lookup and enqueue, and a live line cannot overtake that pending drain.
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        match state.child.as_ref() {
+            Some(child) => child.announce([line]),
+            None => state.pending.push(line),
+        }
     }
 
     fn attach(&self, child: &Arc<ChildState>) {
-        *self
-            .state
-            .child
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(child));
-        let pending = std::mem::take(
-            &mut *self
-                .state
-                .pending
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-        );
-        child.announce(pending);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.child = Some(Arc::clone(child));
+        child.announce(std::mem::take(&mut state.pending));
     }
 }
 
@@ -717,6 +693,41 @@ mod tests {
             "expected an announcement to need no question first, received {:?}",
             launcher.written()
         );
+    }
+
+    /// Attach completes while publication is held, without relying on scheduler races.
+    #[tokio::test]
+    async fn an_announcement_crossing_attachment_is_delivered_in_order() {
+        let gate = std::sync::Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+        let announcer = Announcer::new();
+        announcer.announce("before");
+        let mut paused = announcer.clone();
+        paused.before_publish = Some(std::sync::Arc::clone(&gate));
+        let publishing = std::thread::spawn(move || paused.announce("crossing"));
+        gate.0.wait();
+        let launcher = FakeLauncher::new();
+        launcher.push(FakeProcess::responding(|_| Vec::new()).announcing(announcer.clone()));
+        let child = launcher.spawn(spec(&["fake"])).await.expect("child");
+        gate.1.wait();
+        publishing.join().expect("publisher");
+        announcer.announce("after");
+        let mut lines = LineStream::new(child.stdout, LineLimits::default());
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            received.push(
+                tokio::time::timeout(std::time::Duration::from_secs(1), lines.next_line())
+                    .await
+                    .expect("expected every announcement to remain deliverable after attach")
+                    .expect("line")
+                    .expect("live output"),
+            );
+        }
+        assert_eq!(received, ["before", "crossing", "after"]);
+        child
+            .control
+            .kill(CancelReason::Shutdown)
+            .await
+            .expect("cleanup");
     }
 
     #[tokio::test]
