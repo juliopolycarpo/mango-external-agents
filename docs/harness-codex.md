@@ -28,9 +28,9 @@ claim support qualification for that release.
 | Version read from | `codex --version` before any app-server starts (discovery, session open, picker); the handshake's own `userAgent` as the second line |
 | Minimum version   | `0.154.0` (`MINIMUM_CODEX_VERSION`); current schema pin: `rust-v0.155.0`                                                             |
 
-The floor is the pinned build rather than something older. The app-server's item families and its
-`thread/`–`turn/` method names changed shape inside the 0.15x series, so a lower floor would be a
-claim about builds nothing here was checked against. An older `codex` on `PATH` reports
+The supported floor is the qualified 0.154.0 baseline; the current reproduction pin is 0.155.0.
+Both builds were checked against the consumed public contract, which is unchanged. A pin refresh
+does not itself require raising the supported floor. A `codex` below 0.154.0 on `PATH` reports
 `GateVerdict::VersionTooOld` with both numbers and claims no capabilities; it never crashes, and no
 app-server is spawned for it. That holds for a session open and the short-lived picker connection
 too: they apply the same floor before they spawn `codex app-server`, because an older app-server
@@ -1053,9 +1053,11 @@ method discriminators in `vendor/schema.json`. The tests in
 `src/protocol/schema.rs` assert every name this crate writes or reads against it, so a field
 renamed upstream fails a test here rather than a turn on a user's machine.
 
-Re-pinning is `scripts/vendor-codex.sh <version>`, which refuses to run against a `codex` whose
-version is not the one being pinned. It needs the vendor's CLI, so it is a maintainer's command
-rather than a CI lane; the pin test (`PIN == MINIMUM_CODEX_VERSION`) runs everywhere.
+Re-pinning is `scripts/vendor-codex.sh <version>`, which requires the vendor's CLI at exactly
+the requested version. Maintainers run it to update the inventory; the pinned CI lane runs the
+same generator to reproduce that contract without modifying the checkout.
+The schema test checks that `vendor/PIN` matches the inventory version stamp and that the pin
+is accepted by the qualified minimum-version gate. It does not require pin and minimum equality.
 
 What the inventory deliberately does **not** catch is a field *added* upstream. This harness reads
 a subset on purpose, and every addition would otherwise be a red build.

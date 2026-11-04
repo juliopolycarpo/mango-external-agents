@@ -116,6 +116,18 @@ test_every_pinned_platform_has_a_checksum() {
     'codex 0.154.0 darwin-arm64' \
     'codex 0.154.0 windows-x64' \
     'codex 0.154.0 windows-arm64' \
+    'claude 2.1.278 linux-x64' \
+    'claude 2.1.278 linux-arm64' \
+    'claude 2.1.278 darwin-x64' \
+    'claude 2.1.278 darwin-arm64' \
+    'claude 2.1.278 windows-x64' \
+    'claude 2.1.278 windows-arm64' \
+    'codex 0.155.0 linux-x64' \
+    'codex 0.155.0 linux-arm64' \
+    'codex 0.155.0 darwin-x64' \
+    'codex 0.155.0 darwin-arm64' \
+    'codex 0.155.0 windows-x64' \
+    'codex 0.155.0 windows-arm64' \
     'opencode 1.18.30 linux-x64' \
     'opencode 1.18.30 linux-arm64' \
     'opencode 1.18.30 darwin-x64' \

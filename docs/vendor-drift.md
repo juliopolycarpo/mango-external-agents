@@ -10,9 +10,13 @@ them with the committed files:
 
 | Vendor       | Pin       | Reproduced public artifact                                   |
 | ------------ | --------- | ------------------------------------------------------------ |
-| Claude Code  | `2.1.270` | `fixtures/claude/contract/`                                  |
-| OpenAI Codex | `0.154.0` | `fixtures/codex/contract/` and the vendored schema inventory |
+| Claude Code  | `2.1.278` | `fixtures/claude/contract/`                                  |
+| OpenAI Codex | `0.155.0` | `fixtures/codex/contract/` and the vendored schema inventory |
 | OpenCode ACP | `1.18.30` | `fixtures/acp/opencode/contract/`                            |
+
+The reproduction pins select the builds whose public artifacts CI regenerates. Codex's supported
+minimum remains the separately qualified 0.154.0 baseline; changing a reproduction pin does not
+automatically raise that floor. The 2026-11-04 refresh found no consumed-surface changes.
 
 Release tags and assets can change, so pinned assets are not treated as immutable. Before extracting
 an archive, the installer verifies its SHA-256 against [the recorded per-platform digests](../scripts/vendor-cli-pinned-sha256sums.txt).
@@ -45,7 +49,7 @@ turn loads.
 To inspect a Codex schema without touching the checkout, use:
 
 ```bash
-scripts/vendor-codex.sh 0.154.0 --out /tmp/codex-contract
+scripts/vendor-codex.sh 0.155.0 --out /tmp/codex-contract
 scripts/check-vendor-contract.sh codex \
   crates/mango-agent-codex/vendor/schema.json /tmp/codex-contract/schema.json
 ```

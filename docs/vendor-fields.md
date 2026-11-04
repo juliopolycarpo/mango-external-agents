@@ -23,7 +23,10 @@ per-harness guides, which say why each surface is driven the way it is.
 `refuse` is distinct from `omit`: an omitted field is one this library read and did not carry, and a
 refused one is a request it answered "no" to. Only requests can be refused.
 
-## Claude Code — `claude` 2.1.270
+## Claude Code — reproduction pin `claude` 2.1.278
+
+The field observations below originated at 2.1.270. The 2026-11-04 public-contract refresh
+reproduced the same consumed CLI surface and help at 2.1.278; it was not a new authenticated turn.
 
 | Field                                                          | Enabled | Destination                     | Disposition | Reason                                                                                                                                                                            | Evidence                                                                                           |
 | -------------------------------------------------------------- | ------- | ------------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
@@ -46,7 +49,11 @@ refused one is a request it answered "no" to. Only requests can be refused.
 | `uuid`                                                         | runtime | —                               | omit        | Numbers a stream record nothing addresses; the session and the turn are both already identified                                                                                   | none — recorded as a decision                                                                      |
 | `--permission-prompt-tool stdio`                               | runtime | —                               | refuse      | Real and undocumented. Driving it would make this library the answering host for every prompt                                                                                     | `docs/harness-claude.md` "Approvals: none, and why"                                                |
 
-## Codex — `codex` 0.154.0 (`vendor/PIN`)
+## Codex — reproduction pin `codex` 0.155.0 (`vendor/PIN`)
+
+The qualified supported minimum remains 0.154.0. Field observations and historical transcripts
+originated at that baseline; the 2026-11-04 refresh found the consumed schema unchanged at 0.155.0.
+Reproduction pins and supported minimums are separate evidence, not interchangeable versions.
 
 | Field                                                            | Enabled      | Destination                                            | Disposition | Reason                                                                                                                                                                               | Evidence                                                                                                |
 | ---------------------------------------------------------------- | ------------ | ------------------------------------------------------ | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------- |
