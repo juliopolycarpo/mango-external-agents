@@ -33,6 +33,7 @@ run scripts/test-bench-runner.sh
 run scripts/test-consumer-pin.sh
 run scripts/test-fresh-receipt.sh
 run scripts/test-check-powerset.sh
+run scripts/test-check-tls.sh
 run scripts/check-standalone.sh
 run cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 run cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
