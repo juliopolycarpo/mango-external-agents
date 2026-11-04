@@ -509,6 +509,12 @@ executable example of `TokioLauncher`, terminal approval decisions, terminal que
 event consumption without the runtime's browser or database dependencies. Its question path is the
 one worth copying: it reads `QuestionForm`, numbers the choices, and never touches the broker.
 
+When `mea turn` fails and closing its session also fails, the CLI reports the original turn
+failure on stderr and returns the original cleanup error. Before converting that error to text,
+it inspects any retained cleanup control and names the launched pid for manual reconciliation
+(or says that the injected control has no pid). It does not repeat a one-stop request or claim
+that an unconfirmed process is gone. A CLI diagnostic is not a Rust control handoff to another host.
+
 On Windows, `TokioLauncher` also resolves installed `.ps1` entrypoints when native executable
 resolution fails. It searches only the supplied `PATH`, runs Windows PowerShell from the supplied
 `SystemRoot` with `-File`, and preserves arguments as data. This covers Cursor's official Windows

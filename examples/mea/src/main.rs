@@ -364,7 +364,23 @@ async fn turn(options: &Options) -> Result<(), String> {
         },
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|error| turn_failure(&error))
+}
+
+/// Names incomplete process cleanup while the typed recovery control is still owned here.
+/// The CLI cannot hand a Rust control to its operator; it reports the launched pid for manual
+/// reconciliation rather than blindly repeating the control's one-stop request.
+fn turn_failure(error: &mango_external_agents::Error) -> String {
+    let cleanup = error.cleanup_control().map(|control| control.pid());
+    match cleanup {
+        Some(Some(pid)) => format!(
+            "{error}; process-tree cleanup is unconfirmed for launched pid {pid}; inspect the process before retrying"
+        ),
+        Some(None) => format!(
+            "{error}; process-tree cleanup is unconfirmed and the injected control has no pid; inspect the launcher before retrying"
+        ),
+        None => error.to_string(),
+    }
 }
 
 async fn capture(arguments: &[String]) -> Result<(), String> {
@@ -507,6 +523,12 @@ mod tests {
         PermissionLevel, PermissionMatrix, ProfileId, Result, Session, TransportKind,
         TransportSelection, VendorInfo,
     };
+
+    #[test]
+    fn an_ordinary_turn_failure_needs_no_process_cleanup_warning() {
+        let error = Error::Closed { subject: "session" };
+        assert_eq!(super::turn_failure(&error), error.to_string());
+    }
 
     #[test]
     fn the_turn_report_names_requested_and_effective_transport() {
