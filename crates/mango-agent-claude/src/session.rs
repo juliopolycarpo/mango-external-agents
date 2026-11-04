@@ -178,6 +178,10 @@ fn copy_error(error: &Error) -> Error {
             program: program.clone(),
             message: message.clone(),
         },
+        Error::Teardown { pid, message } => Error::Teardown {
+            pid: *pid,
+            message: message.clone(),
+        },
         Error::Link { peer, message } => Error::Link {
             peer: peer.clone(),
             message: message.clone(),

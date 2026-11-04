@@ -325,6 +325,12 @@ a retry. Decide using the existing queries together:
 | `cleanup_control()`         | Retain and finish bounded process cleanup even when submission never happened. `close` returns it on all three harnesses, `cancel` on Claude and Codex. |
 | `session.snapshot().status` | Session usability is separate from the error. A nonretryable error does not prove the session remains healthy.                                          |
 
+The built-in launcher reports `Error::Launch` only while starting an executable. A failure
+interrupting, ending or confirming an already-launched tree is `Error::Teardown { pid, message }`:
+`pid` retains the launched leader's numeric identity when available, and the message names a safe
+OS cause or deadline. Neither cause alone proves cleanup complete; retain any `cleanup_control()`
+until the host has reconciled it.
+
 An ACP agent's readable JSON-RPC error answer to a prompt ends that turn only: the session stays
 `Ready`, and a host that treats the failure as fatal for the conversation calls `close` itself. An
 answer the client cannot read, or a link that closes before one, ends the session. See

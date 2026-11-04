@@ -529,8 +529,8 @@ impl TokioChild {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
             .unwrap_or_else(|| String::from("the contained process tree ended without a result"));
-        Error::Launch {
-            program: String::from("Windows Job"),
+        Error::Teardown {
+            pid: self.pid,
             message,
         }
     }
@@ -542,8 +542,8 @@ impl TokioChild {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        Error::Launch {
-            program: String::from("Windows Job"),
+        Error::Teardown {
+            pid: self.pid,
             message: recorded.unwrap_or_else(|| {
                 format!(
                     "a contained process tree still had members after {waited:?}; expected an empty Job"
@@ -769,8 +769,8 @@ impl ProcessControl for TokioChild {
                 return if self.exited().is_some() {
                     Ok(())
                 } else {
-                    Err(Error::Launch {
-                        program: String::from("<unknown>"),
+                    Err(Error::Teardown {
+                        pid: None,
                         message: String::from("a running child with no process id to end"),
                     })
                 };
@@ -785,8 +785,8 @@ impl ProcessControl for TokioChild {
                 return if tree_ends_within(pid, self.exit.clone(), waited).await {
                     Ok(())
                 } else {
-                    Err(Error::Launch {
-                        program: format!("process group {pid}"),
+                    Err(Error::Teardown {
+                        pid: Some(pid),
                         message: format!(
                             "a live process after {waited:?}, with an escalation already running"
                         ),
@@ -797,8 +797,8 @@ impl ProcessControl for TokioChild {
             // The owned task retains the reaper observation until the tree is stopped or refused.
             tokio::spawn(end_process_tree(pid, self.kill_grace, self.exit.clone()))
                 .await
-                .map_err(|_| Error::Launch {
-                    program: String::from("process group"),
+                .map_err(|_| Error::Teardown {
+                    pid: Some(pid),
                     message: String::from("process-tree cleanup task did not finish"),
                 })?
         }
@@ -814,8 +814,8 @@ impl ProcessControl for TokioChild {
             let Some(pid) = self.pid else {
                 return Ok(crate::process::InterruptOutcome::NotDelivered);
             };
-            killpg(group_of(pid), Signal::SIGINT).map_err(|error| Error::Launch {
-                program: String::from("process group"),
+            killpg(group_of(pid), Signal::SIGINT).map_err(|error| Error::Teardown {
+                pid: Some(pid),
                 message: format!("interrupt failed with OS error {error}"),
             })?;
             Ok(crate::process::InterruptOutcome::Delivered)
@@ -961,10 +961,16 @@ async fn end_process_tree(
     if tree_ends_within(pid, exit, grace).await {
         return Ok(());
     }
-    Err(Error::Launch {
-        program: format!("process group {pid}"),
+    Err(tree_timeout_error(pid, grace))
+}
+
+/// The exhausted Unix escalation, with the identity of the group it could not end.
+#[cfg(unix)]
+fn tree_timeout_error(pid: u32, grace: Duration) -> Error {
+    Error::Teardown {
+        pid: Some(pid),
         message: format!("a live group member after {grace:?}"),
-    })
+    }
 }
 
 #[cfg(test)]
@@ -976,6 +982,80 @@ mod tests {
     use std::time::Duration;
 
     mod stop_bound;
+
+    /// Diagnostic failures do not send signals: the repeated-stop case only observes our group.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn teardown_diagnostics_name_cleanup_and_keep_process_identity() {
+        use super::TokioChild;
+        use crate::{Error, StderrTail};
+        use std::sync::atomic::AtomicBool;
+        let (_sender, exit) = tokio::sync::watch::channel(None);
+        let child = TokioChild {
+            pid: None,
+            exit: exit.clone(),
+            stderr: StderrTail::default(),
+            kill_grace: Duration::ZERO,
+            killed: AtomicBool::new(true),
+        };
+        let error = crate::ProcessControl::kill(&child, CancelReason::Shutdown)
+            .await
+            .expect_err("missing pid must refuse cleanup");
+        assert_eq!(
+            error.to_string(),
+            "expected to end a process tree, received a running child with no process id to end"
+        );
+
+        let pid = u32::try_from(nix::unistd::getpgrp().as_raw()).expect("process group");
+        let mut child = child;
+        child.pid = Some(pid);
+        let error = crate::ProcessControl::kill(&child, CancelReason::Shutdown)
+            .await
+            .expect_err("our observed group is still alive");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "expected to end process tree {pid}, received a live process after 0ns, with an escalation already running"
+            )
+        );
+        let error: Error = super::tree_timeout_error(42, Duration::from_secs(5));
+        assert_eq!(
+            error.to_string(),
+            "expected to end process tree 42, received a live group member after 5s"
+        );
+    }
+
+    /// Both Job failure paths retain the launched leader without redacting it as a program.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn teardown_diagnostics_name_windows_job_cleanup() {
+        use super::TokioChild;
+        use crate::StderrTail;
+        use std::sync::{Arc, Mutex, atomic::AtomicBool};
+        let (_sender, exit) = tokio::sync::watch::channel(None);
+        let (stop, _) = tokio::sync::watch::channel(false);
+        let child = TokioChild {
+            pid: Some(42),
+            exit: exit.clone(),
+            stderr: StderrTail::default(),
+            kill_grace: Duration::ZERO,
+            killed: AtomicBool::new(true),
+            stop,
+            cleanup: exit,
+            cleanup_error: Arc::new(Mutex::new(Some(String::from(
+                "a Windows Job cleanup failure (PermissionDenied)",
+            )))),
+        };
+        assert_eq!(
+            child.job_cleanup_error().to_string(),
+            "expected to end process tree 42, received a Windows Job cleanup failure (PermissionDenied)"
+        );
+        *child.cleanup_error.lock().expect("cleanup") = None;
+        assert_eq!(
+            child.job_timeout_error(Duration::from_secs(5)).to_string(),
+            "expected to end process tree 42, received a contained process tree still had members after 5s; expected an empty Job"
+        );
+    }
 
     /// Selects what the re-executed test binary does when it stands in for a vendor CLI.
     const FIXTURE_MODE: &str = "MEA_LAUNCHER_FIXTURE";
