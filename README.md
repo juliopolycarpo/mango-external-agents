@@ -61,12 +61,17 @@ host can log or route one without matching on what happened first.
 - [`docs/adopt.md`](docs/adopt.md): how a host implements the ports and maps events
 - [`docs/compliance.md`](docs/compliance.md): what each vendor permits and what the library does
 - [`docs/harness-claude.md`](docs/harness-claude.md), [`docs/harness-codex.md`](docs/harness-codex.md), [`docs/harness-acp.md`](docs/harness-acp.md)
-- [`docs/releasing.md`](docs/releasing.md)
+- [`docs/lifecycle.md`](docs/lifecycle.md): turn ownership, cancellation, cleanup and recovery
+- [`docs/contracts.md`](docs/contracts.md): public API shapes, identities and compatibility
+- [`docs/vendor-fields.md`](docs/vendor-fields.md): vendor field mappings and their test evidence
+- [`docs/vendor-drift.md`](docs/vendor-drift.md): detecting and qualifying vendor changes
+- [`docs/benchmarks.md`](docs/benchmarks.md): benchmark commands and dated measurement receipts
+- [`docs/releasing.md`](docs/releasing.md): library publication and consumer-pin updates
 
 ## Smoke CLI
 
-Build `mea` from this repository. It is an unpublished diagnostic tool; v0.1 ships library crates
-only, with no downloadable `mea` binaries.
+Build `mea` from this repository. It is a source-only, unpublished diagnostic example. Releases
+publish the four library crates and release notes, with no downloadable `mea` binaries.
 
 ```sh
 cargo run -p mea -- doctor --json
