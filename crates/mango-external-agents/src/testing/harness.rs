@@ -486,8 +486,7 @@ fn question_request(operation: OperationRef, expires_at: std::time::SystemTime) 
 impl FakeSession {
     async fn finish(
         &self,
-        option_id: &str,
-        source: DecisionSource,
+        response: PermissionResponse,
         owner: Option<&OperationRef>,
     ) -> Result<()> {
         let mut pending = self.pending.lock().await;
@@ -498,9 +497,24 @@ impl FakeSession {
         }) {
             return Ok(());
         }
+        if let Some(turn) = pending.as_ref() {
+            let request = turn.approval.as_ref().ok_or_else(|| Error::Protocol {
+                expected: String::from("an outstanding approval"),
+                received: String::from("a pending question"),
+            })?;
+            if request.interaction.id != response.interaction_id {
+                return Err(Error::Protocol {
+                    expected: String::from("the outstanding approval interaction"),
+                    received: String::from("a different interaction"),
+                });
+            }
+            request.respond(&response.option_id, response.source)?;
+        }
         let Some(turn) = pending.take() else {
             return Ok(());
         };
+        let option_id = response.option_id.as_str();
+        let source = response.source;
         let decision = turn
             .approval
             .as_ref()
@@ -757,8 +771,7 @@ impl Session for FakeSession {
         })
         .await?;
         if let Some(response) = answer {
-            self.finish(&response.option_id, response.source, Some(&operation))
-                .await?;
+            self.finish(response, Some(&operation)).await?;
         }
 
         Ok(stream())
@@ -772,8 +785,7 @@ impl Session for FakeSession {
                 "this harness would not take the answer",
             )));
         }
-        self.finish(&response.option_id, response.source, None)
-            .await
+        self.finish(response, None).await
     }
 
     async fn answer(&self, response: QuestionResponse) -> Result<()> {
@@ -1102,6 +1114,93 @@ mod tests {
             panic!("expected an answered outcome, received {resolved:?}");
         };
         assert_eq!(answers.len(), 2);
+    }
+
+    /// Invalid approval routing must leave the same turn available for a corrected response.
+    #[tokio::test]
+    async fn invalid_approval_answers_leave_the_original_request_pending() {
+        for wrong_id in [true, false] {
+            let session = FakeHarness::new()
+                .open_session(&host(), OpenSession::new("chat"))
+                .await
+                .expect("session");
+            let mut turn = session
+                .start_turn(TurnRequest::new("turn", "work"))
+                .await
+                .expect("turn");
+            let request = loop {
+                if let EventKind::ApprovalRequested { request } =
+                    turn.recv().await.expect("approval").kind
+                {
+                    break request;
+                }
+            };
+            let mut invalid = request.allow().expect("allow");
+            if wrong_id {
+                invalid.interaction_id = crate::InteractionId::new("different-request");
+            } else {
+                invalid.option_id = String::from("not-offered");
+            }
+            let error = session
+                .respond(invalid)
+                .await
+                .expect_err("invalid approval must refuse before consuming pending work");
+            assert!(matches!(error.cause(), crate::Error::Protocol { .. }));
+            session
+                .respond(request.allow().expect("allow"))
+                .await
+                .expect("corrected response");
+            let mut resolved = 0;
+            let mut completed = 0;
+            while let Some(event) = turn.recv().await {
+                match event.kind {
+                    EventKind::ApprovalResolved { .. } => resolved += 1,
+                    EventKind::Completed => completed += 1,
+                    _ => {}
+                }
+            }
+            assert_eq!((resolved, completed), (1, 1));
+        }
+    }
+
+    /// The approval surface cannot consume a pending question that authorises nothing.
+    #[tokio::test]
+    async fn an_approval_answer_cannot_consume_a_pending_question() {
+        let session = FakeHarness::new()
+            .asking_a_question()
+            .open_session(&host(), OpenSession::new("chat"))
+            .await
+            .expect("session");
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn", "work"))
+            .await
+            .expect("turn");
+        let request = loop {
+            if let EventKind::QuestionAsked { request } = turn.recv().await.expect("question").kind
+            {
+                break request;
+            }
+        };
+        let error = session
+            .respond(crate::PermissionResponse {
+                interaction_id: request.interaction.id.clone(),
+                option_id: String::from("allow"),
+                source: crate::DecisionSource::User,
+            })
+            .await
+            .expect_err("no pending approval");
+        assert!(matches!(error.cause(), crate::Error::Protocol { .. }));
+        session
+            .cancel(crate::CancelReason::Shutdown)
+            .await
+            .expect("cancel retained question");
+        let mut withdrawn = false;
+        while let Some(event) = turn.recv().await {
+            if matches!(event.kind, EventKind::QuestionResolved { .. }) {
+                withdrawn = true;
+            }
+        }
+        assert!(withdrawn, "question remained owned until cancellation");
     }
 
     /// An approval that a person chose reaches the host's audit trail carrying how far the choice
