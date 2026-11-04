@@ -148,9 +148,10 @@ impl Teardown {
     }
 }
 
-/// Reconstructs the result a second close or cancel observes after the first caller has consumed
-/// it. `Error` deliberately has no `Clone` because it may wrap another error, so teardown owns the
-/// first value and makes a typed copy for each waiter.
+/// Reconstructs the retained result for each close or cancel waiter.
+///
+/// `Error` implements `Clone`; this explicit reconstruction remains until the shared-error
+/// refactor replaces it with cloning.
 fn copy_error(error: &Error) -> Error {
     match error {
         Error::Busy => Error::Busy,
@@ -2699,6 +2700,22 @@ mod tests {
     };
     use mango_external_agents::{CancelReason, CancelToken, ExitStatus, Resumability};
     use std::sync::Arc;
+
+    #[test]
+    fn copying_a_teardown_error_preserves_process_identity_and_message() {
+        let error = mango_external_agents::Error::Teardown {
+            pid: Some(42),
+            message: String::from("a live group member after 5s"),
+        };
+        let copied = super::copy_error(&error);
+        match copied {
+            mango_external_agents::Error::Teardown { pid, message } => {
+                assert_eq!(pid, Some(42));
+                assert_eq!(message, "a live group member after 5s");
+            }
+            received => panic!("expected the retained Teardown variant, received: {received:?}"),
+        }
+    }
 
     /// The verdict a host reads is derived from the same state `start_turn` refuses on, in the
     /// order the conversation lived through it.
