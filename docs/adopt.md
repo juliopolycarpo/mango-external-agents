@@ -510,7 +510,9 @@ event consumption without the runtime's browser or database dependencies. Its qu
 one worth copying: it reads `QuestionForm`, numbers the choices, and never touches the broker.
 
 When `mea turn` fails and closing its session also fails, the CLI reports the original turn
-failure on stderr and returns the original cleanup error. Before converting that error to text,
+failure on stderr and returns the original cleanup error. If the primary failure itself retains
+another cleanup control, its launched pid is reported before that error is released. Before
+converting the returned error to text,
 it inspects any retained cleanup control and names the launched pid for manual reconciliation
 (or says that the injected control has no pid). It does not repeat a one-stop request or claim
 that an unconfirmed process is gone. A CLI diagnostic is not a Rust control handoff to another host.

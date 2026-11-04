@@ -153,7 +153,10 @@ async fn run_turn(
     .await;
     let closed = session.close(CloseReason::Requested).await;
     with_cleanup(outcome, closed, |primary| {
-        eprintln!("turn failed before cleanup: {primary}");
+        eprintln!(
+            "turn failed before cleanup: {}",
+            crate::turn_failure(primary)
+        );
     })
 }
 
@@ -1828,6 +1831,36 @@ mod tests {
             );
             assert!(crate::turn_failure(&error).contains("4242"));
         }
+    }
+
+    /// Both process identities remain reportable before CLI result precedence discards one error.
+    #[test]
+    fn double_cleanup_failures_report_both_owners_without_repeating_a_stop() {
+        let primary = Error::CleanupRequired {
+            control: Arc::new(CleanupControl(Some(41))),
+            source: Box::new(Error::Closed {
+                subject: "launch cleanup",
+            }),
+        };
+        let remaining: Arc<dyn mango_external_agents::ProcessControl> =
+            Arc::new(CleanupControl(Some(42)));
+        let cleanup = Error::CleanupRequired {
+            control: Arc::clone(&remaining),
+            source: Box::new(Error::Closed {
+                subject: "session cleanup",
+            }),
+        };
+        let mut primary_report = String::new();
+        let result = super::with_cleanup::<()>(Err(primary), Err(cleanup), |error| {
+            primary_report = crate::turn_failure(error)
+        })
+        .expect_err("both failed");
+        assert!(primary_report.contains("launched pid 41"));
+        assert!(crate::turn_failure(&result).contains("launched pid 42"));
+        assert!(Arc::ptr_eq(
+            &result.cleanup_control().expect("returned owner"),
+            &remaining
+        ));
     }
 
     #[test]
