@@ -892,7 +892,7 @@ impl SessionPage {
         // its limit is noticed without the whole overrun being built first.
         let sessions: Vec<NativeSession> = usable.by_ref().take(SESSION_PAGE_LIMIT).collect();
         Self {
-            truncated: usable.next().is_some(),
+            truncated: self.truncated || usable.next().is_some(),
             sessions,
             next_cursor: self.next_cursor,
         }
@@ -1539,6 +1539,25 @@ mod tests {
         // The cursor is the vendor's and is carried as it was: dropping it would lose rows 81 and
         // beyond on top of the ones the cap already took.
         assert_eq!(page.next_cursor, Some(String::from("after-thread-79")));
+    }
+
+    /// Wrappers may normalise an already-normalised provider page without losing evidence.
+    #[test]
+    fn listing_truncation_survives_repeated_normalization() {
+        for (count, flagged) in [(80, false), (2, true), (0, true), (2, false)] {
+            let page = SessionPage {
+                sessions: (0..count).map(|n| row(&format!("thread_{n}"))).collect(),
+                next_cursor: Some(String::from("after-page")),
+                truncated: flagged,
+            }
+            .normalized();
+            let again = page.clone().normalized().normalized();
+            assert_eq!(
+                again.truncated,
+                flagged || count > super::SESSION_PAGE_LIMIT
+            );
+            assert_eq!(again, page);
+        }
     }
 
     /// The flag means "the cap fired", not "something was dropped". A row refused as unusable is a
