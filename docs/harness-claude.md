@@ -869,6 +869,9 @@ The reducer holds three properties, each with a fixture case behind it:
 - **Subagents stay the vendor's.** `--forward-subagent-text` tags a subagent's messages with
   `parent_tool_use_id`; those nest under the `Task` activity as accumulating detail, never
   promoted into the transcript, which would tell a user the host made a hand-off it did not make.
+  A finished public reducer releases its nested transcript buffers after constructing closure
+  events, including cancellation and abort; retaining that reducer retains no child text.
+
 - **Unknown records are ignored, not fatal.** `system/status`, `system/thinking_tokens`,
   `system/api_retry` and `rate_limit_event` all appear on one live run, and the vocabulary keeps
   growing. Only a `result` ends the turn.

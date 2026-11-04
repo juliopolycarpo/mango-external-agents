@@ -376,6 +376,9 @@ impl TurnReducer {
         let mut events = self.close_reasoning_blocks();
         self.delivered_by_block.clear();
         events.extend(self.close_open_activities());
+        // Closures have consumed the detail they need; a retained finished reducer cannot use
+        // these child transcripts or their full markers again.
+        self.nested_text.clear();
         events
     }
 
@@ -1960,6 +1963,38 @@ mod tests {
             !reduce(reducer, &line).is_empty(),
             "expected the Task call {id} to open an activity"
         );
+    }
+
+    /// Retaining a finished public reducer must not retain unreachable child transcripts.
+    #[test]
+    fn finished_reducers_release_nested_text_and_full_markers() {
+        for ending in ["cancel", "abort", "result"] {
+            let mut reducer = TurnReducer::new();
+            open_task(&mut reducer, "task");
+            nested_detail(
+                &mut reducer,
+                "task",
+                &"x".repeat(DETAIL_CARRY_MAX_CHARS + 10),
+            );
+            assert!(!reducer.nested_text.is_empty());
+            let events = match ending {
+                "cancel" => reducer.cancel(),
+                "abort" => {
+                    reducer.abort(VendorError::new(ErrorCode::from_static("gone"), "exited"))
+                }
+                _ => reduce(
+                    &mut reducer,
+                    r#"{"type":"result","subtype":"success","is_error":false}"#,
+                ),
+            };
+            assert!(!events.is_empty());
+            assert!(reducer.finished());
+            assert!(
+                reducer.nested_text.is_empty(),
+                "expected {ending} to release nested buffers"
+            );
+            assert!(reducer.cancel().is_empty());
+        }
     }
 
     #[test]
