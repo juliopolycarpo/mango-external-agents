@@ -20,3 +20,18 @@ opencode 1.18.30 opencode-linux-arm64.tar.gz 4111a55c2a02c0fac314bd51e9a2330280e
 opencode 1.18.30 opencode-linux-x64.tar.gz 55007246858165496ff85ba1c2b648f7421e8e2013bf4189a680c9ff8e699d17
 opencode 1.18.30 opencode-windows-arm64.zip 35d6ff7d80aff5ade71ac06fc32dd89357b5b0bac050fc6db41ecf0929cea560
 opencode 1.18.30 opencode-windows-x64.zip c8c0e0d05ac3dac544a0edfad8de9eb244bf46c6c7a131c38619d40fcf31bd1f
+
+# Additional official GitHub Releases API asset digests retrieved 2026-11-04.
+# anthropics/claude-code v2.1.278; openai/codex rust-v0.155.0.
+claude 2.1.278 claude-darwin-arm64.tar.gz d16dc23a4e27155a59cdc35251eccd7fa30ed46482c51af1c33e71b14d790f6b
+claude 2.1.278 claude-darwin-x64.tar.gz d5fa59ea628b85b0a9d4b2c8aa59a20a9b9714a0b08c938b2d04de1f00c07bb2
+claude 2.1.278 claude-linux-arm64.tar.gz 5e3cc367f997847c89cdba3f5b1cd6ff5aabb8e94e14b19bad401124c0e838ed
+claude 2.1.278 claude-linux-x64.tar.gz 1d1f9950b96acb5a50bf342a3d3bd51cdf40b1714b2ca3ce2319ba8e8e7f3633
+claude 2.1.278 claude-win32-arm64.zip 1029abe6a88ff866896347de4f86e8bf0969e67ae39260255f060cc08bfab22d
+claude 2.1.278 claude-win32-x64.zip 8a223953a84861805ca7d00be12dee25590c06533e02f48dd9496f90db709d2e
+codex 0.155.0 codex-aarch64-apple-darwin.tar.gz 5a584b7cddc2a97083cada53f10f5bc4231526b7f64105f6a5bb82d01ccdba49
+codex 0.155.0 codex-aarch64-pc-windows-msvc.exe.zip dd0da6cf1345494edba56685c2baabb32cd37b92182585abec1b81092a70073a
+codex 0.155.0 codex-aarch64-unknown-linux-musl.tar.gz 8b4a9c356916c515f7c93f918a01b8fa1371bcc9758addbfa723b85fbec5694b
+codex 0.155.0 codex-x86_64-apple-darwin.tar.gz cc84081b15284eea10c8b8d428818d1c8debdce5a7f0f4f5c04dfc7c72518174
+codex 0.155.0 codex-x86_64-pc-windows-msvc.exe.zip b8c4c83b3da224b1d0dac10fcc886cc79adec2e945802cb74a4b88ca4b0ac5af
+codex 0.155.0 codex-x86_64-unknown-linux-musl.tar.gz e415cc3adb94ade16e8d44b4dd58a9201cc34b2ee51a5d6eddf2a3a00aecb6c0

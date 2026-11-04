@@ -3,10 +3,21 @@
 Drives the `codex` CLI a user already installed, through `codex app-server` — the interface OpenAI
 documents for rich clients and uses for its own VS Code extension.
 
-The implementation targets `codex-cli 0.154.0`; `vendor/PIN` records the tag
-`rust-v0.154.0`. Evidence dates belong to the sections below: the interface README
+The current public-contract pin is `codex-cli 0.155.0`; `vendor/PIN` records the tag
+`rust-v0.155.0`. The qualified minimum remains 0.154.0. Evidence dates belong to the sections below: the interface README
 was re-read on 2026-10-22, and the version-probe documentation on 2026-10-13.
 These documentation dates do not establish a new live qualification of the CLI.
+
+## Public-contract refresh — 2026-11-04
+
+The official 0.155.0 release archive was checksum-verified by `scripts/install-vendor-cli.sh`.
+`mea capture` regenerated the version and initialization schemas, and `scripts/vendor-codex.sh`
+regenerated the inventory. Consumed definitions, properties, enum values and method discriminators
+are unchanged from 0.154.0, so that qualified minimum and its historical transcripts remain valid.
+A separate per-variant inventory comparison also found no field-ownership changes.
+This is an offline public-surface check, not authenticated live-turn qualification.
+The official latest-release API reported 0.166.0 on this date; this bounded refresh does not
+claim support qualification for that release.
 
 ## The executable and the version gate
 
@@ -15,7 +26,7 @@ These documentation dates do not establish a new live qualification of the CLI.
 | Executable        | `codex`, resolved by the host (`OpenSession::with_executable`) or by name                                                            |
 | Arguments         | `app-server`, and nothing else                                                                                                       |
 | Version read from | `codex --version` before any app-server starts (discovery, session open, picker); the handshake's own `userAgent` as the second line |
-| Minimum version   | `0.154.0` (`MINIMUM_CODEX_VERSION`), recorded as `rust-v0.154.0` in `vendor/PIN`                                                     |
+| Minimum version   | `0.154.0` (`MINIMUM_CODEX_VERSION`); current schema pin: `rust-v0.155.0`                                                             |
 
 The floor is the pinned build rather than something older. The app-server's item families and its
 `thread/`–`turn/` method names changed shape inside the 0.15x series, so a lower floor would be a
@@ -65,7 +76,7 @@ second line, for what `--version` could not say.
 Every method below follows the [official app-server documentation][app-server] and the
 [`codex-rs/app-server/README.md`][readme] at document revision
 `41e22fee981a63b3698df7ed36bad393cda24715` (`rust-v0.153.0`), re-read on 2026-10-22.
-The tested CLI and schema pin remain `rust-v0.154.0`. JSON-RPC
+The current public-contract CLI and schema pin are `rust-v0.155.0`. JSON-RPC
 2.0 over newline-delimited JSON, **without** the `"jsonrpc"` member — the README's own words:
 "bidirectional communication using JSON-RPC 2.0 messages (with the `"jsonrpc":"2.0"` header omitted
 on the wire)".
@@ -656,7 +667,7 @@ never read as the narrow one.
 An amendment option writes a rule Codex applies on its own from then on, so the option's label
 carries the rule itself and never a generic description of it. The pinned digest in
 `vendor/schema.json` lists property names only, with no field types. The types come from
-`codex app-server generate-json-schema` run at the pinned 0.154.0:
+`codex app-server generate-json-schema` originally checked at 0.154.0:
 `CommandExecutionRequestApprovalParams.proposedExecpolicyAmendment` is `string[]` (a command
 prefix), `proposedNetworkPolicyAmendments` is `NetworkPolicyAmendment[]` where
 `NetworkPolicyAmendment` is `{host: string, action: "allow" | "deny"}`, and

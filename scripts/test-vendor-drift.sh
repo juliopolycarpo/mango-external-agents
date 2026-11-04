@@ -183,8 +183,8 @@ test_codex_generator_cleans_up_in_a_standalone_process() {
   export PATH="$fake_bin:$PATH"
   export FAKE_CODEX_SCHEMA="$repo_root/crates/mango-agent-codex/vendor/schema.json"
   "$repo_root/scripts/vendor-codex.sh" 0.154.0 --out "$output" >/dev/null
-  assert_contains "$output/schema.json" '"codexVersion": "0.154.0"' \
-    'standalone Codex inventory output'
+  # This named fake copies the current inventory; its stamp need not match the fake CLI.
+  cmp "$FAKE_CODEX_SCHEMA" "$output/schema.json" || fail 'standalone Codex inventory output'
   unset FAKE_CODEX_SCHEMA
   export PATH="$original_path"
 }

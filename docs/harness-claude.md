@@ -10,6 +10,15 @@ under `fixtures/claude/contract/`.
 
 Compliance posture: see [compliance.md](compliance.md).
 
+## Public-contract refresh — 2026-11-04
+
+The current public-contract pin is **2.1.278**. Its official release archive was checksum-verified
+by `scripts/install-vendor-cli.sh`, then re-captured with `mea capture`. The consumed CLI surface
+and help match 2.1.270 byte-for-byte; only the version record and its manifest digest change.
+Historical behavioral observations below retain their original versions and dates. This is not
+an authenticated turn or smoke test. The official latest-release API reported 2.1.318 on this
+date; this bounded refresh does not claim qualification for that release.
+
 ## The executable and the version gate
 
 |                   |                                                                                           |
@@ -63,7 +72,7 @@ concludes from the lines that did arrive differs:
 
 Anthropic's [CLI reference](https://code.claude.com/docs/en/cli-reference.md#cli-flags) cautions
 that `claude --help` does not list every supported flag. This harness deliberately applies the
-runtime gate only to the fixed argv it drives, each measured in the pinned 2.1.270 capture and
+runtime gate only to the fixed argv it drives, each measured in the original 2.1.270 capture and
 documented on the linked CLI and headless references. If a later build omits one of those required
 flags from `--help`, opening refuses it even when the published reference still lists the flag.
 The conservative limitation avoids treating a changed help grammar as proof that an untested child

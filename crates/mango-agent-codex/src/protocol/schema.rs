@@ -19,9 +19,9 @@ pub const PIN: &str = include_str!("../../vendor/PIN");
 
 /// The oldest `codex` this harness drives.
 ///
-/// The pinned build, not an older one: the app-server's item families and the `thread`/`turn`
-/// method names changed shape inside the 0.15x series, and a floor below the pin would be a claim
-/// about builds nothing here was ever checked against.
+/// The qualified 0.154.0 baseline remains supported: refreshing the public schema pin
+/// to 0.155.0 found no consumed-surface differences. A pin refresh does not invalidate
+/// the older captured transcripts or require raising the host's version floor.
 pub const MINIMUM_CODEX_VERSION: &str = "0.154.0";
 
 #[cfg(test)]
@@ -141,19 +141,22 @@ mod tests {
         assert!(collab.contains(&serde_json::json!("receiverThreadIds")));
     }
 
-    /// The gate and the pin are one number. Two would drift, and the one that drifted would be the
-    /// one a host reads out of `GateVerdict::VersionTooOld`.
+    /// A refresh keeps the version stamp consistent without discarding a qualified baseline.
     #[test]
-    fn the_version_gate_is_the_version_the_schema_was_pinned_at() {
-        assert_eq!(
-            PIN.trim(),
-            format!("rust-v{MINIMUM_CODEX_VERSION}"),
-            "expected vendor/PIN to name the gated version"
-        );
+    fn the_schema_pin_and_stamp_agree_and_do_not_precede_the_qualified_floor() {
+        let pinned = PIN
+            .trim()
+            .strip_prefix("rust-v")
+            .expect("expected a Codex release tag");
         assert_eq!(
             inventory()["codexVersion"].as_str(),
-            Some(MINIMUM_CODEX_VERSION),
-            "expected the inventory to be generated at the gated version"
+            Some(pinned),
+            "expected the inventory version stamp to match vendor/PIN"
+        );
+        assert_eq!(
+            crate::discovery::gate(Some(pinned), MINIMUM_CODEX_VERSION),
+            mango_external_agents::GateVerdict::Usable,
+            "expected pin {pinned} at or above qualified floor {MINIMUM_CODEX_VERSION}"
         );
     }
 
