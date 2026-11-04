@@ -14,8 +14,7 @@
 //! * **Session state is not transcript.** The mode, config-option, session-info and command-catalog
 //!   updates describe the session rather than the turn. Command and configuration catalogs are
 //!   reported as [`SessionFact::Commands`] and [`SessionFact::ConfigurationOptions`], rather than
-//!   transcript [`EventKind`] values. The client publishes these into core session state; see
-//!   [`state::SessionState::set_commands`](mango_external_agents::state::SessionState::set_commands).
+//!   transcript [`EventKind`] values. The client publishes these into core session state.
 //!   Current-mode and session-info updates have no mapped core state here and are omitted.
 //!
 //! ACP v1 reference: <https://agentclientprotocol.com/protocol/v1/prompt-turn>
