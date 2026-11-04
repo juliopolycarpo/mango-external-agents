@@ -1675,10 +1675,8 @@ pub(crate) struct ConnectionHandle {
     ended: mango_external_agents::CancelToken,
     shutdown_started: AtomicBool,
     shutdown_complete: mango_external_agents::CancelToken,
-    /// The one teardown outcome every close waiter observes. `Error` is intentionally reduced to
-    /// its diagnostic-safe summary here because the core error is not cloneable and a second close
-    /// must still report the first cleanup failure rather than inventing success.
-    shutdown_result: Mutex<Option<std::result::Result<(), String>>>,
+    /// The typed outcome replayed through core `Error: Clone` to every close waiter.
+    shutdown_result: Mutex<Option<Result<()>>>,
     /// Which request passed its deadline, when that is why this side ended the connection.
     timed_out: std::sync::OnceLock<String>,
     /// The runtime the connection was driven on. Shutdown is spawned through it, so a request
@@ -1698,7 +1696,7 @@ pub(crate) struct ChildReaper {
     control: Arc<dyn ProcessControl>,
     claimed: Arc<AtomicBool>,
     limits: Limits,
-    result: Arc<Mutex<Option<std::result::Result<(), String>>>>,
+    result: Arc<Mutex<Option<Result<()>>>>,
     done: mango_external_agents::CancelToken,
 }
 
@@ -1724,14 +1722,25 @@ impl ChildReaper {
                 let _complete = ReapCompletion(done);
                 // On a task of its own, so a host control that panics is told apart from this
                 // reaper being lost: the outcome below names the host's control, not the agent.
+                let stopping = Arc::clone(&control);
                 let outcome = tokio::spawn(async move {
-                    stop_process_with_limits(control.as_ref(), reason, &limits).await
+                    stop_process_with_limits(stopping.as_ref(), reason, &limits).await
                 })
                 .await
                 .map_or_else(
-                    |joined| Err(control_stop_lost(&joined)),
-                    |stopped| stopped.map(|_| ()).map_err(|error| error.to_string()),
-                );
+                    |joined| Err(Error::Vendor(link_failure(control_stop_lost(&joined)))),
+                    |stopped| stopped.map(|_| ()),
+                )
+                .map_err(|error| {
+                    if error.cleanup_control().is_some() {
+                        error
+                    } else {
+                        Error::CleanupRequired {
+                            control,
+                            source: Box::new(error),
+                        }
+                    }
+                });
                 *result.lock().unwrap_or_else(PoisonError::into_inner) = Some(outcome);
             });
         }
@@ -1740,10 +1749,13 @@ impl ChildReaper {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
-            .unwrap_or_else(|| Err(String::from("ACP child cleanup ended without an outcome")))
-            .map_err(|message| Error::CleanupRequired {
-                control: Arc::clone(&self.control),
-                source: Box::new(Error::Vendor(link_failure(message))),
+            .unwrap_or_else(|| {
+                Err(Error::CleanupRequired {
+                    control: Arc::clone(&self.control),
+                    source: Box::new(Error::Vendor(link_failure(String::from(
+                        "ACP child cleanup ended without an outcome",
+                    )))),
+                })
             })
     }
 }
@@ -1917,10 +1929,7 @@ impl ConnectionHandle {
         #[cfg(test)]
         self.shutdown_runs.fetch_add(1, Ordering::AcqRel);
         self.runtime.spawn(async move {
-            let result = connection
-                .shutdown(reason)
-                .await
-                .map_err(|error| error.to_string());
+            let result = connection.shutdown(reason).await;
             *connection
                 .shutdown_result
                 .lock()
@@ -1955,22 +1964,18 @@ impl ConnectionHandle {
     /// Waits for the shutdown task started by [`Self::begin_shutdown`].
     pub(crate) async fn wait_shutdown(&self) -> Result<()> {
         self.shutdown_complete.cancelled().await;
-        let result = self
-            .shutdown_result
+        self.shutdown_result
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
             .unwrap_or_else(|| {
-                Err(String::from(
-                    "the ACP shutdown task ended without an outcome",
-                ))
-            });
-        result.map_err(|message| Error::CleanupRequired {
-            control: Arc::clone(&self.child_reaper.control),
-            source: Box::new(Error::Vendor(link_failure(format!(
-                "ACP connection cleanup failed: {message}"
-            )))),
-        })
+                Err(Error::CleanupRequired {
+                    control: Arc::clone(&self.child_reaper.control),
+                    source: Box::new(Error::Vendor(link_failure(String::from(
+                        "the ACP shutdown task ended without an outcome",
+                    )))),
+                })
+            })
     }
 
     /// The child, for diagnostics and for ending it.
@@ -2595,6 +2600,76 @@ mod tests {
         let launched = crate::transport::frame(process, &host).expect("expected framed child");
         let connection = drive(launched, Arc::new(state));
         (Arc::new(connection), kills, launcher)
+    }
+
+    /// A named host control that refuses cleanup with a typed, already-owned cause.
+    struct TypedStopFailure {
+        error: Error,
+        kills: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessControl for TypedStopFailure {
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+        fn stderr_tail(&self) -> String {
+            String::new()
+        }
+        async fn wait(&self) -> Result<ExitStatus> {
+            Ok(ExitStatus::default())
+        }
+        async fn kill(&self, _reason: CancelReason) -> Result<()> {
+            self.kills.fetch_add(1, Ordering::AcqRel);
+            Err(self.error.clone())
+        }
+    }
+
+    /// Both reaper and connection waiters must retain the original cleanup control and cause.
+    #[tokio::test]
+    async fn shared_teardown_replays_typed_cause_dispatch_and_original_control() {
+        let (connection, _, _launcher) = counted_connection().await;
+        let mut connection = Arc::try_unwrap(connection).expect("sole connection owner");
+        let original = Arc::clone(&connection.control);
+        let control = Arc::new(TypedStopFailure {
+            error: Error::CleanupRequired {
+                control: Arc::clone(&original),
+                source: Box::new(
+                    Error::Protocol {
+                        expected: String::from("the injected cleanup proof"),
+                        received: String::from("unconfirmed"),
+                    }
+                    .with_dispatch(mango_external_agents::Dispatch::Accepted),
+                ),
+            },
+            kills: AtomicUsize::new(0),
+        });
+        connection.child_reaper = super::ChildReaper::new(control.clone(), connection.limits);
+        let reaper = connection.child_reaper.clone();
+        let connection = Arc::new(connection);
+        connection.begin_shutdown(CancelReason::Shutdown);
+        let (first, second, third) = tokio::join!(
+            reaper.reap(CancelReason::Requested),
+            connection.wait_shutdown(),
+            connection.wait_shutdown(),
+        );
+        for result in [first, second, third] {
+            let error = result.expect_err("incomplete cleanup");
+            assert_eq!(error.dispatch(), mango_external_agents::Dispatch::Accepted);
+            assert!(Arc::ptr_eq(
+                &error.cleanup_control().expect("retained original control"),
+                &original
+            ));
+            assert!(
+                matches!(error.cause(), Error::Protocol { expected, received }
+                if expected == "the injected cleanup proof" && received == "unconfirmed")
+            );
+        }
+        assert_eq!(control.kills.load(Ordering::Acquire), 1);
+        original
+            .kill(CancelReason::Shutdown)
+            .await
+            .expect("release fake child");
     }
 
     /// The child reaper is its own single-flight owner: two reaps, even concurrent, kill once and
