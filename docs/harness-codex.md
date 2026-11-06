@@ -1118,6 +1118,10 @@ named by the vendor's own `type`, bracketed by its `id`. Echoes of the client's 
 id renders nothing because no completion could address it. The item families are listed in the
 [app-server documentation][app-server].
 
+Starting and completing an item use the same family/identity eligibility decision. Completion
+checks that decision directly, so finishing a patch does not construct and discard a started
+activity with another copy of its diffs.
+
 ## Known gaps
 
 - No websocket or unix-socket transport (see above).

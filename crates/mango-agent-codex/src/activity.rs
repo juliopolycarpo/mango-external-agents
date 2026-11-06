@@ -16,13 +16,13 @@ use crate::protocol::items::{FileUpdateChange, ItemStatus, ThreadItem};
 /// for a family this harness does not render.
 #[must_use]
 pub fn started(item: &ThreadItem) -> Option<Activity> {
-    if item.is_streamed_text() {
+    if !is_rendered(item) {
         return None;
     }
     let (name, kind, title, detail, content) = match item {
         // A family this build does not model is still work the agent did: shown under the
         // vendor's own name, and only when it carries an id a completion can address.
-        ThreadItem::Other { item_type, id, .. } if item.is_unmodelled_family() && id.is_some() => (
+        ThreadItem::Other { item_type, .. } => (
             item_type.as_str(),
             ActivityKind::Other,
             item_type.clone(),
@@ -88,9 +88,7 @@ pub fn started(item: &ThreadItem) -> Option<Activity> {
             None,
             None,
         ),
-        ThreadItem::AgentMessage { .. }
-        | ThreadItem::Reasoning { .. }
-        | ThreadItem::Other { .. } => {
+        ThreadItem::AgentMessage { .. } | ThreadItem::Reasoning { .. } => {
             return None;
         }
     };
@@ -126,7 +124,9 @@ pub fn started(item: &ThreadItem) -> Option<Activity> {
 pub fn completed(item: &ThreadItem) -> Option<ActivityResult> {
     // Both halves have to agree: an item never announced as an activity must not be completed
     // as one, or the host receives a completion for a call id it was never told about.
-    started(item)?;
+    if !is_rendered(item) {
+        return None;
+    }
     let (status, detail, content) = match item {
         ThreadItem::CommandExecution {
             status,
@@ -173,6 +173,14 @@ pub fn completed(item: &ThreadItem) -> Option<ActivityResult> {
         Some(content) => result.with_content(content),
         None => result,
     })
+}
+
+/// The shared start/completion decision, without constructing either display record.
+fn is_rendered(item: &ThreadItem) -> bool {
+    match item {
+        ThreadItem::Other { id, .. } => id.is_some() && item.is_unmodelled_family(),
+        _ => !item.is_streamed_text(),
+    }
 }
 
 fn command_detail(output: Option<&str>, exit_code: Option<i64>) -> Option<String> {
@@ -222,7 +230,7 @@ pub(crate) fn file_change_content(changes: &[FileUpdateChange]) -> Option<Activi
 
 #[cfg(test)]
 mod tests {
-    use super::{completed, started};
+    use super::{completed, is_rendered, started};
     use crate::protocol::items::ThreadItem;
     use mango_external_agents::content::ActivityContent;
     use mango_external_agents::event::{ActivityKind, ActivityStatus};
@@ -396,6 +404,11 @@ mod tests {
             (json!({"type": "plan", "id": "i", "text": "1. go"}), true),
             (json!({"type": "subAgentActivity", "id": "i"}), true),
             (
+                json!({"type": "subAgentActivity", "id": "i", "kind": "started",
+                    "agentThreadId": "child", "agentPath": "root/child"}),
+                true,
+            ),
+            (
                 json!({"type": "enteredReviewMode", "id": "i", "review": "r"}),
                 true,
             ),
@@ -411,6 +424,10 @@ mod tests {
             ),
             (json!({"type": "imageView"}), false),
             (json!({"type": "imageView", "id": 7}), false),
+            (
+                json!({"type": "futureVendorFamily", "id": "i", "status": "failed"}),
+                true,
+            ),
             // The client's own input echoed back is not work.
             (
                 json!({"type": "userMessage", "id": "i", "content": []}),
@@ -431,6 +448,10 @@ mod tests {
                 json!({"type": "agentMessage", "id": "i", "text": []}),
                 false,
             ),
+            (
+                json!({"type": "subAgentActivity", "id": "i", "agentThreadId": 7}),
+                false,
+            ),
             (json!({"type": "plan"}), false),
             // Not an item at all.
             (json!({"id": "i"}), false),
@@ -441,6 +462,11 @@ mod tests {
                 assert!(!shown, "expected {raw} to decode as an item that is shown");
                 continue;
             };
+            assert_eq!(
+                is_rendered(&item),
+                shown,
+                "expected eligibility to show {raw}: {shown}"
+            );
             assert_eq!(
                 started(&item).is_some(),
                 shown,
