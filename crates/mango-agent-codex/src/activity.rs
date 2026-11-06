@@ -246,6 +246,9 @@ mod tests {
         assert_eq!(activity.item_id.as_deref(), Some("child-item"));
         assert_eq!(activity.parent_id, None);
         assert_eq!(activity.kind, ActivityKind::Subagent);
+        assert_eq!(activity.title, "started");
+        assert_eq!(activity.detail, None);
+        assert!(activity.extensions.is_empty());
     }
 
     #[test]
