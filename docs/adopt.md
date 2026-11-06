@@ -156,12 +156,13 @@ let host = HostContext::builder()
    [harness-acp.md](harness-acp.md#deadlines), [harness-claude.md](harness-claude.md#deadlines) and
    the stop-a-turn deadlines of [harness-codex.md](harness-codex.md#sessions-turns-and-steering).
    Add a margin of your own; these are the harness's bounds, not a promise about a typical stop.
-   When a bound runs out, `close` returns `Error::CleanupRequired` on all three harnesses, and so
-   does `cancel` on Claude and Codex (an ACP `cancel` only queues `session/cancel`):
-   `cleanup_control()` is the control your launcher returned for the child, and a repeated `close`
-   returns the same error without asking the child again. `cause()` is the stage that failed on
-   Claude and Codex, and `Error::Vendor` text on ACP. One rule reconciles a leftover child
-   whichever harness raised it; see [lifecycle.md](lifecycle.md#owners-and-cancellation).
+   When process cleanup cannot finish, `close` returns `Error::CleanupRequired` on all three
+   harnesses, and so does `cancel` on Claude and Codex (an ACP `cancel` only queues `session/cancel`):
+   `cleanup_control()` names your launched child's injected control. A repeated `close` returns
+   the same typed error without asking the child again, including any nested cleanup evidence in
+   its source chain. `cause()` identifies the failed stage on all three harnesses. One rule
+   reconciles a leftover child whichever harness raised it; see
+   [lifecycle.md](lifecycle.md#owners-and-cancellation).
 
 For ACP, one outgoing frame may be `Limits::turn_buffer_bytes` by default, and the writer queue
 holds twice that, counting the frame being written, so a full-size prompt can still be followed by

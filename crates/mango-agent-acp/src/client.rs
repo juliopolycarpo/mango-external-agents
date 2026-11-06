@@ -1731,15 +1731,11 @@ impl ChildReaper {
                     |joined| Err(Error::Vendor(link_failure(control_stop_lost(&joined)))),
                     |stopped| stopped.map(|_| ()),
                 )
-                .map_err(|error| {
-                    if error.cleanup_control().is_some() {
-                        error
-                    } else {
-                        Error::CleanupRequired {
-                            control,
-                            source: Box::new(error),
-                        }
-                    }
+                .map_err(|source| Error::CleanupRequired {
+                    // This control owns the launched child. Keep any nested cleanup handle in
+                    // its original typed source instead of substituting it for this child.
+                    control,
+                    source: Box::new(source),
                 });
                 *result.lock().unwrap_or_else(PoisonError::into_inner) = Some(outcome);
             });
@@ -2625,7 +2621,7 @@ mod tests {
         }
     }
 
-    /// Both reaper and connection waiters must retain the original cleanup control and cause.
+    /// Waiters retain the launched child's control and the complete nested cleanup evidence.
     #[tokio::test]
     async fn shared_teardown_replays_typed_cause_dispatch_and_original_control() {
         let (connection, _, _launcher) = counted_connection().await;
@@ -2644,6 +2640,8 @@ mod tests {
             },
             kills: AtomicUsize::new(0),
         });
+        let injected: Arc<dyn ProcessControl> = control.clone();
+        connection.control = Arc::clone(&injected);
         connection.child_reaper = super::ChildReaper::new(control.clone(), connection.limits);
         let reaper = connection.child_reaper.clone();
         let connection = Arc::new(connection);
@@ -2653,23 +2651,33 @@ mod tests {
             connection.wait_shutdown(),
             connection.wait_shutdown(),
         );
+        let kills = control.kills.load(Ordering::Acquire);
+        original
+            .kill(CancelReason::Shutdown)
+            .await
+            .expect("release fake child before replay assertions");
         for result in [first, second, third] {
             let error = result.expect_err("incomplete cleanup");
             assert_eq!(error.dispatch(), mango_external_agents::Dispatch::Accepted);
             assert!(Arc::ptr_eq(
                 &error.cleanup_control().expect("retained original control"),
-                &original
+                &injected
             ));
+            let nested = match &error {
+                Error::CleanupRequired { source, .. } => {
+                    source.cleanup_control().expect("nested cleanup evidence")
+                }
+                received => {
+                    panic!("expected launched-child cleanup ownership, received {received:?}")
+                }
+            };
+            assert!(Arc::ptr_eq(&nested, &original));
             assert!(
                 matches!(error.cause(), Error::Protocol { expected, received }
                 if expected == "the injected cleanup proof" && received == "unconfirmed")
             );
         }
-        assert_eq!(control.kills.load(Ordering::Acquire), 1);
-        original
-            .kill(CancelReason::Shutdown)
-            .await
-            .expect("release fake child");
+        assert_eq!(kills, 1);
     }
 
     /// The child reaper is its own single-flight owner: two reaps, even concurrent, kill once and
