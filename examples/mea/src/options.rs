@@ -302,6 +302,8 @@ pub(crate) struct CaptureOptions {
     pub workspace: Option<PathBuf>,
     #[arg(long)]
     pub transcripts: bool,
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(crate::capture::scenario_names()))]
+    pub scenario: Option<String>,
 }
 
 impl CaptureOptions {
@@ -323,6 +325,13 @@ impl CaptureOptions {
         if self.transcripts && selected != HarnessChoice::Codex {
             return Err(format!(
                 "expected codex for --transcripts, received {selected}"
+            ));
+        }
+        if self.scenario.is_some()
+            && (selected != HarnessChoice::Codex || (self.legacy.is_none() && !self.transcripts))
+        {
+            return Err(format!(
+                "expected a Codex transcript capture for --scenario, received {selected} without transcript selection"
             ));
         }
         Ok(selected)
@@ -356,10 +365,33 @@ mod capture_tests {
             vec!["--harness", "claude", "--transcripts"],
             vec!["codex", "--harness", "claude"],
             vec!["--transcrips"],
+            vec!["--harness", "claude", "--scenario", "subagent"],
+            vec!["--harness", "codex", "--scenario", "subagent"],
+            vec!["codex", "--scenario", "unknown"],
+            vec!["codex", "--scenario"],
         ] {
             let parsed =
                 CaptureOptions::parse(&args.into_iter().map(String::from).collect::<Vec<_>>());
             assert!(parsed.and_then(|options| options.kind()).is_err());
+        }
+    }
+
+    #[test]
+    fn every_named_scenario_is_accepted_only_for_explicit_codex_transcripts() {
+        for name in crate::capture::scenario_names() {
+            for args in [
+                vec!["codex", "--scenario", name],
+                vec!["--harness", "codex", "--transcripts", "--scenario", name],
+            ] {
+                let options =
+                    CaptureOptions::parse(&args.into_iter().map(String::from).collect::<Vec<_>>())
+                        .expect("registered scenario");
+                assert_eq!(
+                    options.kind().expect("transcript capture"),
+                    HarnessChoice::Codex
+                );
+                assert_eq!(options.scenario.as_deref(), Some(name));
+            }
         }
     }
 }

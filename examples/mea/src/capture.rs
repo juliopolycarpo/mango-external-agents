@@ -86,22 +86,31 @@ const SCENARIOS: &[Scenario] = &[
         name: "user-defaults",
         purpose: "a thread and turn that leave the user's Codex permission defaults untouched",
     },
+    Scenario {
+        name: "subagent",
+        purpose: "one read-only subagent with multi_agent_v2 enabled for the capture process",
+    },
 ];
 
-/// Records every Codex scenario into `out_dir`.
+/// The named Codex transcript scenarios, for the CLI's `--scenario` parser.
+pub fn scenario_names() -> Vec<&'static str> {
+    SCENARIOS.iter().map(|scenario| scenario.name).collect()
+}
+
+/// Records every Codex scenario, or only `selected`, into `out_dir`.
 ///
 /// # Errors
 ///
 /// Whatever the launcher or the vendor reported. A scenario that fails leaves the fixtures written
 /// so far in place: a partial capture is a diff to read, not a reason to lose the rest.
-pub async fn codex(out_dir: &Path, workspace: &Path) -> Result<()> {
+pub async fn codex(out_dir: &Path, workspace: &Path, selected: Option<&str>) -> Result<()> {
     let host = HostContext::builder()
         .launcher(Arc::new(TokioLauncher::new()))
         .cwd(workspace.to_path_buf())
         .client_info("mea", env!("CARGO_PKG_VERSION"))
         .environment(mango_external_agents::EnvSource::from_process())
         .build()?;
-    codex_with(&host, out_dir, workspace).await
+    codex_with(&host, out_dir, workspace, selected).await
 }
 
 /// Refuses a `codex` older than the library's floor, before any app-server is started.
@@ -114,7 +123,7 @@ pub async fn codex(out_dir: &Path, workspace: &Path) -> Result<()> {
 ///
 /// [`Error::VersionGate`] for a build below the floor, and whatever the version command reported
 /// when it could not run.
-async fn require_supported_codex(host: &HostContext) -> Result<()> {
+async fn require_supported_codex(host: &HostContext) -> Result<Option<String>> {
     let output = contracts::command_output(
         host,
         vec![String::from("codex"), String::from("--version")],
@@ -122,7 +131,7 @@ async fn require_supported_codex(host: &HostContext) -> Result<()> {
     )
     .await?;
     let Some(version) = mango_agent_codex::discovery::parse_version(&output) else {
-        return Ok(());
+        return Ok(None);
     };
     let minimum = mango_agent_codex::MINIMUM_CODEX_VERSION;
     if mango_agent_codex::discovery::meets_minimum(&version, minimum) == Some(false) {
@@ -131,28 +140,88 @@ async fn require_supported_codex(host: &HostContext) -> Result<()> {
             minimum: String::from(minimum),
         });
     }
-    Ok(())
+    Ok(Some(version))
 }
 
 /// [`codex`] on a host the caller built, so a test can inject its own launcher.
-async fn codex_with(host: &HostContext, out_dir: &Path, workspace: &Path) -> Result<()> {
-    require_supported_codex(host).await?;
+async fn codex_with(
+    host: &HostContext,
+    out_dir: &Path,
+    workspace: &Path,
+    selected: Option<&str>,
+) -> Result<()> {
+    let scenarios: Vec<_> = SCENARIOS
+        .iter()
+        .filter(|scenario| selected.is_none_or(|name| scenario.name == name))
+        .collect();
+    if scenarios.is_empty() {
+        return Err(Error::HostConfiguration {
+            expected: "a named Codex transcript scenario",
+            received: selected.unwrap_or_default().to_owned(),
+        });
+    }
+    let version = require_supported_codex(host).await?;
     std::fs::create_dir_all(out_dir).map_err(|error| Error::HostConfiguration {
         expected: "a writable fixture directory",
         received: error.to_string(),
     })?;
 
-    for scenario in SCENARIOS {
+    for scenario in scenarios {
         println!("capturing codex/{}: {}", scenario.name, scenario.purpose);
-        let recorded = record(host, scenario, workspace).await?;
+        let prefix = if scenario.name == "subagent" {
+            let metadata = json!({
+                "codexVersion": version,
+                "captureVersion": env!("CARGO_PKG_VERSION"),
+                "capturedAtUnixSeconds": host.now().duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_secs()).ok(),
+                "features": ["multi_agent_v2"],
+            });
+            format!("# capture {metadata}\n")
+        } else {
+            String::new()
+        };
+        let partial = out_dir.join(format!("{}.partial.jsonl", scenario.name));
+        let diagnostic =
+            (scenario.name == "subagent").then_some((partial.as_path(), prefix.as_str()));
+        let conversation = record(host, scenario, workspace, diagnostic).await?;
+        let recorded = prefix + &conversation;
         let path = out_dir.join(format!("{}.jsonl", scenario.name));
-        std::fs::write(&path, recorded).map_err(|error| Error::HostConfiguration {
+        std::fs::write(&path, &recorded).map_err(|error| Error::HostConfiguration {
             expected: "a writable fixture file",
             received: error.to_string(),
         })?;
         println!("  wrote {}", path.display());
+        if scenario.name == "subagent" && !has_captured_subagent(&recorded) {
+            return Err(Error::Protocol {
+                expected: String::from(
+                    "a captured subAgentActivity item with a nonempty agentThreadId",
+                ),
+                received: String::from(
+                    "a completed transcript with no such item; the generated transcript was retained",
+                ),
+            });
+        }
     }
     Ok(())
+}
+
+/// A completed turn alone is not evidence of an attributed child item.
+fn has_captured_subagent(recorded: &str) -> bool {
+    recorded
+        .lines()
+        .filter_map(|line| line.strip_prefix(RECEIVED))
+        .any(|line| {
+            let Ok(frame) = serde_json::from_str::<Value>(line) else {
+                return false;
+            };
+            matches!(
+                frame["method"].as_str(),
+                Some("item/started" | "item/completed")
+            ) && frame["params"]["item"]["type"] == "subAgentActivity"
+                && frame["params"]["item"]["agentThreadId"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty() && id != redact::PLACEHOLDER)
+        })
 }
 
 /// One scenario, as the lines both sides wrote.
@@ -161,14 +230,18 @@ async fn codex_with(host: &HostContext, out_dir: &Path, workspace: &Path) -> Res
 /// fixture is not affected, but a `codex app-server` left running on the maintainer's machine is
 /// not something to report as a clean run. When the conversation failed too, that error is the one
 /// returned and the cleanup failure is printed beside it.
-async fn record(host: &HostContext, scenario: &Scenario, workspace: &Path) -> Result<String> {
-    let transport = stdio::open(
-        host,
-        &StdioSpec::new(["codex", "app-server"]),
-        &ExecutablePath::default(),
-        &["CODEX_HOME"],
-    )
-    .await?;
+async fn record(
+    host: &HostContext,
+    scenario: &Scenario,
+    workspace: &Path,
+    diagnostic: Option<(&Path, &str)>,
+) -> Result<String> {
+    let spec = if scenario.name == "subagent" {
+        StdioSpec::new(["codex", "--enable", "multi_agent_v2", "app-server"])
+    } else {
+        StdioSpec::new(["codex", "app-server"])
+    };
+    let transport = stdio::open(host, &spec, &ExecutablePath::default(), &["CODEX_HOME"]).await?;
     let (sender, receiver) = transport.link.split();
     let mut recorder = Recorder {
         sender,
@@ -190,6 +263,15 @@ async fn record(host: &HostContext, scenario: &Scenario, workspace: &Path) -> Re
             Ok(recorder.lines.join("\n") + "\n")
         }
         Err(error) => {
+            if let Some((path, prefix)) = diagnostic {
+                let partial = format!(
+                    "{prefix}# incomplete capture\n{}\n",
+                    recorder.lines.join("\n")
+                );
+                if let Err(write_error) = std::fs::write(path, partial) {
+                    eprintln!("could not retain the redacted partial capture: {write_error}");
+                }
+            }
             if let Err(cleanup) = stopped {
                 eprintln!(
                     "codex/{}: the app-server was not reaped: {cleanup}",
@@ -239,6 +321,7 @@ impl Recorder {
             }
             "permission-transitions" => self.permission_transitions().await,
             "user-defaults" => self.user_defaults().await,
+            "subagent" => self.subagent().await,
             other => Err(Error::HostConfiguration {
                 expected: "a scenario this command knows",
                 received: other.to_owned(),
@@ -286,6 +369,30 @@ impl Recorder {
         }}))
         .await?;
         self.read_until(is_turn_completed).await.map(|_| ())
+    }
+
+    async fn subagent(&mut self) -> Result<()> {
+        let thread = self.start_thread("read-only", "never").await?;
+        self.send(json!({"id": 10, "method": "turn/start", "params": {
+            "threadId": thread,
+            "input": [{"type": "text", "text":
+                "Use exactly one subagent to reply with the single word mango. Wait for it, then reply done. \
+                 Do not run commands, read or modify files, or start additional agents.",
+                "text_elements": []}]
+        }})).await?;
+        let terminal = self
+            .read_until(|frame| {
+                (is_turn_completed(frame) && frame["params"]["threadId"] == thread)
+                    || (frame.get("id") == Some(&json!(10)) && frame.get("error").is_some())
+            })
+            .await?;
+        if terminal.get("error").is_some() {
+            return Err(Error::Protocol {
+                expected: String::from("an accepted turn/start for a subagent capture"),
+                received: redact::incoming_frame(terminal, self.paths()).to_string(),
+            });
+        }
+        Ok(())
     }
 
     async fn approval(&mut self) -> Result<()> {
@@ -443,11 +550,19 @@ impl Recorder {
     /// Reads and records until a frame matches, or the step's deadline passes.
     async fn read_until(&mut self, matches: impl Fn(&Value) -> bool) -> Result<Value> {
         let deadline = tokio::time::Instant::now() + STEP_TIMEOUT;
+        let request = self
+            .lines
+            .iter()
+            .rev()
+            .filter_map(|line| line.strip_prefix(SENT))
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find_map(|frame| frame["method"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| String::from("vendor"));
         loop {
             let next = tokio::time::timeout_at(deadline, self.receiver.recv())
                 .await
                 .map_err(|_| Error::Timeout {
-                    operation: String::from("a captured step"),
+                    operation: format!("a captured {request} step"),
                     after: STEP_TIMEOUT,
                 })?;
             let Some(line) = next? else {
@@ -559,6 +674,41 @@ mod tests {
         })
     }
 
+    /// Scripted protocol traffic, not a claimed vendor capture.
+    fn subagent_app_server(with_child_item: bool, refused: bool) -> FakeProcess {
+        FakeProcess::responding(move |line| {
+            let Ok(frame) = serde_json::from_str::<Value>(line) else {
+                return Vec::new();
+            };
+            let (Some(method), Some(id)) = (frame["method"].as_str(), frame.get("id")) else {
+                return Vec::new();
+            };
+            if method != "turn/start" {
+                return vec![
+                    json!({"id": id, "result": {"thread": {"id": "parent-thread"}}}).to_string(),
+                ];
+            }
+            if refused {
+                return vec![
+                    json!({"id": id, "error": {"code": -32000, "message": "capture refused"}})
+                        .to_string(),
+                ];
+            }
+            let item = if with_child_item {
+                json!({"type": "subAgentActivity", "id": "child-item", "kind": "started",
+                    "agentPath": "root/child", "agentThreadId": "child-thread"})
+            } else {
+                json!({"type": "collabAgentToolCall", "id": "collab", "agentThreadId": "wrong-family"})
+            };
+            [
+                json!({"id": id, "result": {"turn": {"id": "parent-turn", "status": "inProgress"}}}),
+                json!({"method": "item/started", "params": {"threadId": "parent-thread", "turnId": "parent-turn", "item": item}}),
+                json!({"method": "turn/completed", "params": {"threadId": "child-thread", "turn": {"id": "child-turn", "status": "completed"}}}),
+                json!({"method": "turn/completed", "params": {"threadId": "parent-thread", "turn": {"id": "parent-turn", "status": "completed"}}}),
+            ].into_iter().map(|frame| frame.to_string()).collect()
+        })
+    }
+
     /// A launcher whose children end on a kill but report that they could not be reaped.
     struct UnreapableLauncher {
         inner: Arc<FakeLauncher>,
@@ -637,15 +787,215 @@ mod tests {
         let launcher = Arc::new(FakeLauncher::new());
         launcher.push(app_server());
 
-        let recorded = record(&host(launcher.clone()), handshake(), &std::env::temp_dir())
-            .await
-            .expect("expected a reaped capture to succeed");
+        let recorded = record(
+            &host(launcher.clone()),
+            handshake(),
+            &std::env::temp_dir(),
+            None,
+        )
+        .await
+        .expect("expected a reaped capture to succeed");
 
         assert!(
             recorded.contains("account/read"),
             "expected a transcript that reads the account | received {recorded}"
         );
         assert_eq!(launcher.live_children(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_named_subagent_capture_records_only_that_scenario_and_waits_for_its_parent() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(version_line(mango_agent_codex::MINIMUM_CODEX_VERSION));
+        launcher.push(subagent_app_server(true, false));
+        let out =
+            std::env::temp_dir().join(format!("mea-selected-subagent-{}", std::process::id()));
+        let result = codex_with(
+            &host(launcher.clone()),
+            &out,
+            &std::env::temp_dir(),
+            Some("subagent"),
+        )
+        .await;
+        let recorded = std::fs::read_to_string(out.join("subagent.jsonl")).unwrap_or_default();
+        let files = std::fs::read_dir(&out)
+            .map(|files| files.count())
+            .unwrap_or_default();
+        if out.exists() {
+            std::fs::remove_dir_all(&out).expect("remove generated test capture");
+        }
+
+        assert!(
+            result.is_ok(),
+            "expected a qualified child capture, received {result:?}"
+        );
+        assert_eq!(files, 1);
+        assert_eq!(
+            launched(&launcher),
+            [
+                "codex --version",
+                "codex --enable multi_agent_v2 app-server"
+            ]
+        );
+        assert!(super::has_captured_subagent(&recorded));
+        let metadata: Value = serde_json::from_str(
+            recorded
+                .lines()
+                .next()
+                .expect("metadata")
+                .trim_start_matches("# capture "),
+        )
+        .expect("capture metadata");
+        assert_eq!(
+            metadata["codexVersion"],
+            mango_agent_codex::MINIMUM_CODEX_VERSION
+        );
+        assert!(metadata["capturedAtUnixSeconds"].is_u64());
+        let last: Value = serde_json::from_str(
+            recorded
+                .lines()
+                .last()
+                .expect("parent terminal")
+                .trim_start_matches(super::RECEIVED),
+        )
+        .expect("terminal frame");
+        assert_eq!(last["params"]["threadId"], "parent-thread");
+        assert_eq!(launcher.live_children(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_completed_capture_without_an_attributed_child_fails_and_retains_its_record() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(version_line(mango_agent_codex::MINIMUM_CODEX_VERSION));
+        launcher.push(subagent_app_server(false, false));
+        let out = std::env::temp_dir().join(format!("mea-absent-subagent-{}", std::process::id()));
+        let result = codex_with(
+            &host(launcher.clone()),
+            &out,
+            &std::env::temp_dir(),
+            Some("subagent"),
+        )
+        .await;
+        let recorded = std::fs::read_to_string(out.join("subagent.jsonl")).unwrap_or_default();
+        if out.exists() {
+            std::fs::remove_dir_all(&out).expect("remove unqualified test capture");
+        }
+
+        assert!(
+            matches!(result, Err(Error::Protocol { expected, .. }) if expected.contains("agentThreadId"))
+        );
+        assert!(recorded.contains("collabAgentToolCall"));
+        assert!(!super::has_captured_subagent(&recorded));
+        assert_eq!(launcher.live_children(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_capture_names_its_step_and_retains_only_redacted_partial_traffic() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(version_line(mango_agent_codex::MINIMUM_CODEX_VERSION));
+        launcher.push(FakeProcess::responding(|line| {
+            let frame: Value = serde_json::from_str(line).expect("scripted request");
+            let Some(id) = frame.get("id") else { return Vec::new(); };
+            let result = match frame["method"].as_str() {
+                Some("initialize") => json!({}),
+                Some("account/read") => json!({"account": {"type": "chatgpt", "email": "capture-canary@example.invalid"}}),
+                _ => return Vec::new(),
+            };
+            vec![json!({"id": id, "result": result}).to_string()]
+        }));
+        let out = std::env::temp_dir().join(format!("mea-stalled-subagent-{}", std::process::id()));
+        let workspace = out.join("private-workspace-canary");
+        let result = codex_with(&host(launcher.clone()), &out, &workspace, Some("subagent")).await;
+        let partial = std::fs::read_to_string(out.join("subagent.partial.jsonl"))
+            .expect("retained partial traffic");
+        assert!(!out.join("subagent.jsonl").exists());
+        std::fs::remove_dir_all(&out).expect("remove partial test capture");
+        assert!(
+            matches!(&result, Err(Error::Timeout { operation, after })
+            if operation.contains("thread/start") && *after == super::STEP_TIMEOUT),
+            "expected the stalled step and its deadline, received {result:?}"
+        );
+        assert!(partial.contains("# incomplete capture"));
+        assert!(partial.contains("account/read"));
+        assert!(partial.contains("thread/start"));
+        assert!(!partial.contains("capture-canary@example.invalid"));
+        assert!(!partial.contains(&*workspace.to_string_lossy()));
+        assert_eq!(launcher.live_children(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_refused_subagent_turn_reports_the_refusal_and_reaps() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(subagent_app_server(false, true));
+        let scenario = SCENARIOS
+            .iter()
+            .find(|scenario| scenario.name == "subagent")
+            .expect("subagent scenario");
+        let result = record(
+            &host(launcher.clone()),
+            scenario,
+            &std::env::temp_dir(),
+            None,
+        )
+        .await;
+        let Err(Error::Protocol { expected, received }) = &result else {
+            panic!("expected a refused turn/start, received {result:?}");
+        };
+        assert!(expected.contains("turn/start"));
+        let error: Value = serde_json::from_str(received).expect("redacted refusal frame");
+        assert_eq!(error["error"]["code"], -32000);
+        assert_eq!(launcher.live_children(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_scenario_is_refused_before_any_probe_or_child() {
+        let launcher = Arc::new(FakeLauncher::new());
+        let result = codex_with(
+            &host(launcher.clone()),
+            &std::env::temp_dir(),
+            &std::env::temp_dir(),
+            Some("not-a-scenario"),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(Error::HostConfiguration { received, .. }) if received == "not-a-scenario")
+        );
+        assert!(launcher.launches().is_empty());
+    }
+
+    #[test]
+    fn capture_qualification_requires_a_received_child_item_and_nonempty_identity() {
+        for id in [
+            json!(""),
+            json!(crate::redact::PLACEHOLDER),
+            Value::Null,
+            json!(7),
+        ] {
+            let frame = json!({"method": "item/started", "params": {"item": {
+                "type": "subAgentActivity", "id": "child", "agentThreadId": id
+            }}});
+            assert!(!super::has_captured_subagent(&format!(
+                "{}{}",
+                super::RECEIVED,
+                frame
+            )));
+        }
+        let frame = json!({"method": "item/completed", "params": {"item": {
+            "type": "subAgentActivity", "id": "child", "agentThreadId": "child-thread"
+        }}});
+        assert!(!super::has_captured_subagent(&format!(
+            "{}{}",
+            super::SENT,
+            frame
+        )));
+        assert!(super::has_captured_subagent(&format!(
+            "# metadata\n{}{}",
+            super::RECEIVED,
+            frame
+        )));
+        assert!(!super::has_captured_subagent(
+            "<<not JSON\n# agentThreadId child-thread"
+        ));
     }
 
     #[tokio::test]
@@ -657,6 +1007,7 @@ mod tests {
             &host(unreapable(&launcher)),
             handshake(),
             &std::env::temp_dir(),
+            None,
         )
         .await;
 
@@ -684,6 +1035,7 @@ mod tests {
             &host(unreapable(&launcher)),
             &scenario,
             &std::env::temp_dir(),
+            None,
         )
         .await;
 
@@ -721,7 +1073,7 @@ mod tests {
         let out = std::env::temp_dir().join(format!("mea-capture-outdated-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&out);
 
-        let result = codex_with(&host(launcher.clone()), &out, &std::env::temp_dir()).await;
+        let result = codex_with(&host(launcher.clone()), &out, &std::env::temp_dir(), None).await;
 
         let launches = launched(&launcher);
         let wrote_a_directory = out.exists();
@@ -750,7 +1102,7 @@ mod tests {
         let out = std::env::temp_dir().join(format!("mea-capture-current-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&out);
 
-        let result = codex_with(&host(launcher.clone()), &out, &std::env::temp_dir()).await;
+        let result = codex_with(&host(launcher.clone()), &out, &std::env::temp_dir(), None).await;
 
         let launches = launched(&launcher);
         let _ = std::fs::remove_dir_all(&out);
@@ -773,7 +1125,7 @@ mod tests {
         let out = std::env::temp_dir().join(format!("mea-capture-unknown-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&out);
 
-        let result = codex_with(&host(launcher.clone()), &out, &std::env::temp_dir()).await;
+        let result = codex_with(&host(launcher.clone()), &out, &std::env::temp_dir(), None).await;
 
         let launches = launched(&launcher);
         let _ = std::fs::remove_dir_all(&out);
@@ -796,7 +1148,13 @@ mod tests {
         let out = std::env::temp_dir().join(format!("mea-capture-unreaped-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&out);
 
-        let result = codex_with(&host(unreapable(&launcher)), &out, &std::env::temp_dir()).await;
+        let result = codex_with(
+            &host(unreapable(&launcher)),
+            &out,
+            &std::env::temp_dir(),
+            None,
+        )
+        .await;
 
         let written: Vec<_> = std::fs::read_dir(&out)
             .expect("expected the fixture directory to exist")
