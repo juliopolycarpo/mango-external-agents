@@ -26,7 +26,30 @@ and the absence of product dependencies, then tests with and without the bundled
 the current consumer on the declared minimum Rust version. A second consumer,
 [`tests/standalone-historical`](../tests/standalone-historical/README.md), stays at `=0.3.1` on its
 own older minimum as a fixed control; it is not evidence for any later release.
-The [coupling audit](adoption-audit.md) records the dependency and contract evidence.
+These deterministic consumers prove independent compilation and harness integration, including
+accepted cwd, filtered environment and fake-child cleanup. They do not qualify live vendor
+installations, Windows containment or native cleanup.
+
+## SDK independence and host policy
+
+The SDK's four library crates have no dependency on MangoStudio, Mango Protocol, a Hub service or
+another product's release pipeline. Client identity comes from the caller; branding in package
+metadata does not provide a runtime identity. Vendor protocol types stay within their owning
+harness crates. Real vendor use still requires the official CLI and its own authentication;
+the SDK adds no login facility.
+
+`ProcessLauncher` and the byte-I/O ports are injectable; `launcher-tokio` is optional. The concrete
+harnesses document their Tokio requirements. The host owns process supervision, authorized cwd,
+child-visible scratch, environment and consent policy. A basic host needs no database, durable
+reservation or recovery loop. The optional `examples/hub-host` defines a local `HubApi`, not a
+product protocol dependency. Its reservations and retry loop are example-host policy, described
+under [optional durable host orchestration](#optional-durable-host-orchestration).
+
+The [standalone adoption and reference-host change](https://github.com/juliopolycarpo/mango-external-agents/pull/111)
+records the original isolation and retry regressions. Its
+[0.3.1 audit snapshot](https://github.com/juliopolycarpo/mango-external-agents/blob/0fd4f39892ca739d17a565f90a553055551af122/docs/adoption-audit.md)
+is historical evidence; the current and historical consumers above have distinct roles.
+Documentation-only maintenance needs no SDK publication or downstream pin change.
 
 The remaining sections explain the ports and optional services when your host needs them.
 
