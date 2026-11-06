@@ -286,4 +286,5 @@ test_drift_report
 test_claude_bare_reference
 test_issue_deduplication
 python3 scripts/test-vendor-result.py
+python3 scripts/test-codex-schema-inventory.py
 echo 'vendor drift script tests passed'

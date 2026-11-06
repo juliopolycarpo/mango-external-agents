@@ -150,15 +150,14 @@ pub enum ThreadItem {
     },
     /// A subagent the vendor started.
     ///
-    /// The pinned schema's `ThreadItem` property union also lists `agentThreadId`,
-    /// `senderThreadId` and `receiverThreadIds` — but that union is flattened across every item
-    /// family (`collabAgentToolCall` among them), not broken out per variant, so it cannot say
-    /// which family actually carries them. Nothing here claims one for `SubAgentActivity` without
-    /// that confirmation; a thread id invented on the wrong family would be worse than the field
-    /// staying absent.
+    /// The pinned per-variant inventory declares `agentThreadId` on this family;
+    /// `senderThreadId` and `receiverThreadIds` belong to `collabAgentToolCall` instead.
     SubAgentActivity {
         /// The item's own id.
         id: String,
+        /// The vendor's child thread identity, for observational attribution only.
+        #[serde(default)]
+        agent_thread_id: Option<String>,
         /// What the subagent did.
         #[serde(default)]
         kind: Option<String>,
@@ -326,8 +325,16 @@ impl fmt::Debug for ThreadItem {
                 .field("id", &redacted::text(id))
                 .field("text", &redacted::text(text))
                 .finish(),
-            Self::SubAgentActivity { id, kind } => formatter
+            Self::SubAgentActivity {
+                id,
+                kind,
+                agent_thread_id,
+            } => formatter
                 .debug_struct("SubAgentActivity")
+                .field(
+                    "agent_thread_id",
+                    &redacted::opt_text(agent_thread_id.as_deref()),
+                )
                 .field("id", &redacted::text(id))
                 .field("kind", &redacted::opt_text(kind.as_deref()))
                 .finish(),

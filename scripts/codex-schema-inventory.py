@@ -213,6 +213,32 @@ def fields(schema):
     return sorted(names), sorted(values), sorted(methods)
 
 
+def variants(schema):
+    """Keep ThreadItem field ownership instead of guessing from its property union.
+
+    Fail on a new schema layout: losing ownership silently would restore the ambiguity
+    this inventory is meant to remove. No property schemas or descriptions are copied.
+    """
+    branches = schema.get("oneOf")
+    if not isinstance(branches, list) or not branches:
+        raise ValueError(f"expected a nonempty ThreadItem oneOf, received {branches!r}")
+    result = {}
+    for branch in branches:
+        properties = branch.get("properties", {})
+        tag = properties.get("type", {})
+        names = tag.get("enum", [tag.get("const")])
+        if len(names) != 1 or not isinstance(names[0], str):
+            raise ValueError(f"expected one string type discriminator, received {tag!r}")
+        name = names[0]
+        if name in result:
+            raise ValueError(f"expected unique variants, received duplicate {name!r}")
+        result[name] = {
+            "properties": sorted(properties),
+            "required": sorted(branch.get("required", [])),
+        }
+    return result
+
+
 def main():
     if len(sys.argv) != 4:
         sys.exit(__doc__)
@@ -234,6 +260,8 @@ def main():
             entry["properties"] = properties
         if values:
             entry["values"] = values
+        if name == "ThreadItem":
+            entry["variants"] = variants(schema)
         inventory[name] = entry
 
     if missing:

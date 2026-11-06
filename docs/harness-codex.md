@@ -1099,9 +1099,17 @@ addressed to a call id the host was never told about.
 
 `FileChange::kind` stays **absent**: the pinned schema states no per-file kind, and reading one off
 the diff text would be the re-parsing the type exists to prevent. Every activity carries the item's
-own id in `item_id`. A subagent's thread id is not carried either — the vendored inventory is a
-flattened property union across all nineteen item families, so it cannot say which family owns
-`agentThreadId`, and no captured frame carries it.
+own id in `item_id`. The per-variant inventory regenerated from Codex 0.154.0's documented
+`app-server generate-json-schema` confirms `agentThreadId` on `subAgentActivity`; it travels as
+`Activity::subagent_id` through `Activity::by_subagent`. The collaboration family's `senderThreadId`
+and `receiverThreadIds` do not identify this item. Missing or empty child identities stay absent,
+and no parent call id is inferred. This identity is for display only, never a host tool executor.
+The offline tests parse schema-shaped wire values; no authenticated subagent frame was captured.
+
+In 0.8, `ThreadItem::SubAgentActivity` gains `agent_thread_id: Option<String>`. A host constructing
+the wire variant must supply it (`None` preserves the previous behavior); a host matching the
+variant can add `..` or bind the new field. Install the four library crates from the 0.8 minor
+together. Published 0.7 sources and registry consumer fixtures retain their existing API.
 
 An item family this build does not model — `imageView`, `dynamicToolCall`, `sleep`, or one a
 newer Codex adds — is still work the agent did, so it renders as an `ActivityKind::Other` activity
@@ -1113,7 +1121,7 @@ id renders nothing because no completion could address it. The item families are
 ## Known gaps
 
 - No websocket or unix-socket transport (see above).
-- A subagent item's thread id is unmappable: see above.
+- Subagent attribution has pinned schema evidence but no authenticated replay capture yet.
 - Claude-style plan structure has no counterpart; `plan` is freeform text at this pin.
 - `PermissionLevel` sends `AskForApproval::Never` (`never`) for read-only/full access and
   `AskForApproval::OnRequest` (`on-request`) for default access. `Untrusted` is modeled but

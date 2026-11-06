@@ -586,6 +586,35 @@ mod tests {
     const THREAD: &str = "thread-1";
     const TURN: &str = "turn-1";
 
+    #[test]
+    fn a_schema_shaped_subagent_frame_keeps_its_child_identity_on_the_activity() {
+        let mut turn = TurnReducer::new();
+        let notification = Notification::parse(
+            method::ITEM_STARTED,
+            json!({
+                "threadId": THREAD, "turnId": TURN, "item": {
+                    "type": "subAgentActivity", "id": "child-item", "kind": "started",
+                    "agentPath": "root/child", "agentThreadId": "child-thread"
+                }
+            }),
+        );
+        let outcome = turn.reduce(
+            &notification,
+            THREAD,
+            Some(TURN),
+            SystemTime::UNIX_EPOCH,
+            tokio::time::Instant::now(),
+        );
+        assert!(
+            matches!(&outcome, Outcome::Emit(events)
+            if matches!(events.as_slice(), [EventKind::ActivityStarted { activity, .. }]
+                if activity.subagent_id.as_deref() == Some("child-thread")
+                    && activity.item_id.as_deref() == Some("child-item")
+                    && activity.parent_id.is_none())),
+            "expected observational child attribution, received {outcome:?}"
+        );
+    }
+
     /// A turn with one running command, announced the way the app-server does.
     fn running(item_type: &str, item_id: &str) -> (TurnReducer, tokio::time::Instant) {
         let mut turn = TurnReducer::new();
