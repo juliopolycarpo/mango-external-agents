@@ -268,11 +268,26 @@ pub enum Error {
         /// A payload-free summary of what stopped the launch, written verbatim by
         /// [`Display`](fmt::Display).
         ///
-        /// Named for the same reason `HostConfiguration`'s `received` is: an absent executable, a
-        /// permission refusal and a process tree that would not end are the operator's own to
-        /// fix, and "a launcher failure" does not distinguish them. Every construction site
+        /// Named for the same reason `HostConfiguration`'s `received` is: an absent executable
+        /// and a permission refusal are the operator's own to fix, and "a launcher failure"
+        /// does not distinguish them. Every construction site
         /// therefore owes a summary built from a structured value — an [`std::io::ErrorKind`], a
         /// duration, a static phrase — and never a path, an argv or a line a program printed.
+        message: String,
+    },
+
+    /// A launched process tree could not be interrupted, ended or confirmed empty.
+    ///
+    /// Separate from [`Launch`](Self::Launch): a child already exists and may still need
+    /// host-owned cleanup. This cause alone does not transfer a process handle; an operation
+    /// that retains one wraps it in [`CleanupRequired`](Self::CleanupRequired).
+    Teardown {
+        /// The launched tree's leader id, if the launcher obtained one.
+        ///
+        /// A numeric process identity, never a host-provided executable path.
+        pid: Option<u32>,
+        /// A payload-free cause built from an OS error kind, a duration or a static phrase.
+        /// Never include a path, environment value, argv or vendor output.
         message: String,
     },
 
@@ -402,6 +417,13 @@ impl fmt::Display for Error {
                 "expected to launch {}, received {message}",
                 redact::program_name(program)
             ),
+            Self::Teardown { pid, message } => {
+                match pid {
+                    Some(pid) => write!(formatter, "expected to end process tree {pid}"),
+                    None => formatter.write_str("expected to end a process tree"),
+                }?;
+                write!(formatter, ", received {message}")
+            }
             Self::Link { message, .. } => {
                 write!(formatter, "expected a live vendor link, received {message}")
             }
@@ -751,6 +773,10 @@ mod tests {
 
         let unknown = [
             Error::Closed { subject: "link" },
+            Error::Teardown {
+                pid: Some(42),
+                message: String::from("a process tree whose cleanup could not finish"),
+            },
             Error::Timeout {
                 operation: String::from("turn/start"),
                 after: std::time::Duration::from_secs(1),
@@ -769,6 +795,32 @@ mod tests {
             assert!(error.dispatch().needs_reconciliation());
             assert!(!error.dispatch().is_safe_to_replay());
         }
+    }
+
+    /// A teardown's diagnostic, typed identity and operation context survive core replay.
+    #[test]
+    fn teardown_is_typed_and_replayable_without_claiming_cleanup() {
+        let error = Error::Teardown {
+            pid: Some(42),
+            message: String::from("a live group member after 5s"),
+        }
+        .with_dispatch(Dispatch::Accepted);
+        let replay = error.clone();
+        assert!(matches!(
+            replay.cause(),
+            Error::Teardown { pid: Some(42), .. }
+        ));
+        assert_eq!(replay.dispatch(), Dispatch::Accepted);
+        assert!(!replay.retryable());
+        assert!(replay.cleanup_control().is_none());
+        assert_eq!(
+            replay.to_string(),
+            "expected to end process tree 42, received a live group member after 5s"
+        );
+        assert_eq!(
+            format!("{replay:?}"),
+            "Error(\"expected to end process tree 42, received a live group member after 5s\")"
+        );
     }
 
     /// A vendor saying "retry" is not a vendor saying "this never happened".

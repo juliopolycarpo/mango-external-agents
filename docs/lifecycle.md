@@ -20,6 +20,11 @@ has already started survives cancellation of its caller while the host runtime r
 The host must keep its runtime alive until shutdown completes and supply a launcher that contains
 and reaps its process trees.
 
+`Error::Teardown { pid, message }` names a failed interruption or cleanup of an already-launched
+tree, unlike `Error::Launch`. Like `Error::Link` or `Error::Timeout`, it does not establish a
+request's acceptance or make replay safe. The numeric leader id identifies the tree to reconcile;
+the cause alone carries no process control.
+
 If bounded cleanup for a pre-session operation or a session close fails, the operation returns
 `Error::CleanupRequired`. Its typed source describes the cleanup failure and
 `Error::cleanup_control()` returns the host's `ProcessControl` handle. That handle may already
