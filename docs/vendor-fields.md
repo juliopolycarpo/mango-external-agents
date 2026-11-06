@@ -58,6 +58,7 @@ refused one is a request it answered "no" to. Only requests can be refused.
 | `commandExecution.exitCode`                                      | runtime      | `ActivityResult::detail`                               | preserve    | Known only at completion, where there is no extensions map; it stays in the detail it shares with the output                                                                         | `activity::tests::a_finished_commands_output_becomes_structured_content_alongside_its_detail`           |
 | `plan.text`                                                      | runtime      | `Activity::detail`                                     | preserve    | Freeform at this pin — there is no step array, and splitting the text into steps would invent structure                                                                              | `activity::tests::a_plan_keeps_its_freeform_text_with_no_step_structure_invented`                       |
 | `subAgentActivity.agentThreadId`                                 | runtime      | `Activity::subagent_id`                                | preserve    | The pinned per-variant inventory declares `agentThreadId`; preserved as observational child identity, never a host tool or inferred parent                                           | `activity::tests::a_subagent_item_preserves_only_its_own_thread_identity`                               |
+| `subAgentActivity.agentPath`                                     | runtime      | —                                                      | omit        | No shared activity field represents this path; `agentThreadId` supplies child identity without interpreting path segments or inventing a parent call id                              | `activity::tests::a_subagent_item_preserves_only_its_own_thread_identity`                               |
 | `ThreadTokenUsage`, `TokenUsageBreakdown`                        | runtime      | `Usage` / `ThreadUsage`                                | preserve    | —                                                                                                                                                                                    | `reducer::tests::usage_reports_this_turn_and_the_whole_thread_as_two_different_things`                  |
 | `RateLimitSnapshot.primary`/`secondary`                          | runtime      | `AccountLimits`                                        | preserve    | —                                                                                                                                                                                    | `rate_limits::tests::both_windows_travel_with_their_labels_and_their_reset_times`                       |
 | `RateLimitSnapshot.credits`                                      | runtime      | `AccountLimits::credits`                               | preserve    | A `null` balance in a sparse update keeps the baseline's                                                                                                                             | `rate_limits::tests::credits_and_spend_control_merge_like_every_other_field`                            |
@@ -147,8 +148,9 @@ One gap remains:
 - **Claude's `TodoWrite`.** It is where a plan's steps live, and it is the one place Claude is
   behind the other two harnesses. Unblocking it needs `mea capture` to record a turn that drives it
   at the pin, not a guess at its input keys.
-  Codex's pinned inventory now preserves properties and required fields for each of its nineteen
-  `ThreadItem` variants. `agentThreadId` belongs to `subAgentActivity`; `senderThreadId` and
-  `receiverThreadIds` belong to `collabAgentToolCall`. The former is carried as `subagent_id`.
-  There is no captured authenticated subagent frame yet: the attribution tests use schema-shaped
-  wire values and do not claim live smoke qualification or a parent call relationship.
+
+Codex's pinned inventory now preserves properties and required fields for each of its nineteen
+`ThreadItem` variants. `agentThreadId` belongs to `subAgentActivity`; `senderThreadId` and
+`receiverThreadIds` belong to `collabAgentToolCall`. The former is carried as `subagent_id`.
+There is no captured authenticated subagent frame yet: the attribution tests use schema-shaped
+wire values and do not claim live smoke qualification or a parent call relationship.

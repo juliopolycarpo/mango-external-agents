@@ -1106,6 +1106,11 @@ and `receiverThreadIds` do not identify this item. Missing or empty child identi
 and no parent call id is inferred. This identity is for display only, never a host tool executor.
 The offline tests parse schema-shaped wire values; no authenticated subagent frame was captured.
 
+In 0.8, `ThreadItem::SubAgentActivity` gains `agent_thread_id: Option<String>`. A host constructing
+the wire variant must supply it (`None` preserves the previous behavior); a host matching the
+variant can add `..` or bind the new field. Install the four library crates from the 0.8 minor
+together. Published 0.7 sources and registry consumer fixtures retain their existing API.
+
 An item family this build does not model — `imageView`, `dynamicToolCall`, `sleep`, or one a
 newer Codex adds — is still work the agent did, so it renders as an `ActivityKind::Other` activity
 named by the vendor's own `type`, bracketed by its `id`. Echoes of the client's own input
