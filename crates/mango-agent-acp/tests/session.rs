@@ -1838,35 +1838,66 @@ async fn a_failed_picker_cleanup_returns_recovery_control_before_the_listing_err
 async fn repeated_failed_session_closes_preserve_the_same_recovery_control() {
     let inner = FakeLauncher::new();
     inner.push(FakeAcpAgent::new().process());
-    let launcher = RecoverableCleanupLauncher::new(inner.clone());
+    let launcher = RecoverableCleanupLauncher::new(inner.clone()).with_failure(
+        Error::Teardown {
+            pid: Some(42),
+            message: String::from("the first test cleanup attempt failed"),
+        }
+        .with_dispatch(Dispatch::Accepted),
+    );
     let host = recoverable_cleanup_host(&launcher);
     let session = AcpHarness::new(profile())
         .open_session(&host, OpenSession::new("recover-close"))
         .await
         .expect("expected a session");
-    let first = session
-        .close(CloseReason::Shutdown)
-        .await
-        .expect_err("expected the first cleanup attempt to fail");
-    let control = first
-        .cleanup_control()
-        .expect("expected session close to retain its recovery control");
-    let repeated = session
-        .close(CloseReason::Requested)
-        .await
-        .expect_err("expected repeated close to retain the first failure");
-    let repeated_control = repeated
-        .cleanup_control()
-        .expect("expected repeated close to retain its recovery control");
-    assert!(Arc::ptr_eq(&control, &repeated_control));
+    let original = launcher
+        .control
+        .lock()
+        .expect("captured control")
+        .clone()
+        .expect("expected the launched control");
+    let (first, concurrent) = tokio::join!(
+        session.close(CloseReason::Shutdown),
+        session.close(CloseReason::Requested),
+    );
+    let repeated = session.close(CloseReason::Requested).await;
+    let kills_before_recovery = launcher.kills.load(Ordering::Acquire);
+    // Reap before the assertions so a red replay regression cannot leave its fake child alive.
     mango_external_agents::process::stop_process_with_limits(
-        control.as_ref(),
+        original.as_ref(),
         CancelReason::Shutdown,
         host.limits(),
     )
     .await
     .expect("expected host recovery to reap the child");
     assert_eq!(inner.live_children(), 0);
+    assert_eq!(
+        kills_before_recovery, 1,
+        "session close owns one cleanup attempt"
+    );
+    assert_eq!(
+        launcher.kills.load(Ordering::Acquire),
+        2,
+        "the host retried once"
+    );
+    assert_eq!(session.snapshot().status, SessionStatus::Closing);
+    for result in [first, concurrent, repeated] {
+        let error = result.expect_err("expected the retained cleanup failure");
+        assert_eq!(error.dispatch(), Dispatch::Accepted);
+        assert!(!error.retryable());
+        assert!(Arc::ptr_eq(
+            &error.cleanup_control().expect("original recovery control"),
+            &original,
+        ));
+        assert!(
+            matches!(
+                error.cause(),
+                Error::Teardown { pid: Some(42), message }
+                    if message == "the first test cleanup attempt failed"
+            ),
+            "expected the original typed teardown cause, received {error:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2901,6 +2932,9 @@ struct GatedLauncher {
 struct RecoverableCleanupLauncher {
     inner: FakeLauncher,
     fail_next_kill: Arc<AtomicBool>,
+    failure: Error,
+    control: Arc<Mutex<Option<Arc<dyn ProcessControl>>>>,
+    kills: Arc<AtomicUsize>,
 }
 
 impl RecoverableCleanupLauncher {
@@ -2908,7 +2942,18 @@ impl RecoverableCleanupLauncher {
         Self {
             inner,
             fail_next_kill: Arc::new(AtomicBool::new(true)),
+            failure: Error::Launch {
+                program: String::from("fake ACP agent"),
+                message: String::from("the first test cleanup attempt failed"),
+            },
+            control: Arc::new(Mutex::new(None)),
+            kills: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    fn with_failure(mut self, failure: Error) -> Self {
+        self.failure = failure;
+        self
     }
 }
 
@@ -3115,10 +3160,14 @@ impl ProcessLauncher for RecoverableCleanupLauncher {
         spec: mango_external_agents::LaunchSpec,
     ) -> mango_external_agents::Result<ManagedProcess> {
         let mut process = self.inner.spawn(spec).await?;
-        process.control = Arc::new(FailOnceCleanupControl {
+        let control: Arc<dyn ProcessControl> = Arc::new(FailOnceCleanupControl {
             inner: Arc::clone(&process.control),
             fail_next_kill: Arc::clone(&self.fail_next_kill),
+            failure: self.failure.clone(),
+            kills: Arc::clone(&self.kills),
         });
+        *self.control.lock().expect("captured control") = Some(Arc::clone(&control));
+        process.control = control;
         Ok(process)
     }
 }
@@ -3131,11 +3180,13 @@ struct GatedControl {
     kills: Arc<AtomicUsize>,
 }
 
-/// The first termination request reports a typed host-launch error; every later one reaches the
+/// The first termination request reports the configured typed error; every later one reaches the
 /// fake process so a caller holding `Error::cleanup_control` can reconcile the child.
 struct FailOnceCleanupControl {
     inner: Arc<dyn ProcessControl>,
     fail_next_kill: Arc<AtomicBool>,
+    failure: Error,
+    kills: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
@@ -3181,11 +3232,9 @@ impl ProcessControl for FailOnceCleanupControl {
     }
 
     async fn kill(&self, reason: CancelReason) -> mango_external_agents::Result<()> {
+        self.kills.fetch_add(1, Ordering::AcqRel);
         if self.fail_next_kill.swap(false, Ordering::AcqRel) {
-            return Err(Error::Launch {
-                program: String::from("fake ACP agent"),
-                message: String::from("the first test cleanup attempt failed"),
-            });
+            return Err(self.failure.clone());
         }
         self.inner.kill(reason).await
     }

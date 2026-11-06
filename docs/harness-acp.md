@@ -994,10 +994,14 @@ exit or a failed transport, and an abandoned request all join that task rather t
 child again. A dropped session has no connection handle left to join, so its watcher reaps through
 the same shared reaper instead. Every `close` waits for the shared result, so a second or
 concurrent close never reports success before the child is reaped, and a cleanup failure is the
-error each waiter receives. Once the watcher sees the agent go, it refuses new turns before it
-waits on anything. `Closed` is published only after the reap succeeds and the running turn has
-written its terminal; when a close is in progress, the close publishes it. After a successful
-cleanup, a close waits for a turn another task is still settling, bounded by
+error each waiter receives. The reaper, connection and public session close all retain the core
+`Error`: its typed cause, dispatch annotation and cleanup-control identity survive every waiter.
+The top-level cleanup control owns the launched child; any control already carried by a nested
+failure remains in its source chain. See
+[host reconciliation](lifecycle.md#owners-and-cancellation). Once the watcher sees the agent go,
+it refuses new turns before it waits on anything. `Closed` is published only after the reap succeeds
+and the running turn has written its terminal; when a close is in progress, the close publishes it.
+After a successful cleanup, a close waits for a turn another task is still settling, bounded by
 `Limits::shutdown_timeout`. Past that bound the close returns `Error::Timeout` naming the turn slot
 release and the session stays `Closing`: it admits no new work, but it does not claim the turn
 settled. After a failed cleanup the close returns that failure at once. The watcher waits under

@@ -25,8 +25,8 @@ tree, unlike `Error::Launch`. Like `Error::Link` or `Error::Timeout`, it does no
 request's acceptance or make replay safe. The numeric leader id identifies the tree to reconcile;
 the cause alone carries no process control.
 
-If bounded cleanup for a pre-session operation or a session close fails, the operation returns
-`Error::CleanupRequired`. Its typed source describes the cleanup failure and
+If bounded process cleanup for a pre-session operation or a session close fails, the operation
+returns `Error::CleanupRequired`. Its typed source describes the cleanup failure and
 `Error::cleanup_control()` returns the host's `ProcessControl` handle. That handle may already
 have received `kill`; the host owns reconciliation and any bounded retry, including reaping the
 tree. The library does not retain a global cleanup registry or promise cleanup after the host
@@ -37,11 +37,11 @@ One rule reconciles a leftover child on all three harnesses: branch on `cleanup_
 and ACP, and so does a Claude or Codex `cancel` that has to stop the process; an ACP `cancel` only
 queues `session/cancel` and never stops one. A stage that ran out of time, an error from the host's
 control and a panic in its code all count. `cleanup_control()` is the control the host's launcher
-returned. The cause differs: Claude and Codex keep the typed failure of the stage, readable
-through `cause()`, where ACP carries it as `Error::Vendor` text. The first outcome of a teardown is
-kept: a later `close` returns a copy of it, with the same control, and does not ask the child to
-stop again. A `close` that gave up on a launch still inside the launcher has no child and so no
-control; the `start_turn` that owns the launch gets the `CleanupRequired` if its stop then fails,
+returned for the child. All three harnesses keep the typed failure of the stage, readable through
+`cause()`, with nested cleanup errors retained in the source chain. The first outcome of a
+teardown is kept: a later `close` returns a copy of it, with the same control, and does not ask
+the child to stop again. A `close` that gave up on a launch still inside the launcher has no child
+and so no control; the `start_turn` that owns the launch gets the `CleanupRequired` if its stop then fails,
 and so does a later Claude `close`.
 
 These are different observations:

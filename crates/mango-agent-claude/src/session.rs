@@ -67,7 +67,7 @@ struct ActiveTurn {
 }
 
 struct Teardown {
-    result: Mutex<Option<std::result::Result<(), Arc<Error>>>>,
+    result: Mutex<Option<Result<()>>>,
     done: tokio::sync::Notify,
     worker_started: AtomicBool,
     taint_continuation: bool,
@@ -90,10 +90,7 @@ impl Teardown {
     /// The retained outcome, or `None` while the stop has not finished.
     fn outcome(&self) -> Option<Result<()>> {
         let result = self.result.lock().unwrap_or_else(PoisonError::into_inner);
-        result.as_ref().map(|result| match result {
-            Ok(()) => Ok(()),
-            Err(error) => Err(copy_error(error)),
-        })
+        result.clone()
     }
 
     async fn wait(&self) -> Result<()> {
@@ -142,82 +139,8 @@ impl Teardown {
     }
 
     fn finish(&self, result: Result<()>) {
-        *self.result.lock().unwrap_or_else(PoisonError::into_inner) =
-            Some(result.map_err(Arc::new));
+        *self.result.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
         self.done.notify_waiters();
-    }
-}
-
-/// Reconstructs the retained result for each close or cancel waiter.
-///
-/// `Error` implements `Clone`; this explicit reconstruction remains until the shared-error
-/// refactor replaces it with cloning.
-fn copy_error(error: &Error) -> Error {
-    match error {
-        Error::Busy => Error::Busy,
-        Error::Operation { dispatch, source } => copy_error(source).with_dispatch(*dispatch),
-        Error::CleanupRequired { control, source } => Error::CleanupRequired {
-            control: Arc::clone(control),
-            source: Box::new(copy_error(source)),
-        },
-        Error::Vendor(error) => Error::Vendor(error.clone()),
-        Error::NotSupported { capability } => Error::NotSupported {
-            capability: *capability,
-        },
-        Error::UnsupportedTransport { harness, transport } => Error::UnsupportedTransport {
-            harness: harness.clone(),
-            transport: *transport,
-        },
-        Error::VersionGate { found, minimum } => Error::VersionGate {
-            found: found.clone(),
-            minimum: minimum.clone(),
-        },
-        Error::AuthRequired { login_hint } => Error::AuthRequired {
-            login_hint: login_hint.clone(),
-        },
-        Error::Launch { program, message } => Error::Launch {
-            program: program.clone(),
-            message: message.clone(),
-        },
-        Error::Teardown { pid, message } => Error::Teardown {
-            pid: *pid,
-            message: message.clone(),
-        },
-        Error::Link { peer, message } => Error::Link {
-            peer: peer.clone(),
-            message: message.clone(),
-        },
-        Error::LimitExceeded {
-            subject,
-            limit,
-            received,
-        } => Error::LimitExceeded {
-            subject,
-            limit: *limit,
-            received: *received,
-        },
-        Error::InvalidVendorValue { field, received } => Error::InvalidVendorValue {
-            field,
-            received: received.clone(),
-        },
-        Error::Protocol { expected, received } => Error::Protocol {
-            expected: expected.clone(),
-            received: received.clone(),
-        },
-        Error::Timeout { operation, after } => Error::Timeout {
-            operation: operation.clone(),
-            after: *after,
-        },
-        Error::Cancelled { reason } => Error::Cancelled { reason: *reason },
-        Error::Closed { subject } => Error::Closed { subject },
-        Error::HostConfiguration { expected, received } => Error::HostConfiguration {
-            expected,
-            received: received.clone(),
-        },
-        _ => Error::HostConfiguration {
-            expected: "a replayable Claude teardown failure",
-            received: String::from("an error variant this harness does not retain"),
-        },
     }
 }
 
@@ -783,7 +706,7 @@ fn retain_failed_launch(shared: &Shared, end: &Arc<TurnEnd>, error: &Error) {
     if let Some(teardown) = teardown
         && teardown.starts_worker()
     {
-        teardown.finish(Err(copy_error(error)));
+        teardown.finish(Err(error.clone()));
     }
 }
 
@@ -2701,20 +2624,74 @@ mod tests {
     use mango_external_agents::{CancelReason, CancelToken, ExitStatus, Resumability};
     use std::sync::Arc;
 
-    #[test]
-    fn copying_a_teardown_error_preserves_process_identity_and_message() {
-        let error = mango_external_agents::Error::Teardown {
+    #[tokio::test]
+    async fn shared_teardown_preserves_process_identity_and_message() {
+        let teardown = super::Teardown::new(false);
+        teardown.finish(Err(mango_external_agents::Error::Teardown {
             pid: Some(42),
             message: String::from("a live group member after 5s"),
-        };
-        let copied = super::copy_error(&error);
-        match copied {
-            mango_external_agents::Error::Teardown { pid, message } => {
-                assert_eq!(pid, Some(42));
-                assert_eq!(message, "a live group member after 5s");
+        }));
+        let (first, second) = tokio::join!(teardown.wait(), teardown.wait());
+        for result in [first, second] {
+            match result.expect_err("retained teardown failure") {
+                mango_external_agents::Error::Teardown { pid, message } => {
+                    assert_eq!(pid, Some(42));
+                    assert_eq!(message, "a live group member after 5s");
+                }
+                received => {
+                    panic!("expected the retained Teardown variant, received: {received:?}")
+                }
             }
-            received => panic!("expected the retained Teardown variant, received: {received:?}"),
         }
+    }
+
+    /// Claude's retained outcome replays core-owned typing, dispatch and cleanup identity.
+    #[tokio::test]
+    async fn shared_teardown_replays_typed_cause_dispatch_and_original_control() {
+        use mango_external_agents::testing::{FakeLauncher, FakeProcess};
+        use mango_external_agents::{Dispatch, Error, LaunchSpec, ProcessLauncher};
+        let launcher = FakeLauncher::new();
+        launcher.push(FakeProcess::responding(|_| Vec::new()));
+        let process = launcher
+            .spawn(LaunchSpec {
+                argv: vec![String::from("fake")],
+                cwd: std::env::temp_dir(),
+                env: Default::default(),
+                stdin: true,
+                hide_window: true,
+            })
+            .await
+            .expect("child");
+        let original = process.control;
+        let teardown = super::Teardown::new(false);
+        teardown.finish(Err(Error::CleanupRequired {
+            control: Arc::clone(&original),
+            source: Box::new(
+                Error::Protocol {
+                    expected: String::from("cleanup proof"),
+                    received: String::from("unconfirmed"),
+                }
+                .with_dispatch(Dispatch::Accepted),
+            ),
+        }));
+        let (first, second, third) =
+            tokio::join!(teardown.wait(), teardown.wait(), teardown.wait());
+        for result in [first, second, third] {
+            let error = result.expect_err("cleanup failure");
+            assert_eq!(error.dispatch(), Dispatch::Accepted);
+            assert!(Arc::ptr_eq(
+                &error.cleanup_control().expect("control"),
+                &original
+            ));
+            assert!(
+                matches!(error.cause(), Error::Protocol { expected, received }
+                if expected == "cleanup proof" && received == "unconfirmed")
+            );
+        }
+        original
+            .kill(CancelReason::Shutdown)
+            .await
+            .expect("release child");
     }
 
     /// The verdict a host reads is derived from the same state `start_turn` refuses on, in the

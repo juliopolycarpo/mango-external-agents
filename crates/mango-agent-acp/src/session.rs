@@ -64,14 +64,7 @@ pub struct AcpSession {
 pub(crate) struct CloseState {
     started: AtomicBool,
     done: mango_external_agents::CancelToken,
-    result: Mutex<Option<std::result::Result<(), CloseFailure>>>,
-}
-
-/// Cloneable cleanup evidence shared by every waiter on the same close operation.
-#[derive(Clone)]
-struct CloseFailure {
-    message: String,
-    control: Option<Arc<dyn mango_external_agents::ProcessControl>>,
+    result: Mutex<Option<Result<()>>>,
 }
 
 impl Default for CloseState {
@@ -95,11 +88,7 @@ impl CloseState {
     }
 
     fn finish(&self, result: Result<()>) {
-        *self.result.lock().unwrap_or_else(PoisonError::into_inner) =
-            Some(result.map_err(|error| CloseFailure {
-                message: error.to_string(),
-                control: error.cleanup_control(),
-            }));
+        *self.result.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
         self.done.cancel();
     }
 
@@ -110,23 +99,9 @@ impl CloseState {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
             .unwrap_or_else(|| {
-                Err(CloseFailure {
-                    message: String::from("the ACP close task ended without an outcome"),
-                    control: None,
-                })
-            })
-            .map_err(|failure| {
-                let source = Error::Vendor(link_failure(format!(
-                    "ACP session cleanup failed: {}",
-                    failure.message
-                )));
-                match failure.control {
-                    Some(control) => Error::CleanupRequired {
-                        control,
-                        source: Box::new(source),
-                    },
-                    None => source,
-                }
+                Err(Error::Vendor(link_failure(String::from(
+                    "ACP session cleanup failed: the ACP close task ended without an outcome",
+                ))))
             })
     }
 }
