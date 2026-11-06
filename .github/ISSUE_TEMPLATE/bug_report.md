@@ -2,7 +2,7 @@
 name: Bug report
 about: A harness, transport, event or session behaviour that disagrees with the vendor surface or these docs
 title: ""
-labels: ["type: bug"]
+labels: ["bug"]
 ---
 
 ## What happened
