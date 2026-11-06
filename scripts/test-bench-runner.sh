@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Regression coverage for scripts/check-bench-runner.sh: identical copies pass; a differing copy or
 # a missing file is rejected with the expected/received message, and every tracked runner copy is
-# one the default check lists.
+# one the default check lists. The default benchmark command also covers every registered target
+# and forwards case filters unchanged.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -61,4 +62,52 @@ for runner in $(git ls-files ':(glob)**/benches/support/mod.rs'); do
     exit 1
   }
 done
+
+# The default command promises all registered benchmark targets. Inspect actual Cargo argv with
+# a named fake executor, and derive the expected targets from metadata instead of another list.
+cargo metadata --locked --no-deps --format-version 1 > "$scratch/metadata.json"
+mkdir -p "$scratch/bin"
+cp scripts/test-fixtures/fake-bench-cargo.sh "$scratch/bin/cargo"
+PATH="$scratch/bin:$PATH" FAKE_BENCH_CARGO_LOG="$scratch/cargo.jsonl" \
+  scripts/bench.sh fixture-filter > "$scratch/bench.out"
+python3 - "$scratch/metadata.json" "$scratch/cargo.jsonl" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    packages = json.load(source)["packages"]
+declared = {
+    (package["name"], target["name"])
+    for package in packages
+    for target in package["targets"]
+    if "bench" in target["kind"]
+}
+executed = set()
+with open(sys.argv[2], encoding="utf-8") as log:
+    for line in log:
+        argv = json.loads(line)
+        if not argv or argv[0] != "bench":
+            continue
+        boundary = argv.index("--") if "--" in argv else len(argv)
+        flags = argv[1:boundary]
+        received_filter = argv[boundary + 1:]
+        if received_filter != ["fixture-filter"]:
+            raise SystemExit(f"expected benchmark filter fixture-filter, received {received_filter!r}")
+        selected_packages = {
+            flags[index + 1] for index, value in enumerate(flags)
+            if value in ("-p", "--package")
+        }
+        selected_benches = {
+            flags[index + 1] for index, value in enumerate(flags)
+            if value == "--bench"
+        }
+        executed.update(
+            (package, bench) for package, bench in declared
+            if (not selected_packages or package in selected_packages)
+            and (not selected_benches or bench in selected_benches)
+        )
+if declared != executed:
+    missing = sorted(f"{package}/{bench}" for package, bench in declared - executed)
+    raise SystemExit(f"expected scripts/bench.sh to run every registered benchmark, received missing {missing}")
+PY
 echo "bench runner checks passed"
