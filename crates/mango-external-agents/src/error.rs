@@ -773,6 +773,10 @@ mod tests {
 
         let unknown = [
             Error::Closed { subject: "link" },
+            Error::Teardown {
+                pid: Some(42),
+                message: String::from("a process tree whose cleanup could not finish"),
+            },
             Error::Timeout {
                 operation: String::from("turn/start"),
                 after: std::time::Duration::from_secs(1),
