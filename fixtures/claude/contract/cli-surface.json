@@ -20,6 +20,7 @@
     "--dangerously-skip-permissions",
     "--debug",
     "--debug-file",
+    "--desktop",
     "--disable-slash-commands",
     "--disallowed-tools",
     "--disallowedTools",

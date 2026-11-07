@@ -247,6 +247,7 @@ mod tests {
         let activity = started(&item(json!({
             "type": "subAgentActivity", "id": "child-item", "kind": "started",
             "agentPath": "root/child", "agentThreadId": "child-thread",
+            "model": "vendor-model", "reasoningEffort": "high",
             "senderThreadId": "wrong-sender", "receiverThreadIds": ["wrong-receiver"]
         })))
         .expect("expected a subagent activity");
@@ -423,6 +424,12 @@ mod tests {
                 true,
             ),
             (json!({"type": "imageView"}), false),
+            // The 0.166 schema no longer requires the legacy image-generation result member.
+            (
+                json!({"type": "imageGeneration", "id": "i", "status": "completed",
+                    "generationId": "generation", "inputImages": [], "savedPath": "/workspace/image.png"}),
+                true,
+            ),
             (json!({"type": "imageView", "id": 7}), false),
             (
                 json!({"type": "futureVendorFamily", "id": "i", "status": "failed"}),

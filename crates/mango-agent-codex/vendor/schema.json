@@ -1,17 +1,19 @@
 {
-  "codexVersion": "0.154.0",
+  "codexVersion": "0.166.0",
   "definitions": {
     "Account": {
       "properties": [
         "email",
         "planType",
         "type",
-        "usesCodexManagedCredentials"
+        "usesCodexManagedCredentials",
+        "workspaceName"
       ],
       "values": [
         "amazonBedrock",
         "apiKey",
-        "chatgpt"
+        "chatgpt",
+        "gcp"
       ]
     },
     "AccountRateLimitsUpdatedNotification": {
@@ -63,14 +65,18 @@
         "badRequest",
         "contextWindowExceeded",
         "cyberPolicy",
+        "flexUnavailable",
         "internalServerError",
         "misalignmentPolicyViolation",
+        "modelNotFound",
         "other",
+        "policyCapacityUnavailable",
         "rateLimitExceeded",
         "sandboxError",
         "serverOverloaded",
         "sessionBudgetExceeded",
         "threadRollbackFailed",
+        "tooManyDenials",
         "unauthorized",
         "usageLimitExceeded"
       ]
@@ -179,6 +185,23 @@
         "path"
       ]
     },
+    "GatewayOAuthReadResponse": {
+      "properties": [
+        "error",
+        "providerId",
+        "providerName",
+        "required",
+        "status"
+      ]
+    },
+    "GatewayOAuthStatus": {
+      "values": [
+        "failed",
+        "notReady",
+        "started",
+        "succeeded"
+      ]
+    },
     "GetAccountParams": {
       "properties": [
         "refreshToken"
@@ -204,6 +227,16 @@
       "properties": [
         "fileSystem",
         "network"
+      ]
+    },
+    "InitializeCapabilities": {
+      "properties": [
+        "experimentalApi",
+        "explicitGatewayOauth",
+        "extensions",
+        "mcpServerOpenaiFormElicitation",
+        "optOutNotificationMethods",
+        "requestAttestation"
       ]
     },
     "InitializeParams": {
@@ -282,6 +315,7 @@
       "properties": [
         "additionalSpeedTiers",
         "availabilityNux",
+        "availableAccessPrograms",
         "defaultReasoningEffort",
         "defaultServiceTier",
         "description",
@@ -543,6 +577,7 @@
         "clientId",
         "command",
         "commandActions",
+        "completedAtMs",
         "content",
         "contentItems",
         "cwd",
@@ -551,10 +586,14 @@
         "error",
         "exitCode",
         "failure",
+        "fileId",
         "fragments",
+        "generationId",
         "id",
+        "inputImages",
         "kind",
         "mcpAppResourceUri",
+        "mcpAppUi",
         "memoryCitation",
         "model",
         "name",
@@ -579,6 +618,7 @@
         "senderThreadId",
         "server",
         "source",
+        "startedAtMs",
         "status",
         "success",
         "summary",
@@ -771,8 +811,9 @@
         "imageGeneration": {
           "properties": [
             "failure",
+            "generationId",
             "id",
-            "result",
+            "inputImages",
             "revisedPrompt",
             "savedPath",
             "status",
@@ -781,7 +822,6 @@
           ],
           "required": [
             "id",
-            "result",
             "status",
             "type"
           ]
@@ -806,6 +846,7 @@
             "error",
             "id",
             "mcpAppResourceUri",
+            "mcpAppUi",
             "pluginId",
             "readOnlyHint",
             "result",
@@ -865,6 +906,8 @@
             "agentThreadId",
             "id",
             "kind",
+            "model",
+            "reasoningEffort",
             "type"
           ],
           "required": [
@@ -909,6 +952,7 @@
         "archived",
         "cursor",
         "cwd",
+        "excludedThreadIds",
         "limit",
         "modelProviders",
         "originators",
@@ -959,7 +1003,9 @@
       "properties": [
         "approvalPolicy",
         "approvalsReviewer",
+        "collaborationMode",
         "cwd",
+        "disabledPluginIds",
         "instructionSources",
         "itemsBackwardsCursor",
         "model",
@@ -1017,6 +1063,7 @@
         "approvalPolicy",
         "approvalsReviewer",
         "cwd",
+        "disabledPluginIds",
         "instructionSources",
         "model",
         "modelProvider",
@@ -1099,6 +1146,7 @@
         "id",
         "items",
         "itemsView",
+        "rootTurnId",
         "startedAt",
         "status"
       ]
@@ -1129,11 +1177,14 @@
         "approvalsReviewer",
         "clientUserMessageId",
         "cwd",
+        "disabledPluginIds",
         "effort",
         "input",
         "model",
         "outputSchema",
+        "parentTurnId",
         "personality",
+        "rootTurnId",
         "sandboxPolicy",
         "serviceTier",
         "serviceTierForTurn",
@@ -1178,6 +1229,7 @@
     "UserInput": {
       "properties": [
         "detail",
+        "fileId",
         "name",
         "path",
         "text",
@@ -1201,6 +1253,7 @@
       "initialized"
     ],
     "ClientRequest": [
+      "account/gatewayOAuth/read",
       "account/rateLimits/read",
       "account/read",
       "initialize",

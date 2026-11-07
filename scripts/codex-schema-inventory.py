@@ -17,8 +17,11 @@ import sys
 WANTED = [
     # Handshake.
     "InitializeParams",
+    "InitializeCapabilities",
     "InitializeResponse",
     "ClientInfo",
+    "GatewayOAuthReadResponse",
+    "GatewayOAuthStatus",
     # Threads.
     "ThreadStartParams",
     "ThreadStartResponse",
@@ -133,6 +136,7 @@ WANTED_METHODS = {
         "review/start",
         "model/list",
         "account/read",
+        "account/gatewayOAuth/read",
         "account/rateLimits/read",
         "permissionProfile/list",
     ],

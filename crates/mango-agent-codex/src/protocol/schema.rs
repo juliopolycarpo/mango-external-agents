@@ -19,10 +19,9 @@ pub const PIN: &str = include_str!("../../vendor/PIN");
 
 /// The oldest `codex` this harness drives.
 ///
-/// The pinned build, not an older one: the app-server's item families and the `thread`/`turn`
-/// method names changed shape inside the 0.15x series, and a floor below the pin would be a claim
-/// about builds nothing here was ever checked against.
-pub const MINIMUM_CODEX_VERSION: &str = "0.154.0";
+/// Version 0.166.0 supplies the explicit gateway authorization capability and read-only
+/// readiness handshake. Older transcripts remain historical decoder evidence.
+pub const MINIMUM_CODEX_VERSION: &str = "0.166.0";
 
 #[cfg(test)]
 mod tests {
@@ -139,21 +138,38 @@ mod tests {
         assert!(!collab.contains(&serde_json::json!("agentThreadId")));
         assert!(collab.contains(&serde_json::json!("senderThreadId")));
         assert!(collab.contains(&serde_json::json!("receiverThreadIds")));
+        for field in ["model", "reasoningEffort"] {
+            assert!(
+                child["properties"]
+                    .as_array()
+                    .expect("properties")
+                    .contains(&serde_json::json!(field))
+            );
+            assert!(
+                !child["required"]
+                    .as_array()
+                    .expect("required")
+                    .contains(&serde_json::json!(field))
+            );
+        }
     }
 
-    /// The gate and the pin are one number. Two would drift, and the one that drifted would be the
-    /// one a host reads out of `GateVerdict::VersionTooOld`.
+    /// A refresh keeps the version stamp consistent without discarding a qualified baseline.
     #[test]
-    fn the_version_gate_is_the_version_the_schema_was_pinned_at() {
-        assert_eq!(
-            PIN.trim(),
-            format!("rust-v{MINIMUM_CODEX_VERSION}"),
-            "expected vendor/PIN to name the gated version"
-        );
+    fn the_schema_pin_and_stamp_agree_and_do_not_precede_the_qualified_floor() {
+        let pinned = PIN
+            .trim()
+            .strip_prefix("rust-v")
+            .expect("expected a Codex release tag");
         assert_eq!(
             inventory()["codexVersion"].as_str(),
-            Some(MINIMUM_CODEX_VERSION),
-            "expected the inventory to be generated at the gated version"
+            Some(pinned),
+            "expected the inventory version stamp to match vendor/PIN"
+        );
+        assert_eq!(
+            crate::discovery::gate(Some(pinned), MINIMUM_CODEX_VERSION),
+            mango_external_agents::GateVerdict::Usable,
+            "expected pin {pinned} at or above qualified floor {MINIMUM_CODEX_VERSION}"
         );
     }
 
@@ -175,6 +191,7 @@ mod tests {
                 method::REVIEW_START,
                 method::MODEL_LIST,
                 method::ACCOUNT_READ,
+                method::GATEWAY_OAUTH_READ,
                 method::ACCOUNT_RATE_LIMITS_READ,
                 method::PERMISSION_PROFILE_LIST,
             ],
@@ -220,6 +237,15 @@ mod tests {
     #[test]
     fn the_handshake_fields_are_the_ones_the_pinned_build_declares() {
         assert_declares("InitializeParams", &["clientInfo", "capabilities"]);
+        assert_declares(
+            "InitializeCapabilities",
+            &["explicitGatewayOauth", "optOutNotificationMethods"],
+        );
+        assert_declares("GatewayOAuthReadResponse", &["required", "status"]);
+        assert_accepts(
+            "GatewayOAuthStatus",
+            &["notReady", "started", "succeeded", "failed"],
+        );
         assert_declares("ClientInfo", &["name", "title", "version"]);
         assert_declares("InitializeResponse", &["userAgent", "platformOs"]);
     }
@@ -471,7 +497,7 @@ mod tests {
     #[test]
     fn the_account_and_model_fields_are_the_ones_the_pinned_build_declares() {
         assert_declares("GetAccountResponse", &["account", "requiresOpenaiAuth"]);
-        assert_accepts("Account", &["apiKey", "chatgpt", "amazonBedrock"]);
+        assert_accepts("Account", &["apiKey", "chatgpt", "amazonBedrock", "gcp"]);
         assert_declares("ModelListParams", &["cursor", "limit"]);
         assert_declares("ModelListResponse", &["data", "nextCursor"]);
         assert_declares(

@@ -31,8 +31,9 @@ use crate::account::{AccountFingerprintKey, CodexAccount, CodexDiscovery};
 use crate::discovery::{self, LOGIN_HINT, PROGRAM};
 use crate::permissions::PermissionOverrides;
 use crate::protocol::requests::{
-    AccountReadResponse, ApprovalsReviewer, ClientInfo, InitializeParams, InitializeResponse,
-    ModelListParams, ModelListResponse, PermissionProfileListParams, PermissionProfileListResponse,
+    AccountReadResponse, ApprovalsReviewer, ClientInfo, GatewayOAuthReadResponse,
+    InitializeCapabilities, InitializeParams, InitializeResponse, ModelListParams,
+    ModelListResponse, PermissionProfileListParams, PermissionProfileListResponse,
     PermissionProfileSummary, ThreadReadParams, ThreadReadResponse, ThreadResumeParams,
     ThreadStartParams, ThreadStartResponse, ThreadSummary, empty_params,
 };
@@ -379,13 +380,17 @@ async fn open_thread(
             method::INITIALIZE,
             InitializeParams {
                 client_info: client_info(host.client_info()),
-                capabilities: None,
+                capabilities: Some(InitializeCapabilities {
+                    explicit_gateway_oauth: Some(true),
+                    ..InitializeCapabilities::default()
+                }),
             },
         )
         .await?;
     client.notify(method::INITIALIZED, empty_params()).await?;
 
     require_supported_handshake_version(&handshake)?;
+    require_gateway_ready(client).await?;
 
     let account: AccountReadResponse = client
         .request(method::ACCOUNT_READ, empty_params())
@@ -862,6 +867,12 @@ async fn probe_app_server(
     let connection = match ProbeConnection::open(host, executable).await {
         Ok(connection) => connection,
         Err(error) if error.cleanup_control().is_some() => return Err(error),
+        Err(Error::AuthRequired { login_hint }) => {
+            return Ok(Probed {
+                auth: AuthState::LoggedOut { login_hint },
+                ..Probed::unknown()
+            });
+        }
         Err(_) => return Ok(Probed::unknown()),
     };
 
@@ -933,18 +944,23 @@ impl ProbeConnection {
                 method::INITIALIZE,
                 InitializeParams {
                     client_info: client_info(host.client_info()),
-                    capabilities: None,
+                    capabilities: Some(InitializeCapabilities {
+                        explicit_gateway_oauth: Some(true),
+                        ..InitializeCapabilities::default()
+                    }),
                 },
             )
             .await;
-        let result = match handshake {
-            Ok(handshake) => connection
+        let result = async {
+            let handshake = handshake?;
+            connection
                 .client
                 .notify(method::INITIALIZED, empty_params())
-                .await
-                .and_then(|()| require_supported_handshake_version(&handshake)),
-            Err(error) => Err(error),
-        };
+                .await?;
+            require_supported_handshake_version(&handshake)?;
+            require_gateway_ready(&connection.client).await
+        }
+        .await;
         if let Err(error) = result {
             return match connection.close().await {
                 Ok(()) => Err(error),
@@ -961,6 +977,14 @@ impl ProbeConnection {
             Err(error) => Err(error),
         }
     }
+}
+
+/// A successful read proves support; initialize alone may silently ignore the capability.
+async fn require_gateway_ready(client: &Client) -> Result<()> {
+    let gateway: GatewayOAuthReadResponse = client
+        .request(method::GATEWAY_OAUTH_READ, empty_params())
+        .await?;
+    gateway.require_ready()
 }
 
 fn to_model(model: crate::protocol::requests::Model) -> Model {

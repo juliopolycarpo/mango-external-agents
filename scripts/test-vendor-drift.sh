@@ -97,37 +97,49 @@ test_archive_checksum_verification() {
 }
 
 test_every_pinned_platform_has_a_checksum() {
-  local entry
+  local registry="$repo_root/scripts/vendor-cli-pinned-sha256sums.txt"
+  local workflow="$repo_root/.github/workflows/vendor-drift.yml"
   local vendor
   local version
+  local key
   local target
   local asset
   local digest
-  for entry in \
-    'claude 2.1.270 linux-x64' \
-    'claude 2.1.270 linux-arm64' \
-    'claude 2.1.270 darwin-x64' \
-    'claude 2.1.270 darwin-arm64' \
-    'claude 2.1.270 windows-x64' \
-    'claude 2.1.270 windows-arm64' \
-    'codex 0.154.0 linux-x64' \
-    'codex 0.154.0 linux-arm64' \
-    'codex 0.154.0 darwin-x64' \
-    'codex 0.154.0 darwin-arm64' \
-    'codex 0.154.0 windows-x64' \
-    'codex 0.154.0 windows-arm64' \
-    'opencode 1.18.30 linux-x64' \
-    'opencode 1.18.30 linux-arm64' \
-    'opencode 1.18.30 darwin-x64' \
-    'opencode 1.18.30 darwin-arm64' \
-    'opencode 1.18.30 windows-x64' \
-    'opencode 1.18.30 windows-arm64'; do
-    read -r vendor version target <<EOF
-$entry
-EOF
-    asset=$(asset_name "$vendor" "$target")
-    digest=$(pinned_archive_digest "$vendor" "$version" "$asset")
-    assert_eq "${#digest}" '64' "pinned digest length for $vendor $target"
+
+  python3 - "$registry" <<'PYREGISTRY'
+import re
+import sys
+from pathlib import Path
+
+seen = set()
+for number, line in enumerate(Path(sys.argv[1]).read_text().splitlines(), 1):
+    if not line.strip() or line.lstrip().startswith("#"):
+        continue
+    fields = line.split()
+    assert len(fields) == 4, f"expected four registry fields at line {number}"
+    vendor, version, asset, digest = fields
+    assert vendor in {"claude", "codex", "opencode"}, f"unknown registry vendor at line {number}"
+    assert re.fullmatch(r"[0-9a-f]{64}", digest), f"invalid pinned SHA-256 at line {number}"
+    key = (vendor, version, asset)
+    assert key not in seen, f"duplicate pinned checksum entry at line {number}"
+    seen.add(key)
+PYREGISTRY
+
+  for vendor in claude codex opencode; do
+    case "$vendor" in
+      claude) key='CLAUDE_VERSION:' ;;
+      codex) key='CODEX_VERSION:' ;;
+      opencode) key='OPENCODE_VERSION:' ;;
+    esac
+    version=$(awk -v key="$key" '$1 == key { print $2 }' "$workflow")
+    if [ -z "$version" ]; then
+      fail "expected current $vendor pin in $workflow, received none"
+    fi
+    for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64 windows-x64 windows-arm64; do
+      asset=$(asset_name "$vendor" "$target")
+      digest=$(pinned_archive_digest "$vendor" "$version" "$asset")
+      assert_eq "${#digest}" '64' "pinned digest length for $vendor $version $target"
+    done
   done
 }
 
@@ -183,8 +195,8 @@ test_codex_generator_cleans_up_in_a_standalone_process() {
   export PATH="$fake_bin:$PATH"
   export FAKE_CODEX_SCHEMA="$repo_root/crates/mango-agent-codex/vendor/schema.json"
   "$repo_root/scripts/vendor-codex.sh" 0.154.0 --out "$output" >/dev/null
-  assert_contains "$output/schema.json" '"codexVersion": "0.154.0"' \
-    'standalone Codex inventory output'
+  # This named fake copies the current inventory; its stamp need not match the fake CLI.
+  cmp "$FAKE_CODEX_SCHEMA" "$output/schema.json" || fail 'standalone Codex inventory output'
   unset FAKE_CODEX_SCHEMA
   export PATH="$original_path"
 }
@@ -225,7 +237,21 @@ test_claude_bare_reference() {
   local reference="$test_root/claude-headless.html"
   printf '%s\n' 'Without it, <code>claude -p</code> loads the same context as an interactive session.' > "$reference"
   validate_reference "$reference" >/dev/null
+  printf '%s\n' 'Without it, `claude -p` discovers and loads them as an interactive session would. --bare will become the default for -p in a future release.' > "$reference"
+  validate_reference "$reference" >/dev/null
+  printf '%s\n' 'Without it, <code>claude&nbsp;-p</code>' 'discovers and loads them as an interactive session would.' > "$reference"
+  validate_reference "$reference" >/dev/null
   printf '%s\n' 'bare mode is now the default.' > "$reference"
+  expect_status 1 validate_reference "$reference"
+  printf '%s\n' 'Without it, <code>claude -p</code> loads the same context as an interactive session.' 'Bare mode is now the default.' > "$reference"
+  expect_status 1 validate_reference "$reference"
+  printf '%s\n' '<script>Without it, <code>claude -p</code> loads the same context.</script>' '<style>Without it, claude -p discovers and loads them as an interactive session would.</style>' > "$reference"
+  expect_status 1 validate_reference "$reference"
+  printf '%s\n' '<pre>Without it, <code>claude -p</code> loads the same context.</pre>' > "$reference"
+  expect_status 1 validate_reference "$reference"
+  printf '%s\n' '```text' 'Without it, <code>claude -p</code> loads the same context.' '```' > "$reference"
+  expect_status 1 validate_reference "$reference"
+  printf '%s\n' 'The opt-in guarantee has unknown replacement wording.' > "$reference"
   expect_status 1 validate_reference "$reference"
   expect_status 2 validate_reference "$reference/missing"
 }

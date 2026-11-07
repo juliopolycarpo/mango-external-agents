@@ -345,12 +345,26 @@ struct Recorder {
 impl Recorder {
     async fn run(&mut self, scenario: &Scenario) -> Result<()> {
         self.send(json!({"id": 0, "method": "initialize", "params": {
-            "clientInfo": {"name": "mea", "title": "mea capture", "version": "0.1.0"}
+            "clientInfo": {"name": "mea", "title": "mea capture", "version": "0.1.0"},
+            "capabilities": {"explicitGatewayOauth": true}
         }}))
         .await?;
         self.read_until(|frame| frame.get("id") == Some(&json!(0)))
             .await?;
         self.send(json!({"method": "initialized"})).await?;
+
+        self.send(json!({"id": 100, "method": "account/gatewayOAuth/read", "params": {}}))
+            .await?;
+        let gateway = self
+            .read_until(|frame| frame.get("id") == Some(&json!(100)))
+            .await?;
+        let readiness: mango_agent_codex::protocol::requests::GatewayOAuthReadResponse =
+            serde_json::from_value(gateway.get("result").cloned().unwrap_or(Value::Null))
+                .map_err(|_| Error::Protocol {
+                    expected: String::from("a successful gateway readiness result with boolean required and optional status"),
+                    received: String::from("unsupported, failed or malformed account/gatewayOAuth/read response"),
+                })?;
+        readiness.require_ready()?;
 
         // Every scenario reads the account, because every session the harness opens does: it is
         // how a signed-out CLI is refused before a turn is started. A fixture without it would be
@@ -719,8 +733,68 @@ mod tests {
             let (Some(_), Some(id)) = (frame.get("method"), frame.get("id")) else {
                 return Vec::new();
             };
+            if frame["method"] == "account/gatewayOAuth/read" {
+                return vec![
+                    json!({"id": id, "result": {"required": false, "status": null}}).to_string(),
+                ];
+            }
             vec![json!({"id": id, "result": {"thread": {"id": "thread-1"}}}).to_string()]
         })
+    }
+
+    /// A scripted gateway rejection; any later request would be visible in the launcher's log.
+    fn gateway_rejecting_server(reply: Value) -> FakeProcess {
+        FakeProcess::responding(move |line| {
+            let frame: Value = serde_json::from_str(line).expect("capture request");
+            let Some(id) = frame.get("id") else {
+                return Vec::new();
+            };
+            let mut answer = if frame["method"] == "account/gatewayOAuth/read" {
+                reply.clone()
+            } else {
+                json!({"result": {}})
+            };
+            answer["id"] = id.clone();
+            vec![answer.to_string()]
+        })
+    }
+
+    #[tokio::test]
+    async fn capture_refuses_gateway_failures_before_account_or_thread_requests() {
+        for reply in [
+            json!({"error": {"code": -32601, "message": "private-error-canary"}}),
+            json!({"result": {}}),
+            json!({"result": {"required": true, "status": "notReady"}}),
+            json!({"result": {"required": true, "status": "futureStatus"}}),
+        ] {
+            let launcher = Arc::new(FakeLauncher::new());
+            launcher.push(gateway_rejecting_server(reply));
+            let error = record(
+                &host(launcher.clone()),
+                &SCENARIOS[0],
+                &std::env::temp_dir(),
+                None,
+            )
+            .await
+            .expect_err("gateway must block capture");
+            assert!(!format!("{error:?}").contains("canary"));
+            let frames: Vec<Value> = launcher
+                .written()
+                .iter()
+                .map(|line| serde_json::from_str(line).expect("capture frame"))
+                .collect();
+            assert_eq!(
+                frames[0]["params"]["capabilities"]["explicitGatewayOauth"],
+                true
+            );
+            assert_eq!(
+                frames.len(),
+                3,
+                "initialize, initialized, readiness only: {frames:?}"
+            );
+            assert_eq!(frames[2]["method"], "account/gatewayOAuth/read");
+            assert_eq!(launcher.live_children(), 0);
+        }
     }
 
     /// Mechanical replies for scenario-selection tests, not a vendor transcript.
@@ -736,6 +810,11 @@ mod tests {
             let (Some(method), Some(id)) = (frame["method"].as_str(), frame.get("id")) else {
                 return Vec::new();
             };
+            if method == "account/gatewayOAuth/read" {
+                return vec![
+                    json!({"id": id, "result": {"required": false, "status": null}}).to_string(),
+                ];
+            }
             let response = json!({"id": id, "result": {
                 "thread": {"id": "parent-thread"}, "turn": {"id": "turn"}
             }});
@@ -760,6 +839,12 @@ mod tests {
                 return Vec::new();
             };
             if method != "turn/start" {
+                if method == "account/gatewayOAuth/read" {
+                    return vec![
+                        json!({"id": id, "result": {"required": false, "status": null}})
+                            .to_string(),
+                    ];
+                }
                 return vec![
                     json!({"id": id, "result": {"thread": {"id": "parent-thread"}}}).to_string(),
                 ];
@@ -1052,6 +1137,7 @@ mod tests {
             let Some(id) = frame.get("id") else { return Vec::new(); };
             let result = match frame["method"].as_str() {
                 Some("initialize") => json!({}),
+                Some("account/gatewayOAuth/read") => json!({"required": false, "status": null}),
                 Some("account/read") => json!({"account": {"type": "chatgpt", "email": "capture-canary@example.invalid"}}),
                 _ => return Vec::new(),
             };

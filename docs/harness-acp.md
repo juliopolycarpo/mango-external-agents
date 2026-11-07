@@ -772,7 +772,7 @@ held back.
 | ------------------------------ | ------------------------------------ | --------------------- | ----------------------------------- |
 | [`cursor`][p-cursor]           | `cursor-agent acp`                   | `cursor-agent login`  | live 2026-09-13; capture 2026-09-19 |
 | [`grok`][p-grok]               | `grok --no-auto-update agent stdio`  | `grok login`          | live 2026-09-13; capture 2026-09-19 |
-| [`opencode`][p-opencode]       | `opencode acp`                       | `opencode auth login` | captured handshake, 2026-09-17      |
+| [`opencode`][p-opencode]       | `opencode acp`                       | `opencode auth login` | captured handshake, 2026-11-07      |
 | [`gemini`][p-gemini]           | `gemini --acp`                       | none; inside `gemini` | none                                |
 | [`copilot`][p-copilot]         | `copilot --acp`                      | `copilot login`       | none                                |
 | [`goose`][p-goose]             | `goose acp --with-builtin developer` | `goose configure`     | none                                |
@@ -821,7 +821,7 @@ Two methods, and they are not degrees of the same thing:
 `cursor` and `grok` carry one of each: the live run that earned verification, and the handshake
 captured on 2026-09-19 under `fixtures/acp/cursor/contract` and
 `fixtures/acp/grok/contract` (see their manifests and `AcpProfile::evidence`), so the capability set they are driven under is a file rather than a memory.
-`opencode` carries the second kind alone and is deliberately **not** verified. Its committed capture
+`opencode` 1.19.5 was recaptured on 2026-11-07. It carries the second kind alone and is deliberately **not** verified. Its committed capture
 is an `initialize` probe whose manifest records `sessionOpened: false`; calling that verified would
 claim a session nobody opened. A profile with no evidence at all is a documented entry nobody has
 run; a host can say so in its own interface, and nothing here pretends otherwise.

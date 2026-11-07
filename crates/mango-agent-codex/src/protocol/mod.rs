@@ -72,6 +72,8 @@ pub mod method {
     pub const MODEL_LIST: &str = "model/list";
     /// Who is signed in, without reading what they signed in with.
     pub const ACCOUNT_READ: &str = "account/read";
+    /// Reads gateway policy and existing credential readiness without starting login.
+    pub const GATEWAY_OAUTH_READ: &str = "account/gatewayOAuth/read";
     /// The account's plan quota.
     pub const ACCOUNT_RATE_LIMITS_READ: &str = "account/rateLimits/read";
     /// The permission profiles this machine's configuration allows.
