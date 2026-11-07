@@ -799,9 +799,11 @@ withdrawal cannot replace the accepted source. The handler selects its audit and
 the same settlement lock: stopping before that selection records and returns a cancelled refusal;
 a choice cleanup already published keeps its matching native reply. A broker result claimed after
 stopping is refused, and a failed host-response send does not accept a choice. Questions retain
-their own outcomes separately and
-grant no authority. This is client-side timing only: it adds no app-server method or wire field
-beyond the existing [documented surface][readme].
+their own outcomes separately through publication and grant no authority. For announced question
+rounds, if the request, withdrawal or cleanup publisher is cancelled, a surviving waiter or terminal
+cleanup publishes the retained outcome once. The waiter's native answer remains independent of
+which path published that outcome. This is client-side timing only: it adds no app-server method or
+wire field beyond the existing [documented surface][readme].
 
 ### Debug output
 

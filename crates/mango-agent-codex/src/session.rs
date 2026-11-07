@@ -268,6 +268,8 @@ pub(crate) struct Shared {
     #[cfg(test)]
     approval_publication_gate: Mutex<Option<Arc<ResolutionMarkerGate>>>,
     #[cfg(test)]
+    question_publication_gate: Mutex<Option<Arc<ResolutionMarkerGate>>>,
+    #[cfg(test)]
     approval_answer_gate: Mutex<Option<Arc<ResolutionMarkerGate>>>,
     #[cfg(test)]
     approval_claim_gate: Mutex<Option<Arc<ResolutionMarkerGate>>>,
@@ -320,6 +322,8 @@ impl Shared {
             approval_settlement_gate: Mutex::new(None),
             #[cfg(test)]
             approval_publication_gate: Mutex::new(None),
+            #[cfg(test)]
+            question_publication_gate: Mutex::new(None),
             #[cfg(test)]
             approval_answer_gate: Mutex::new(None),
             #[cfg(test)]
@@ -1372,19 +1376,9 @@ enum QuestionAnswer {
     /// ends while a round is still open. A plain deadline never sends this:
     /// [`CodexHandler::decide_question`] notices its own expiry locally instead, the same way
     /// [`CodexHandler::refuse_claimed`] does for an approval.
-    Cancelled {
-        /// Whether the caller that settled this round already recorded its audit event.
-        ///
-        /// The same bit [`Answer::Chosen`] carries, for the same reason: the canceller publishes
-        /// the resolution itself so it lands before the turn's terminal, and the waiter it wakes
-        /// must not publish an identical second one.
-        reported: bool,
-    },
+    Cancelled,
     /// The server stopped waiting on its own.
-    ResolvedByTheServer {
-        /// Whether the withdrawing side already closed the host-visible round.
-        reported: bool,
-    },
+    ResolvedByTheServer,
 }
 
 /// The first result while the broker and host race under one approval deadline.
@@ -1651,6 +1645,10 @@ impl Shared {
 
     /// Puts one event on the stream that still belongs to this start attempt.
     async fn emit_for(&self, route: &ActiveTurnRoute, kind: EventKind) -> Result<()> {
+        #[cfg(test)]
+        if matches!(&kind, EventKind::QuestionResolved { .. }) {
+            self.wait_for_question_publication_gate().await;
+        }
         let mut turn = self.turn.lock().await;
         let Some(active) = turn
             .as_mut()
@@ -2100,38 +2098,38 @@ impl Shared {
 
     /// Settles question rounds while the caller already holds [`Shared::interaction_settlements`].
     async fn release_pending_questions_for_locked(&self, owner: Option<&Arc<()>>) {
-        let waiting = {
-            let mut pending = self.pending_questions.lock().await;
-            let matching: Vec<InteractionId> = pending
-                .iter()
-                .filter(|(_, entry)| {
-                    owner.is_none_or(|owner| Arc::ptr_eq(&entry.route.owner, owner))
-                })
-                .map(|(id, _)| id.clone())
-                .collect();
-            matching
-                .into_iter()
-                .filter_map(|id| pending.remove(&id))
-                .collect::<Vec<_>>()
-        };
-        self.signal_idle_change();
-        for entry in waiting {
-            let outcome = entry.settlement.unwrap_or(QuestionOutcome::Cancelled);
-            if let Some(answer) = entry.answer {
-                let _ = answer.send(QuestionAnswer::Cancelled { reported: true });
+        let mut pending = self.pending_questions.lock().await;
+        let matching: Vec<_> = pending
+            .iter()
+            .filter(|(_, entry)| owner.is_none_or(|owner| Arc::ptr_eq(&entry.route.owner, owner)))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in matching {
+            let entry = pending.get_mut(&id).expect("selected under the same lock");
+            let outcome = entry
+                .settlement
+                .get_or_insert(QuestionOutcome::Cancelled)
+                .clone();
+            if let Some(answer) = entry.answer.take() {
+                let _ = answer.send(QuestionAnswer::Cancelled);
             }
             if entry.announced {
                 let _ = self
                     .emit_for(
                         &entry.route,
                         EventKind::QuestionResolved {
-                            interaction_id: entry.request.interaction.id.clone(),
+                            interaction_id: id.clone(),
                             outcome,
                         },
                     )
                     .await;
             }
+            // A cancelled publication keeps the retained entry; a committed one retires it
+            // synchronously, before another settler can acquire the interaction lock.
+            pending.remove(&id);
         }
+        drop(pending);
+        self.signal_idle_change();
     }
 
     /// Remembers an answer only until Codex confirms the server request ended.
@@ -2225,6 +2223,15 @@ impl Shared {
     /// Holds a broker/deadline claim after deliberation but before claiming an answer slot.
     async fn wait_for_approval_claim_gate(&self) {
         let gate = self.approval_claim_gate.lock().await.clone();
+        if let Some(gate) = gate {
+            gate.wait_for_release().await;
+        }
+    }
+
+    #[cfg(test)]
+    /// Pauses one question publication so cancellation leaves subsequent cleanup unblocked.
+    async fn wait_for_question_publication_gate(&self) {
+        let gate = self.question_publication_gate.lock().await.take();
         if let Some(gate) = gate {
             gate.wait_for_release().await;
         }
@@ -3444,86 +3451,50 @@ impl CodexHandler {
         #[cfg(test)]
         self.shared.wait_for_question_settlement_gate().await;
 
-        // Serialise this removal and publication with terminal cleanup. Once either side takes
-        // the entry, it also puts its resolution on the stream before the terminal can claim it.
+        // The wire result belongs to the waiter even if cleanup already published its audit.
+        let (wire, outcome) = match settled {
+            Some(QuestionAnswer::Answered(response)) => (
+                Some(to_wire_answers(&response)),
+                QuestionOutcome::Answered {
+                    answers: response.answers,
+                },
+            ),
+            Some(QuestionAnswer::Expired) => (
+                Some(ToolRequestUserInputResponse::none()),
+                QuestionOutcome::Expired,
+            ),
+            Some(QuestionAnswer::Cancelled) => (
+                Some(ToolRequestUserInputResponse::none()),
+                QuestionOutcome::Cancelled,
+            ),
+            Some(QuestionAnswer::ResolvedByTheServer) => (None, QuestionOutcome::Cancelled),
+            None => (
+                Some(ToolRequestUserInputResponse::none()),
+                if self.shared.host.cancel().is_cancelled() {
+                    QuestionOutcome::Cancelled
+                } else {
+                    QuestionOutcome::Expired
+                },
+            ),
+        };
         let _settlement = self.shared.interaction_settlements.lock().await;
-        let removed = self
-            .shared
-            .pending_questions
-            .lock()
-            .await
-            .remove(&request_id);
-        if removed
-            .as_ref()
-            .is_some_and(|entry| !Arc::ptr_eq(&entry.route.owner, &route.owner))
-        {
-            if let Some(entry) = removed {
-                self.shared
-                    .pending_questions
-                    .lock()
-                    .await
-                    .insert(request_id.clone(), entry);
+        let mut pending = self.shared.pending_questions.lock().await;
+        if let Some(entry) = pending.get_mut(&request_id) {
+            if !Arc::ptr_eq(&entry.route.owner, &route.owner) {
+                return None;
             }
-            return None;
+            // The map is the publication owner, including after interrupted cleanup woke this
+            // waiter. Keep the accepted outcome until publication returns, then remove it with
+            // no intervening await; an absent entry means another path already published it.
+            let outcome = entry.settlement.get_or_insert(outcome).clone();
+            if entry.announced {
+                self.question_resolved(&route, &request_id, outcome).await;
+            }
+            pending.remove(&request_id);
         }
-
-        match settled {
-            Some(QuestionAnswer::Answered(response)) => {
-                if removed.is_some() {
-                    self.question_resolved(
-                        &route,
-                        &request_id,
-                        QuestionOutcome::Answered {
-                            answers: response.answers.clone(),
-                        },
-                    )
-                    .await;
-                }
-                Some(to_wire_answers(&response))
-            }
-            Some(QuestionAnswer::Expired) => {
-                if removed.is_some() {
-                    self.question_resolved(&route, &request_id, QuestionOutcome::Expired)
-                        .await;
-                }
-                Some(ToolRequestUserInputResponse::none())
-            }
-            Some(QuestionAnswer::Cancelled { reported }) => {
-                if !reported {
-                    self.question_resolved(&route, &request_id, QuestionOutcome::Cancelled)
-                        .await;
-                }
-                Some(ToolRequestUserInputResponse::none())
-            }
-            Some(QuestionAnswer::ResolvedByTheServer { reported }) => {
-                if !reported {
-                    self.question_resolved(&route, &request_id, QuestionOutcome::Cancelled)
-                        .await;
-                }
-                None
-            }
-            None => {
-                // Nobody answered: the oneshot was not ready when the shared deadline elapsed or
-                // the host started going away. `select!` above is biased toward `waiting`, so a
-                // value that had already landed on the oneshot — an answer, or the `Cancelled`
-                // that `release_pending_for` sends ahead of a shutdown — would have won that arm
-                // instead; its `reported` bit is what keeps that path from publishing twice.
-                //
-                // Reported only by the waiter that still owned the round: an empty slot means
-                // somebody else already took this round and published for it. A round the host
-                // answered in the same window is likewise not this task's to report — saying
-                // nothing is better than publishing `Cancelled` over an answer that landed.
-                if removed.is_some() {
-                    let outcome = if self.shared.host.cancel().is_cancelled() {
-                        QuestionOutcome::Cancelled
-                    } else {
-                        QuestionOutcome::Expired
-                    };
-                    self.question_resolved(&route, &request_id, outcome).await;
-                }
-                Some(ToolRequestUserInputResponse::none())
-            }
-        }
+        drop(pending);
+        self.shared.signal_idle_change();
+        wire
     }
 
     async fn question_resolved(
@@ -3566,7 +3537,7 @@ impl CodexHandler {
             }
         }
 
-        let question_entry = {
+        {
             let mut pending = self.shared.pending_questions.lock().await;
             let id = pending
                 .iter()
@@ -3575,22 +3546,24 @@ impl CodexHandler {
                         && Arc::ptr_eq(&entry.route.owner, &route.owner)
                 })
                 .map(|(id, _)| id.clone());
-            id.and_then(|id| pending.remove(&id))
-        };
-        if let Some(entry) = question_entry {
-            if entry.announced {
-                let outcome = entry.settlement.unwrap_or(QuestionOutcome::Cancelled);
-                self.question_resolved(&entry.route, &entry.request.interaction.id, outcome)
-                    .await;
+            if let Some(id) = id {
+                let entry = pending.get_mut(&id).expect("selected under the same lock");
+                let outcome = entry
+                    .settlement
+                    .get_or_insert(QuestionOutcome::Cancelled)
+                    .clone();
+                if let Some(answer) = entry.answer.take() {
+                    let _ = answer.send(QuestionAnswer::ResolvedByTheServer);
+                }
+                if entry.announced {
+                    self.question_resolved(&entry.route, &id, outcome).await;
+                }
+                pending.remove(&id);
+                drop(pending);
+                drop(question_settlement);
+                self.shared.signal_idle_change();
+                return true;
             }
-            if let Some(answer) = entry.answer {
-                let _ = answer.send(QuestionAnswer::ResolvedByTheServer {
-                    reported: entry.announced,
-                });
-            }
-            drop(question_settlement);
-            self.shared.signal_idle_change();
-            return true;
         }
         drop(question_settlement);
 
@@ -6000,16 +5973,9 @@ mod tests {
 
     /// A shutdown that empties the round before the waiter is polled resolves it once.
     ///
-    /// `release_pending_for` sends `QuestionAnswer::Cancelled { reported: true }` on the pending
-    /// entry's oneshot before this waiter can be polled again, so once the schedule below forces
-    /// that ordering the waiting task's `select!` — biased toward `waiting`, not the cancel token
-    /// — takes the oneshot's `Cancelled` arm rather than the nobody-answered `None` arm. The
-    /// `reported` bit is what keeps that arm from publishing a second time: the canceller already
-    /// reported for this round, so the waiter reports nothing.
-    ///
-    /// The schedule is forced rather than hoped for. `release_pending_for` empties the map before
-    /// its first real yield, so on a current-thread runtime the waiting task cannot be polled in
-    /// between, and the losing order is the one this test always runs.
+    /// `release_pending_for` wakes the waiter with `QuestionAnswer::Cancelled` before the waiter
+    /// can poll again. The retained pending entry owns publication; its absence tells the waiter
+    /// that cleanup already published the outcome and prevents a duplicate resolution.
     #[tokio::test]
     async fn a_shutdown_that_empties_the_round_first_resolves_it_exactly_once() {
         let shared = shared();
@@ -6914,6 +6880,289 @@ mod tests {
         assert!(stream.recv().await.is_none());
         assert!(shared.pending.lock().await.is_empty());
     }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum QuestionAbortSource {
+        Host,
+        Expiry,
+        Withdrawal,
+        Cleanup,
+    }
+
+    /// Cancels an actual publisher after it owns an outcome and before it can publish it.
+    async fn question_publication_abort(source: QuestionAbortSource, end: ApprovalRaceEnd) {
+        use mango_external_agents::{
+            Answer as CoreAnswer, AnswerValue, QuestionId, QuestionOutcome, QuestionResponse,
+        };
+        let host = HostContext::builder()
+            .launcher(Arc::new(FakeLauncher::new()))
+            .cwd("/workspace")
+            .client_info("question-publication", "0.0.0")
+            .limits(Limits {
+                approval_timeout: if source == QuestionAbortSource::Expiry {
+                    std::time::Duration::from_secs(1)
+                } else {
+                    std::time::Duration::from_secs(60)
+                },
+                ..Limits::default()
+            })
+            .build()
+            .expect("host");
+        let shared = Arc::new(Shared::new(
+            host,
+            mango_external_agents::SessionId::new("chat-1"),
+        ));
+        shared.adopt_thread(String::from("thread-1"));
+        let (_, mut stream) = running(&shared, "vendor-turn-1").await;
+        let gate = ResolutionMarkerGate::closed();
+        *shared.question_publication_gate.lock().await = Some(Arc::clone(&gate));
+        let request_shared = Arc::clone(&shared);
+        let mut request = tokio::spawn(async move {
+            CodexHandler { shared: request_shared }.on_request(
+                String::from("item/tool/requestUserInput"),
+                serde_json::json!({"threadId":"thread-1","turnId":"vendor-turn-1","itemId":"ask-1",
+                    "isBlocking":false,"questions":[{"id":"note","header":"Note","question":"Anything else?"}]}),
+                mango_external_agents::jsonrpc::RequestId::new(serde_json::json!(1)),
+            ).await
+        });
+        let asked = tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv())
+            .await
+            .expect("bounded announced question")
+            .expect("announced question");
+        assert!(
+            matches!(asked.kind, EventKind::QuestionAsked { .. }),
+            "expected question, received {:?}",
+            asked.kind
+        );
+        let response = QuestionResponse::new(
+            mango_external_agents::InteractionId::new("ask-1"),
+            vec![CoreAnswer::new(
+                QuestionId::new("note"),
+                AnswerValue::text("keep this answer"),
+            )],
+        );
+        let expected = match source {
+            QuestionAbortSource::Host => QuestionOutcome::Answered {
+                answers: response.answers.clone(),
+            },
+            QuestionAbortSource::Expiry => QuestionOutcome::Expired,
+            _ => QuestionOutcome::Cancelled,
+        };
+        let session = if source == QuestionAbortSource::Host {
+            let session = question_session(Arc::clone(&shared)).await;
+            session
+                .answer(response)
+                .await
+                .expect("public answer accepted");
+            Some(session)
+        } else {
+            None
+        };
+        if source == QuestionAbortSource::Expiry {
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        }
+        let publisher_shared = Arc::clone(&shared);
+        let publisher = match source {
+            QuestionAbortSource::Withdrawal => Some(tokio::spawn(async move {
+                CodexHandler {
+                    shared: publisher_shared,
+                }
+                .on_notification(
+                    String::from("serverRequest/resolved"),
+                    serde_json::json!({"threadId":"thread-1","requestId":1}),
+                )
+                .await;
+            })),
+            QuestionAbortSource::Cleanup => Some(tokio::spawn(async move {
+                publisher_shared
+                    .release_pending_for(None, mango_external_agents::DecisionSource::Cancelled)
+                    .await;
+            })),
+            _ => None,
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_until_entered())
+            .await
+            .expect("publisher reaches the actual publication boundary");
+        let keep_request = if let Some(publisher) = publisher {
+            publisher.abort();
+            let error = tokio::time::timeout(std::time::Duration::from_secs(5), publisher)
+                .await
+                .expect("bounded publisher abort")
+                .expect_err("publisher cancelled");
+            assert!(error.is_cancelled());
+            true
+        } else {
+            request.abort();
+            let error = tokio::time::timeout(std::time::Duration::from_secs(5), &mut request)
+                .await
+                .expect("bounded request abort")
+                .expect_err("request cancelled");
+            assert!(error.is_cancelled());
+            false
+        };
+        let status = match end {
+            ApprovalRaceEnd::Complete => "completed",
+            ApprovalRaceEnd::Cancel => "interrupted",
+            ApprovalRaceEnd::Fail => "failed",
+        };
+        let mut turn = serde_json::json!({"id":"vendor-turn-1","status":status});
+        if matches!(end, ApprovalRaceEnd::Fail) {
+            turn["error"] = serde_json::json!({"message":"synthetic failure","codexErrorInfo":null,"additionalDetails":null});
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            CodexHandler {
+                shared: Arc::clone(&shared),
+            }
+            .on_notification(
+                String::from("turn/completed"),
+                serde_json::json!({"threadId":"thread-1","turn":turn}),
+            ),
+        )
+        .await
+        .expect("terminal cleanup does not depend on the aborted publisher");
+        let wire = if keep_request {
+            Some(
+                tokio::time::timeout(std::time::Duration::from_secs(5), request)
+                    .await
+                    .expect("bounded question handler")
+                    .expect("question task"),
+            )
+        } else {
+            None
+        };
+        let events = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut events = Vec::new();
+            while let Some(event) = stream.recv().await {
+                events.push(event.kind);
+            }
+            events
+        })
+        .await
+        .expect("bounded terminal stream");
+        let terminal_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    EventKind::Completed | EventKind::Cancelled { .. } | EventKind::Error { .. }
+                )
+            })
+            .expect("terminal");
+        assert!(
+            match end {
+                ApprovalRaceEnd::Complete => matches!(events[terminal_index], EventKind::Completed),
+                ApprovalRaceEnd::Cancel =>
+                    matches!(events[terminal_index], EventKind::Cancelled { .. }),
+                ApprovalRaceEnd::Fail => matches!(events[terminal_index], EventKind::Error { .. }),
+            },
+            "expected selected terminal {end:?}, received {events:?}"
+        );
+        let resolved: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                EventKind::QuestionResolved {
+                    interaction_id,
+                    outcome,
+                } => Some((index, interaction_id, outcome)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            resolved.len(),
+            1,
+            "question outcome must survive cancelled publication exactly once before terminal; {source:?}/{end:?}: {events:?}"
+        );
+        assert!(resolved[0].0 < terminal_index);
+        assert_eq!(resolved[0].1.as_str(), "ask-1");
+        assert_eq!(
+            resolved[0].2, &expected,
+            "accepted question outcome survives cancellation"
+        );
+        if let Some(wire) = wire {
+            let mango_external_agents::jsonrpc::ServerRequestOutcome::Answer(wire) = wire else {
+                panic!("expected native answer, received {wire:?}");
+            };
+            let expected_wire = if source == QuestionAbortSource::Withdrawal {
+                serde_json::json!({})
+            } else {
+                serde_json::json!({"answers":{}})
+            };
+            assert_eq!(wire, expected_wire);
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, EventKind::Completed))
+                .count(),
+            if matches!(end, ApprovalRaceEnd::Fail) {
+                0
+            } else {
+                1
+            }
+        );
+        assert!(shared.pending_questions.lock().await.is_empty());
+        drop(session);
+    }
+
+    macro_rules! question_abort_test {
+        ($name:ident, $source:ident, $end:ident) => {
+            #[tokio::test(start_paused = true)]
+            async fn $name() {
+                question_publication_abort(QuestionAbortSource::$source, ApprovalRaceEnd::$end)
+                    .await;
+            }
+        };
+    }
+    question_abort_test!(
+        question_publication_abort_host_before_complete,
+        Host,
+        Complete
+    );
+    question_abort_test!(question_publication_abort_host_before_cancel, Host, Cancel);
+    question_abort_test!(question_publication_abort_host_before_fail, Host, Fail);
+    question_abort_test!(
+        question_publication_abort_expiry_before_complete,
+        Expiry,
+        Complete
+    );
+    question_abort_test!(
+        question_publication_abort_expiry_before_cancel,
+        Expiry,
+        Cancel
+    );
+    question_abort_test!(question_publication_abort_expiry_before_fail, Expiry, Fail);
+    question_abort_test!(
+        question_publication_abort_withdrawal_before_complete,
+        Withdrawal,
+        Complete
+    );
+    question_abort_test!(
+        question_publication_abort_withdrawal_before_cancel,
+        Withdrawal,
+        Cancel
+    );
+    question_abort_test!(
+        question_publication_abort_withdrawal_before_fail,
+        Withdrawal,
+        Fail
+    );
+    question_abort_test!(
+        question_publication_abort_cleanup_before_complete,
+        Cleanup,
+        Complete
+    );
+    question_abort_test!(
+        question_publication_abort_cleanup_before_cancel,
+        Cleanup,
+        Cancel
+    );
+    question_abort_test!(
+        question_publication_abort_cleanup_before_fail,
+        Cleanup,
+        Fail
+    );
 
     /// A terminal cannot overtake the resolution of an answer [`Session::answer`] accepted.
     #[tokio::test]
