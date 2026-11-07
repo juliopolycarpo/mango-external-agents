@@ -519,11 +519,14 @@ control and names the launched pid for manual reconciliation
 (or says that the injected control has no pid). It does not repeat a one-stop request or claim
 that an unconfirmed process is gone. A CLI diagnostic is not a Rust control handoff to another host.
 
-The transcript recorder owns a `ProcessCleanupGuard` from transport acquisition. Its stop uses the
-host's limits, and dropping the capture future starts the bounded cleanup worker while its runtime
-remains alive. Failed cleanup returns `CleanupRequired` with the injected control. A requested
-partial diagnostic remains marked unqualified even when the conversation finished and only cleanup
-failed; it does not become a replay fixture.
+Transcript recording, public command probes and ACP contract initialization own a
+`ProcessCleanupGuard` from transport acquisition. Their stops use the host's limits, and dropping a
+capture future starts the bounded cleanup worker while its runtime remains alive. Failed cleanup
+returns `CleanupRequired` with the injected control. Leader exit alone does not qualify public
+command output; process-tree cleanup must also succeed. A requested transcript diagnostic retains
+the caller's prefix and gains `# incomplete capture`, even when the conversation finished and only
+cleanup failed. It does not become a replay fixture. The separate `# unqualified capture` header
+marks a completed recording that failed its scenario checks.
 
 On Windows, `TokioLauncher` also resolves installed `.ps1` entrypoints when native executable
 resolution fails. It searches only the supplied `PATH`, runs Windows PowerShell from the supplied

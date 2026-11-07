@@ -715,7 +715,7 @@ mod tests {
         unconfigured_turn_params,
     };
     use mango_external_agents::process::{
-        LaunchSpec, ManagedProcess, ProcessControl, ProcessLauncher,
+        ByteSource, LaunchSpec, ManagedProcess, ProcessControl, ProcessLauncher,
     };
     use mango_external_agents::testing::{FakeLauncher, FakeProcess};
     use mango_external_agents::{
@@ -923,7 +923,10 @@ mod tests {
         capture_host_with_limits(launcher, Limits::default())
     }
 
-    fn capture_host_with_limits(launcher: Arc<dyn ProcessLauncher>, limits: Limits) -> HostContext {
+    pub(super) fn capture_host_with_limits(
+        launcher: Arc<dyn ProcessLauncher>,
+        limits: Limits,
+    ) -> HostContext {
         HostContext::builder()
             .launcher(launcher)
             .limits(limits)
@@ -948,31 +951,37 @@ mod tests {
     }
 
     #[derive(Clone)]
-    enum CaptureStop {
+    pub(super) enum CaptureStop {
         Refuse(Error),
         Hold,
         End,
     }
 
     /// A capture-owned child whose stop and recovery identity the test can inspect.
-    struct CaptureCleanupLauncher {
-        inner: Arc<FakeLauncher>,
+    pub(super) struct CaptureCleanupLauncher {
+        pub(super) inner: Arc<FakeLauncher>,
+        pub(super) reads: Arc<tokio::sync::Notify>,
         stop: CaptureStop,
         control: Mutex<Option<Arc<CaptureCleanupControl>>>,
     }
 
     impl CaptureCleanupLauncher {
         fn new(stop: CaptureStop) -> Arc<Self> {
+            Self::with_process(stop, app_server())
+        }
+
+        pub(super) fn with_process(stop: CaptureStop, process: FakeProcess) -> Arc<Self> {
             let inner = Arc::new(FakeLauncher::new());
-            inner.push(app_server());
+            inner.push(process);
             Arc::new(Self {
                 inner,
+                reads: Arc::new(tokio::sync::Notify::new()),
                 stop,
                 control: Mutex::new(None),
             })
         }
 
-        fn control(&self) -> Arc<CaptureCleanupControl> {
+        pub(super) fn control(&self) -> Arc<CaptureCleanupControl> {
             self.control
                 .lock()
                 .expect("control ledger")
@@ -986,6 +995,10 @@ mod tests {
     impl ProcessLauncher for CaptureCleanupLauncher {
         async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
             let mut child = self.inner.spawn(spec).await?;
+            child.stdout = Box::new(CaptureReadObservation {
+                inner: child.stdout,
+                reads: self.reads.clone(),
+            });
             let control = Arc::new(CaptureCleanupControl {
                 inner: child.control,
                 stop: self.stop.clone(),
@@ -998,11 +1011,24 @@ mod tests {
         }
     }
 
-    struct CaptureCleanupControl {
-        inner: Arc<dyn ProcessControl>,
+    struct CaptureReadObservation {
+        inner: Box<dyn ByteSource>,
+        reads: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl ByteSource for CaptureReadObservation {
+        async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+            self.reads.notify_one();
+            self.inner.next_chunk().await
+        }
+    }
+
+    pub(super) struct CaptureCleanupControl {
+        pub(super) inner: Arc<dyn ProcessControl>,
         stop: CaptureStop,
-        calls: AtomicUsize,
-        finished: tokio::sync::Notify,
+        pub(super) calls: AtomicUsize,
+        pub(super) finished: tokio::sync::Notify,
     }
 
     #[async_trait::async_trait]
