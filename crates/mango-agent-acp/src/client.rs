@@ -1458,8 +1458,8 @@ async fn on_request_permission(
     );
     let question = match question.normalized() {
         Ok(question) => question,
-        // A question nobody could render — no options, or an id that cannot survive bounding — is
-        // withdrawn on its own rather than ending the turn it belongs to.
+        // A question the core refuses to normalize is withdrawn on its own rather than ending
+        // the turn it belongs to.
         Err(_) => return reply.respond(permission::cancelled()),
     };
 
