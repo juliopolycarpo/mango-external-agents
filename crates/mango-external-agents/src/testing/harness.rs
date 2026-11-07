@@ -30,9 +30,8 @@ use crate::interaction::{
 };
 use crate::operation::OperationRef;
 use crate::permission::{
-    ApprovalDecision, ConfigurationVerdict, DecisionSource, PermissionEffect, PermissionMatrix,
-    PermissionOption, PermissionRequest, PermissionResponse, PermissionRisk, PermissionScope,
-    broker_response,
+    ApprovalDecision, ConfigurationVerdict, PermissionEffect, PermissionMatrix, PermissionOption,
+    PermissionRequest, PermissionResponse, PermissionRisk, PermissionScope, broker_response,
 };
 use crate::session::{
     CancelReason, CloseReason, OpenSession, Session, SessionIds, Steer, SteerOutcome, TurnRequest,
@@ -415,10 +414,11 @@ async fn close_open_interactions(turn: &PendingTurn) {
 fn approval_request(
     operation: OperationRef,
     expires_at: std::time::SystemTime,
+    turn: u64,
 ) -> PermissionRequest {
     PermissionRequest::new(
         Interaction::new(
-            InteractionId::new("fake-approval-1"),
+            InteractionId::new(format!("fake-approval-{turn}")),
             InteractionKind::Permission,
             operation.session_id.clone(),
             expires_at,
@@ -443,10 +443,14 @@ fn approval_request(
     .with_detail("cargo test --workspace")
 }
 
-fn question_request(operation: OperationRef, expires_at: std::time::SystemTime) -> QuestionRequest {
+fn question_request(
+    operation: OperationRef,
+    expires_at: std::time::SystemTime,
+    turn: u64,
+) -> QuestionRequest {
     QuestionRequest::new(
         Interaction::new(
-            InteractionId::new("fake-question-1"),
+            InteractionId::new(format!("fake-question-{turn}")),
             InteractionKind::Question,
             operation.session_id.clone(),
             expires_at,
@@ -486,8 +490,7 @@ fn question_request(operation: OperationRef, expires_at: std::time::SystemTime) 
 impl FakeSession {
     async fn finish(
         &self,
-        option_id: &str,
-        source: DecisionSource,
+        response: PermissionResponse,
         owner: Option<&OperationRef>,
     ) -> Result<()> {
         let mut pending = self.pending.lock().await;
@@ -498,9 +501,24 @@ impl FakeSession {
         }) {
             return Ok(());
         }
+        if let Some(turn) = pending.as_ref() {
+            let request = turn.approval.as_ref().ok_or_else(|| Error::Protocol {
+                expected: String::from("an outstanding approval"),
+                received: String::from("a pending question"),
+            })?;
+            if request.interaction.id != response.interaction_id {
+                return Err(Error::Protocol {
+                    expected: String::from("the outstanding approval interaction"),
+                    received: String::from("a different interaction"),
+                });
+            }
+            request.respond(&response.option_id, response.source)?;
+        }
         let Some(turn) = pending.take() else {
             return Ok(());
         };
+        let option_id = response.option_id.as_str();
+        let source = response.source;
         let decision = turn
             .approval
             .as_ref()
@@ -512,10 +530,7 @@ impl FakeSession {
                     .map(|option| ApprovalDecision::from_option(option, source))
             })
             .unwrap_or_else(|| ApprovalDecision::unresolved(option_id, source));
-        let interaction_id = turn.approval.map_or_else(
-            || InteractionId::new("fake-approval-1"),
-            |request| request.interaction.id,
-        );
+        let interaction_id = response.interaction_id;
         turn.sink
             .emit(EventKind::ApprovalResolved {
                 interaction_id,
@@ -710,7 +725,8 @@ impl Session for FakeSession {
         let operation = sink.operation();
 
         if self.asks_a_question {
-            let question = question_request(operation, self.host.now() + Duration::from_secs(300));
+            let question =
+                question_request(operation, self.host.now() + Duration::from_secs(300), turn);
             *pending = Some(PendingTurn {
                 sink: sink.clone(),
                 approval: None,
@@ -739,6 +755,7 @@ impl Session for FakeSession {
         let request_for_approval = approval_request(
             operation.clone(),
             self.host.now() + Duration::from_secs(300),
+            turn,
         );
         *pending = Some(PendingTurn {
             sink: sink.clone(),
@@ -757,8 +774,7 @@ impl Session for FakeSession {
         })
         .await?;
         if let Some(response) = answer {
-            self.finish(&response.option_id, response.source, Some(&operation))
-                .await?;
+            self.finish(response, Some(&operation)).await?;
         }
 
         Ok(stream())
@@ -772,8 +788,7 @@ impl Session for FakeSession {
                 "this harness would not take the answer",
             )));
         }
-        self.finish(&response.option_id, response.source, None)
-            .await
+        self.finish(response, None).await
     }
 
     async fn answer(&self, response: QuestionResponse) -> Result<()> {
@@ -1102,6 +1117,341 @@ mod tests {
             panic!("expected an answered outcome, received {resolved:?}");
         };
         assert_eq!(answers.len(), 2);
+    }
+
+    /// Invalid approval routing must leave the same turn available for a corrected response.
+    #[tokio::test]
+    async fn invalid_approval_answers_leave_the_original_request_pending() {
+        for wrong_id in [true, false] {
+            let session = FakeHarness::new()
+                .open_session(&host(), OpenSession::new("chat"))
+                .await
+                .expect("session");
+            let mut turn = session
+                .start_turn(TurnRequest::new("turn", "work"))
+                .await
+                .expect("turn");
+            let request = loop {
+                if let EventKind::ApprovalRequested { request } =
+                    turn.recv().await.expect("approval").kind
+                {
+                    break request;
+                }
+            };
+            let mut invalid = request.allow().expect("allow");
+            if wrong_id {
+                invalid.interaction_id = crate::InteractionId::new("different-request");
+            } else {
+                invalid.option_id = String::from("not-offered");
+            }
+            let error = session
+                .respond(invalid)
+                .await
+                .expect_err("invalid approval must refuse before consuming pending work");
+            assert!(matches!(error.cause(), crate::Error::Protocol { .. }));
+            session
+                .respond(request.allow().expect("allow"))
+                .await
+                .expect("corrected response");
+            let (resolved, completed) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    let mut resolved = 0;
+                    let mut completed = 0;
+                    while let Some(event) = turn.recv().await {
+                        match event.kind {
+                            EventKind::ApprovalResolved {
+                                interaction_id,
+                                decision,
+                            } => {
+                                assert_eq!(interaction_id, request.interaction.id);
+                                assert_eq!(decision.option_id, "allow");
+                                assert_eq!(decision.effect, crate::PermissionEffect::Allow);
+                                assert_eq!(decision.scope, Some(crate::PermissionScope::Once));
+                                assert_eq!(decision.source, crate::DecisionSource::User);
+                                assert!(!decision.policy_changing);
+                                resolved += 1;
+                            }
+                            EventKind::Completed => completed += 1,
+                            _ => {}
+                        }
+                    }
+                    (resolved, completed)
+                })
+                .await
+                .expect("corrected response must settle the original approval and turn");
+            assert_eq!((resolved, completed), (1, 1));
+        }
+    }
+
+    /// Exercise both the capability refusal and the pending-question guard inside `finish`.
+    #[tokio::test]
+    async fn an_approval_answer_cannot_consume_a_pending_question() {
+        for advertises_approvals in [false, true] {
+            let harness = if advertises_approvals {
+                // Keep both capabilities declared while the question builder raises only a
+                // question. This public builder composition lets `respond` reach `finish`.
+                FakeHarness::new().advertising_an_interaction_it_never_raises()
+            } else {
+                FakeHarness::new()
+            }
+            .asking_a_question();
+            let session = harness
+                .open_session(&host(), OpenSession::new("chat"))
+                .await
+                .expect("session");
+            assert_eq!(
+                session
+                    .capabilities()
+                    .has(crate::Capability::InteractiveApprovals),
+                advertises_approvals
+            );
+            assert!(session.capabilities().has(crate::Capability::Questions));
+            let mut turn = session
+                .start_turn(TurnRequest::new("turn", "work"))
+                .await
+                .expect("turn");
+            let request = loop {
+                if let EventKind::QuestionAsked { request } =
+                    turn.recv().await.expect("question").kind
+                {
+                    break request;
+                }
+            };
+            let error = session
+                .respond(crate::PermissionResponse {
+                    interaction_id: request.interaction.id.clone(),
+                    option_id: String::from("allow"),
+                    source: crate::DecisionSource::User,
+                })
+                .await
+                .expect_err("no pending approval");
+            if advertises_approvals {
+                assert!(
+                    matches!(error.cause(), crate::Error::Protocol { expected, received }
+                    if expected == "an outstanding approval" && received == "a pending question"),
+                    "expected finish's pending-question guard, received {error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(error.cause(), crate::Error::NotSupported { capability }
+                    if *capability == crate::Capability::InteractiveApprovals)
+                );
+            }
+            session
+                .cancel(crate::CancelReason::Shutdown)
+                .await
+                .expect("cancel retained question");
+            let events = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                let mut events = Vec::new();
+                while let Some(event) = turn.recv().await {
+                    events.push(event.kind);
+                }
+                events
+            })
+            .await
+            .expect("cancel must settle the retained question and turn");
+            assert_eq!(events.iter().filter(|event| matches!(event,
+                EventKind::QuestionResolved { interaction_id, outcome: crate::QuestionOutcome::Cancelled }
+                    if interaction_id == &request.interaction.id)).count(), 1);
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, EventKind::ApprovalResolved { .. }))
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, EventKind::Completed))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    /// An answer retained by a caller must not grant a later turn's approval.
+    #[tokio::test]
+    async fn a_stale_approval_answer_cannot_complete_a_later_turn() {
+        let session = FakeHarness::new()
+            .open_session(&host(), OpenSession::new("chat"))
+            .await
+            .expect("session");
+        let mut previous: Option<crate::PermissionResponse> = None;
+        for number in 1..=2 {
+            // Reuse host metadata: interaction identity must belong to the fake's native turn.
+            let mut turn = session
+                .start_turn(TurnRequest::new("same-host-turn", "work"))
+                .await
+                .expect("turn");
+            let request = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if let EventKind::ApprovalRequested { request } =
+                        turn.recv().await.expect("approval").kind
+                    {
+                        break request;
+                    }
+                }
+            })
+            .await
+            .expect("approval must arrive");
+            let current = request.allow().expect("allow");
+            let repeated = current.clone();
+            if let Some(stale) = previous.take() {
+                let old_id = stale.interaction_id.clone();
+                let error = session
+                    .respond(stale)
+                    .await
+                    .expect_err("a stale approval answer must not settle the later turn");
+                assert!(matches!(error.cause(), crate::Error::Protocol { .. }));
+                assert_ne!(old_id, request.interaction.id);
+                session.respond(current).await.expect("current answer");
+            } else {
+                previous = Some(current);
+                session
+                    .cancel(crate::CancelReason::Shutdown)
+                    .await
+                    .expect("cancel first turn");
+            }
+            let events = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                let mut events = Vec::new();
+                while let Some(event) = turn.recv().await {
+                    events.push(event.kind);
+                }
+                events
+            })
+            .await
+            .expect("the owned turn must settle");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event,
+                EventKind::ApprovalResolved { interaction_id, .. }
+                    if interaction_id == &request.interaction.id))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, EventKind::Completed))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, EventKind::Cancelled { .. }))
+                    .count(),
+                usize::from(number == 1)
+            );
+            if number == 2 {
+                session
+                    .respond(repeated)
+                    .await
+                    .expect("a late answer with no pending approval remains harmless");
+                assert!(turn.recv().await.is_none());
+            }
+        }
+    }
+
+    /// An informational answer from a cancelled turn must not answer a later question.
+    #[tokio::test]
+    async fn a_stale_question_answer_cannot_complete_a_later_turn() {
+        use crate::interaction::{
+            Answer, AnswerValue, QuestionId, QuestionOptionId, QuestionResponse,
+        };
+
+        let session = FakeHarness::new()
+            .asking_a_question()
+            .open_session(&host(), OpenSession::new("chat"))
+            .await
+            .expect("session");
+        let answers = vec![
+            Answer::new(QuestionId::new("branch"), AnswerValue::text("next")),
+            Answer::new(
+                QuestionId::new("run-tests"),
+                AnswerValue::chosen(QuestionOptionId::new("yes")),
+            ),
+        ];
+        let mut previous: Option<QuestionResponse> = None;
+        for number in 1..=2 {
+            let mut turn = session
+                .start_turn(TurnRequest::new("same-host-turn", "work"))
+                .await
+                .expect("turn");
+            let request = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if let EventKind::QuestionAsked { request } =
+                        turn.recv().await.expect("question").kind
+                    {
+                        break request;
+                    }
+                }
+            })
+            .await
+            .expect("question must arrive");
+            let current = QuestionResponse::new(request.interaction.id.clone(), answers.clone());
+            let repeated = current.clone();
+            if let Some(stale) = previous.take() {
+                let old_id = stale.interaction_id.clone();
+                let error = session
+                    .answer(stale)
+                    .await
+                    .expect_err("a stale question answer must not settle the later turn");
+                assert!(matches!(error.cause(), crate::Error::Protocol { .. }));
+                assert_ne!(old_id, request.interaction.id);
+                session.answer(current).await.expect("current answer");
+            } else {
+                previous = Some(current);
+                session
+                    .cancel(crate::CancelReason::Shutdown)
+                    .await
+                    .expect("cancel first turn");
+            }
+            let events = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                let mut events = Vec::new();
+                while let Some(event) = turn.recv().await {
+                    events.push(event.kind);
+                }
+                events
+            })
+            .await
+            .expect("the owned turn must settle");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event,
+                EventKind::QuestionResolved { interaction_id, .. }
+                    if interaction_id == &request.interaction.id))
+                    .count(),
+                1
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, EventKind::ApprovalResolved { .. }))
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, EventKind::Completed))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, EventKind::Cancelled { .. }))
+                    .count(),
+                usize::from(number == 1)
+            );
+            if number == 2 {
+                session
+                    .answer(repeated)
+                    .await
+                    .expect("a late answer with no pending question remains harmless");
+                assert!(turn.recv().await.is_none());
+            }
+        }
     }
 
     /// An approval that a person chose reaches the host's audit trail carrying how far the choice
