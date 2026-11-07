@@ -200,8 +200,14 @@ impl CodexHarness {
         host: &HostContext,
         key: Option<&AccountFingerprintKey>,
     ) -> Result<(Discovery, Option<CodexAccount>)> {
-        let VersionProbe::Started(version) = read_version(host, &self.executable).await? else {
-            return Ok((Discovery::not_installed(), None));
+        let version = match read_version(host, &self.executable).await? {
+            VersionProbe::Started(version) => version,
+            // A typed launch failure means the executable was unavailable to the launcher.
+            // Host policy, resource and cancellation refusals are different facts and stay typed.
+            VersionProbe::NotStarted(error) if matches!(error.cause(), Error::Launch { .. }) => {
+                return Ok((Discovery::not_installed(), None));
+            }
+            VersionProbe::NotStarted(error) => return Err(error),
         };
         let gate = discovery::gate(version.as_deref(), MINIMUM_CODEX_VERSION);
 
@@ -592,7 +598,7 @@ fn vouched_version(
 /// # Errors
 ///
 /// [`Error::Cancelled`] when the host was shut down, and [`Error::VersionGate`] when the version is
-/// parseable and below the floor.
+/// parseable and below the floor. A refused probe retains the host's typed launch error.
 async fn refuse_outdated_before_spawn(
     host: &HostContext,
     executable: &ExecutablePath,
@@ -602,7 +608,7 @@ async fn refuse_outdated_before_spawn(
         Some(version) => Some(version),
         None => match read_version(host, executable).await? {
             VersionProbe::Started(version) => version,
-            VersionProbe::NotStarted => None,
+            VersionProbe::NotStarted(error) => return Err(error),
         },
     };
     if host.cancel().is_cancelled() {
@@ -724,7 +730,7 @@ fn client_info(host: &HostClientInfo) -> ClientInfo {
 
 /// Whether the probe actually started an installed executable, independently of parsing its banner.
 enum VersionProbe {
-    NotStarted,
+    NotStarted(Error),
     Started(Option<String>),
 }
 
@@ -747,7 +753,7 @@ async fn read_version(host: &HostContext, executable: &ExecutablePath) -> Result
     {
         Ok(child) => child,
         Err(error) if error.cleanup_control().is_some() => return Err(error),
-        Err(_) => return Ok(VersionProbe::NotStarted),
+        Err(error) => return Ok(VersionProbe::NotStarted(error)),
     };
 
     let mut lines = mango_external_agents::process::LineStream::new(

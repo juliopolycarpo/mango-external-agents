@@ -63,8 +63,11 @@ too: they apply the same floor before they spawn `codex app-server`, because an 
 creates sqlite state, an installation id and system skills under `CODEX_HOME` merely by starting.
 They refuse with `Error::VersionGate { found, minimum }` and launch nothing but the version command.
 
-An executable that started but printed no readable version is `GateVerdict::Unknown`;
-`NotInstalled` is reserved for a probe that could not start. A `--version` line nobody can parse is
+An executable that started but printed no readable version is `GateVerdict::Unknown`.
+Discovery reports `NotInstalled` for the launcher's typed `Error::Launch` unavailability;
+host policy, resource and cancellation refusals remain typed errors, including their dispatch
+and any cleanup control. Opening and listing stop after every failed version-probe launch,
+without attempting an app-server. A `--version` line nobody can parse is
 `GateVerdict::Unknown`, not a refusal: a CLI that changed
 the shape of its version output has not stopped working, and the host may still choose to try.
 
