@@ -161,9 +161,23 @@ async fn expiry_answer_refusal_keeps_the_connection_and_sibling_owned() {
     for _ in 0..3 {
         kinds.push(events.recv().await.expect("approval event").kind);
     }
+    for (kind, expected_id) in kinds[..2].iter().zip(["1", "2"]) {
+        assert!(
+            matches!(kind, EventKind::ApprovalRequested { request }
+                if request.interaction.id.as_str() == expected_id),
+            "expected the initial request for {expected_id}, received {kind:?}"
+        );
+    }
     assert!(
         matches!(&kinds[2], EventKind::ApprovalResolved { interaction_id, decision }
         if interaction_id.as_str() == "1" && decision.source == DecisionSource::Cancelled)
+    );
+    assert!(
+        matches!(
+            events.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ),
+        "expected exactly three audit events"
     );
     assert!(matches!(
         state
@@ -178,5 +192,24 @@ async fn expiry_answer_refusal_keeps_the_connection_and_sibling_owned() {
     assert_eq!(sibling["result"]["outcome"]["optionId"], "reject");
     assert!(state.lock_pending().is_empty());
     assert!(client.ended().is_none());
+    turn.approvals
+        .flush(&turn.sink)
+        .await
+        .expect("sibling audit");
+    let resolved = events.recv().await.expect("sibling resolution").kind;
+    assert!(
+        matches!(&resolved, EventKind::ApprovalResolved { interaction_id, decision }
+            if interaction_id.as_str() == "2" && decision.source == DecisionSource::User
+                && decision.option_id == "reject"),
+        "expected the sibling's user resolution, received {resolved:?}"
+    );
+    assert!(
+        matches!(
+            events.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ),
+        "expected no extra sibling audit event"
+    );
+    assert!(!turn.cancellation.is_cancelled());
     client.close().await.expect("close after assertions");
 }
