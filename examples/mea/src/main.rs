@@ -136,7 +136,9 @@ fn print_banner() {
     println!(
         "       mea capture --harness claude|codex|acp[:profile] [--profile ID] [--out DIR] [--workspace DIR] [--transcripts]"
     );
-    println!("       mea capture codex [--out DIR] [--workspace DIR] (archival transcripts)");
+    println!(
+        "       mea capture codex [--scenario NAME] [--out DIR] [--workspace DIR] (archival transcripts)"
+    );
     println!(
         "       mea digests [--out DIR] [--check] (rewrite or verify capture manifest digests)"
     );
@@ -374,7 +376,7 @@ async fn capture(arguments: &[String]) -> Result<(), String> {
     let workspace = workspace::CaptureWorkspace::new(options.workspace)?;
     let result = match &kind {
         HarnessChoice::Codex if options.legacy.is_some() || options.transcripts => {
-            capture::codex(&out, &workspace.path).await
+            capture::codex(&out, &workspace.path, options.scenario.as_deref()).await
         }
         HarnessChoice::Codex => capture::codex_contract(&out, &workspace.path).await,
         HarnessChoice::Claude => capture::claude(&out, &workspace.path).await,

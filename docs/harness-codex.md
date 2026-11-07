@@ -1041,6 +1041,7 @@ cargo run -p mea -- discover --harness codex
 cargo run -p mea -- turn --harness codex "summarise this repository"
 cargo run -p mea -- capture --harness codex       # public schema contract
 cargo run -p mea -- capture codex                 # archival authenticated transcripts
+cargo run -p mea -- capture codex --scenario subagent # one attribution scenario
 ```
 
 `mea capture --harness codex` records the public CLI version plus the generated initialization
@@ -1054,6 +1055,28 @@ targets, `permission-transitions` and `user-defaults`. The redaction happens in 
 (`examples/mea/src/redact.rs`). Incoming frames retain the wire shape, enum values and opaque
 identifiers that replay needs, while every other vendor string becomes `[REDACTED]`. Fixtures are
 protocol evidence, not a record of a model answer, command, tool result, review or reasoning.
+
+`--scenario NAME` selects one named Codex transcript conversation; it also works with
+`--harness codex --transcripts`. Other capture modes reject it before launching a vendor. The
+`subagent` scenario is opt-in with `--scenario subagent`; the default archival run keeps the ten
+existing conversations. It enables `multi_agent_v2` only for its app-server process, starts a read-only
+thread with approvals set to `never`, and asks for exactly one child that replies without tools.
+It waits for the parent thread's terminal frame, then requires a received `subAgentActivity` item
+with a nonempty, unmasked `agentThreadId`. A completed turn without that evidence fails rather
+than being credited as a capture. The generated header records the CLI version, capture version,
+timestamp and process feature. Failed conversations retain redacted traffic in
+`subagent.partial.jsonl`; a timeout names the scripted request that stalled. Neither a partial
+record nor an unqualified completed transcript proves attribution. An unqualified completion goes
+to `subagent.unqualified.jsonl` with an explicit first-line marker; its error reports the received
+item types, or none. Completed evidence replaces a stale partial diagnostic, and a qualified
+capture also removes the stale unqualified diagnostic. Only qualified evidence uses
+`subagent.jsonl`. The identity is structural;
+the child's display path and free-form text remain redacted.
+
+This follows the official [app-server protocol](https://developers.openai.com/codex/app-server)
+and [subagent configuration](https://learn.chatgpt.com/docs/agent-configuration/subagents).
+Feature availability must be checked against the captured CLI version; enabling a process flag
+does not prove that the selected model emitted an attributed item.
 
 The approval fixture records a **refusal**. A fixture that captured a grant would be a recording of
 this tool letting an agent out of its sandbox, checked into the repository.

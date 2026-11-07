@@ -49,6 +49,7 @@ const REDACTED_IN_FAMILY: &[(&str, &[&str])] = &[("mcpServer/", &["name"])];
 /// default, so a new app-server field cannot leak a model answer or a command result before this
 /// list is reviewed.
 const STRUCTURAL_STRING_MEMBERS: &[&str] = &[
+    "agentThreadId",
     "approvalId",
     "approvalPolicy",
     "approvalsReviewer",
@@ -351,6 +352,22 @@ mod tests {
         assert_eq!(redacted["params"]["turn"]["type"], "turn");
         assert_eq!(redacted["params"]["turn"]["text"], PLACEHOLDER);
         assert_eq!(redacted["params"]["turn"]["output"], PLACEHOLDER);
+    }
+
+    #[test]
+    fn a_subagent_identity_survives_while_its_label_and_text_are_private() {
+        let redacted = incoming_frame(
+            json!({"method": "item/started", "params": {"item": {
+                "id": "child-item", "type": "subAgentActivity", "kind": "started",
+                "agentThreadId": "child-thread", "agentPath": "private-label",
+                "message": "private child answer"
+            }}}),
+            Paths::default(),
+        );
+        let item = &redacted["params"]["item"];
+        assert_eq!(item["agentThreadId"], "child-thread");
+        assert_eq!(item["agentPath"], PLACEHOLDER);
+        assert_eq!(item["message"], PLACEHOLDER);
     }
 
     /// A login short enough to be a substring of ordinary words is left alone: a transcript
