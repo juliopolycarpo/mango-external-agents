@@ -19,6 +19,11 @@ workspace = true
 # The library has no benchmarks of its own, so `cargo bench` skips its unit tests.
 bench = false
 
+[features]
+default = []
+# The version-answering launcher, for hosts testing against injected fake processes.
+testing = ["mango-external-agents/testing"]
+
 [dependencies]
 async-trait = "0.1.92"
 http = "1.4.0"

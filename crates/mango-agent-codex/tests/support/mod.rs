@@ -13,8 +13,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use mango_external_agents::process::{LaunchSpec, ManagedProcess, ProcessLauncher};
-use mango_external_agents::testing::{FakeLauncher, FakeProcess};
+use mango_external_agents::testing::FakeProcess;
 use serde_json::Value;
 
 /// The prefix `mea capture` writes on a line the library sent.
@@ -311,43 +310,55 @@ fn readdress(frame: &Value, id: Option<&Value>) -> Value {
     Value::Object(readdressed)
 }
 
-/// A launcher that answers `codex --version` itself and hands every other launch to `inner`.
-///
-/// `open_session` and the session listing run `codex --version` before they start an app-server,
-/// and the replay fakes queue one child per launch with no argv to tell them apart. Without this,
-/// the version probe would take the child queued for the app-server. The probe is answered here
-/// with a build that meets the floor and is not recorded in `inner`'s launch log, so a test's own
-/// assertions about the app-server launches stand as they were.
-pub struct VersionAnsweringLauncher {
-    inner: Arc<dyn ProcessLauncher>,
-}
-
-impl VersionAnsweringLauncher {
-    /// Wraps `inner`.
-    pub fn over(inner: Arc<dyn ProcessLauncher>) -> Arc<Self> {
-        Arc::new(Self { inner })
-    }
-}
-
-#[async_trait::async_trait]
-impl ProcessLauncher for VersionAnsweringLauncher {
-    async fn spawn(&self, spec: LaunchSpec) -> mango_external_agents::Result<ManagedProcess> {
-        if spec.argv.get(1).map(String::as_str) != Some("--version") {
-            return self.inner.spawn(spec).await;
-        }
-        let answer = FakeLauncher::new();
-        answer.push(FakeProcess::transcript([format!(
-            "codex-cli {}",
-            mango_agent_codex::MINIMUM_CODEX_VERSION
-        )]));
-        answer.spawn(spec).await
-    }
-}
+// All-features tests exercise the public export. Default-feature tests reuse the exact same
+// implementation without turning an optional test API into a production default.
+#[cfg(not(feature = "testing"))]
+use mango_agent_codex::MINIMUM_CODEX_VERSION;
+#[cfg(feature = "testing")]
+pub use mango_agent_codex::testing::VersionAnsweringLauncher;
+#[cfg(not(feature = "testing"))]
+#[path = "../../src/testing_launcher.rs"]
+#[allow(dead_code)]
+mod version_answering_launcher;
+#[cfg(not(feature = "testing"))]
+pub use version_answering_launcher::VersionAnsweringLauncher;
 
 #[cfg(test)]
 mod tests {
     use super::{Step, Transcript, readdress, workspace_path};
     use serde_json::json;
+
+    /// Another agent's version probe must keep its own fake process and launch authority.
+    #[tokio::test]
+    async fn a_non_codex_version_probe_reaches_the_inner_launcher() {
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        use mango_external_agents::process::{LaunchSpec, ProcessLauncher};
+        use mango_external_agents::testing::{FakeLauncher, FakeProcess};
+
+        for program in ["claude", "acp-agent"] {
+            let inner = Arc::new(FakeLauncher::new());
+            inner.push(FakeProcess::transcript(["native version banner"]));
+            let spec = LaunchSpec {
+                argv: vec![program.to_owned(), String::from("--version")],
+                cwd: workspace_path(),
+                env: BTreeMap::from([(String::from("TEST_SETTING"), String::from("kept"))]),
+                stdin: false,
+                hide_window: true,
+            };
+            let mut process = super::VersionAnsweringLauncher::over(inner.clone())
+                .spawn(spec.clone())
+                .await
+                .expect("expected a fake version process");
+            while process.stdout.next_chunk().await.expect("stdout").is_some() {}
+            assert_eq!(
+                inner.last_launch(),
+                Some(spec),
+                "expected another program's version probe to reach the inner launcher"
+            );
+        }
+    }
 
     #[test]
     fn replay_workspace_is_a_native_absolute_path() {

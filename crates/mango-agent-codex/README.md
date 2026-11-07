@@ -43,3 +43,20 @@ request to run one is refused with a protocol error — and nothing here grants 
 The protocol types are hand-written against OpenAI's own published schema rather than copied from
 its source tree; `docs/harness-codex.md` records why, along with the surface driven, the permission
 matrix, and the known gaps. Compliance posture is in `docs/compliance.md`.
+
+## Host tests
+
+The optional `testing` feature exports `testing::VersionAnsweringLauncher` and forwards the
+core crate's `testing` feature. Enable it in a development dependency when the host injects a
+`FakeLauncher` whose queued process belongs to the app-server rather than the preceding version
+probe.
+
+`VersionAnsweringLauncher::over(inner)` answers `codex --version` with the crate's
+`MINIMUM_CODEX_VERSION` in the `codex-cli` banner, without consuming that queued process or adding
+to its launch log. `new(inner).with_executable(path).with_version_line(line)` also answers the exact configured
+executable and lets tests supply older or changed banners. Only a two-element version probe is
+intercepted; other programs and arguments reach the inner launcher with their complete launch
+specification, I/O, controls and typed errors unchanged.
+
+This helper belongs to the unreleased 0.8 source. Published 0.7 consumers need a qualified
+release before adopting the new feature.
