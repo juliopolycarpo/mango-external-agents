@@ -189,9 +189,11 @@ impl TransportSelection {
 /// host reads it as "no evidence either way", never as "safe".
 ///
 /// - **Claude Code** reports all four values. `Resumable` once the conversation's latest turn
-///   finished with the vendor's own `result` or was stopped by a graceful interrupt;
+///   finished with the vendor's own `result` or was stopped by a graceful interrupt, without a
+///   transcript refusal;
 ///   `UnfinishedTurn` after a turn the vendor did not finish and nobody interrupted cleanly (the
-///   child was force-terminated, died, went silent, or a stop did not complete); `Unverified`
+///   child was force-terminated, died, went silent, or a stop did not complete), or after the
+///   harness refused a transcript event even if cleanup interrupted cleanly; `Unverified`
 ///   after a strict resume that could not be confirmed. `Unknown` before the first turn finishes
 ///   (including a freshly opened session resuming a conversation whose last turn finished: the
 ///   harness has verified nothing yet), while a turn runs, and while a stop is pending.
@@ -218,13 +220,15 @@ pub enum Resumability {
     /// No evidence either way. The default, and all a Codex or ACP session ever reports.
     #[default]
     Unknown,
-    /// The conversation exists and its latest turn finished, or was interrupted cleanly.
+    /// The conversation exists, its transcript was accepted, and its latest turn finished or was
+    /// interrupted cleanly.
     Resumable,
-    /// A turn ended without the vendor's `result` and without a clean interrupt, so the stored
-    /// conversation may end at a prompt the vendor left unfinished: the child was
+    /// A transcript event was refused, or a turn ended without the vendor's `result` and without
+    /// a clean interrupt. The stored conversation may end at a prompt the vendor left unfinished:
+    /// the child was
     /// force-terminated, died, went silent, or a stop did not complete and the child may still be
     /// running. A later turn the vendor finishes settles it, unless the ending refused later
-    /// turns (a kill), in which case it lasts for the session.
+    /// turns (a kill or a refused transcript event), in which case it lasts for the session.
     UnfinishedTurn,
     /// A strict resume could not be confirmed: the vendor did not identify the requested
     /// conversation, or ended before it started. Later turns are refused, so it lasts for the

@@ -2229,6 +2229,16 @@ async fn pump(
                         ErrorCode::from_static("claude-event-refused"),
                         error.to_string(),
                     );
+                    // A clean interrupt cannot qualify a conversation whose transcript the
+                    // host could not accept. Publish that verdict before its failure terminal.
+                    {
+                        let mut state = shared.lock();
+                        state.mark_nonresumable(
+                            CancelReason::Requested,
+                            Resumability::UnfinishedTurn,
+                        );
+                        publish_resumability(&shared, &state);
+                    }
                     exit.release();
                     let mut room = true;
                     for close in reducer.abort(refused.clone()) {
