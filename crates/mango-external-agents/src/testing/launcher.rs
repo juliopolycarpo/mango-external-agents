@@ -297,6 +297,7 @@ struct LauncherState {
     launches: Mutex<Vec<LaunchSpec>>,
     /// Shared with every child, so `written` is one list across all of them.
     written: Arc<Mutex<Vec<String>>>,
+    written_changed: Arc<Notify>,
     /// Children that have not exited or been killed yet.
     live_children: Arc<AtomicUsize>,
 }
@@ -355,6 +356,28 @@ impl FakeLauncher {
             .clone()
     }
 
+    /// Waits until at least `count` complete stdin lines have been recorded across all children.
+    ///
+    /// This acknowledges the write, not the fake agent's response. Bound the wait with a timeout
+    /// when the test also needs to diagnose a missing write.
+    pub async fn wait_for_written(&self, count: usize) {
+        loop {
+            let mut changed = std::pin::pin!(self.state.written_changed.notified());
+            changed.as_mut().enable();
+            let ready = self
+                .state
+                .written
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len()
+                >= count;
+            if ready {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     /// The fake children that are still alive.
     ///
     /// Tests use this to prove a harness reaped a peer after a broken output pipe, rather than
@@ -402,6 +425,7 @@ impl ProcessLauncher for FakeLauncher {
             exit: process.exit,
             stderr,
             written: Arc::clone(&self.state.written),
+            written_changed: Arc::clone(&self.state.written_changed),
             live_children: Arc::clone(&self.state.live_children),
             changed: Notify::new(),
         });
@@ -436,6 +460,7 @@ struct ChildState {
     exit: ExitStatus,
     stderr: StderrTail,
     written: Arc<Mutex<Vec<String>>>,
+    written_changed: Arc<Notify>,
     live_children: Arc<AtomicUsize>,
     changed: Notify,
 }
@@ -572,6 +597,7 @@ impl ByteSink for FakeStdin {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(line.clone());
+            self.state.written_changed.notify_waiters();
             if let Some(responder) = &self.state.responder {
                 let answers = responder(&line);
                 let mut stdout = self
@@ -610,6 +636,55 @@ mod tests {
             stdin: true,
             hide_window: true,
         }
+    }
+
+    #[tokio::test]
+    async fn written_waiters_acknowledge_complete_lines_and_wake_every_registered_waiter() {
+        use std::future::Future;
+        use std::task::Poll;
+        let launcher = FakeLauncher::new();
+        launcher.push(FakeProcess::responding(|_| Vec::new()));
+        let mut child = launcher.spawn(spec(&["fake"])).await.expect("fake child");
+        launcher.wait_for_written(0).await;
+        let mut tasks = Vec::new();
+        let mut ready = Vec::new();
+        for _ in 0..2 {
+            let observed = launcher.clone();
+            let (registered, receiver) = tokio::sync::oneshot::channel();
+            ready.push(receiver);
+            tasks.push(tokio::spawn(async move {
+                let mut wait = std::pin::pin!(observed.wait_for_written(1));
+                std::future::poll_fn(|cx| {
+                    assert!(wait.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                registered.send(()).expect("waiting test");
+                wait.await;
+            }));
+        }
+        for registered in ready {
+            registered.await.expect("waiter registration");
+        }
+        let stdin = child.stdin.as_mut().expect("fake stdin");
+        stdin.write_all(b"partial").await.expect("partial write");
+        assert!(launcher.written().is_empty());
+        assert!(tasks.iter().all(|task| !task.is_finished()));
+        stdin.write_all(b" line\n").await.expect("completed line");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            for task in tasks {
+                task.await.expect("notified waiter");
+            }
+        })
+        .await
+        .expect("every registered waiter must wake");
+        launcher.wait_for_written(1).await;
+        assert_eq!(launcher.written(), vec![String::from("partial line")]);
+        child
+            .control
+            .kill(CancelReason::Shutdown)
+            .await
+            .expect("cleanup");
     }
 
     /// A responder only speaks when spoken to. The peers this library drives also announce, and a
