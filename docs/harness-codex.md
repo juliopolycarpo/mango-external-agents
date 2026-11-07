@@ -908,13 +908,16 @@ migrating host keeps matching its continuations. The address is borrowed from th
 answer for that one digest and returned nowhere. A plain hash is refused on purpose: anyone holding it
 could test a guessed address offline, so the key is required (`AccountFingerprintKey` refuses an
 empty one) and never leaves the host. `Harness::discover`, which has no key, computes nothing. A
-ChatGPT account without an email, an API-key account and a Bedrock account have no fingerprint.
+ChatGPT account without an email, an API-key account, a Bedrock account, a GCP account and an
+unknown account kind have no fingerprint.
 
 | `account/read`                      | `AuthState`                               |
 | ----------------------------------- | ----------------------------------------- |
 | `{"type":"chatgpt"}`                | `LoggedIn { Subscription }`               |
 | `{"type":"apiKey"}`                 | `LoggedIn { ApiKey }`                     |
 | `{"type":"amazonBedrock"}`          | `LoggedIn { Other("amazon-bedrock") }`    |
+| `{"type":"gcp"}`                    | `LoggedIn { Other("gcp") }`               |
+| an unknown future account kind      | `Unknown`                                 |
 | `null`, `requiresOpenaiAuth: true`  | `LoggedOut { login_hint: "codex login" }` |
 | `null`, `requiresOpenaiAuth: false` | `Unknown`                                 |
 
@@ -922,6 +925,21 @@ The last row matters: a build pointed at a provider of its own is not signed out
 would stop a turn, and telling the user to run `codex login` would send them to fix something that
 is not broken. Opening a session against a signed-out CLI fails with `Error::AuthRequired` carrying
 the vendor's own command as text. The library never runs it.
+
+The official Codex 0.166.0 schema describes `gcp` as Google Cloud Vertex AI with externally
+managed credentials. This account kind is read from the documented
+[app-server surface](https://developers.openai.com/codex/app-server), generated from the
+[official 0.166.0 release](https://github.com/openai/codex/releases/tag/rust-v0.166.0). It adds a
+non-secret sign-in mode; this library does not configure, inspect or forward those credentials.
+Future account kinds decode without retaining their payload and report `Unknown`, regardless of
+`requiresOpenaiAuth`. Malformed known account shapes remain decoder errors. The compatibility
+tests use schema-shaped responses and a named fake launcher; they do not credit a real GCP login
+or vendor turn. The separately qualified minimum remains 0.154.0.
+
+In the unreleased 0.8 minor, `protocol::Account` gains `Gcp` and `Unknown` and becomes
+non-exhaustive. Callers matching this wire enum must include a wildcard arm. The core `AuthMode`
+stays unchanged: GCP uses `Other("gcp")`, and unknown kinds stay `AuthState::Unknown`. Install the
+four library crates from the 0.8 minor together; published 0.7 consumers keep their existing API.
 
 ## Account quota
 

@@ -138,7 +138,7 @@ impl CodexAccount {
     /// The account facts from one raw `account/read` answer, for a ChatGPT sign-in only.
     ///
     /// The address is borrowed from `response` for the digest and goes nowhere else. `None` for
-    /// an API-key or Bedrock account, or no account, which have no address to fingerprint.
+    /// an API-key, Bedrock, GCP or unknown account, or no account, which have no address to fingerprint.
     #[must_use]
     pub fn from_account_read(
         response: &serde_json::Value,

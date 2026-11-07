@@ -887,7 +887,9 @@ pub struct PermissionProfileListResponse {
 /// No credential is anywhere in this shape, and none is asked for: `account/read` answers with the
 /// kind of account and, for a ChatGPT sign-in, a plan name. The email upstream also returns is not
 /// modelled — a harness that does not need it should not be the thing that carries it into a log.
+/// Future account kinds decode as [`Account::Unknown`] without retaining their private members.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -904,6 +906,11 @@ pub enum Account {
     },
     /// An Amazon Bedrock account.
     AmazonBedrock,
+    /// Google Cloud Vertex AI with credentials managed outside this library.
+    Gcp,
+    /// A future vendor account kind, whose sign-in state this build cannot classify.
+    #[serde(other)]
+    Unknown,
 }
 
 /// What asking who is signed in answered with.
@@ -1181,5 +1188,38 @@ mod tests {
         )
         .expect("expected an account response");
         assert_eq!(bedrock.account, Some(Account::AmazonBedrock));
+    }
+
+    #[test]
+    fn gcp_and_future_accounts_decode_without_retaining_private_members() {
+        for kind in ["gcp", "futureCloud"] {
+            // Schema-shaped account kind, with canaries in deliberately unmodelled members.
+            let response: AccountReadResponse = serde_json::from_value(serde_json::json!({
+                "account": {"type": kind, "email": "account-canary@example.invalid",
+                    "workspaceName": "workspace-canary"}, "requiresOpenaiAuth": false
+            }))
+            .expect("expected a documented or future account kind to decode");
+            assert!(response.account.is_some());
+            let debug = format!("{response:?}");
+            assert!(!debug.contains("account-canary"));
+            assert!(!debug.contains("workspace-canary"));
+        }
+    }
+
+    #[test]
+    fn malformed_known_accounts_do_not_become_unknown_accounts() {
+        for account in [
+            serde_json::json!({"type": "chatgpt", "planType": 7}),
+            serde_json::json!({"type": 7}),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                serde_json::from_value::<AccountReadResponse>(serde_json::json!({
+                    "account": account, "requiresOpenaiAuth": true
+                }))
+                .is_err(),
+                "expected malformed account data to be refused"
+            );
+        }
     }
 }

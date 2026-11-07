@@ -134,6 +134,10 @@ pub fn auth_state(account: Option<&Account>, requires_openai_auth: bool) -> Auth
         Some(Account::AmazonBedrock) => AuthState::LoggedIn {
             mode: AuthMode::Other(String::from("amazon-bedrock")),
         },
+        Some(Account::Gcp) => AuthState::LoggedIn {
+            mode: AuthMode::Other(String::from("gcp")),
+        },
+        Some(Account::Unknown) => AuthState::Unknown,
         None if requires_openai_auth => AuthState::LoggedOut {
             login_hint: String::from(LOGIN_HINT),
         },
@@ -300,6 +304,12 @@ mod tests {
             auth_state(Some(&Account::AmazonBedrock), false),
             AuthState::LoggedIn {
                 mode: AuthMode::Other(String::from("amazon-bedrock"))
+            }
+        );
+        assert_eq!(
+            auth_state(Some(&Account::Gcp), false),
+            AuthState::LoggedIn {
+                mode: AuthMode::Other(String::from("gcp"))
             }
         );
     }

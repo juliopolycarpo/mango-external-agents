@@ -4,6 +4,8 @@
 //! replays them. That is the only way to test a dialect on a machine where the vendor's CLI is not
 //! installed — which is every machine, in CI.
 
+#[path = "replay/account_kinds.rs"]
+mod account_kinds;
 #[path = "replay/contracts.rs"]
 mod contracts;
 #[path = "replay/redaction.rs"]
