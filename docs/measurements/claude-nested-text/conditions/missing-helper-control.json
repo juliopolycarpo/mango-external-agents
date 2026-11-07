@@ -1,0 +1,8 @@
+{
+  "created_before_run": "2026-11-07T08:36:00.223621+00:00",
+  "reproducer_sha256": "cfab99c75112d44d426da3f4bfb123eef4e8760999ae07ff5329953778e56493",
+  "fake_python_sha256": "e0c72cb3afc44c0e6a092a5c067191ebbf22570aba2a206e8fd6775baa295f95",
+  "control_exit": 127,
+  "control_stderr": "FakePython: managed cloud helper unavailable",
+  "condition": "Managed helper unavailable; all other Python commands delegated; Cargo/Rust present."
+}

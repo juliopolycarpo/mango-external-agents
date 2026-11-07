@@ -17,5 +17,38 @@
     "peak_bytes",
     "events",
     "closing_events"
-  ]
+  ],
+  "additional_separate_batches": [
+    {
+      "batch": "ownership",
+      "samples": 24,
+      "successful_attempts": 31,
+      "script": "reproduce-process-ownership.py",
+      "script_sha256": "cab8be8380195be9e4641e5563e7a48c0f54577a1f7f723b9b87186bf122d4f3",
+      "metrics_match_original": true,
+      "correctness_matches_original": true,
+      "raw_dhat_totals_crosschecked": true
+    },
+    {
+      "batch": "conditions",
+      "samples": 24,
+      "successful_attempts": 31,
+      "script": "reproduce-condition-recording.py",
+      "script_sha256": "cfab99c75112d44d426da3f4bfb123eef4e8760999ae07ff5329953778e56493",
+      "metrics_match_original": true,
+      "correctness_matches_original": true,
+      "raw_dhat_totals_crosschecked": true
+    },
+    {
+      "batch": "portable",
+      "samples": 24,
+      "successful_attempts": 31,
+      "script": "reproduce.py",
+      "script_sha256": "2ac338b303bab6635ba302d60282f5c6d59d8b1a0b184fdf6fb4297d2cab39c3",
+      "metrics_match_original": true,
+      "correctness_matches_original": true,
+      "raw_dhat_totals_crosschecked": true
+    }
+  ],
+  "command_cleanup_implementation_identical_to_tested_versions": true
 }

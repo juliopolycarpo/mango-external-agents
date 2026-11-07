@@ -7,13 +7,15 @@ not a vendor capture or a whole-application measurement.
 
 Sources: [issue #261](https://github.com/juliopolycarpo/mango-external-agents/issues/261),
 [finish-retention issue #252](https://github.com/juliopolycarpo/mango-external-agents/issues/252),
+[runner portability issue #262](https://github.com/juliopolycarpo/mango-external-agents/issues/262),
 and [PR #221](https://github.com/juliopolycarpo/mango-external-agents/pull/221).
 
 ## Decision and scope
 
 **Accepted:** all original gates passed in 24 profiles, with no failed, excluded or retried
-attempts. A separate 24-profile validation of the portable reproducer passed and produced
-identical allocation metrics. The batches are retained separately and are not pooled.
+attempts. Four separate 24-profile reproducer validations produced identical allocation
+metrics. The final runner passed with the managed cloud helper deliberately unavailable.
+The original experiment and each validation batch remain separate; samples are not pooled.
 
 The baseline is signed `1c07cd6f52098da30ae858465caa40b5f38b498f`, the exact original #221
 rebase onto main `f181ea8c786cd37fbc8a092753b5e42c642cf47d`. It already includes finished
@@ -85,7 +87,7 @@ setup commands and all 24 profiles exited successfully; the 30-minute setup/tria
 60-second per-process timeout were met. No retry or exclusion rule was invoked.
 The [command audit](raw/attempts.jsonl) records each command, cwd, timestamps, exit status and
 stdout/stderr hashes. Raw DHAT totals were crosschecked against every sample's total bytes,
-allocation blocks and end bytes. The [crosschecks](crosschecks.json) also compare both batches.
+allocation blocks and end bytes. The [crosschecks](crosschecks.json) compare every batch.
 
 Execution: managed Linux 6.18.57 x86_64, four-CPU cgroup quota and 16 GiB cgroup memory limit;
 Rust 1.99.0 `b940084d7`, Cargo 1.99.0 and LLVM 23.1.1. Each side has an independent writable
@@ -96,6 +98,10 @@ See the [environment and graph verification](raw/environment.json) and
 
 All original raw files, including the large DHAT profiles, full dependency metadata and every
 command's stdout/stderr, are retained byte-for-byte in [raw-evidence.tar.gz](raw-evidence.tar.gz).
+Later validation and runner regression artifacts are also archived. The historical
+condition-recording validation plan omits its machine name; [redactions.json](redactions.json)
+identifies that field and both original and published hashes. Its measurements and command
+artifacts are unchanged. The final runner records OS, kernel and architecture without a machine name.
 The [archive index](archive-index.json) records each member's SHA-256 and size. Summaries,
 audits, correctness output and identities also remain readable as individual files. To restore
 the full raw layout beside this receipt, run `tar -xzf raw-evidence.tar.gz` from this directory.
@@ -115,7 +121,7 @@ The exact generated manifests are preserved as [baseline](base-Cargo.toml.txt) a
 
 ## Reproduction
 
-Create clean, independent worktrees at the baseline and candidate SHAs above. With Rust
+Create clean, independent worktrees at the baseline and candidate SHAs above. On Linux with Rust
 1.99.0, Python 3 and Cargo available, run:
 
 ```sh
@@ -132,10 +138,37 @@ source identities and stages the plan without building or profiling. An existing
 directory is refused so earlier attempts are preserved. The portable script is separate from
 the frozen collection harness and records its own hash and derived plan before measurement.
 
-Its actual full validation is preserved under [reproduction](reproduction/summary.json), with
-its [derived plan](reproduction/plan.json), [identities](reproduction/identities.json),
-[command audit](reproduction/attempts.jsonl), raw profiles and logs. It uses the same probe
-and source SHAs, but its different probe/output paths and script identity remain explicit.
+The current runner invokes Cargo directly and owns each command's process group. On timeout
+or interruption it kills that group, waits for the direct child and records the attempt;
+spawn failures are recorded as not started. No managed cloud helper is needed. The derived
+plan records the actual compiler, Cargo, OS and cgroup conditions, separates historical
+reference conditions, and labels registry and OS cache warmth as uncontrolled.
+
+The final full validation is preserved under [portable](portable/summary.json), with its
+[derived plan](portable/plan.json), [identities](portable/identities.json),
+[command audit](portable/attempts.jsonl) and [missing-helper control](portable/missing-helper-control.json).
+All 31 commands succeeded, including all 24 profiles. The frozen probe and measured SDK source
+are unchanged. The runner SHA-256 is
+`2ac338b303bab6635ba302d60282f5c6d59d8b1a0b184fdf6fb4297d2cab39c3`.
+
+Historical validations retain their exact script identities separately:
+
+- [Initial validation](reproduction/summary.json), using
+  [the original draft](reproduce-before-runtime-fix.py): it passed here but still depended on
+  the private runtime helper. It does not prove portability.
+- [Process-ownership validation](ownership/summary.json), using
+  [the cleanup correction](reproduce-process-ownership.py): all 24 profiles passed with the helper unavailable.
+- [Condition-recording validation](conditions/summary.json), using
+  [the intermediate recorder](reproduce-condition-recording.py): all 24 profiles passed;
+  its historical plan has the single documented machine-name redaction.
+
+The archive's `reproducer-regression/` directory preserves the missing-helper failure,
+named FakePython/FakeBuildParent controls, timeout and interruption audits, spawn-failure
+audit, and test driver. The old command implementation left a sleeping fake child after
+timeout; that test-owned child was explicitly cleaned up. The corrected implementation
+leaves no surviving fake child after timeout or interruption. The current runner's command
+implementation is identical to both tested corrected versions. An initial control with an
+incorrect Cargo PATH is retained as a setup error and is not counted as a valid regression proof.
 
 ## Limits
 

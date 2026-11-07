@@ -1,7 +1,9 @@
 import datetime
 import hashlib
 import json
+import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -27,18 +29,41 @@ def command(label, args, cwd, timeout=600):
     stderr = EVIDENCE / (label + '.stderr')
     record = {'attempt': label, 'start': stamp(), 'command': args, 'cwd': str(cwd),
               'stdout': stdout.name, 'stderr': stderr.name}
+    pending_error = None
     with stdout.open('w') as out, stderr.open('w') as err:
+        process = None
         try:
-            result = subprocess.run(args, cwd=cwd, stdout=out, stderr=err, timeout=timeout)
-            record['exit'] = result.returncode
+            process = subprocess.Popen(args, cwd=cwd, stdout=out, stderr=err,
+                                       start_new_session=True)
+            record['exit'] = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
             record['exit'] = 'timeout'
+            record['cleanup_returncode'] = process.returncode
+        except OSError as error:
+            record['exit'] = 'not-started'
+            err.write(f'expected a runnable command, received {error}\n')
+        except BaseException as error:
+            if process is not None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+            record['exit'] = 'interrupted'
+            pending_error = error
     record['end'] = stamp()
     record['stdout_sha256'] = sha(stdout)
     record['stderr_sha256'] = sha(stderr)
     with AUDIT.open('a') as audit:
         audit.write(json.dumps(record) + '\n')
     print(label, record['exit'], flush=True)
+    if pending_error is not None:
+        raise pending_error
     assert record['exit'] == 0, record
     return stdout.read_text()
 
@@ -70,8 +95,8 @@ debug = 1
                     '--manifest-path', str(path / 'Cargo.toml')], path)
         else:
             shutil.copy2(SIDES['base'] / 'Cargo.lock', path / 'Cargo.lock')
-        command('setup-build-' + side, ['python3', '/workspace/.cloud-tools/reap.py', 'cargo',
-                'build', '--release', '--locked', '--manifest-path', str(path / 'Cargo.toml')], path)
+        command('setup-build-' + side, ['cargo', 'build', '--release', '--locked',
+                '--manifest-path', str(path / 'Cargo.toml')], path)
         command('setup-metadata-' + side, ['cargo', 'metadata', '--locked', '--format-version=1',
                 '--manifest-path', str(path / 'Cargo.toml')], path)
         command('setup-correctness-' + side, [str(binary(side)), 'correctness'], path, 60)
@@ -150,6 +175,8 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--verify-only', action='store_true', help='Validate source identities and stage the plan without building or profiling.')
     args = parser.parse_args()
+    if not sys.platform.startswith('linux'):
+        raise RuntimeError(f'expected Linux/POSIX process ownership, received {sys.platform}')
     OUT = args.output.resolve()
     assert not OUT.exists(), 'Use a fresh output directory; preserve prior attempts.'
     ROOT = OUT / 'projects'
@@ -168,6 +195,26 @@ if __name__ == '__main__':
     plan['created_at'] = stamp()
     plan['reproduction_of_plan_sha256'] = sha(original_plan)
     plan['evidence'] = str(EVIDENCE)
+    plan['reference_conditions'] = {key: plan.pop(key) for key in ['build', 'execution', 'cache']}
+    plan['build'] = {
+        'rustc': subprocess.check_output([os.environ.get('RUSTC') or 'rustc', '-vV'], text=True),
+        'cargo': subprocess.check_output(['cargo', '-vV'], text=True),
+        'profile': 'release with debug=1; same frozen probe and copied lock on both sides',
+        'compiler_wrapper_configured': bool(os.environ.get('RUSTC_WRAPPER')),
+    }
+    plan['execution'] = {
+        'os': os.uname().sysname,
+        'kernel': os.uname().release,
+        'architecture': os.uname().machine,
+        'cpu_quota': Path('/sys/fs/cgroup/cpu.max').read_text().strip()
+        if Path('/sys/fs/cgroup/cpu.max').exists() else None,
+        'memory_limit': Path('/sys/fs/cgroup/memory.max').read_text().strip()
+        if Path('/sys/fs/cgroup/memory.max').exists() else None,
+    }
+    plan['cache'] = {'registry': 'shared caller cache; warmth uncontrolled',
+                     'build': 'fresh independent target directories',
+                     'application': 'fresh process; one unprofiled warm-up',
+                     'os': 'uncontrolled; no machine-cold claim'}
     (OUT / 'perf-261-plan.json').write_text(json.dumps(plan, indent=2) + '\n')
     shutil.copy2(Path(__file__).with_name('probe.rs'), OUT / 'perf-261-probe.rs')
     if args.verify_only:

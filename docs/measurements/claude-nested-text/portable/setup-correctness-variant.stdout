@@ -1,0 +1,6 @@
+{"events":3,"scenario":"ordinary-ascii","serialized_bytes":577,"sha256":"0471fe588e120b2fd75c1484a0ffd3f8b2bf857958edba9d1e80d8fe43a60380"}
+{"events":10,"scenario":"ordinary-unicode","serialized_bytes":8467,"sha256":"9f3a4ff670ac74d61dd1ed816859d9c27d8d64b79b0f3a4c144562e27144ce08"}
+{"events":3,"scenario":"oversized-ascii","serialized_bytes":8513,"sha256":"7a0e41a85562cc4d51507f9655b6fe85188b13f078347c1c6b2d2b4f3f9908f5"}
+{"events":3,"scenario":"oversized-unicode","serialized_bytes":33089,"sha256":"afd16f24c2ca7d28ac6e09a4d3f01d3ef2a08d2e970a5d2741c5c5c12113341d"}
+{"events":4,"scenario":"grow-then-oversized","serialized_bytes":8856,"sha256":"9912bdddfe26bcdff8c0785ff01b839bf40e58441ceb636cc3a449bfc9b4f2f2"}
+{"events":4,"scenario":"full-then-ignored","serialized_bytes":16791,"sha256":"49abeadc3f8a9a9f47298b40788f91041dcd1e0c65951459caa08ff597064d68"}
