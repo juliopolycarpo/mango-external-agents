@@ -2153,6 +2153,7 @@ mod commit_hold_tests;
 
 #[cfg(test)]
 mod tests {
+    mod refusal_tests;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
