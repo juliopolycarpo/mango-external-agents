@@ -1,0 +1,190 @@
+{
+  "excludes_self": true,
+  "files": [
+    {
+      "path": ".gitattributes",
+      "bytes": 138,
+      "sha256": "0a8065056c4b31aa1dc7235d3089f1a8725f74607cf637ab001432de75260be1"
+    },
+    {
+      "path": "README.md",
+      "bytes": 9710,
+      "sha256": "ec214fc343582ab88248378264bc4d46805a9555f8b734fdf63fb6b117532f3b"
+    },
+    {
+      "path": "archive-index.json",
+      "bytes": 33144,
+      "sha256": "08c5e9b77d1c0f523cb8b8efc0d20f222820319ed0c4f7918f016d3ceb3029d7"
+    },
+    {
+      "path": "base-Cargo.toml.txt",
+      "bytes": 312,
+      "sha256": "2ba4cb58461441403419fea82c4e9f4569f132d70172397f6fe1bf905aebf99f"
+    },
+    {
+      "path": "crosschecks.json",
+      "bytes": 440,
+      "sha256": "7c82addc1193d72bec20c4fbef8bd3927b0282f292fa89c36526c80077f0df79"
+    },
+    {
+      "path": "harness-recorded.py",
+      "bytes": 7912,
+      "sha256": "6ecd61296de0f23953984c1810bc775ca8d208256190031aebf64432af9d5fce"
+    },
+    {
+      "path": "plan.json",
+      "bytes": 4315,
+      "sha256": "5dc521a3d84b75dcfd523cf6b4dacd1570e1224ceef6241d0d5cb8b116fa8431"
+    },
+    {
+      "path": "probe-Cargo.lock",
+      "bytes": 18382,
+      "sha256": "d4ff078ba12e7ca0e0afb381904974da9882b4f63cb0d582d9a32e47d2aac5fa"
+    },
+    {
+      "path": "probe.rs",
+      "bytes": 4141,
+      "sha256": "8de148885026e5b3198961eb6af72bcf3e79e85410d463cf6cc834cc992cd241"
+    },
+    {
+      "path": "raw/attempts.jsonl",
+      "bytes": 20945,
+      "sha256": "d96fe8445ef74dd4f52ceb7b2cbce3d8d9a96526c9d04d51308f12ef79378925"
+    },
+    {
+      "path": "raw/environment.json",
+      "bytes": 1293,
+      "sha256": "f784b2b35542ddce84356aa2c425eb5303f7b11c4351de344c327cbc2b0d3b86"
+    },
+    {
+      "path": "raw/identities.json",
+      "bytes": 1414,
+      "sha256": "6a05b0b7fde77b52ca86375fc5cb38d5fd3eb75fe05900c770e11cd7ee79eb2d"
+    },
+    {
+      "path": "raw/raw-samples.json",
+      "bytes": 14265,
+      "sha256": "bff2110962b44d24d476c19638f51816ed5398220c977f0f50943ef3322b6750"
+    },
+    {
+      "path": "raw/setup-correctness-base.stdout",
+      "bytes": 862,
+      "sha256": "1022605c083c2c47e8f57fa7f16c51c4003fa7d3e671d70dc26b7e859761e254"
+    },
+    {
+      "path": "raw/setup-correctness-variant.stdout",
+      "bytes": 862,
+      "sha256": "1022605c083c2c47e8f57fa7f16c51c4003fa7d3e671d70dc26b7e859761e254"
+    },
+    {
+      "path": "raw/summary.json",
+      "bytes": 18650,
+      "sha256": "22a92264d263a913c28d414fbeecc429d943c8267cab8b08e0eeae2fb22e060b"
+    },
+    {
+      "path": "raw-evidence.tar.gz",
+      "bytes": 342830,
+      "sha256": "518bb3b5d9a1a4f9ef8dfa0e7bdafab338f80744ce70b379669b3d101ee147ea"
+    },
+    {
+      "path": "regression/empty-record-test-setup-failure.txt",
+      "bytes": 4763,
+      "sha256": "61417e87cb07d7e634909c18e6c1b9b4e55f99bd7c741386dc0e29f0c5b43591"
+    },
+    {
+      "path": "regression/pr-221-abort-red.patch",
+      "bytes": 6541,
+      "sha256": "fa703da548c5b8d498e85138e685f790e747e125c5ac3171e1772900b9b41abc"
+    },
+    {
+      "path": "regression/pr-221-abort-red.txt",
+      "bytes": 900,
+      "sha256": "bd035e6e9aab3a4815920039aa6ddc04c12d89dfb0f13c2aee30d3588898d717"
+    },
+    {
+      "path": "regression/pr-221-cancel-red.patch",
+      "bytes": 6542,
+      "sha256": "18e9e4ac45ba5958bb86dbda5ece505bb3d7eac638a92b58ecd3d5713dc2f1c3"
+    },
+    {
+      "path": "regression/pr-221-cancel-red.txt",
+      "bytes": 1060,
+      "sha256": "393f07a7cbb045598dbd4971d0c44fc2690de887798bfcd670b6c4df6751c4df"
+    },
+    {
+      "path": "regression/pr-221-result-red.patch",
+      "bytes": 6542,
+      "sha256": "c14b73d771d27805bc178c5d7ff2421f9a9fa4f00d8c845a1c864e855744686e"
+    },
+    {
+      "path": "regression/pr-221-result-red.txt",
+      "bytes": 901,
+      "sha256": "49318b9c94b7be47aa8cfd5c7044a863288dc71327fa6e9aa02838abf3d0f7a4"
+    },
+    {
+      "path": "regression/pr-261-capacity-red.patch",
+      "bytes": 5998,
+      "sha256": "2eb10cf475f793db832842a1b1611df022b9ebaea0be5895c42724d6ee418934"
+    },
+    {
+      "path": "regression/pr-261-capacity-red.txt",
+      "bytes": 1030,
+      "sha256": "9319c93991593ea191cc47285f38b15f5ee10bb7978072393444a7f2c34f08be"
+    },
+    {
+      "path": "regression/red-proof.json",
+      "bytes": 865,
+      "sha256": "dc8a1c10fcc151eb9ff4570493ba3e458f76a6e9248e4edd6e870e03c6049915"
+    },
+    {
+      "path": "regression/reducer-green.txt",
+      "bytes": 4175,
+      "sha256": "e999e3e4ca522c8e243302e342a3c7dfeec489baee71ba6b84cae84f06333a09"
+    },
+    {
+      "path": "reproduce.py",
+      "bytes": 9833,
+      "sha256": "ba86e13ba0d445fe447daa5b3dcbb30fe74a3faf3118d494d6920acae349c321"
+    },
+    {
+      "path": "reproduction/attempts.jsonl",
+      "bytes": 22274,
+      "sha256": "e7b2a2f8f1535bbdb9d5a405a56d3e8e20252df2e71b85d86d0f527219aa1e20"
+    },
+    {
+      "path": "reproduction/identities.json",
+      "bytes": 1414,
+      "sha256": "83b111657538552aa212b854eeab3c43ba206d86d84bace0023a5a432db02cd1"
+    },
+    {
+      "path": "reproduction/plan.json",
+      "bytes": 4340,
+      "sha256": "742ff3b4b3ba5da74d654d582bc23e3dd0d57415ba3adce8012650d073f82fed"
+    },
+    {
+      "path": "reproduction/raw-samples.json",
+      "bytes": 14265,
+      "sha256": "a9bbe7d56aeda8c527ea4400cbf505bf839dd92c4ae8074770e98e804050bfb3"
+    },
+    {
+      "path": "reproduction/setup-correctness-base.stdout",
+      "bytes": 862,
+      "sha256": "1022605c083c2c47e8f57fa7f16c51c4003fa7d3e671d70dc26b7e859761e254"
+    },
+    {
+      "path": "reproduction/setup-correctness-variant.stdout",
+      "bytes": 862,
+      "sha256": "1022605c083c2c47e8f57fa7f16c51c4003fa7d3e671d70dc26b7e859761e254"
+    },
+    {
+      "path": "reproduction/summary.json",
+      "bytes": 18650,
+      "sha256": "63e6893f04b66647f631c9916e1f46a6deb08a6b76aedb4c9267e7b17cb68178"
+    },
+    {
+      "path": "variant-Cargo.toml.txt",
+      "bytes": 315,
+      "sha256": "aa28c484a79a73df7e8da5fdbdcc49185377bdc48b271cebeafea9bc349c7a20"
+    }
+  ]
+}

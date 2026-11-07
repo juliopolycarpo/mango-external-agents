@@ -1,0 +1,3 @@
+# Preserve generated patch context and captured command output byte-for-byte.
+regression/*.patch -whitespace
+regression/*.txt -whitespace

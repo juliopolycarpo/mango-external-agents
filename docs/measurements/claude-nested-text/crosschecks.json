@@ -1,0 +1,21 @@
+{
+  "original_samples": 24,
+  "reproduction_samples": 24,
+  "separate_batches": true,
+  "paired_metrics_identical_across_batches": true,
+  "raw_dhat_totals_crosschecked": true,
+  "metrics": [
+    "active_blocks",
+    "active_bytes",
+    "finished_blocks",
+    "finished_bytes",
+    "released_blocks",
+    "released_bytes",
+    "total_blocks",
+    "total_bytes",
+    "peak_blocks",
+    "peak_bytes",
+    "events",
+    "closing_events"
+  ]
+}
