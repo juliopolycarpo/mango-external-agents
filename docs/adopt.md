@@ -484,6 +484,12 @@ different decisions, and a host that shows one as the other widens an authorisat
 Requests that expire or belong to a closed session are removed from the pending map. The runtime
 must not register the vendor's tools as application tools.
 
+Vendor approval requests must pass `PermissionRequest::normalized` before policy or UI. It refuses
+empty, oversized and duplicate option-ID sets rather than merging choices that might have different
+effects or scopes. The public `broker_response` helper also skips malformed raw choice sets without
+calling the broker and returns `None` for no automatic answer. Use `normalized` for the typed refusal;
+do not present those invalid choices to the host.
+
 | Library event or call                                       | Runtime integration                                           |
 | ----------------------------------------------------------- | ------------------------------------------------------------- |
 | `TextDelta`                                                 | Append to the vendor session's assistant message              |

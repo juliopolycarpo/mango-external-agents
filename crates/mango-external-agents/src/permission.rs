@@ -810,7 +810,7 @@ impl PermissionRequest {
     /// # Errors
     ///
     /// [`Error::InvalidVendorValue`] when the request id or an option id does not survive
-    /// bounding, [`Error::Protocol`] when the vendor offered no options, and
+    /// bounding, [`Error::Protocol`] when the vendor offered no options or duplicate option ids, and
     /// [`Error::LimitExceeded`] when it offered more than [`APPROVAL_MAX_OPTIONS`]. A request
     /// nobody can render is refused on its own rather than ending the turn it belongs to.
     pub fn normalized(self) -> Result<Self> {
@@ -834,6 +834,12 @@ impl PermissionRequest {
                 subject: "approval options offered",
                 limit: APPROVAL_MAX_OPTIONS,
                 received: self.options.len(),
+            });
+        }
+        if self.has_duplicate_option_ids() {
+            return Err(Error::Protocol {
+                expected: String::from("unique approval option ids"),
+                received: String::from("duplicate approval option id"),
             });
         }
 
@@ -863,6 +869,15 @@ impl PermissionRequest {
             detail: detail.map(|detail| detail.text),
             options,
             truncated: self.truncated || title.truncated || detail_truncated || options_truncated,
+        })
+    }
+
+    /// Called only after checking the option-count bound: at most 16 options, with no extra set.
+    fn has_duplicate_option_ids(&self) -> bool {
+        self.options.iter().enumerate().any(|(index, option)| {
+            self.options[..index]
+                .iter()
+                .any(|previous| previous.id == option.id)
         })
     }
 
@@ -1082,15 +1097,26 @@ impl fmt::Debug for BrokerDecision {
 
 /// What a broker decided, as an answer the vendor will accept.
 ///
-/// `Ok(None)` means the request has to reach the host: there was no broker, the broker said
+/// `None` means no automatic answer: there was no broker, the broker said
 /// [`BrokerDecision::Ask`], or the vendor offered nothing matching what the broker decided. The
 /// last case is deliberately not an error — a policy that cannot be applied to this question is a
 /// question for a person, not a failed turn.
+///
+/// Empty, oversized or duplicate raw choice sets also return `None`, without invoking the broker.
+/// Normalize vendor requests with [`PermissionRequest::normalized`] before publishing them to the
+/// host; it supplies the typed refusal for a malformed request rather than presenting its choices.
 pub async fn broker_response(
     broker: Option<&Arc<dyn PermissionBroker>>,
     request: &PermissionRequest,
 ) -> Option<PermissionResponse> {
-    let decision = broker?.decide(request).await;
+    let broker = broker?;
+    if request.options.is_empty()
+        || request.options.len() > APPROVAL_MAX_OPTIONS
+        || request.has_duplicate_option_ids()
+    {
+        return None;
+    }
+    let decision = broker.decide(request).await;
     let response = match decision {
         BrokerDecision::Ask => None,
         BrokerDecision::Allow => request.allow().ok(),
@@ -1111,6 +1137,7 @@ mod tests {
     use crate::event::{ActivityKind, SessionId};
     use crate::interaction::{Interaction, InteractionId, InteractionKind};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime};
 
     /// A broker that answers the same way every time and remembers what it was asked.
@@ -1121,6 +1148,19 @@ mod tests {
     #[async_trait::async_trait]
     impl PermissionBroker for FixedBroker {
         async fn decide(&self, _request: &PermissionRequest) -> BrokerDecision {
+            self.decision.clone()
+        }
+    }
+
+    struct CountingBroker {
+        decision: BrokerDecision,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl PermissionBroker for CountingBroker {
+        async fn decide(&self, _request: &PermissionRequest) -> BrokerDecision {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             self.decision.clone()
         }
     }
@@ -1566,6 +1606,146 @@ mod tests {
             .map(|index| PermissionOption::new(format!("option-{index}"), PermissionEffect::Allow))
             .collect();
         assert!(request(many).normalized().is_err());
+    }
+
+    const DUPLICATE_OPTION_ID: &str = "private-duplicate-option-id";
+
+    fn conflicting_options() -> Vec<PermissionOption> {
+        vec![
+            PermissionOption::new(DUPLICATE_OPTION_ID, PermissionEffect::Allow)
+                .with_scope(PermissionScope::Once),
+            PermissionOption::new(DUPLICATE_OPTION_ID, PermissionEffect::Reject)
+                .with_scope(PermissionScope::Once),
+        ]
+    }
+
+    fn assert_duplicate_approval_refused(options: Vec<PermissionOption>) {
+        let error = request(options)
+            .normalized()
+            .expect_err("duplicate approval option IDs must be refused before selection");
+        assert!(matches!(
+            &error,
+            Error::Protocol { expected, received }
+                if expected == "unique approval option ids" && received == "duplicate approval option id"
+        ));
+        assert_eq!(
+            error.to_string(),
+            "expected unique approval option ids, received invalid vendor data"
+        );
+        for rendered in [
+            format!("{error}"),
+            format!("{error:?}"),
+            format!("{error:#}"),
+        ] {
+            assert!(!rendered.contains(DUPLICATE_OPTION_ID));
+            assert!(!rendered.contains("private option label"));
+        }
+    }
+
+    #[test]
+    fn duplicate_approval_ids_with_conflicting_effects_are_refused_before_selection() {
+        let ambiguous = request(conflicting_options());
+        assert_eq!(
+            ambiguous.allow().expect("allowing choice").option_id,
+            ambiguous.deny().expect("denying choice").option_id,
+            "the same wire ID cannot distinguish these opposite choices"
+        );
+        assert_duplicate_approval_refused(ambiguous.options);
+    }
+
+    #[test]
+    fn duplicate_approval_ids_with_different_scopes_are_refused_before_selection() {
+        assert_duplicate_approval_refused(vec![
+            PermissionOption::new(DUPLICATE_OPTION_ID, PermissionEffect::Allow)
+                .with_scope(PermissionScope::Once),
+            PermissionOption::new(DUPLICATE_OPTION_ID, PermissionEffect::Allow)
+                .with_scope(PermissionScope::Persistent),
+        ]);
+    }
+
+    #[test]
+    fn identical_nonadjacent_approval_ids_are_refused_before_selection() {
+        let repeated = PermissionOption::new(DUPLICATE_OPTION_ID, PermissionEffect::Allow)
+            .with_label("private option label");
+        assert_duplicate_approval_refused(vec![
+            repeated.clone(),
+            PermissionOption::new("different-option", PermissionEffect::Reject),
+            repeated,
+        ]);
+    }
+
+    async fn assert_broker_not_called(options: Vec<PermissionOption>, decision: BrokerDecision) {
+        let recording = Arc::new(CountingBroker {
+            decision,
+            calls: AtomicUsize::new(0),
+        });
+        let broker: Arc<dyn PermissionBroker> = recording.clone();
+        let answer = broker_response(Some(&broker), &request(options)).await;
+        assert_eq!(
+            recording.calls.load(Ordering::SeqCst),
+            0,
+            "an ambiguous or malformed raw request must not reach a host broker"
+        );
+        assert_eq!(answer, None);
+    }
+
+    #[tokio::test]
+    async fn an_allowing_broker_never_sees_duplicate_approval_option_ids() {
+        assert_broker_not_called(conflicting_options(), BrokerDecision::Allow).await;
+    }
+
+    #[tokio::test]
+    async fn a_denying_broker_never_sees_duplicate_approval_option_ids() {
+        assert_broker_not_called(
+            conflicting_options(),
+            BrokerDecision::Deny {
+                reason: String::from("host policy"),
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_empty_raw_approval_never_reaches_a_broker() {
+        assert_broker_not_called(Vec::new(), BrokerDecision::Allow).await;
+    }
+
+    #[tokio::test]
+    async fn an_oversized_raw_approval_never_reaches_a_broker() {
+        let options = (0..17)
+            .map(|index| PermissionOption::new(format!("option-{index}"), PermissionEffect::Allow))
+            .collect();
+        assert_broker_not_called(options, BrokerDecision::Allow).await;
+    }
+
+    #[test]
+    fn distinct_approval_ids_preserve_order_and_standing_choice_metadata() {
+        let options = vec![
+            PermissionOption::new("standing", PermissionEffect::Allow)
+                .with_scope(PermissionScope::Persistent)
+                .with_risk(PermissionRisk::Destructive)
+                .policy_changing()
+                .with_label("Standing choice"),
+            PermissionOption::new("once", PermissionEffect::Allow)
+                .with_scope(PermissionScope::Once)
+                .with_label("Once"),
+            PermissionOption::new("no", PermissionEffect::Reject),
+        ];
+        let normalized = request(options.clone())
+            .normalized()
+            .expect("valid choices");
+        assert_eq!(normalized.options, options);
+        assert_eq!(
+            normalized.allow().expect("narrowest allow").option_id,
+            "once"
+        );
+        let standing = normalized
+            .respond("standing", DecisionSource::User)
+            .expect("standing");
+        assert_eq!(standing.option_id, "standing");
+        assert!(normalized.options[0].is_standing());
+        assert!(normalized.options[0].policy_changing);
+        assert_eq!(normalized.deny().expect("refusal").option_id, "no");
     }
 
     #[test]

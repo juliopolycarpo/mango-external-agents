@@ -12,6 +12,8 @@ use std::time::{Duration, SystemTime};
 
 #[path = "session/deadlines.rs"]
 mod deadlines;
+#[path = "session/duplicate_options.rs"]
+mod duplicate_options;
 #[path = "session/stalling.rs"]
 mod stalling;
 #[path = "session/teardown.rs"]
