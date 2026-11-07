@@ -986,6 +986,11 @@ four library crates from the 0.8 minor together; published 0.7 consumers keep th
 
 ## Account quota
 
+A host that drops `refresh_account_usage` releases its registered quota read synchronously.
+A later sparse update can therefore request a missing baseline; answers from concurrent refreshes
+still use read-generation ordering and retain the fresher full reading. This is host bookkeeping
+around the documented `account/rateLimits/read` surface ([app-server][app-server]).
+
 `account/rateLimits/read` returns the account's full quota, and `account/rateLimits/updated` is
 "emitted whenever a user's ChatGPT rate limits change" ([app-server][app-server]) and may carry only
 what changed. The session keeps the last full reading as a baseline: `Session::refresh_account_usage`

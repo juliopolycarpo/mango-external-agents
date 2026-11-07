@@ -7604,3 +7604,37 @@ async fn an_unanswered_question_round_expires_exactly_once() {
         "expected a protocol refusal, received {error:?}"
     );
 }
+
+/// Dropping a refresh must release its registered read so a later sparse update can obtain a
+/// baseline rather than believing an abandoned request is still going to provide one.
+#[tokio::test]
+async fn a_cancelled_refresh_does_not_block_the_next_quota_baseline() {
+    let running = Arc::new(
+        AnnouncedTurn::open_answering(replay_limits(), |frame| {
+            (frame.get("method") == Some(&serde_json::json!("account/rateLimits/read")))
+                .then(Vec::new)
+        })
+        .await,
+    );
+    let refreshing = {
+        let running = Arc::clone(&running);
+        tokio::spawn(async move { running.session.refresh_account_usage().await })
+    };
+    let _ = nth_rate_limits_read(&running, 0).await;
+    refreshing.abort();
+    assert!(
+        refreshing
+            .await
+            .expect_err("cancelled refresh")
+            .is_cancelled()
+    );
+    running.announcer.announce(serde_json::json!({
+        "method":"account/rateLimits/updated", "params":{"rateLimits":{"primary":{"usedPercent":25.0}}}
+    }).to_string());
+    let _ = nth_rate_limits_read(&running, 1).await;
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("close");
+}
