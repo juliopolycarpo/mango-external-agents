@@ -782,6 +782,10 @@ Nothing is auto-answered. Without a `PermissionBroker` every question reaches th
 `ApprovalRequested` event; with one, the event is still emitted and the broker's answer is
 attributed to `DecisionSource::AutoReview`.
 
+An announcement and its pending entry's `announced` status commit under the same pending-map guard.
+No later mutex acquisition separates them, so cancelling the request task after publication cannot
+leave the host with a prompt that terminal cleanup treats as unannounced.
+
 A question has the host's `Limits::approval_timeout` deadline, because the app-server sets none
 of its own and blocks until the client replies. Its `expires_at` is translated once into the core
 `ApprovalDeadline`, so event backpressure cannot restart the timer and broker deliberation and a
