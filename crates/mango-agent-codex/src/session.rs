@@ -273,6 +273,8 @@ pub(crate) struct Shared {
     approval_answer_gate: Mutex<Option<Arc<ResolutionMarkerGate>>>,
     #[cfg(test)]
     approval_claim_gate: Mutex<Option<Arc<ResolutionMarkerGate>>>,
+    #[cfg(test)]
+    announcement_gate: Mutex<Option<Arc<ResolutionMarkerGate>>>,
 }
 
 impl Shared {
@@ -328,6 +330,8 @@ impl Shared {
             approval_answer_gate: Mutex::new(None),
             #[cfg(test)]
             approval_claim_gate: Mutex::new(None),
+            #[cfg(test)]
+            announcement_gate: Mutex::new(None),
         }
     }
 
@@ -1646,6 +1650,14 @@ impl Shared {
     /// Puts one event on the stream that still belongs to this start attempt.
     async fn emit_for(&self, route: &ActiveTurnRoute, kind: EventKind) -> Result<()> {
         #[cfg(test)]
+        if matches!(
+            &kind,
+            EventKind::ApprovalRequested { .. } | EventKind::QuestionAsked { .. }
+        ) {
+            self.wait_for_announcement_gate().await;
+        }
+
+        #[cfg(test)]
         if matches!(&kind, EventKind::QuestionResolved { .. }) {
             self.wait_for_question_publication_gate().await;
         }
@@ -2232,6 +2244,15 @@ impl Shared {
     /// Pauses one question publication so cancellation leaves subsequent cleanup unblocked.
     async fn wait_for_question_publication_gate(&self) {
         let gate = self.question_publication_gate.lock().await.take();
+        if let Some(gate) = gate {
+            gate.wait_for_release().await;
+        }
+    }
+
+    #[cfg(test)]
+    /// Pauses before publication, allowing contention on the actual later bookkeeping mutex.
+    async fn wait_for_announcement_gate(&self) {
+        let gate = self.announcement_gate.lock().await.take();
         if let Some(gate) = gate {
             gate.wait_for_release().await;
         }
@@ -2847,20 +2868,27 @@ impl CodexHandler {
 
         // The deadline is created before publication, so bounded publication cannot restart the
         // decision window while the host catches up.
-        let emitted = self
-            .shared
-            .emit_for(
-                &route,
-                EventKind::ApprovalRequested {
-                    request: bounded.clone(),
-                },
-            )
-            .await;
-        if emitted.is_ok()
-            && let Some(entry) = self.shared.pending.lock().await.get_mut(&request_id)
-        {
-            entry.announced = true;
-        }
+        let emitted = {
+            let mut entries = self.shared.pending.lock().await;
+            let entry = entries
+                .get_mut(&request_id)
+                .filter(|entry| Arc::ptr_eq(&entry.route.owner, &route.owner))?;
+            let emitted = self
+                .shared
+                .emit_for(
+                    &route,
+                    EventKind::ApprovalRequested {
+                        request: bounded.clone(),
+                    },
+                )
+                .await;
+            // Publication returns synchronously after commit; no later lock acquisition may
+            // leave a committed prompt looking unannounced if this request task is cancelled.
+            if emitted.is_ok() {
+                entry.announced = true;
+            }
+            emitted
+        };
         drop(publication);
         if matches!(emitted, Err(Error::LimitExceeded { .. })) {
             self.shared
@@ -3396,17 +3424,10 @@ impl CodexHandler {
                     .remove(&request_id);
                 return None;
             }
-            if !self
-                .shared
-                .pending_questions
-                .lock()
-                .await
-                .get(&request_id)
-                .is_some_and(|entry| Arc::ptr_eq(&entry.route.owner, &route.owner))
-            {
-                return None;
-            }
-
+            let mut entries = self.shared.pending_questions.lock().await;
+            let entry = entries
+                .get_mut(&request_id)
+                .filter(|entry| Arc::ptr_eq(&entry.route.owner, &route.owner))?;
             let emitted = self
                 .shared
                 .emit_for(
@@ -3416,15 +3437,7 @@ impl CodexHandler {
                     },
                 )
                 .await;
-            if emitted.is_ok()
-                && let Some(entry) = self
-                    .shared
-                    .pending_questions
-                    .lock()
-                    .await
-                    .get_mut(&request_id)
-                && Arc::ptr_eq(&entry.route.owner, &route.owner)
-            {
+            if emitted.is_ok() {
                 entry.announced = true;
             }
             emitted
@@ -7163,6 +7176,195 @@ mod tests {
         Cleanup,
         Fail
     );
+
+    /// Parks before publication, then blocks only the actual post-publication bookkeeping lock.
+    async fn announcement_bookkeeping_abort(question: bool, end: ApprovalRaceEnd) {
+        let shared = shared();
+        shared.adopt_thread(String::from("thread-1"));
+        let (_, mut stream) = running(&shared, "vendor-turn-1").await;
+        let gate = ResolutionMarkerGate::closed();
+        *shared.announcement_gate.lock().await = Some(Arc::clone(&gate));
+        let request_shared = Arc::clone(&shared);
+        let request = tokio::spawn(async move {
+            let (method, params) = if question {
+                (
+                    "item/tool/requestUserInput",
+                    serde_json::json!({"threadId":"thread-1","turnId":"vendor-turn-1","itemId":"interaction-1","isBlocking":false,"questions":[{"id":"note","header":"Note","question":"Anything else?"}]}),
+                )
+            } else {
+                (
+                    "item/commandExecution/requestApproval",
+                    serde_json::json!({"threadId":"thread-1","turnId":"vendor-turn-1","itemId":"interaction-1","command":"pwd"}),
+                )
+            };
+            CodexHandler {
+                shared: request_shared,
+            }
+            .on_request(
+                String::from(method),
+                params,
+                mango_external_agents::jsonrpc::RequestId::new(serde_json::json!(1)),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_until_entered())
+            .await
+            .expect("bounded pre-publication gate");
+        // If publication already owns this map, bookkeeping is in its synchronous critical
+        // section. Otherwise retain the available guard to force its real later lock to wait.
+        // No await is inserted after the event commits, on either implementation.
+        let approval_guard = if question {
+            None
+        } else {
+            shared.pending.try_lock().ok()
+        };
+        let question_guard = if question {
+            shared.pending_questions.try_lock().ok()
+        } else {
+            None
+        };
+        let held_bookkeeping = approval_guard.is_some() || question_guard.is_some();
+        gate.open();
+        let asked = tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv())
+            .await
+            .expect("bounded committed announcement")
+            .expect("announcement");
+        let expected_id = match asked.kind {
+            EventKind::QuestionAsked { request } if question => request.interaction.id,
+            EventKind::ApprovalRequested { request } if !question => request.id().clone(),
+            other => panic!("expected selected announcement, received {other:?}"),
+        };
+        if let Some(guard) = approval_guard.as_ref() {
+            assert!(
+                !guard
+                    .values()
+                    .next()
+                    .expect("registered approval")
+                    .announced,
+                "bookkeeping lock is held after committed announcement"
+            );
+        }
+        if let Some(guard) = question_guard.as_ref() {
+            assert!(
+                !guard
+                    .values()
+                    .next()
+                    .expect("registered question")
+                    .announced,
+                "bookkeeping lock is held after committed announcement"
+            );
+        }
+        request.abort();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), request)
+                .await
+                .expect("bounded cancellation at production await")
+                .expect_err("cancelled request")
+                .is_cancelled()
+        );
+        drop(approval_guard);
+        drop(question_guard);
+        let status = match end {
+            ApprovalRaceEnd::Complete => "completed",
+            ApprovalRaceEnd::Cancel => "interrupted",
+            ApprovalRaceEnd::Fail => "failed",
+        };
+        let mut turn = serde_json::json!({"id":"vendor-turn-1","status":status});
+        if matches!(end, ApprovalRaceEnd::Fail) {
+            turn["error"] = serde_json::json!({"message":"synthetic failure","codexErrorInfo":null,"additionalDetails":null});
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            CodexHandler {
+                shared: Arc::clone(&shared),
+            }
+            .on_notification(
+                String::from("turn/completed"),
+                serde_json::json!({"threadId":"thread-1","turn":turn}),
+            ),
+        )
+        .await
+        .expect("bounded terminal cleanup");
+        let events = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut events = Vec::new();
+            while let Some(event) = stream.recv().await {
+                events.push(event.kind);
+            }
+            events
+        })
+        .await
+        .expect("bounded terminal stream");
+        let terminal = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    EventKind::Completed | EventKind::Cancelled { .. } | EventKind::Error { .. }
+                )
+            })
+            .expect("terminal");
+        assert!(
+            match end {
+                ApprovalRaceEnd::Complete => matches!(events[terminal], EventKind::Completed),
+                ApprovalRaceEnd::Cancel => matches!(events[terminal], EventKind::Cancelled { .. }),
+                ApprovalRaceEnd::Fail => matches!(events[terminal], EventKind::Error { .. }),
+            },
+            "expected selected terminal, received {events:?}"
+        );
+        let resolutions: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                EventKind::QuestionResolved { interaction_id, .. } if question => {
+                    Some((index, interaction_id))
+                }
+                EventKind::ApprovalResolved { interaction_id, .. } if !question => {
+                    Some((index, interaction_id))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            resolutions.len(),
+            1,
+            "committed announcement must retain its resolution owner across real bookkeeping contention; question={question}, held_bookkeeping={held_bookkeeping}, end={end:?}, events={events:?}"
+        );
+        assert!(resolutions[0].0 < terminal);
+        assert_eq!(resolutions[0].1, &expected_id);
+        assert!(shared.pending.lock().await.is_empty());
+        assert!(shared.pending_questions.lock().await.is_empty());
+    }
+
+    macro_rules! announcement_abort_test {
+        ($name:ident,$question:expr,$end:ident) => {
+            #[tokio::test(start_paused = true)]
+            async fn $name() {
+                announcement_bookkeeping_abort($question, ApprovalRaceEnd::$end).await;
+            }
+        };
+    }
+    announcement_abort_test!(
+        announcement_bookkeeping_approval_before_complete,
+        false,
+        Complete
+    );
+    announcement_abort_test!(
+        announcement_bookkeeping_approval_before_cancel,
+        false,
+        Cancel
+    );
+    announcement_abort_test!(announcement_bookkeeping_approval_before_fail, false, Fail);
+    announcement_abort_test!(
+        announcement_bookkeeping_question_before_complete,
+        true,
+        Complete
+    );
+    announcement_abort_test!(
+        announcement_bookkeeping_question_before_cancel,
+        true,
+        Cancel
+    );
+    announcement_abort_test!(announcement_bookkeeping_question_before_fail, true, Fail);
 
     /// A terminal cannot overtake the resolution of an answer [`Session::answer`] accepted.
     #[tokio::test]
