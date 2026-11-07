@@ -61,6 +61,13 @@ impl State {
     }
 }
 
+/// Pauses a sender after its ownership decision until the test observes both decisions.
+#[cfg(test)]
+pub(super) struct SenderDropGate {
+    pub(super) entered: std::sync::mpsc::Sender<()>,
+    pub(super) resume: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
 pub(super) struct Buffer {
     state: Mutex<State>,
     limits: Limits,
@@ -68,6 +75,9 @@ pub(super) struct Buffer {
     abandoned: CancelToken,
     terminated: CancelToken,
     senders: AtomicUsize,
+    /// Forces both release decisions to precede completion without scheduling other buffers.
+    #[cfg(test)]
+    pub(super) drop_gate: Mutex<Option<Arc<SenderDropGate>>>,
 }
 
 impl Buffer {
@@ -79,12 +89,50 @@ impl Buffer {
             abandoned: CancelToken::new(),
             terminated: CancelToken::new(),
             senders: AtomicUsize::new(1),
+            #[cfg(test)]
+            drop_gate: Mutex::new(None),
         });
         (Arc::clone(&buffer), EventReceiver { buffer })
     }
 
+    #[cfg(test)]
+    pub(super) fn pause_sender_drop(&self) {
+        let gate = self
+            .drop_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(gate) = gate {
+            gate.entered.send(()).expect("sender decision observer");
+            gate.resume
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("sender release within the test bound");
+        }
+    }
+
     pub(super) fn add_sender(&self) {
         self.senders.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Releases a nonfinal sender, or elects the final owner while keeping its count live.
+    ///
+    /// The final owner still owes terminal publication before a reader may see disconnect.
+    pub(super) fn release_nonfinal_sender(&self) -> bool {
+        let mut count = self.senders.load(Ordering::Acquire);
+        while count > 1 {
+            match self.senders.compare_exchange_weak(
+                count,
+                count - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => count = current,
+            }
+        }
+        false
     }
 
     pub(super) fn remove_sender(&self) {

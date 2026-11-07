@@ -199,9 +199,16 @@ impl Clone for EventSink {
 
 impl Drop for EventSink {
     fn drop(&mut self) {
+        let nonfinal = self.buffer.release_nonfinal_sender();
+        let owed = !nonfinal && self.buffer.owes_overflow_terminal();
+        #[cfg(test)]
+        self.buffer.pause_sender_drop();
+        if nonfinal {
+            return;
+        }
         // A close was dropped for room and nobody committed a terminal: the host would otherwise
         // see the stream simply stop, with an activity still open and no reason.
-        if self.buffer.owes_overflow_terminal() {
+        if owed {
             let error = VendorError::new(
                 crate::ErrorCode::from_static("stream-overflow"),
                 "expected a terminal after a close was refused for room, received the last sender dropped",
@@ -1165,6 +1172,58 @@ mod tests {
         assert!(
             matches!(kinds.last(), Some(EventKind::Error { error }) if error.code.as_str() == "stream-overflow"),
             "expected a stream-overflow terminal instead of a silent end | received {kinds:?}"
+        );
+    }
+
+    /// Park both senders after their release decision, before either can finish dropping.
+    #[tokio::test]
+    async fn concurrent_final_sender_drops_commit_one_overflow_terminal() {
+        let (first, mut events) = sink(1);
+        first.emit(queued_text()).await.expect("payload");
+        let _ = first.emit_close(activity_close("a")).await;
+        let second = first.clone();
+        let (entered, observed) = std::sync::mpsc::channel();
+        let (resume, released) = std::sync::mpsc::channel();
+        let (finished, completed) = std::sync::mpsc::channel();
+        *first.buffer.drop_gate.lock().expect("drop gate") =
+            Some(std::sync::Arc::new(super::buffer::SenderDropGate {
+                entered,
+                resume: std::sync::Mutex::new(released),
+            }));
+        let first_finished = finished.clone();
+        let first_drop = std::thread::spawn(move || {
+            drop(first);
+            first_finished.send(()).expect("first completion observer");
+        });
+        let second_drop = std::thread::spawn(move || {
+            drop(second);
+            finished.send(()).expect("second completion observer");
+        });
+        for _ in 0..2 {
+            observed
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("each sender reaches its release decision");
+        }
+        for _ in 0..2 {
+            resume.send(()).expect("sender release");
+        }
+        for _ in 0..2 {
+            completed
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("each sender finishes within the test bound");
+        }
+        first_drop.join().expect("first drop");
+        second_drop.join().expect("second drop");
+        let kinds = tokio::time::timeout(std::time::Duration::from_secs(1), drained(&mut events))
+            .await
+            .expect("the released stream must reach EOF");
+        assert_eq!(kinds.iter().filter(|kind| matches!(kind, EventKind::Error { error } if error.code.as_str() == "stream-overflow")).count(), 1,
+            "expected exactly one overflow terminal after both senders released, received {kinds:?}");
+        assert_eq!(kinds.first(), Some(&queued_text()));
+        assert_eq!(
+            kinds.len(),
+            2,
+            "expected the queued payload and one terminal"
         );
     }
 
