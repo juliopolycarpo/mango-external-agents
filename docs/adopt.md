@@ -515,6 +515,11 @@ executable example of `TokioLauncher`, terminal approval decisions, terminal que
 event consumption without the runtime's browser or database dependencies. Its question path is the
 one worth copying: it reads `QuestionForm`, numbers the choices, and never touches the broker.
 
+An unknown question form keeps its vendor label in
+`UnsupportedQuestion::UnrecognisedForm::received` for explicit typed access. Normalization bounds
+that label; `Display` and `Debug` report only the refusal class. Normalized vendor text is still
+vendor text and must not be copied into diagnostics through formatting.
+
 When `mea turn` fails and closing its session also fails, the CLI reports the original turn
 failure on stderr and returns the original cleanup error. If the primary failure itself retains
 another cleanup control, its launched pid is reported before that error is released. The Codex
