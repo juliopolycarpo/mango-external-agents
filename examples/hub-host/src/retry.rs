@@ -31,7 +31,8 @@ pub trait Jitter: Send + Sync {
     ///
     /// A factor outside the range is clamped by [`RetryPolicy::delay_for`], so an implementation
     /// that gets its arithmetic wrong lengthens or shortens a wait rather than producing a
-    /// negative duration.
+    /// negative duration. NaN leaves the full capped delay unchanged instead of accelerating a
+    /// retry or panicking during duration conversion.
     fn factor(&self) -> f64;
 }
 
@@ -239,7 +240,12 @@ impl RetryPolicy {
                 .min(self.cap);
             doublings -= chunk;
         }
-        let factor = self.jitter.factor().clamp(0.0, 1.0);
+        let factor = self.jitter.factor();
+        let factor = if factor.is_nan() {
+            1.0
+        } else {
+            factor.clamp(0.0, 1.0)
+        };
         let multiplier = 1.0 - JITTER_SPREAD + JITTER_SPREAD * factor;
         // Avoid rounding Duration::MAX up past its range when maximum jitter changes nothing.
         let computed = if multiplier == 1.0 {
