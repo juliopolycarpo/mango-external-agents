@@ -58,12 +58,12 @@ use crate::version::{self, Comparison};
 
 /// The transports an ACP agent is driven over.
 ///
-/// One, in 0.1. [`AcpSpec::Http`] exists in the core and this crate does not carry it: the official
-/// `agent-client-protocol-http` crate pulls `aws-lc-rs` through `reqwest` and `async-tungstenite`,
-/// and this workspace's `deny.toml` bans it — TLS is `ring` everywhere. An HTTP carrier lands when
-/// that crate can be built on `ring`, and until then asking for one is
-/// [`Error::UnsupportedTransport`](mango_external_agents::Error::UnsupportedTransport) rather than a
-/// dependency nobody can release.
+/// One carrier: a host-owned child's pipes. [`AcpSpec::Http`] is representable configuration,
+/// but [`transport::connect`] refuses it with
+/// [`Error::UnsupportedTransport`](mango_external_agents::Error::UnsupportedTransport) before
+/// launching a child. HTTP remains unsupported under the workspace's `ring`-only TLS policy.
+/// Adding it requires a supported-agent need and a reviewed compatible dependency path with
+/// target coverage; an upstream backend change alone does not enable it.
 const TRANSPORTS: &[TransportKind] = &[TransportKind::Acp];
 
 /// The ceiling of what this harness could reach given a new enough agent.

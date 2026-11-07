@@ -12,10 +12,10 @@
 //! * **Our own text never comes back.** `user_message_chunk` is the agent echoing the prompt the
 //!   host just sent; replaying it would duplicate the host's own message.
 //! * **Session state is not transcript.** The mode, config-option, session-info and command-catalog
-//!   updates describe the session rather than the turn. The command catalog is reported as a
-//!   [`SessionFact`] rather than an [`EventKind`], because it is session state — see
-//!   [`state::SessionState::set_commands`](mango_external_agents::state::SessionState::set_commands)
-//!   — and the rest are dropped, because 0.1 has no session-state slot for them yet.
+//!   updates describe the session rather than the turn. Command and configuration catalogs are
+//!   reported as [`SessionFact::Commands`] and [`SessionFact::ConfigurationOptions`], rather than
+//!   transcript [`EventKind`] values. The client publishes these into core session state.
+//!   Current-mode and session-info updates have no mapped core state here and are omitted.
 //!
 //! ACP v1 reference: <https://agentclientprotocol.com/protocol/v1/prompt-turn>
 
@@ -96,12 +96,10 @@ pub const UNTITLED_TOOL_CALL: &str = "tool";
 
 /// A session-scoped fact one frame carried, alongside whatever it said about the turn.
 ///
-/// ACP re-announces its command catalog mid-session; that catalog is session state, not transcript
-/// (see the module's own docs), so it is reported here rather than folded into
-/// [`Reducer::update`]'s event vector. The harness applies it to
-/// [`SessionState::set_commands`](mango_external_agents::state::SessionState::set_commands) instead
-/// of the turn stream, which is what lets a *second* announcement reach a host that already read
-/// the first.
+/// ACP can replace its command and configuration catalogs mid-session. These describe session
+/// state rather than transcript, so the reducer reports them here instead of folding them into
+/// [`Reducer::update`]'s event vector. The client publishes the corresponding core session catalog,
+/// letting later announcements reach a host that already read the first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionFact {
     /// The agent announced its slash-command catalog.

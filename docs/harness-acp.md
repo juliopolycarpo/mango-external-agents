@@ -133,10 +133,17 @@ reconciliation, and its cause keeps the `acp-link-closed` code, but the message 
 `the host's process control failed: expected the host's process stop to return | received: it
 panicked` (`it was cancelled` when the stop task was cancelled instead).
 
-`AcpSpec::Http` exists in the core and is **not implemented**: `agent-client-protocol-http` 3.3.0 pulls
-`aws-lc-rs` through `reqwest` 0.13's `rustls` feature and through `async-tungstenite`'s
-`tokio-rustls-webpki-roots`, and this workspace's `deny.toml` bans it — TLS is `ring` everywhere.
-Asking for it is `Error::UnsupportedTransport`.
+`AcpSpec::Http` represents an endpoint in configuration and remains **unsupported**. The public
+`transport::connect` API returns `Error::UnsupportedTransport` for it before launching a child.
+Only `AcpSpec::ChildPipes` is supported; accepting an HTTP URL in configuration does not make it a
+working transport.
+
+The policy decision in [#10](https://github.com/juliopolycarpo/mango-external-agents/issues/10) keeps
+TLS `ring`-only. The evaluated `agent-client-protocol-http` 3.3.0 dependency path pulls `aws-lc-rs`
+through `reqwest` 0.13's `rustls` feature and `async-tungstenite`'s
+`tokio-rustls-webpki-roots`, which this workspace's `deny.toml` bans. HTTP support requires a concrete
+supported-agent need, a reviewed compatible dependency path and supported-target evidence. An
+upstream backend change alone does not enable a carrier or relax that policy.
 
 ## The driving model
 
