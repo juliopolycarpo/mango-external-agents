@@ -511,11 +511,22 @@ one worth copying: it reads `QuestionForm`, numbers the choices, and never touch
 
 When `mea turn` fails and closing its session also fails, the CLI reports the original turn
 failure on stderr and returns the original cleanup error. If the primary failure itself retains
-another cleanup control, its launched pid is reported before that error is released. Before
-converting the returned error to text,
-it inspects any retained cleanup control and names the launched pid for manual reconciliation
+another cleanup control, its launched pid is reported before that error is released. The Codex
+transcript recorder uses the same precedence when its conversation and cleanup both fail.
+
+Before converting a `turn` or `capture` failure to text, the CLI inspects any retained cleanup
+control and names the launched pid for manual reconciliation
 (or says that the injected control has no pid). It does not repeat a one-stop request or claim
 that an unconfirmed process is gone. A CLI diagnostic is not a Rust control handoff to another host.
+
+Transcript recording, public command probes and ACP contract initialization own a
+`ProcessCleanupGuard` from transport acquisition. Their stops use the host's limits, and dropping a
+capture future starts the bounded cleanup worker while its runtime remains alive. Failed cleanup
+returns `CleanupRequired` with the injected control. Leader exit alone does not qualify public
+command output; process-tree cleanup must also succeed. A requested transcript diagnostic retains
+the caller's prefix and gains `# incomplete capture`, even when the conversation finished and only
+cleanup failed. It does not become a replay fixture. The separate `# unqualified capture` header
+marks a completed recording that failed its scenario checks.
 
 On Windows, `TokioLauncher` also resolves installed `.ps1` entrypoints when native executable
 resolution fails. It searches only the supplied `PATH`, runs Windows PowerShell from the supplied

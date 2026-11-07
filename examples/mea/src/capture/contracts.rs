@@ -11,7 +11,9 @@ use std::time::Duration;
 use mango_external_agents::error::{Error, Result};
 use mango_external_agents::launcher::TokioLauncher;
 use mango_external_agents::transports::stdio;
-use mango_external_agents::{CancelReason, EnvSource, ExecutablePath, HostContext, StdioSpec};
+use mango_external_agents::{
+    CancelReason, EnvSource, ExecutablePath, HostContext, ProcessCleanupGuard, StdioSpec,
+};
 use serde_json::{Map, Value, json};
 
 pub mod manifest;
@@ -258,7 +260,9 @@ async fn command_lines(
         vendor_environment_keys,
     )
     .await?;
-    let control = Arc::clone(&transport.control);
+    let control = transport.control;
+    let cleanup =
+        ProcessCleanupGuard::new(Arc::clone(&control), *host.limits(), CancelReason::Shutdown);
     let (mut sender, mut receiver) = transport.link.split();
     let outcome = async {
         sender.close().await?;
@@ -289,10 +293,14 @@ async fn command_lines(
         })
     }
     .await;
-    if outcome.is_err() {
-        let _ = control.kill(CancelReason::Shutdown).await;
-    }
-    outcome
+    let stopped = cleanup.finish().await.map(|_| ());
+    crate::failure::with_cleanup(outcome, stopped, |primary| {
+        eprintln!(
+            "{}: public capture failed before cleanup: {}",
+            command_name(&argv),
+            crate::failure::describe(primary)
+        );
+    })
 }
 
 async fn acp_initialize(
@@ -307,7 +315,8 @@ async fn acp_initialize(
         profile.vendor_environment_keys,
     )
     .await?;
-    let control = Arc::clone(&transport.control);
+    let cleanup =
+        ProcessCleanupGuard::new(transport.control, *host.limits(), CancelReason::Shutdown);
     let (mut sender, mut receiver) = transport.link.split();
     let outcome = async {
         sender
@@ -347,18 +356,16 @@ async fn acp_initialize(
             after: CONTRACT_TIMEOUT,
         })?
     }
-    .await;
-    let stopped = control.kill(CancelReason::Shutdown).await;
-    match outcome {
-        Ok(response) => {
-            stopped?;
-            normalize_acp_initialize(response)
-        }
-        Err(error) => {
-            let _ = stopped;
-            Err(error)
-        }
-    }
+    .await
+    .and_then(normalize_acp_initialize);
+    let stopped = cleanup.finish().await.map(|_| ());
+    crate::failure::with_cleanup(outcome, stopped, |primary| {
+        eprintln!(
+            "{}: public capture failed before cleanup: {}",
+            profile.display_name,
+            crate::failure::describe(primary)
+        );
+    })
 }
 
 fn normalize_acp_initialize(frame: Value) -> Result<Value> {
@@ -523,8 +530,12 @@ mod tests {
         CONTRACT_TIMEOUT, acp_initialize, acp_with, claude_surface, claude_with, command_name,
         command_output, copy_generated_schema, normalize_acp_initialize, write_json,
     };
+    use crate::capture::tests::{CaptureCleanupLauncher, CaptureStop, capture_host_with_limits};
     use mango_external_agents::testing::{FakeLauncher, FakeProcess};
-    use mango_external_agents::{EnvSource, Error, ExitStatus, HostContext};
+    use mango_external_agents::{
+        ByteSink, CancelReason, Dispatch, EnvSource, Error, ExitStatus, HostContext, LaunchSpec,
+        Limits, ManagedProcess, ProcessControl, ProcessLauncher, Result,
+    };
     use serde_json::json;
 
     fn host(launcher: Arc<FakeLauncher>) -> HostContext {
@@ -705,6 +716,246 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn successful_public_command_requires_confirmed_tree_cleanup() {
+        assert_public_capture_owner(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn failed_public_command_retains_cleanup_ownership() {
+        assert_public_capture_owner(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn successful_acp_initialize_retains_cleanup_ownership() {
+        assert_public_capture_owner(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn failed_acp_initialize_retains_cleanup_ownership() {
+        assert_public_capture_owner(true, true).await;
+    }
+
+    async fn assert_public_capture_owner(acp: bool, failed: bool) {
+        let process = if acp {
+            if failed {
+                FakeProcess::transcript(Vec::<String>::new())
+            } else {
+                FakeProcess::transcript([
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{},"authMethods":[]}}"#,
+                ])
+            }
+        } else {
+            FakeProcess::transcript([if failed { "oversized-line" } else { "v" }])
+        }.with_exit(success());
+        let launcher = CaptureCleanupLauncher::with_process(
+            CaptureStop::Refuse(
+                Error::Closed {
+                    subject: "public capture stop",
+                }
+                .with_dispatch(Dispatch::Accepted),
+            ),
+            process,
+        );
+        let mut limits = Limits::default();
+        if !acp && failed {
+            limits.line.max_line_bytes = 4;
+            limits.line.max_buffered_bytes = 8;
+        }
+        let host = capture_host_with_limits(launcher.clone(), limits);
+        let result = if acp {
+            let profile = mango_agent_acp::builtin_profile("opencode").expect("profile");
+            acp_initialize(&host, &profile).await.map(|_| ())
+        } else {
+            super::command_lines(
+                &host,
+                vec![String::from("fixture"), String::from("--version")],
+                &[],
+            )
+            .await
+            .map(|_| ())
+        };
+        let control = launcher.control();
+        control
+            .inner
+            .kill(CancelReason::Shutdown)
+            .await
+            .expect("test fake cleanup");
+        assert_eq!(
+            control.calls.load(Ordering::SeqCst),
+            1,
+            "public capture must confirm process-tree cleanup even after successful leader exit"
+        );
+        let error = result.expect_err("expected unconfirmed public capture cleanup");
+        let retained = error
+            .cleanup_control()
+            .expect("public capture must retain recovery control");
+        let expected: Arc<dyn ProcessControl> = control;
+        assert!(Arc::ptr_eq(&retained, &expected));
+        assert_eq!(error.dispatch(), Dispatch::Accepted);
+        assert!(matches!(
+            error.cause(),
+            Error::Closed {
+                subject: "public capture stop"
+            }
+        ));
+        assert_eq!(launcher.inner.live_children(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn public_command_cleanup_obeys_host_stop_limits() {
+        assert_public_capture_stop_bound(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn acp_initialize_cleanup_obeys_host_stop_limits() {
+        assert_public_capture_stop_bound(true).await;
+    }
+
+    async fn assert_public_capture_stop_bound(acp: bool) {
+        let process = FakeProcess::transcript(["oversized-line"]).with_exit(success());
+        let launcher = CaptureCleanupLauncher::with_process(CaptureStop::Hold, process);
+        let mut limits = Limits {
+            kill_grace: std::time::Duration::from_millis(1),
+            shutdown_timeout: std::time::Duration::from_millis(2),
+            ..Limits::default()
+        };
+        limits.line.max_line_bytes = 4;
+        limits.line.max_buffered_bytes = 8;
+        let host = capture_host_with_limits(launcher.clone(), limits);
+        let capture = async {
+            if acp {
+                let profile = mango_agent_acp::builtin_profile("opencode").expect("profile");
+                acp_initialize(&host, &profile).await.map(|_| ())
+            } else {
+                super::command_lines(&host, vec![String::from("fixture")], &[])
+                    .await
+                    .map(|_| ())
+            }
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_millis(20), capture).await;
+        let control = launcher.control();
+        control
+            .inner
+            .kill(CancelReason::Shutdown)
+            .await
+            .expect("test fake cleanup");
+        assert_eq!(control.calls.load(Ordering::SeqCst), 1);
+        let error = result
+            .expect("public capture stop must obey the host budget")
+            .expect_err("expected recoverable cleanup timeout");
+        let retained = error.cleanup_control().expect("timeout recovery control");
+        let expected: Arc<dyn ProcessControl> = control;
+        assert!(Arc::ptr_eq(&retained, &expected));
+        assert!(matches!(error.cause(), Error::Timeout { .. }));
+        assert_eq!(launcher.inner.live_children(), 0);
+    }
+
+    fn no_contract_replies(_: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Models a command that keeps running after its stdin closes, independently of pipe EOF.
+    struct IndependentEofLauncher(Arc<CaptureCleanupLauncher>);
+
+    #[async_trait::async_trait]
+    impl ProcessLauncher for IndependentEofLauncher {
+        async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
+            let mut child = self.0.spawn(spec).await?;
+            child.stdin = Some(Box::new(IndependentEofInput {
+                inner: child.stdin.take().expect("fake input"),
+                closed: false,
+            }));
+            Ok(child)
+        }
+    }
+
+    struct IndependentEofInput {
+        inner: Box<dyn ByteSink>,
+        closed: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ByteSink for IndependentEofInput {
+        async fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+            if self.closed {
+                return Err(Error::Closed {
+                    subject: "fake command input",
+                });
+            }
+            self.inner.write_all(bytes).await
+        }
+
+        async fn close(&mut self) -> Result<()> {
+            self.closed = true;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_public_command_stops_its_owned_child() {
+        assert_public_capture_cancellation(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_acp_initialize_stops_its_owned_child() {
+        assert_public_capture_cancellation(true).await;
+    }
+
+    async fn assert_public_capture_cancellation(acp: bool) {
+        let launcher = CaptureCleanupLauncher::with_process(
+            CaptureStop::End,
+            FakeProcess::responding(no_contract_replies),
+        );
+        let port: Arc<dyn ProcessLauncher> = if acp {
+            launcher.clone()
+        } else {
+            Arc::new(IndependentEofLauncher(launcher.clone()))
+        };
+        let host = capture_host_with_limits(port, Limits::default());
+        let capture = tokio::spawn(async move {
+            if acp {
+                let profile = mango_agent_acp::builtin_profile("opencode").expect("profile");
+                acp_initialize(&host, &profile).await.map(|_| ())
+            } else {
+                super::command_lines(&host, vec![String::from("fixture")], &[])
+                    .await
+                    .map(|_| ())
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), launcher.reads.notified())
+            .await
+            .expect("expected an observed public capture read");
+        assert!(!capture.is_finished());
+        let control = launcher.control();
+        capture.abort();
+        assert!(
+            capture
+                .await
+                .expect_err("expected cancellation")
+                .is_cancelled()
+        );
+        let stopped = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            control.finished.notified(),
+        )
+        .await;
+        let calls = control.calls.load(Ordering::SeqCst);
+        let live = launcher.inner.live_children();
+        control
+            .inner
+            .kill(CancelReason::Shutdown)
+            .await
+            .expect("test fake cleanup");
+        assert!(
+            stopped.is_ok(),
+            "cancelled public capture must stop its owned child"
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(live, 0);
+        assert_eq!(launcher.inner.live_children(), 0);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn stalled_acp_initialize_reaps_the_named_fake_agent() {
         let launcher = Arc::new(FakeLauncher::new());
@@ -714,7 +965,7 @@ mod tests {
         let host = host(Arc::clone(&launcher));
         let capture = tokio::spawn(async move { acp_initialize(&host, profile.as_ref()).await });
 
-        tokio::task::yield_now().await;
+        launcher.wait_for_written(1).await;
         tokio::time::advance(CONTRACT_TIMEOUT).await;
         let error = capture
             .await

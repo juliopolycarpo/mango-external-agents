@@ -1,5 +1,7 @@
 //! Drives one `mea turn` lifecycle after a harness has opened its session.
 
+use crate::failure::with_cleanup;
+
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
@@ -155,25 +157,9 @@ async fn run_turn(
     with_cleanup(outcome, closed, |primary| {
         eprintln!(
             "turn failed before cleanup: {}",
-            crate::turn_failure(primary)
+            crate::failure::describe(primary)
         );
     })
-}
-
-/// Retains the cleanup failure unchanged, reporting the primary context separately when both fail.
-fn with_cleanup<T>(
-    outcome: Result<T>,
-    closed: Result<()>,
-    report_primary: impl FnOnce(&Error),
-) -> Result<T> {
-    match (outcome, closed) {
-        (Err(primary), Err(cleanup)) => {
-            report_primary(&primary);
-            Err(cleanup)
-        }
-        (Ok(_), Err(cleanup)) => Err(cleanup),
-        (outcome, Ok(())) => outcome,
-    }
 }
 
 /// Drains a turn and, when a delay was asked for and elapses first, asks the session to cancel it.
@@ -1829,7 +1815,7 @@ mod tests {
             assert!(
                 matches!(error.cause(), Error::Protocol { expected, .. } if expected == "a confirmed process cleanup")
             );
-            assert!(crate::turn_failure(&error).contains("4242"));
+            assert!(crate::failure::describe(&error).contains("4242"));
         }
     }
 
@@ -1852,11 +1838,11 @@ mod tests {
         };
         let mut primary_report = String::new();
         let result = super::with_cleanup::<()>(Err(primary), Err(cleanup), |error| {
-            primary_report = crate::turn_failure(error)
+            primary_report = crate::failure::describe(error)
         })
         .expect_err("both failed");
         assert!(primary_report.contains("launched pid 41"));
-        assert!(crate::turn_failure(&result).contains("launched pid 42"));
+        assert!(crate::failure::describe(&result).contains("launched pid 42"));
         assert!(Arc::ptr_eq(
             &result.cleanup_control().expect("returned owner"),
             &remaining
@@ -1869,7 +1855,7 @@ mod tests {
             control: Arc::new(CleanupControl(None)),
             source: Box::new(Error::Closed { subject: "cleanup" }),
         };
-        let report = crate::turn_failure(&error);
+        let report = crate::failure::describe(&error);
         assert!(report.contains("unconfirmed"));
         assert!(report.contains("control has no pid"));
     }

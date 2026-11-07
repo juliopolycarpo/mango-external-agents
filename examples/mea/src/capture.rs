@@ -12,12 +12,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mango_external_agents::HostContext;
 use mango_external_agents::error::{Error, Result};
 use mango_external_agents::launcher::TokioLauncher;
 use mango_external_agents::link::{LinkReceiver, LinkSender};
 use mango_external_agents::transport::{ExecutablePath, StdioSpec};
 use mango_external_agents::transports::stdio;
+use mango_external_agents::{HostContext, ProcessCleanupGuard};
 use serde_json::{Map, Value, json};
 
 use crate::redact;
@@ -275,10 +275,9 @@ fn has_captured_subagent(recorded: &str) -> bool {
 
 /// One scenario, as the lines both sides wrote.
 ///
-/// A child that cannot be reaped fails the capture even when the conversation succeeded: the
-/// fixture is not affected, but a `codex app-server` left running on the maintainer's machine is
-/// not something to report as a clean run. When the conversation failed too, that error is the one
-/// returned and the cleanup failure is printed beside it.
+/// Cleanup is owned from transport acquisition and bounded by the host's stop limits. Dropping
+/// this future starts the same bounded worker while its runtime is alive. Unconfirmed cleanup
+/// returns its original recovery control, with any primary conversation failure reported first.
 async fn record(
     host: &HostContext,
     scenario: &Scenario,
@@ -291,6 +290,11 @@ async fn record(
         StdioSpec::new(["codex", "app-server"])
     };
     let transport = stdio::open(host, &spec, &ExecutablePath::default(), &["CODEX_HOME"]).await?;
+    let cleanup = ProcessCleanupGuard::new(
+        transport.control,
+        *host.limits(),
+        mango_external_agents::CancelReason::Shutdown,
+    );
     let (sender, receiver) = transport.link.split();
     let mut recorder = Recorder {
         sender,
@@ -302,34 +306,26 @@ async fn record(
     };
 
     let outcome = recorder.run(scenario).await;
-    let stopped = transport
-        .control
-        .kill(mango_external_agents::CancelReason::Shutdown)
-        .await;
-    match outcome {
-        Ok(()) => {
-            stopped?;
-            Ok(recorder.lines.join("\n") + "\n")
-        }
-        Err(error) => {
-            if let Some((path, prefix)) = diagnostic {
-                let partial = format!(
-                    "{prefix}# incomplete capture\n{}\n",
-                    recorder.lines.join("\n")
-                );
-                if let Err(write_error) = std::fs::write(path, partial) {
-                    eprintln!("could not retain the redacted partial capture: {write_error}");
-                }
-            }
-            if let Err(cleanup) = stopped {
-                eprintln!(
-                    "codex/{}: the app-server was not reaped: {cleanup}",
-                    scenario.name
-                );
-            }
-            Err(error)
+    let stopped = cleanup.finish().await.map(|_| ());
+    if (outcome.is_err() || stopped.is_err())
+        && let Some((path, prefix)) = diagnostic
+    {
+        let partial = format!(
+            "{prefix}# incomplete capture\n{}\n",
+            recorder.lines.join("\n")
+        );
+        if let Err(write_error) = std::fs::write(path, partial) {
+            eprintln!("could not retain the redacted partial capture: {write_error}");
         }
     }
+    crate::failure::with_cleanup(outcome, stopped, |primary| {
+        eprintln!(
+            "codex/{}: capture failed before cleanup: {}",
+            scenario.name,
+            crate::failure::describe(primary)
+        );
+    })?;
+    Ok(recorder.lines.join("\n") + "\n")
 }
 
 /// A conversation being written down as it happens.
@@ -710,7 +706,8 @@ fn review_target(scenario: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use super::{
@@ -718,10 +715,12 @@ mod tests {
         unconfigured_turn_params,
     };
     use mango_external_agents::process::{
-        LaunchSpec, ManagedProcess, ProcessControl, ProcessLauncher,
+        ByteSource, LaunchSpec, ManagedProcess, ProcessControl, ProcessLauncher,
     };
     use mango_external_agents::testing::{FakeLauncher, FakeProcess};
-    use mango_external_agents::{CancelReason, EnvSource, Error, ExitStatus, HostContext, Result};
+    use mango_external_agents::{
+        CancelReason, Dispatch, EnvSource, Error, ExitStatus, HostContext, Limits, Result,
+    };
     use serde_json::{Value, json};
 
     /// A Codex app-server that answers every request, and names a thread for `thread/start`.
@@ -921,8 +920,16 @@ mod tests {
     }
 
     fn host(launcher: Arc<dyn ProcessLauncher>) -> HostContext {
+        capture_host_with_limits(launcher, Limits::default())
+    }
+
+    pub(super) fn capture_host_with_limits(
+        launcher: Arc<dyn ProcessLauncher>,
+        limits: Limits,
+    ) -> HostContext {
         HostContext::builder()
             .launcher(launcher)
+            .limits(limits)
             .cwd(std::env::temp_dir())
             .environment(EnvSource::from_pairs([("PATH", "/fake/bin")]))
             .client_info("mea-test", "0.0.0")
@@ -941,6 +948,287 @@ mod tests {
         Arc::new(UnreapableLauncher {
             inner: Arc::clone(launcher),
         })
+    }
+
+    #[derive(Clone)]
+    pub(super) enum CaptureStop {
+        Refuse(Error),
+        Hold,
+        End,
+    }
+
+    /// A capture-owned child whose stop and recovery identity the test can inspect.
+    pub(super) struct CaptureCleanupLauncher {
+        pub(super) inner: Arc<FakeLauncher>,
+        pub(super) reads: Arc<tokio::sync::Notify>,
+        stop: CaptureStop,
+        control: Mutex<Option<Arc<CaptureCleanupControl>>>,
+    }
+
+    impl CaptureCleanupLauncher {
+        fn new(stop: CaptureStop) -> Arc<Self> {
+            Self::with_process(stop, app_server())
+        }
+
+        pub(super) fn with_process(stop: CaptureStop, process: FakeProcess) -> Arc<Self> {
+            let inner = Arc::new(FakeLauncher::new());
+            inner.push(process);
+            Arc::new(Self {
+                inner,
+                reads: Arc::new(tokio::sync::Notify::new()),
+                stop,
+                control: Mutex::new(None),
+            })
+        }
+
+        pub(super) fn control(&self) -> Arc<CaptureCleanupControl> {
+            self.control
+                .lock()
+                .expect("control ledger")
+                .as_ref()
+                .expect("launched child")
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessLauncher for CaptureCleanupLauncher {
+        async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
+            let mut child = self.inner.spawn(spec).await?;
+            child.stdout = Box::new(CaptureReadObservation {
+                inner: child.stdout,
+                reads: self.reads.clone(),
+            });
+            let control = Arc::new(CaptureCleanupControl {
+                inner: child.control,
+                stop: self.stop.clone(),
+                calls: AtomicUsize::new(0),
+                finished: tokio::sync::Notify::new(),
+            });
+            child.control = control.clone();
+            *self.control.lock().expect("control ledger") = Some(control);
+            Ok(child)
+        }
+    }
+
+    struct CaptureReadObservation {
+        inner: Box<dyn ByteSource>,
+        reads: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl ByteSource for CaptureReadObservation {
+        async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+            self.reads.notify_one();
+            self.inner.next_chunk().await
+        }
+    }
+
+    pub(super) struct CaptureCleanupControl {
+        pub(super) inner: Arc<dyn ProcessControl>,
+        stop: CaptureStop,
+        pub(super) calls: AtomicUsize,
+        pub(super) finished: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessControl for CaptureCleanupControl {
+        fn pid(&self) -> Option<u32> {
+            Some(42)
+        }
+
+        fn stderr_tail(&self) -> String {
+            self.inner.stderr_tail()
+        }
+
+        async fn wait(&self) -> Result<ExitStatus> {
+            self.inner.wait().await
+        }
+
+        async fn kill(&self, reason: CancelReason) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match &self.stop {
+                CaptureStop::Refuse(error) => Err(error.clone()),
+                CaptureStop::Hold => std::future::pending().await,
+                CaptureStop::End => {
+                    self.inner.kill(reason).await?;
+                    self.finished.notify_one();
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_failure_retains_the_exact_cleanup_control_and_dispatch() {
+        assert_capture_cleanup_owner(false).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_capture_retains_the_cleanup_owner_after_a_second_failure() {
+        assert_capture_cleanup_owner(true).await;
+    }
+
+    async fn assert_capture_cleanup_owner(failed_conversation: bool) {
+        let original = Error::LimitExceeded {
+            subject: "capture stop",
+            limit: 1,
+            received: 2,
+        }
+        .with_dispatch(Dispatch::Accepted);
+        let launcher = CaptureCleanupLauncher::new(CaptureStop::Refuse(original.clone()));
+        let unknown = Scenario {
+            name: "unknown",
+            purpose: "synthetic failed conversation",
+        };
+        let result = record(
+            &host(launcher.clone()),
+            if failed_conversation {
+                &unknown
+            } else {
+                handshake()
+            },
+            &std::env::temp_dir(),
+            None,
+        )
+        .await;
+        let control = launcher.control();
+        let still_live = launcher.inner.live_children();
+        // Only this test-owned underlying fake is ended here; the injected refusal is not retried.
+        control
+            .inner
+            .kill(CancelReason::Shutdown)
+            .await
+            .expect("test fake cleanup");
+        assert_eq!(still_live, 1);
+        assert_eq!(control.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(control.pid(), Some(42));
+        assert!(control.stderr_tail().is_empty());
+        let error = result.expect_err("expected unconfirmed capture cleanup");
+        let retained = error
+            .cleanup_control()
+            .expect("capture must retain cleanup ownership");
+        let expected: Arc<dyn ProcessControl> = control;
+        assert!(Arc::ptr_eq(&retained, &expected));
+        assert!(crate::failure::describe(&error).contains("launched pid 42"));
+        assert_eq!(error.dispatch(), Dispatch::Accepted);
+        assert!(matches!(
+            error.cause(),
+            Error::LimitExceeded {
+                subject: "capture stop",
+                limit: 1,
+                received: 2
+            }
+        ));
+        assert_eq!(launcher.inner.live_children(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capture_cleanup_is_bounded_when_the_injected_stop_stalls() {
+        let launcher = CaptureCleanupLauncher::new(CaptureStop::Hold);
+        let host = capture_host_with_limits(
+            launcher.clone(),
+            Limits {
+                kill_grace: Duration::from_millis(1),
+                shutdown_timeout: Duration::from_millis(2),
+                ..Limits::default()
+            },
+        );
+        let result = tokio::time::timeout(
+            Duration::from_millis(20),
+            record(&host, handshake(), &std::env::temp_dir(), None),
+        )
+        .await;
+        let control = launcher.control();
+        control
+            .inner
+            .kill(CancelReason::Shutdown)
+            .await
+            .expect("test fake cleanup");
+        assert_eq!(control.calls.load(Ordering::SeqCst), 1);
+        let error = result
+            .expect("capture cleanup must finish within the host stop budget")
+            .expect_err("expected a recoverable stop timeout");
+        let expected: Arc<dyn ProcessControl> = control;
+        assert!(Arc::ptr_eq(
+            &error.cleanup_control().expect("timeout recovery control"),
+            &expected
+        ));
+        assert!(matches!(error.cause(), Error::Timeout { .. }));
+        assert_eq!(launcher.inner.live_children(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_capture_after_its_first_write_still_stops_the_owned_child() {
+        let launcher = CaptureCleanupLauncher::new(CaptureStop::End);
+        let host = host(launcher.clone());
+        let task = tokio::spawn(async move {
+            record(
+                &host,
+                &Scenario {
+                    name: "turn",
+                    purpose: "synthetic stalled turn",
+                },
+                &std::env::temp_dir(),
+                None,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), launcher.inner.wait_for_written(1))
+            .await
+            .expect("expected the capture's first protocol write");
+        assert!(!task.is_finished());
+        let control = launcher.control();
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("expected cancellation")
+                .is_cancelled()
+        );
+        let stopped =
+            tokio::time::timeout(Duration::from_secs(1), control.finished.notified()).await;
+        let calls = control.calls.load(Ordering::SeqCst);
+        let live = launcher.inner.live_children();
+        control
+            .inner
+            .kill(CancelReason::Shutdown)
+            .await
+            .expect("test fake cleanup");
+        assert!(
+            stopped.is_ok(),
+            "capture cancellation must start owned cleanup"
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(live, 0);
+        assert_eq!(launcher.inner.live_children(), 0);
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_capture_cleanup_retains_only_a_marked_diagnostic() {
+        let workspace = crate::workspace::CaptureWorkspace::new(None).expect("test workspace");
+        let diagnostic = workspace.path.join("unqualified.partial.jsonl");
+        let launcher = CaptureCleanupLauncher::new(CaptureStop::Refuse(Error::Closed {
+            subject: "capture stop",
+        }));
+        let result = record(
+            &host(launcher.clone()),
+            handshake(),
+            &workspace.path,
+            Some((&diagnostic, "# UNQUALIFIED\n")),
+        )
+        .await;
+        launcher
+            .control()
+            .inner
+            .kill(CancelReason::Shutdown)
+            .await
+            .expect("test fake cleanup");
+        assert!(result.is_err());
+        let retained = std::fs::read_to_string(&diagnostic)
+            .expect("capture cleanup failure must retain an unqualified diagnostic");
+        assert!(retained.starts_with("# UNQUALIFIED\n# incomplete capture\n"));
+        assert!(retained.contains(super::SENT) && retained.contains(super::RECEIVED));
+        assert!(!workspace.path.join("handshake.jsonl").exists());
     }
 
     #[tokio::test]
@@ -1272,7 +1560,7 @@ mod tests {
         .await;
 
         assert!(
-            matches!(&result, Err(Error::Timeout { operation, .. }) if operation.contains("reaping")),
+            matches!(&result, Err(error) if matches!(error.cause(), Error::Timeout { operation, .. } if operation.contains("reaping")) && error.cleanup_control().is_some()),
             "expected a capture error naming the reap failure | received {result:?}"
         );
         assert_eq!(
@@ -1283,7 +1571,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_conversation_keeps_its_own_error_when_the_reap_fails_too() {
+    async fn a_failed_conversation_retains_cleanup_ownership_when_the_reap_fails_too() {
         let launcher = Arc::new(FakeLauncher::new());
         launcher.push(app_server());
         let scenario = Scenario {
@@ -1300,8 +1588,8 @@ mod tests {
         .await;
 
         assert!(
-            matches!(&result, Err(Error::HostConfiguration { received, .. }) if received == "unknown"),
-            "expected the conversation's own error | received {result:?}"
+            matches!(&result, Err(error) if matches!(error.cause(), Error::Timeout { operation, .. } if operation.contains("reaping")) && error.cleanup_control().is_some()),
+            "expected original cleanup ownership with separately reported primary context | received {result:?}"
         );
     }
 
