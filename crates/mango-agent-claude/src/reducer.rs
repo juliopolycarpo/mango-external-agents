@@ -794,6 +794,9 @@ impl TurnReducer {
     /// string that is allowed to grow to twice a detail's bound, only for the caller to bound and
     /// copy it again on the way into the event.
     ///
+    /// Only the prefix that fits is appended, so even the first oversized block cannot leave an
+    /// input-sized allocation behind a bounded visible string.
+    ///
     /// Once a cut has happened the buffer holds exactly the bound's worth of characters, and
     /// `head(buffer + '\n' + text)` is that buffer again for any `text`. So a full buffer is handed
     /// back as it is: the block is not copied in only to be cut off, and the buffer's capacity stops
@@ -804,13 +807,18 @@ impl TurnReducer {
         if *full {
             return entry;
         }
+        let mut remaining = DETAIL_CARRY_MAX_CHARS.saturating_sub(entry.chars().count());
         if !entry.is_empty() {
+            if remaining == 0 {
+                *full = true;
+                return entry;
+            }
             entry.push('\n');
+            remaining -= 1;
         }
-        entry.push_str(text);
-        let kept = head(entry, DETAIL_CARRY_MAX_CHARS).len();
-        *full = kept < entry.len();
-        entry.truncate(kept);
+        let fitting = head(text, remaining);
+        entry.push_str(fitting);
+        *full = fitting.len() < text.len();
         entry
     }
 }
@@ -1060,8 +1068,8 @@ mod tests {
     use crate::protocol::StreamRecord;
     use mango_external_agents::normalize::TextLimit;
     use mango_external_agents::{
-        ActivityContent, ActivityKind, ActivityUpdate, ErrorCode, EventKind, FileChangeKind,
-        VendorError,
+        ActivityContent, ActivityKind, ActivityStatus, ActivityUpdate, ErrorCode, EventKind,
+        FileChangeKind, VendorError,
     };
     use serde_json::json;
 
@@ -1976,7 +1984,11 @@ mod tests {
                 "task",
                 &"x".repeat(DETAIL_CARRY_MAX_CHARS + 10),
             );
-            assert!(!reducer.nested_text.is_empty());
+            open_task(&mut reducer, "sibling");
+            nested_detail(&mut reducer, "sibling", "retained sibling text");
+            assert_eq!(reducer.nested_text.len(), 2);
+            assert!(reducer.nested_text["task"].1);
+            assert!(!reducer.nested_text["sibling"].1);
             let events = match ending {
                 "cancel" => reducer.cancel(),
                 "abort" => {
@@ -1987,13 +1999,104 @@ mod tests {
                     r#"{"type":"result","subtype":"success","is_error":false}"#,
                 ),
             };
-            assert!(!events.is_empty());
+            for expected_id in ["task", "sibling"] {
+                assert_eq!(events.iter().filter(|event| matches!(event,
+                    EventKind::ActivityCompleted { call_id, result }
+                        if call_id == expected_id && result.status == ActivityStatus::Cancelled
+                )).count(), 1, "expected {ending} to close {expected_id} exactly once | received {events:?}");
+            }
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, EventKind::Completed))
+                    .count(),
+                usize::from(ending == "result")
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, EventKind::Error { .. }))
+                    .count(),
+                usize::from(ending == "abort")
+            );
             assert!(reducer.finished());
             assert!(
                 reducer.nested_text.is_empty(),
                 "expected {ending} to release nested buffers"
             );
             assert!(reducer.cancel().is_empty());
+            assert!(
+                reducer
+                    .abort(VendorError::new(ErrorCode::from_static("late"), "late"))
+                    .is_empty()
+            );
+            assert!(reduce(&mut reducer, &forwarded_line("task", "late payload")).is_empty());
+            assert!(reducer.nested_text.is_empty());
+        }
+    }
+
+    /// A visible text bound must also bound retained allocation after the first large block.
+    #[test]
+    fn an_oversized_nested_block_keeps_bounded_capacity_for_each_unicode_width() {
+        for (name, text) in [
+            ("ascii", "x".repeat(2 * 1024 * 1024)),
+            ("two-byte", "é".repeat(1024 * 1024)),
+            ("four-byte", "😀".repeat(512 * 1024)),
+        ] {
+            for prefix in ["", "seed"] {
+                let mut reducer = TurnReducer::new();
+                open_task(&mut reducer, "p");
+                let mut reference = String::new();
+                if !prefix.is_empty() {
+                    nested_detail(&mut reducer, "p", prefix);
+                    accumulated_by_cutting_every_time(&mut reference, prefix);
+                }
+                let expected = accumulated_by_cutting_every_time(&mut reference, &text);
+                let received = nested_detail(&mut reducer, "p", &text);
+                assert_eq!(received.as_deref(), Some(expected.as_str()));
+                let (kept, full) = &reducer.nested_text["p"];
+                assert!(*full);
+                assert_eq!(kept.chars().count(), DETAIL_CARRY_MAX_CHARS);
+                assert!(
+                    kept.capacity() <= 8 * DETAIL_CARRY_MAX_CHARS,
+                    "expected {name} retained capacity bounded independently of the {} input bytes, received {} bytes against {}",
+                    text.len(),
+                    kept.capacity(),
+                    8 * DETAIL_CARRY_MAX_CHARS
+                );
+            }
+        }
+    }
+
+    /// Empty blocks and separators must preserve the exact point where the carry becomes full.
+    #[test]
+    fn nested_text_full_markers_preserve_empty_and_exact_boundary_blocks() {
+        let bound = DETAIL_CARRY_MAX_CHARS;
+        for blocks in [
+            vec![String::new(), String::new()],
+            vec![String::from("x"), String::new()],
+            vec!["x".repeat(bound), String::new()],
+            vec!["é".repeat(bound - 1), String::new(), String::new()],
+            vec!["😀".repeat(bound - 1), String::from("tail")],
+        ] {
+            let mut reducer = TurnReducer::new();
+            open_task(&mut reducer, "p");
+            let mut reference = String::new();
+            let mut expected_full = false;
+            for block in blocks {
+                if !expected_full {
+                    let mut combined = reference.clone();
+                    if !combined.is_empty() {
+                        combined.push('\n');
+                    }
+                    combined.push_str(&block);
+                    expected_full = combined.chars().count() > bound;
+                }
+                let expected = accumulated_by_cutting_every_time(&mut reference, &block);
+                let received = reducer.append_nested("p", &block);
+                assert_eq!(received, expected);
+                assert_eq!(reducer.nested_text["p"].1, expected_full);
+            }
         }
     }
 
