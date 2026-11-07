@@ -5,7 +5,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 # Query once, preserving Cargo failures instead of interpreting every nonzero inverse query as
 # an absent package. The locked graph keeps this check aligned with the validated dependency set.
-if graph=$(cargo tree --workspace --all-features --locked -e normal --prefix none --format '{p}'); then
+# Disable styling because the graph is parsed rather than displayed.
+if graph=$(cargo tree --workspace --all-features --locked -e normal --prefix none --format '{p}' --color never); then
   :
 else
   status=$?
@@ -16,5 +17,11 @@ if banned=$(printf '%s\n' "$graph" | grep -E '^(aws-lc-rs|aws-lc-sys|openssl|ope
   echo "expected no banned TLS dependency, received:" >&2
   printf '%s\n' "$banned" >&2
   exit 1
+else
+  status=$?
+  if [ "$status" -ne 1 ]; then
+    echo "expected a searchable dependency graph, received dependency matcher exit $status" >&2
+    exit "$status"
+  fi
 fi
 echo "TLS policy holds: no aws-lc-rs, no openssl"
