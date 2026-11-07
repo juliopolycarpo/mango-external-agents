@@ -152,7 +152,10 @@ async fn codex_with(
 ) -> Result<()> {
     let scenarios: Vec<_> = SCENARIOS
         .iter()
-        .filter(|scenario| selected.is_none_or(|name| scenario.name == name))
+        .filter(|scenario| match selected {
+            Some(name) => scenario.name == name,
+            None => scenario.name != "subagent",
+        })
         .collect();
     if scenarios.is_empty() {
         return Err(Error::HostConfiguration {
@@ -184,23 +187,63 @@ async fn codex_with(
         let diagnostic =
             (scenario.name == "subagent").then_some((partial.as_path(), prefix.as_str()));
         let conversation = record(host, scenario, workspace, diagnostic).await?;
-        let recorded = prefix + &conversation;
-        let path = out_dir.join(format!("{}.jsonl", scenario.name));
+        let mut recorded = prefix + &conversation;
+        let qualified = scenario.name != "subagent" || has_captured_subagent(&recorded);
+        let unqualified = out_dir.join("subagent.unqualified.jsonl");
+        let path = if qualified {
+            out_dir.join(format!("{}.jsonl", scenario.name))
+        } else {
+            recorded.insert_str(0, "# unqualified capture\n");
+            unqualified.clone()
+        };
         std::fs::write(&path, &recorded).map_err(|error| Error::HostConfiguration {
             expected: "a writable fixture file",
             received: error.to_string(),
         })?;
-        println!("  wrote {}", path.display());
-        if scenario.name == "subagent" && !has_captured_subagent(&recorded) {
+        if scenario.name == "subagent" {
+            for path in std::iter::once(&partial).chain(qualified.then_some(&unqualified)) {
+                if let Err(error) = std::fs::remove_file(path)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    return Err(Error::HostConfiguration {
+                        expected: "a removable stale capture diagnostic",
+                        received: error.to_string(),
+                    });
+                }
+            }
+        }
+        if !qualified {
+            let kinds: std::collections::BTreeSet<_> = recorded
+                .lines()
+                .filter_map(|line| line.strip_prefix(RECEIVED))
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|frame| {
+                    matches!(
+                        frame["method"].as_str(),
+                        Some("item/started" | "item/completed")
+                    )
+                })
+                .filter_map(|frame| frame["params"]["item"]["type"].as_str().map(str::to_owned))
+                .collect();
+            let kinds = if kinds.is_empty() {
+                String::from("none")
+            } else {
+                kinds.into_iter().collect::<Vec<_>>().join(", ")
+            };
+            let received = mango_external_agents::redact::bounded(
+                &format!("item types: {kinds}; retained unqualified capture"),
+                mango_external_agents::normalize::TextLimit::ErrorMessage,
+            )
+            .text;
+            println!("  retained unqualified capture {}", path.display());
             return Err(Error::Protocol {
                 expected: String::from(
                     "a captured subAgentActivity item with a nonempty agentThreadId",
                 ),
-                received: String::from(
-                    "a completed transcript with no such item; the generated transcript was retained",
-                ),
+                received,
             });
         }
+        println!("  wrote {}", path.display());
     }
     Ok(())
 }
@@ -680,6 +723,33 @@ mod tests {
         })
     }
 
+    /// Mechanical replies for scenario-selection tests, not a vendor transcript.
+    fn archival_app_server() -> FakeProcess {
+        FakeProcess::responding(|line| {
+            let frame: Value = serde_json::from_str(line).expect("scripted capture request");
+            let terminal = json!({"method": "turn/completed", "params": {
+                "threadId": "parent-thread", "turn": {"id": "turn", "status": "completed"}
+            }});
+            if frame["result"]["decision"] == "decline" {
+                return vec![terminal.to_string()];
+            }
+            let (Some(method), Some(id)) = (frame["method"].as_str(), frame.get("id")) else {
+                return Vec::new();
+            };
+            let response = json!({"id": id, "result": {
+                "thread": {"id": "parent-thread"}, "turn": {"id": "turn"}
+            }});
+            match method {
+                "turn/start" if frame["params"]["input"][0]["text"].as_str().is_some_and(|text| text.contains("mango.txt")) => vec![
+                    response.to_string(), json!({"id": 90, "method": "item/commandExecution/requestApproval", "params": {}}).to_string()
+                ],
+                "turn/start" if frame["params"]["input"][0]["text"].as_str().is_some_and(|text| text.contains("Count slowly")) => vec![response.to_string()],
+                "turn/start" | "turn/interrupt" | "review/start" => vec![response.to_string(), terminal.to_string()],
+                _ => vec![response.to_string()],
+            }
+        })
+    }
+
     /// Scripted protocol traffic, not a claimed vendor capture.
     fn subagent_app_server(with_child_item: bool, refused: bool) -> FakeProcess {
         FakeProcess::responding(move |line| {
@@ -816,6 +886,17 @@ mod tests {
         launcher.push(subagent_app_server(true, false));
         let out =
             std::env::temp_dir().join(format!("mea-selected-subagent-{}", std::process::id()));
+        std::fs::create_dir_all(&out).expect("test capture directory");
+        std::fs::write(
+            out.join("subagent.partial.jsonl"),
+            "# incomplete older attempt\n",
+        )
+        .expect("old partial");
+        std::fs::write(
+            out.join("subagent.unqualified.jsonl"),
+            "# unqualified older attempt\n",
+        )
+        .expect("old unqualified record");
         let result = codex_with(
             &host(launcher.clone()),
             &out,
@@ -875,6 +956,12 @@ mod tests {
         launcher.push(version_line(mango_agent_codex::MINIMUM_CODEX_VERSION));
         launcher.push(subagent_app_server(false, false));
         let out = std::env::temp_dir().join(format!("mea-absent-subagent-{}", std::process::id()));
+        std::fs::create_dir_all(&out).expect("test capture directory");
+        std::fs::write(
+            out.join("subagent.partial.jsonl"),
+            "# incomplete older attempt\n",
+        )
+        .expect("old partial");
         let result = codex_with(
             &host(launcher.clone()),
             &out,
@@ -882,16 +969,77 @@ mod tests {
             Some("subagent"),
         )
         .await;
-        let recorded = std::fs::read_to_string(out.join("subagent.jsonl")).unwrap_or_default();
+        let recorded =
+            std::fs::read_to_string(out.join("subagent.unqualified.jsonl")).unwrap_or_default();
+        let credited = out.join("subagent.jsonl").exists();
+        let partial = out.join("subagent.partial.jsonl").exists();
         if out.exists() {
             std::fs::remove_dir_all(&out).expect("remove unqualified test capture");
         }
 
         assert!(
-            matches!(result, Err(Error::Protocol { expected, .. }) if expected.contains("agentThreadId"))
+            !credited,
+            "expected an unqualified capture not to use the success filename"
         );
+        assert!(
+            !partial,
+            "expected the completed diagnostic to replace the stale partial"
+        );
+        assert!(matches!(result, Err(Error::Protocol { expected, received })
+            if expected.contains("agentThreadId") && received.contains("collabAgentToolCall")));
+        assert!(recorded.starts_with("# unqualified capture\n"));
         assert!(recorded.contains("collabAgentToolCall"));
         assert!(!super::has_captured_subagent(&recorded));
+        assert_eq!(launcher.live_children(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_default_archival_capture_never_enables_or_runs_the_subagent_scenario() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(version_line(mango_agent_codex::MINIMUM_CODEX_VERSION));
+        for _ in SCENARIOS {
+            launcher.push(archival_app_server());
+        }
+        let out = std::env::temp_dir().join(format!("mea-default-archival-{}", std::process::id()));
+        let result = codex_with(&host(launcher.clone()), &out, &std::env::temp_dir(), None).await;
+        let files = std::fs::read_dir(&out).expect("capture directory").count();
+        std::fs::remove_dir_all(&out).expect("remove test captures");
+        assert!(
+            result.is_ok(),
+            "expected the archival set alone to succeed: {result:?}"
+        );
+        assert_eq!(files, 10);
+        let launches = launched(&launcher);
+        assert_eq!(launches[1], "codex app-server");
+        assert_eq!(launches.len(), 11, "version plus ten archival scenarios");
+        assert!(
+            launches
+                .iter()
+                .skip(1)
+                .all(|argv| argv == "codex app-server")
+        );
+        assert!(!launches.iter().any(|argv| argv.contains("--enable")));
+        assert_eq!(launcher.live_children(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unqualified_capture_reports_when_no_item_type_was_received() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(version_line(mango_agent_codex::MINIMUM_CODEX_VERSION));
+        launcher.push(archival_app_server());
+        let out =
+            std::env::temp_dir().join(format!("mea-no-subagent-items-{}", std::process::id()));
+        let result = codex_with(
+            &host(launcher.clone()),
+            &out,
+            &std::env::temp_dir(),
+            Some("subagent"),
+        )
+        .await;
+        std::fs::remove_dir_all(&out).expect("remove test diagnostic");
+        assert!(
+            matches!(result, Err(Error::Protocol { received, .. }) if received.contains("item types: none"))
+        );
         assert_eq!(launcher.live_children(), 0);
     }
 

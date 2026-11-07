@@ -1058,14 +1058,19 @@ protocol evidence, not a record of a model answer, command, tool result, review 
 
 `--scenario NAME` selects one named Codex transcript conversation; it also works with
 `--harness codex --transcripts`. Other capture modes reject it before launching a vendor. The
-`subagent` scenario enables `multi_agent_v2` only for its app-server process, starts a read-only
+`subagent` scenario is opt-in with `--scenario subagent`; the default archival run keeps the ten
+existing conversations. It enables `multi_agent_v2` only for its app-server process, starts a read-only
 thread with approvals set to `never`, and asks for exactly one child that replies without tools.
 It waits for the parent thread's terminal frame, then requires a received `subAgentActivity` item
 with a nonempty, unmasked `agentThreadId`. A completed turn without that evidence fails rather
 than being credited as a capture. The generated header records the CLI version, capture version,
 timestamp and process feature. Failed conversations retain redacted traffic in
 `subagent.partial.jsonl`; a timeout names the scripted request that stalled. Neither a partial
-record nor an unqualified completed transcript proves attribution. The identity is structural;
+record nor an unqualified completed transcript proves attribution. An unqualified completion goes
+to `subagent.unqualified.jsonl` with an explicit first-line marker; its error reports the received
+item types, or none. Completed evidence replaces a stale partial diagnostic, and a qualified
+capture also removes the stale unqualified diagnostic. Only qualified evidence uses
+`subagent.jsonl`. The identity is structural;
 the child's display path and free-form text remain redacted.
 
 This follows the official [app-server protocol](https://developers.openai.com/codex/app-server)
