@@ -1,0 +1,98 @@
+{
+  "created_utc": "2026-11-07T05:02:23.332139+00:00",
+  "issue": 249,
+  "claim": "allocation/reallocation events and requested/profiled-live heap bytes for one data_url call; no timing/RSS/native-performance claim",
+  "sources": {
+    "base": {
+      "sha": "f5f39b2cefb4ac4fe413bcb02bb8e1e0a3c419e4",
+      "tree": "ed4cfb4b129153d10dd02bc7c11287695fdf0bd4",
+      "helper_sha256": "df513901f3e71388621be7df2c57406b566021effeeb3fa709b638caa45d3621"
+    },
+    "candidate": {
+      "sha": "c89d479af1c54cc937f611a79807390402ebeecc",
+      "tree": "a9cc2354030cd71f3ca53aa8c86d7803e5c705e2",
+      "helper_sha256": "4b82af11087f5c4e4e730a198b0b74cc77bab81a9ece856f1d06940fc73315de"
+    }
+  },
+  "probe_lock_sha256": "8e194a89da207da00f782cab8bd39c85dc7bdef8ad9851bac397dcc75ebc1c3f",
+  "sdk_lock_sha256": "2a5d2f16027539daf3ede155c8e905217127c84ff16c17e9781450bfd1873f36",
+  "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.0\nLLVM version: 23.1.1\n",
+  "target": "x86_64-unknown-linux-gnu",
+  "profile": "Cargo default release; DHAT0.3.3; one binary with exact baseline/candidate source modules",
+  "features": "isolated probe has no SDK dependencies; SDK production dependency inputs unchanged",
+  "sizes": [
+    0,
+    1,
+    2,
+    3,
+    1024,
+    65536,
+    2097152
+  ],
+  "pairs": 2,
+  "orders": [
+    [
+      "base",
+      "variant"
+    ],
+    [
+      "variant",
+      "base"
+    ]
+  ],
+  "calls": 28,
+  "pattern": "(i*73+i/7)&255",
+  "warmup": "one unprofiled call per fresh sample process; input allocated before profiler; output retained until snapshot",
+  "acceptance": {
+    "all_outputs": "all5155 baseline/candidate comparisons match; SDK RFC/high-bit/MIME/padding/attachment/preflight tests pass",
+    "nonempty": "every case removes >=1 allocation/reallocation event and >=ceil(n/3)*4 requested bytes",
+    "empty": "no increase in event count, requested bytes or peak profiled bytes",
+    "graphs": "SDK manifests/lock unchanged; relevant standalone/current consumer graphs match under comparable declared configuration",
+    "all_required_samples": true
+  },
+  "validity": "fresh single-thread process per call; no other local builds/tests during profiling; all28 exits0; no exclusions; retain all failures/incomplete/retries; counts not statistical timings",
+  "budget": "setup <=10min, profiles <=5min; a budget overrun is invalid and retained",
+  "caches": {
+    "dependency": "SDK dependency cache warm; DHAT probe cache availability recorded during build",
+    "build": "fresh probe target directory",
+    "application": "new process each call, one warmup",
+    "OS": "uncontrolled"
+  },
+  "host": {
+    "kernel": "6.18.57",
+    "available_cpus": 5,
+    "cpu_max": "400000 100000",
+    "memory_max": "17179869184",
+    "loadavg": "0.00 0.01 0.09 1/208 335766",
+    "filesystem": "overlayfs",
+    "cpu_model": "AMD EPYC 7763 64-Core Processor"
+  },
+  "flags": {
+    "RUSTFLAGS": null,
+    "CARGO_ENCODED_RUSTFLAGS": null,
+    "RUSTUP_TOOLCHAIN": null,
+    "CARGO_BUILD_JOBS": "4"
+  },
+  "commands": {
+    "cwd": "/workspace/mango-external-agents",
+    "reproduce": [
+      "python3",
+      "docs/measurements/codex-data-url/reproduce.py",
+      "--base",
+      "f5f39b2cefb4ac4fe413bcb02bb8e1e0a3c419e4",
+      "--candidate",
+      "c89d479af1c54cc937f611a79807390402ebeecc"
+    ],
+    "environment": "source /workspace/.cloud-tools/activate.sh; CARGO_INCREMENTAL=0; TMPDIR=/workspace/work/pr-wave",
+    "setup": "exact helpers extracted by committed tool; one locked release probe build; byte equality before all allocation profiles",
+    "cleanup": "each sample is a synchronous reaped subprocess; retain probe directory and all logs"
+  },
+  "evidence": {
+    "private": "/workspace/work/pr-wave/perf-249-* and retained generated probe directory",
+    "durable": "GitHub issue249 plus a dated requalification receipt in PR217"
+  },
+  "harness": "Add timestamps/commands/exit records outside the unchanged profiled Rust probe before collection; preserve harness patch identity separately",
+  "harness_patch_sha256": "a0716c3fbc25c33fd6ae5bf6419a013f59478b65b621ceecaa226276eb71220a",
+  "harness_sha256": "b279e34637ba79fe460757435495025c2426628ba6dafe3f71e53766227afe6f",
+  "probe_sha256": "8912e9c1d9b9a00ac7300b1db811207a3a8abec4f82c231fd5c637b58e4ce251"
+}

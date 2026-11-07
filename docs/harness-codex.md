@@ -264,6 +264,11 @@ real `turn/start`. PNG, JPEG, GIF and WebP are accepted, up to four attachments 
 Unsupported kinds, media types and oversized inputs are rejected before encoding or writing a
 request; `UserInput` has no general-purpose file arm.
 
+The standard Base64 encoder writes into the final data-URL buffer; its prefix, alphabet and padding
+are unchanged. The [allocation receipt](measurements/codex-data-url/requalification-2026-11-07.md)
+records exact output equality and a bounded per-call allocation reduction. The documented wire
+surface remains [turn/start](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/app-server/README.md#turnstart).
+
 Cancelling before `turn/start` answers records the request and keeps the vendor's turn slot
 occupied. The returned handle is interrupted as soon as it arrives; another start is refused
 until the vendor completes or the start fails. A transport failure after submission returns a

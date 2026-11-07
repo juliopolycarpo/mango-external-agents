@@ -1,0 +1,7 @@
+[package]
+name = "codex-data-url-allocation-probe"
+version = "0.0.0"
+edition = "2024"
+[workspace]
+[dependencies]
+dhat = "=0.3.3"

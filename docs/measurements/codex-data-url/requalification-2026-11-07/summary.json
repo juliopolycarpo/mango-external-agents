@@ -1,0 +1,169 @@
+{
+  "decision": "accepted allocation experiment: all allocation, output-equality, focused SDK and graph gates pass; full local/native/review delivery gates pending",
+  "calls": 28,
+  "all_exit_zero": true,
+  "profile_failures": 0,
+  "equal_comparisons": 5155,
+  "summary": [
+    {
+      "input_bytes": 0,
+      "pairs": 2,
+      "values": {
+        "total_blocks": [
+          1,
+          1
+        ],
+        "total_bytes": [
+          26,
+          22
+        ],
+        "max_bytes": [
+          26,
+          22
+        ]
+      },
+      "gate": "pass",
+      "observed_variation": 0
+    },
+    {
+      "input_bytes": 1,
+      "pairs": 2,
+      "values": {
+        "total_blocks": [
+          2,
+          1
+        ],
+        "total_bytes": [
+          30,
+          26
+        ],
+        "max_bytes": [
+          30,
+          26
+        ]
+      },
+      "gate": "pass",
+      "observed_variation": 0
+    },
+    {
+      "input_bytes": 2,
+      "pairs": 2,
+      "values": {
+        "total_blocks": [
+          2,
+          1
+        ],
+        "total_bytes": [
+          30,
+          26
+        ],
+        "max_bytes": [
+          30,
+          26
+        ]
+      },
+      "gate": "pass",
+      "observed_variation": 0
+    },
+    {
+      "input_bytes": 3,
+      "pairs": 2,
+      "values": {
+        "total_blocks": [
+          2,
+          1
+        ],
+        "total_bytes": [
+          30,
+          26
+        ],
+        "max_bytes": [
+          30,
+          26
+        ]
+      },
+      "gate": "pass",
+      "observed_variation": 0
+    },
+    {
+      "input_bytes": 1024,
+      "pairs": 2,
+      "values": {
+        "total_blocks": [
+          3,
+          1
+        ],
+        "total_bytes": [
+          2784,
+          1390
+        ],
+        "max_bytes": [
+          2758,
+          1390
+        ]
+      },
+      "gate": "pass",
+      "observed_variation": 0
+    },
+    {
+      "input_bytes": 65536,
+      "pairs": 2,
+      "values": {
+        "total_blocks": [
+          3,
+          1
+        ],
+        "total_bytes": [
+          174816,
+          87406
+        ],
+        "max_bytes": [
+          174790,
+          87406
+        ]
+      },
+      "gate": "pass",
+      "observed_variation": 0
+    },
+    {
+      "input_bytes": 2097152,
+      "pairs": 2,
+      "values": {
+        "total_blocks": [
+          3,
+          1
+        ],
+        "total_bytes": [
+          5592456,
+          2796226
+        ],
+        "max_bytes": [
+          5592430,
+          2796226
+        ]
+      },
+      "gate": "pass",
+      "observed_variation": 0
+    }
+  ],
+  "profile_directory": "/workspace/work/pr-wave/codex-data-url-profile.6uejatyq",
+  "total_setup_and_collection_seconds": 17.506132,
+  "metric_limits": "isolated per-call allocation events/requested and profiled live bytes only; no CPU/RSS claim",
+  "focused_codex": {
+    "passed": 613,
+    "skipped": 1
+  },
+  "graphs": {
+    "sdk": {
+      "equal": true,
+      "lines": 42,
+      "normalized_sha256": "5b1f4990d8a4269963439e8657b36ef40fa16334631e1d5c8300616e5397a0d8"
+    },
+    "consumer": {
+      "equal": true,
+      "lines": 593,
+      "normalized_sha256": "3474f2d5c34b69f5afeca7603fbb524100b8f8f4319958fc41853480261b5350"
+    }
+  },
+  "consumer_fixture_lock_sha256": "9551324984de0001961b891a43338f02240f96571adb473e42a999c40ec8f839"
+}
