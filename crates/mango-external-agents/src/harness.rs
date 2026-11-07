@@ -601,8 +601,7 @@ pub trait Harness: Send + Sync {
         Ok(self
             .probe(host)
             .await?
-            .normalized()
-            .bounded_by(&self.descriptor().capabilities, &self.permission_matrix()))
+            .normalized_bounded_by(&self.descriptor().capabilities, &self.permission_matrix()))
     }
 
     /// Refuses session options outside this harness's declared capability ceiling.
@@ -795,6 +794,140 @@ mod tests {
             _request: crate::session::OpenSession,
         ) -> crate::Result<Box<dyn crate::session::Session>> {
             Err(Error::Closed { subject: "session" })
+        }
+    }
+
+    /// Named in-memory probe for public discovery equivalence, including malformed matrices.
+    struct PermissionProbe {
+        base: UnboundedProbe,
+        declaration: crate::permission::PermissionMatrix,
+        found: crate::Discovery,
+    }
+
+    #[async_trait::async_trait]
+    impl Harness for PermissionProbe {
+        fn descriptor(&self) -> &HarnessDescriptor {
+            self.base.descriptor()
+        }
+        fn permission_matrix(&self) -> crate::permission::PermissionMatrix {
+            self.declaration.clone()
+        }
+        async fn probe(&self, _host: &crate::HostContext) -> crate::Result<crate::Discovery> {
+            Ok(self.found.clone())
+        }
+        async fn open_session(
+            &self,
+            host: &crate::HostContext,
+            request: crate::OpenSession,
+        ) -> crate::Result<Box<dyn crate::Session>> {
+            self.base.open_session(host, request).await
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_permission_intersection_matches_the_normalized_public_reference() {
+        use crate::permission::{ConfigurationVerdict, PermissionMatrix, UnsupportedReason};
+        let host = crate::HostContext::builder()
+            .launcher(std::sync::Arc::new(crate::testing::FakeLauncher::new()))
+            .cwd(std::env::temp_dir())
+            .client_info("permission-probe", "0.0.0")
+            .environment(crate::EnvSource::empty())
+            .build()
+            .expect("named fake host");
+        let ids = [
+            None,
+            Some(String::from("safe-id")),
+            Some(String::from("bad\nid")),
+            Some("x".repeat(129)),
+            Some(String::from("bidi\u{202e}id")),
+        ];
+        for probe_id in &ids {
+            for declared_id in &ids {
+                for probe_support in [false, true] {
+                    for declared_support in [false, true] {
+                        for shape in ["complete", "missing", "duplicate"] {
+                            let matrix = |supported, vendor_id: Option<String>| {
+                                PermissionMatrix::build(|_, _| {
+                                    if supported {
+                                        ConfigurationVerdict::Supported {
+                                            vendor_id: vendor_id.clone(),
+                                        }
+                                    } else {
+                                        ConfigurationVerdict::Unsupported {
+                                            reason: UnsupportedReason::Other(format!(
+                                                "Bearer secret-canary {}\u{202e}",
+                                                "policy ".repeat(900)
+                                            )),
+                                            vendor_id: vendor_id.clone(),
+                                        }
+                                    }
+                                })
+                            };
+                            let mut probe =
+                                serde_json::to_value(matrix(probe_support, probe_id.clone()))
+                                    .expect("matrix");
+                            let mut declaration =
+                                serde_json::to_value(matrix(declared_support, declared_id.clone()))
+                                    .expect("matrix");
+                            if shape == "missing" {
+                                probe.as_array_mut().expect("cells").remove(0);
+                                declaration.as_array_mut().expect("cells").remove(2);
+                            } else if shape == "duplicate" {
+                                let mut first = probe[0].clone();
+                                first["vendorId"] = serde_json::json!("first-wins");
+                                first["unattended"] = serde_json::json!(true);
+                                probe.as_array_mut().expect("cells").insert(0, first);
+                                let last = declaration[0].clone();
+                                declaration.as_array_mut().expect("cells").push(last);
+                            }
+                            let harness = PermissionProbe {
+                                base: UnboundedProbe::new(),
+                                declaration: serde_json::from_value(declaration)
+                                    .expect("raw declaration"),
+                                found: crate::Discovery {
+                                    executable: Some(std::path::PathBuf::from("bad\nexecutable")),
+                                    version: Some(format!("version{}\u{202e}", "x".repeat(500))),
+                                    capabilities: DiscoveredCapabilities::all(),
+                                    permission_matrix: serde_json::from_value(probe)
+                                        .expect("raw probe"),
+                                    models: vec![
+                                        crate::Model::new("bad\u{202e}model"),
+                                        crate::Model::new("kept-model"),
+                                    ],
+                                    ..crate::Discovery::not_installed()
+                                },
+                            };
+                            let expected = harness.found.clone().normalized().bounded_by(
+                                &harness.descriptor().capabilities,
+                                &harness.declaration,
+                            );
+                            let actual = harness.discover(&host).await.expect("public discovery");
+                            assert_eq!(
+                                actual.permission_matrix, expected.permission_matrix,
+                                "shape={shape}, probe_support={probe_support}, declared_support={declared_support}, probe_id={probe_id:?}, declared_id={declared_id:?}"
+                            );
+                            assert_eq!(actual.executable, expected.executable);
+                            assert_eq!(actual.version, expected.version);
+                            assert_eq!(actual.gate, expected.gate);
+                            assert_eq!(actual.auth, expected.auth);
+                            assert_eq!(actual.capabilities, expected.capabilities);
+                            assert_eq!(actual.models, expected.models);
+                            assert_eq!(
+                                actual.configuration_catalog,
+                                expected.configuration_catalog
+                            );
+                            assert_eq!(actual.permission_matrix.cells().len(), 6);
+                            assert_eq!(actual.models.len(), 1);
+                            assert!(
+                                harness
+                                    .open_session(&host, crate::OpenSession::new("unused"))
+                                    .await
+                                    .is_err()
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

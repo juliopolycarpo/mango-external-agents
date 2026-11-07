@@ -85,5 +85,9 @@ name = "copies"
 harness = false
 required-features = ["stdio"]
 
+[[bench]]
+name = "discovery"
+harness = false
+
 [package.metadata.docs.rs]
 all-features = true

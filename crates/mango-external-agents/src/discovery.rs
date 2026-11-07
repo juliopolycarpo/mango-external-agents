@@ -105,6 +105,27 @@ impl Discovery {
     /// to the vendor as the one that was chosen.
     #[must_use]
     pub fn normalized(self) -> Self {
+        let permission_matrix = self.permission_matrix.normalized();
+        self.normalized_with_permissions(permission_matrix)
+    }
+
+    /// Normalizes all discovery values while intersecting permissions in one matrix build.
+    pub(crate) fn normalized_bounded_by(
+        self,
+        capability_ceiling: &CapabilityCeiling,
+        declared_permissions: &PermissionMatrix,
+    ) -> Self {
+        let permission_matrix = self
+            .permission_matrix
+            .normalized_bounded_by(declared_permissions);
+        let capabilities = self.capabilities.clamped_to(capability_ceiling);
+        Self {
+            capabilities,
+            ..self.normalized_with_permissions(permission_matrix)
+        }
+    }
+
+    fn normalized_with_permissions(self, permission_matrix: PermissionMatrix) -> Self {
         Self {
             executable: self.executable.and_then(bounded_executable),
             version: self
@@ -112,7 +133,7 @@ impl Discovery {
                 .map(|version| redact::bounded(&version, TextLimit::AccountLabel).text),
             gate: self.gate.normalized(),
             auth: self.auth.normalized(),
-            permission_matrix: self.permission_matrix.normalized(),
+            permission_matrix,
             models: self
                 .models
                 .into_iter()
