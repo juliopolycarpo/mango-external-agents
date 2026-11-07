@@ -1,6 +1,6 @@
 {
   "archive": "raw-evidence.tar.gz",
-  "sha256": "8a3afcc9196bb9ee4a5c58773b8fcb054f9d74e8d1a4f684f64b705a18b0cbbf",
+  "sha256": "c73524a495a738cfefbb1efac1aa8f07177cc8a2ca135691a3544680707d32b9",
   "entries": [
     {
       "path": "conditions/attempts.jsonl",
@@ -13,9 +13,14 @@
       "sha256": "f097234177f8fb13e435500ec2a66fbf1496c75666d3c3a9248bc6755d444dd4"
     },
     {
-      "path": "conditions/missing-helper-control.json",
+      "path": "conditions/missing-helper-control-recorded.json",
       "bytes": 440,
       "sha256": "89907a80aa77b6b9cbdc0f8652bdfb1ec9dc9eefec0d14f7a69941c38351a94f"
+    },
+    {
+      "path": "conditions/missing-helper-control.json",
+      "bytes": 1231,
+      "sha256": "fa863feb8533864b99232ec7295815b2aacb559bb40ebf04c671f07c657e0945"
     },
     {
       "path": "conditions/pair-1-full-then-ignored-1-base.dhat.json",
@@ -388,6 +393,11 @@
       "sha256": "3007d92806ca1f0708ba984b7f2bd165ca8c0acbd24347cfff9668bffb49545b"
     },
     {
+      "path": "conditions/runner.stdout",
+      "bytes": 1150,
+      "sha256": "3d2537de02574d20e3269c4d6096dff54d849e0b23e9e40f14ddca896202ce5b"
+    },
+    {
       "path": "conditions/setup-build-base.stderr",
       "bytes": 2039,
       "sha256": "71e0842daf8ff3dfc0e07dab753fa819606bbacf0c527b7377677d01cff9731a"
@@ -473,9 +483,14 @@
       "sha256": "a5764956c3cfd3e04335e89ce0b5968bda204a2a9f536a1e187721f8bf7b718a"
     },
     {
-      "path": "ownership/missing-helper-control.json",
+      "path": "ownership/missing-helper-control-recorded.json",
       "bytes": 568,
       "sha256": "0fd7140cfeee64bdacd82f03c41fcc779763c10501a286c4c3d225b48fae1b3a"
+    },
+    {
+      "path": "ownership/missing-helper-control.json",
+      "bytes": 1231,
+      "sha256": "1f886bda9ccdd359dc448bafc5706fbb6abe29ac475984f8deda1c57c470621e"
     },
     {
       "path": "ownership/pair-1-full-then-ignored-1-base.dhat.json",
@@ -848,6 +863,11 @@
       "sha256": "793066d0e229b84049e219af1dd2a55b9616e93786fe350282abe54603b42b40"
     },
     {
+      "path": "ownership/runner.stdout",
+      "bytes": 1131,
+      "sha256": "60690ddc8457e3b1625f22a3c276676e093369e1faccb62efca20a3eb859812e"
+    },
+    {
       "path": "ownership/setup-build-base.stderr",
       "bytes": 2039,
       "sha256": "24ee3b7218ca296709ec223edb591dd339ae05c8423f546664ce41586c3e463c"
@@ -933,9 +953,14 @@
       "sha256": "a579fda4fd3a12336b136f11381915bb4b4c744a186d131ae23b448b244f3f15"
     },
     {
-      "path": "portable/missing-helper-control.json",
+      "path": "portable/missing-helper-control-recorded.json",
       "bytes": 442,
       "sha256": "8e25a6cd15d33179913e1cadc82996dc2a6caa6ecc654ae5e684751b8af1d56d"
+    },
+    {
+      "path": "portable/missing-helper-control.json",
+      "bytes": 1231,
+      "sha256": "3f9c5c1816269a74634b0380c15943c01d65f8e6293504a47bd15f159779e4f6"
     },
     {
       "path": "portable/pair-1-full-then-ignored-1-base.dhat.json",
@@ -1306,6 +1331,11 @@
       "path": "portable/raw-samples.json",
       "bytes": 14265,
       "sha256": "503eb10c8da482fb0ec8e32f5269b4866d038e74a6709f257bb0ee1e70b134c8"
+    },
+    {
+      "path": "portable/runner.stdout",
+      "bytes": 1162,
+      "sha256": "88976925262bcee2471eb2030f591fef1108f77311edcda951d9e5095bb1f552"
     },
     {
       "path": "portable/setup-build-base.stderr",

@@ -1,8 +1,31 @@
 {
-  "created_before_run": "2026-11-07T08:40:45.861994+00:00",
-  "reproducer_sha256": "2ac338b303bab6635ba302d60282f5c6d59d8b1a0b184fdf6fb4297d2cab39c3",
-  "fake_python_sha256": "e0c72cb3afc44c0e6a092a5c067191ebbf22570aba2a206e8fd6775baa295f95",
-  "control_exit": 127,
-  "control_stderr": "FakePython: managed cloud helper unavailable",
-  "condition": "Managed helper unavailable; all other Python commands delegated; Cargo/Rust available."
+  "historical_pre_run_record": {
+    "path": "missing-helper-control-recorded.json",
+    "sha256": "8e25a6cd15d33179913e1cadc82996dc2a6caa6ecc654ae5e684751b8af1d56d",
+    "note": "Original bytes preserved. Its control_exit belongs to the FakePython helper probe, not the reproducer. The original record did not include argv."
+  },
+  "shim_probe": {
+    "argv": [
+      "/workspace/work/pr-wave/perf-262-fake-bin/python3",
+      "/workspace/.cloud-tools/reap.py"
+    ],
+    "start": "2026-11-07T09:09:24.238635+00:00",
+    "end": "2026-11-07T09:09:24.241598+00:00",
+    "exit": 127,
+    "stdout": "",
+    "stderr": "FakePython: managed cloud helper unavailable\n",
+    "note": "Explicit post-run probe recorded during review clarification; does not replace or restamp the historical pre-run control."
+  },
+  "runner_result": {
+    "exit": 0,
+    "recorded_after_run": true,
+    "successful_commands": 31,
+    "profiles": 24,
+    "accepted": true,
+    "attempts": "attempts.jsonl",
+    "summary": "summary.json",
+    "stdout": "runner.stdout",
+    "stdout_sha256": "88976925262bcee2471eb2030f591fef1108f77311edcda951d9e5095bb1f552",
+    "reproducer_sha256": "2ac338b303bab6635ba302d60282f5c6d59d8b1a0b184fdf6fb4297d2cab39c3"
+  }
 }

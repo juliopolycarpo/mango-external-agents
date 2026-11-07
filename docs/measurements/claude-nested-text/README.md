@@ -150,6 +150,12 @@ The final full validation is preserved under [portable](portable/summary.json), 
 All 31 commands succeeded, including all 24 profiles. The frozen probe and measured SDK source
 are unchanged. The runner SHA-256 is
 `2ac338b303bab6635ba302d60282f5c6d59d8b1a0b184fdf6fb4297d2cab39c3`.
+The control record separates the helper shim's exit **127** from the reproducer's exit **0**.
+It records an explicit post-run shim probe's argv, stderr and timestamps separately from the
+historical pre-run record, whose original bytes remain alongside it. That later probe does
+not replace or restamp the pre-run control. Each successful runner result points to its own
+31-command audit, accepted 24-profile summary and archived terminal log. The ownership and
+condition-recording validations use the same explicit separation.
 
 Historical validations retain their exact script identities separately:
 
