@@ -72,7 +72,14 @@ pub struct Announcer {
     state: Arc<Mutex<AnnouncerState>>,
     /// Pauses immediately before publication so attachment can cross that boundary in a test.
     #[cfg(test)]
-    before_publish: Option<Arc<(std::sync::Barrier, std::sync::Barrier)>>,
+    before_publish: Option<Arc<PublicationGate>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct PublicationGate {
+    entered: std::sync::mpsc::Sender<()>,
+    resume: Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
 #[derive(Default)]
@@ -105,8 +112,12 @@ impl Announcer {
         let line = line.into();
         #[cfg(test)]
         if let Some(gate) = &self.before_publish {
-            gate.0.wait();
-            gate.1.wait();
+            gate.entered.send(()).expect("publication observer");
+            gate.resume
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("publication release within the test bound");
         }
         // Attachment and delivery are one publication: a child cannot drain the pending queue
         // between the lookup and enqueue, and a live line cannot overtake that pending drain.
@@ -698,17 +709,30 @@ mod tests {
     /// Attach completes while publication is held, without relying on scheduler races.
     #[tokio::test]
     async fn an_announcement_crossing_attachment_is_delivered_in_order() {
-        let gate = std::sync::Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+        let (entered, observed) = std::sync::mpsc::channel();
+        let (resume, released) = std::sync::mpsc::channel();
+        let (finished, completed) = std::sync::mpsc::channel();
         let announcer = Announcer::new();
         announcer.announce("before");
         let mut paused = announcer.clone();
-        paused.before_publish = Some(std::sync::Arc::clone(&gate));
-        let publishing = std::thread::spawn(move || paused.announce("crossing"));
-        gate.0.wait();
+        paused.before_publish = Some(std::sync::Arc::new(super::PublicationGate {
+            entered,
+            resume: std::sync::Mutex::new(released),
+        }));
+        let publishing = std::thread::spawn(move || {
+            paused.announce("crossing");
+            finished.send(()).expect("publisher completion observer");
+        });
+        observed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("publisher reached the publication boundary");
         let launcher = FakeLauncher::new();
         launcher.push(FakeProcess::responding(|_| Vec::new()).announcing(announcer.clone()));
         let child = launcher.spawn(spec(&["fake"])).await.expect("child");
-        gate.1.wait();
+        resume.send(()).expect("publisher release");
+        completed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("publisher completed within the test bound");
         publishing.join().expect("publisher");
         announcer.announce("after");
         let mut lines = LineStream::new(child.stdout, LineLimits::default());
@@ -717,7 +741,9 @@ mod tests {
             received.push(
                 tokio::time::timeout(std::time::Duration::from_secs(1), lines.next_line())
                     .await
-                    .expect("expected every announcement to remain deliverable after attach")
+                    .unwrap_or_else(|_| {
+                        panic!("expected all announcements after attach, received {received:?}")
+                    })
                     .expect("line")
                     .expect("live output"),
             );
