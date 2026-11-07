@@ -69,37 +69,33 @@ impl StdinFailure {
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct Announcer {
-    state: Arc<AnnouncerState>,
+    state: Arc<Mutex<AnnouncerState>>,
+    /// Lets attachment cross an observed miss; publication must then decide from fresh state.
+    #[cfg(test)]
+    after_miss: Option<Arc<PublicationGate>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct PublicationGate {
+    entered: std::sync::mpsc::Sender<()>,
+    resume: Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
 #[derive(Default)]
 struct AnnouncerState {
     /// The child to speak through, once one has been launched.
-    child: Mutex<Option<Arc<ChildState>>>,
+    child: Option<Arc<ChildState>>,
     /// What was announced before that, in order.
-    pending: Mutex<Vec<String>>,
+    pending: Vec<String>,
 }
 
 impl std::fmt::Debug for AnnouncerState {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("AnnouncerState")
-            .field(
-                "attached",
-                &self
-                    .child
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .is_some(),
-            )
-            .field(
-                "pending",
-                &self
-                    .pending
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .len(),
-            )
+            .field("attached", &self.child.is_some())
+            .field("pending", &self.pending.len())
             .finish()
     }
 }
@@ -114,37 +110,32 @@ impl Announcer {
     /// Puts one line on the child's stdout, as a peer announcing something would.
     pub fn announce(&self, line: impl Into<String>) {
         let line = line.into();
-        let child = self
-            .state
-            .child
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        let Some(child) = child else {
-            self.state
-                .pending
+        // Attachment and delivery are one publication: a child cannot drain the pending queue
+        // between the lookup and enqueue, and a live line cannot overtake that pending drain.
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(test)]
+        if let Some(gate) = self.after_miss.as_ref().filter(|_| state.child.is_none()) {
+            // Only the installed test seam releases the publication guard. Re-read after the
+            // forced overlap rather than enqueueing against the now-stale observation.
+            drop(state);
+            gate.entered.send(()).expect("publication observer");
+            gate.resume
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .push(line);
-            return;
-        };
-        child.announce([line]);
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("publication release within the test bound");
+            state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        }
+        match state.child.as_ref() {
+            Some(child) => child.announce([line]),
+            None => state.pending.push(line),
+        }
     }
 
     fn attach(&self, child: &Arc<ChildState>) {
-        *self
-            .state
-            .child
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(child));
-        let pending = std::mem::take(
-            &mut *self
-                .state
-                .pending
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-        );
-        child.announce(pending);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.child = Some(Arc::clone(child));
+        child.announce(std::mem::take(&mut state.pending));
     }
 }
 
@@ -717,6 +708,58 @@ mod tests {
             "expected an announcement to need no question first, received {:?}",
             launcher.written()
         );
+    }
+
+    /// Attach completes after a missed lookup; publication must recheck before enqueueing.
+    #[tokio::test]
+    async fn an_announcement_crossing_attachment_is_delivered_in_order() {
+        let (entered, observed) = std::sync::mpsc::channel();
+        let (resume, released) = std::sync::mpsc::channel();
+        let (finished, completed) = std::sync::mpsc::channel();
+        let announcer = Announcer::new();
+        announcer.announce("before");
+        let mut paused = announcer.clone();
+        paused.after_miss = Some(std::sync::Arc::new(super::PublicationGate {
+            entered,
+            resume: std::sync::Mutex::new(released),
+        }));
+        let publishing = std::thread::spawn(move || {
+            paused.announce("crossing");
+            finished.send(()).expect("publisher completion observer");
+            paused
+        });
+        observed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("publisher observed an unattached child");
+        let launcher = FakeLauncher::new();
+        launcher.push(FakeProcess::responding(|_| Vec::new()).announcing(announcer.clone()));
+        let child = launcher.spawn(spec(&["fake"])).await.expect("child");
+        resume.send(()).expect("publisher release");
+        completed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("publisher completed within the test bound");
+        let published = publishing.join().expect("publisher");
+        // A live publication must not enter the missed-lookup gate again.
+        published.announce("after");
+        let mut lines = LineStream::new(child.stdout, LineLimits::default());
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            received.push(
+                tokio::time::timeout(std::time::Duration::from_secs(1), lines.next_line())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("expected all announcements after attach, received {received:?}")
+                    })
+                    .expect("line")
+                    .expect("live output"),
+            );
+        }
+        assert_eq!(received, ["before", "crossing", "after"]);
+        child
+            .control
+            .kill(CancelReason::Shutdown)
+            .await
+            .expect("cleanup");
     }
 
     #[tokio::test]
