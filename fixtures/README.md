@@ -16,6 +16,12 @@ without `authenticate` or `session/new`. CI compares only public artifacts: the 
 `contract/` directories and, for Codex, the separately regenerated schema inventory. It excludes
 archival transcripts and historical help.
 
+A Codex transcript capture also requires confirmed process cleanup. The recorder owns bounded
+cleanup from transport acquisition, including when its future is dropped while the runtime remains
+alive. A stop failure retains the injected recovery control and fails the capture even if the
+conversation finished. When requested, its diagnostic stays marked incomplete/unqualified; it is
+not a replay fixture. Qualified transcripts are written only after cleanup and scenario checks pass.
+
 ## Three classes of fixture
 
 **Reproducible public contracts.** CI can install the CLI that produced them at the pin and record

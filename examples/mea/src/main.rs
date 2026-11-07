@@ -7,6 +7,7 @@
 mod ask;
 mod capture;
 mod doctor;
+mod failure;
 mod options;
 mod redact;
 mod terminal;
@@ -16,6 +17,7 @@ mod workspace;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use failure::describe as command_failure;
 use mango_external_agents::launcher::TokioLauncher;
 use mango_external_agents::{
     ApprovalRouting, AuthState, ConfigurationChange, EnvSource, ExecutablePath, HarnessId,
@@ -364,23 +366,7 @@ async fn turn(options: &Options) -> Result<(), String> {
         },
     )
     .await
-    .map_err(|error| turn_failure(&error))
-}
-
-/// Names incomplete process cleanup while the typed recovery control is still owned here.
-/// The CLI cannot hand a Rust control to its operator; it reports the launched pid for manual
-/// reconciliation rather than blindly repeating the control's one-stop request.
-fn turn_failure(error: &mango_external_agents::Error) -> String {
-    let cleanup = error.cleanup_control().map(|control| control.pid());
-    match cleanup {
-        Some(Some(pid)) => format!(
-            "{error}; process-tree cleanup is unconfirmed for launched pid {pid}; inspect the process before retrying"
-        ),
-        Some(None) => format!(
-            "{error}; process-tree cleanup is unconfirmed and the injected control has no pid; inspect the launcher before retrying"
-        ),
-        None => error.to_string(),
-    }
+    .map_err(|error| command_failure(&error))
 }
 
 async fn capture(arguments: &[String]) -> Result<(), String> {
@@ -398,7 +384,7 @@ async fn capture(arguments: &[String]) -> Result<(), String> {
         HarnessChoice::Claude => capture::claude(&out, &workspace.path).await,
         HarnessChoice::Acp(profile) => capture::acp(&out, &workspace.path, profile.as_str()).await,
     };
-    result.map_err(|error| error.to_string())
+    result.map_err(|error| command_failure(&error))
 }
 
 /// Rewrites — or with `--check`, verifies — the file digests of every capture manifest.
@@ -525,9 +511,9 @@ mod tests {
     };
 
     #[test]
-    fn an_ordinary_turn_failure_needs_no_process_cleanup_warning() {
+    fn an_ordinary_command_failure_needs_no_process_cleanup_warning() {
         let error = Error::Closed { subject: "session" };
-        assert_eq!(super::turn_failure(&error), error.to_string());
+        assert_eq!(super::command_failure(&error), error.to_string());
     }
 
     #[test]
