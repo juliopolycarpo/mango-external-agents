@@ -152,7 +152,28 @@ async fn run_turn(
     }
     .await;
     let closed = session.close(CloseReason::Requested).await;
-    outcome.and_then(|end| closed.map(|()| end))
+    with_cleanup(outcome, closed, |primary| {
+        eprintln!(
+            "turn failed before cleanup: {}",
+            crate::turn_failure(primary)
+        );
+    })
+}
+
+/// Retains the cleanup failure unchanged, reporting the primary context separately when both fail.
+fn with_cleanup<T>(
+    outcome: Result<T>,
+    closed: Result<()>,
+    report_primary: impl FnOnce(&Error),
+) -> Result<T> {
+    match (outcome, closed) {
+        (Err(primary), Err(cleanup)) => {
+            report_primary(&primary);
+            Err(cleanup)
+        }
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (outcome, Ok(())) => outcome,
+    }
 }
 
 /// Drains a turn and, when a delay was asked for and elapses first, asks the session to cancel it.
@@ -1716,6 +1737,165 @@ mod tests {
         assert!(
             session.closed.load(Ordering::Acquire),
             "expected a failed start to close the session"
+        );
+    }
+
+    /// A session whose host cleanup still needs reconciliation after its own close.
+    struct CleanupFailureSession {
+        inner: Box<dyn Session>,
+        cleanup: Error,
+    }
+    #[async_trait::async_trait]
+    impl Session for CleanupFailureSession {
+        fn state(&self) -> &SessionState {
+            self.inner.state()
+        }
+        async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
+            self.inner.start_turn(request).await
+        }
+        async fn respond(&self, response: PermissionResponse) -> Result<()> {
+            self.inner.respond(response).await
+        }
+        async fn cancel(&self, reason: CancelReason) -> Result<()> {
+            self.inner.cancel(reason).await
+        }
+        async fn close(&self, reason: CloseReason) -> Result<()> {
+            self.inner.close(reason).await?;
+            Err(self.cleanup.clone())
+        }
+    }
+
+    /// A named recovery identity without a native process.
+    struct CleanupControl(Option<u32>);
+    #[async_trait::async_trait]
+    impl mango_external_agents::ProcessControl for CleanupControl {
+        fn pid(&self) -> Option<u32> {
+            self.0
+        }
+        fn stderr_tail(&self) -> String {
+            String::new()
+        }
+        async fn wait(&self) -> Result<mango_external_agents::ExitStatus> {
+            Ok(Default::default())
+        }
+        async fn kill(&self, _reason: CancelReason) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_failure_does_not_hide_the_original_cleanup_control() {
+        for primary in ["start", "vendor", "success"] {
+            let fake = FakeHarness::new()
+                .without_approvals()
+                .open_session(&host(), OpenSession::new("chat"))
+                .await
+                .expect("fake session");
+            let inner: Box<dyn Session> = match primary {
+                "start" => Box::new(StartFailureSession {
+                    inner: fake,
+                    closed: AtomicBool::new(false),
+                }),
+                "vendor" => Box::new(VendorFailureSession {
+                    inner: fake,
+                    closed: AtomicBool::new(false),
+                }),
+                _ => fake,
+            };
+            let control: Arc<dyn mango_external_agents::ProcessControl> =
+                Arc::new(CleanupControl(Some(4242)));
+            let session = CleanupFailureSession {
+                inner,
+                cleanup: Error::CleanupRequired {
+                    control: Arc::clone(&control),
+                    source: Box::new(Error::Protocol {
+                        expected: String::from("a confirmed process cleanup"),
+                        received: String::from("unconfirmed"),
+                    }),
+                },
+            };
+            let error = run(&session, TurnRequest::new("turn", "work"))
+                .await
+                .expect_err("cleanup failure");
+            assert!(
+                Arc::ptr_eq(
+                    &error
+                        .cleanup_control()
+                        .expect("original cleanup control must survive a primary failure"),
+                    &control
+                ),
+                "{primary}"
+            );
+            assert!(
+                matches!(error.cause(), Error::Protocol { expected, .. } if expected == "a confirmed process cleanup")
+            );
+            assert!(crate::turn_failure(&error).contains("4242"));
+        }
+    }
+
+    /// Both process identities remain reportable before CLI result precedence discards one error.
+    #[test]
+    fn double_cleanup_failures_report_both_owners_without_repeating_a_stop() {
+        let primary = Error::CleanupRequired {
+            control: Arc::new(CleanupControl(Some(41))),
+            source: Box::new(Error::Closed {
+                subject: "launch cleanup",
+            }),
+        };
+        let remaining: Arc<dyn mango_external_agents::ProcessControl> =
+            Arc::new(CleanupControl(Some(42)));
+        let cleanup = Error::CleanupRequired {
+            control: Arc::clone(&remaining),
+            source: Box::new(Error::Closed {
+                subject: "session cleanup",
+            }),
+        };
+        let mut primary_report = String::new();
+        let result = super::with_cleanup::<()>(Err(primary), Err(cleanup), |error| {
+            primary_report = crate::turn_failure(error)
+        })
+        .expect_err("both failed");
+        assert!(primary_report.contains("launched pid 41"));
+        assert!(crate::turn_failure(&result).contains("launched pid 42"));
+        assert!(Arc::ptr_eq(
+            &result.cleanup_control().expect("returned owner"),
+            &remaining
+        ));
+    }
+
+    #[test]
+    fn cleanup_without_a_pid_is_reported_without_inventing_process_identity() {
+        let error = Error::CleanupRequired {
+            control: Arc::new(CleanupControl(None)),
+            source: Box::new(Error::Closed { subject: "cleanup" }),
+        };
+        let report = crate::turn_failure(&error);
+        assert!(report.contains("unconfirmed"));
+        assert!(report.contains("control has no pid"));
+    }
+
+    #[test]
+    fn cleanup_precedence_reports_the_primary_context_without_rebuilding_either_error() {
+        let primary = Error::Protocol {
+            expected: String::from("a turn to start"),
+            received: String::from("refused"),
+        };
+        let mut reported = None;
+        let error = super::with_cleanup::<()>(
+            Err(primary.clone()),
+            Err(Error::Closed { subject: "cleanup" }),
+            |error| reported = Some(error.to_string()),
+        )
+        .expect_err("double failure");
+        assert_eq!(reported, Some(primary.to_string()));
+        assert!(matches!(error, Error::Closed { subject: "cleanup" }));
+        let unchanged =
+            super::with_cleanup::<()>(Err(primary), Ok(()), |_| panic!("no cleanup failure"))
+                .expect_err("primary only");
+        assert!(matches!(unchanged, Error::Protocol { .. }));
+        assert!(
+            super::with_cleanup(Ok(7), Ok(()), |_| panic!("no failures"))
+                .is_ok_and(|value| value == 7)
         );
     }
 
