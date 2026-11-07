@@ -51,10 +51,11 @@ done
 check -p mango-external-agents --all-features
 check "${core[@]}" --all-targets
 
-# Harness crates: the only public feature is `testing` (ACP), and each takes the core with `stdio`
-# regardless, so one bare line per crate and the feature where it exists.
+# Harness crates: Codex and ACP expose `testing`; check each feature independently of dev deps.
+# Every harness also gets its own bare library check.
 check -p mango-agent-claude --no-default-features
 check -p mango-agent-codex --no-default-features
+check -p mango-agent-codex --no-default-features --features testing
 check -p mango-agent-acp --no-default-features
 check -p mango-agent-acp --no-default-features --features testing
 echo "✓ isolated feature checks passed on Rust $toolchain"

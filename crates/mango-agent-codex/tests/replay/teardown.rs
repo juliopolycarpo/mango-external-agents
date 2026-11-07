@@ -358,8 +358,16 @@ async fn codex_teardown_real_process_is_killed_once_and_reaped() {
         directory: wrapper.parent().map(std::path::Path::to_path_buf),
     };
     let counting = CountingTokioLauncher::default();
+    // This fixture uses its own executable instead of the plain `codex` program. Answer its
+    // version probe explicitly so the real control counts only the owned app-server child.
+    let versioned = support::VersionAnsweringLauncher::new(Arc::new(counting.clone()))
+        .with_executable(
+            wrapper
+                .to_str()
+                .expect("expected a UTF-8 fixture executable"),
+        );
     let host = host_context(
-        Arc::new(counting.clone()),
+        Arc::new(versioned),
         None,
         mango_external_agents::Limits {
             kill_grace: std::time::Duration::from_millis(100),

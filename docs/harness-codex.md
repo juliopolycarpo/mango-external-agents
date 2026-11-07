@@ -1213,6 +1213,15 @@ Starting and completing an item use the same family/identity eligibility decisio
 checks that decision directly, so finishing a patch does not construct and discard a started
 activity with another copy of its diffs.
 
+## Host tests
+
+The optional `mango-agent-codex/testing` feature exports `testing::VersionAnsweringLauncher` for
+hosts that queue a fake app-server process. It answers the exact `codex --version` probe at this
+crate's minimum version without consuming the queued child. Configure an additional executable
+with `with_executable` and an older or changed banner with `with_version_line`. Other programs
+and argument shapes retain the inner launch specification, I/O, controls and typed errors.
+The [crate README](../crates/mango-agent-codex/README.md#host-tests) describes the unreleased API.
+
 ## Known gaps
 
 - No websocket or unix-socket transport (see above).

@@ -14,6 +14,8 @@ pub mod rate_limits;
 mod redacted;
 pub mod reducer;
 pub mod session;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod turn_reducer;
 
 pub use harness::CodexHarness;
