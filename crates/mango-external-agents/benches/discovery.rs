@@ -1,3 +1,10 @@
+//! Public discovery normalization over a named in-memory probe.
+//!
+//! Measures permission metadata, hostile metadata and model-catalog normalization without
+//! vendor/process/network I/O. Inputs and correctness assertions are outside timing; cloning
+//! the probe result, normalization, permission intersection and output destruction are inside.
+//! Run with `cargo bench -p mango-external-agents --bench discovery`.
+
 mod support;
 
 use mango_external_agents::discovery::Model;
