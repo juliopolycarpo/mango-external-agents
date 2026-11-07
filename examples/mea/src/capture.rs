@@ -207,6 +207,8 @@ async fn codex_with(
 
 /// A completed turn alone is not evidence of an attributed child item.
 fn has_captured_subagent(recorded: &str) -> bool {
+    use mango_agent_codex::protocol::{Notification, ThreadItem};
+
     recorded
         .lines()
         .filter_map(|line| line.strip_prefix(RECEIVED))
@@ -214,13 +216,17 @@ fn has_captured_subagent(recorded: &str) -> bool {
             let Ok(frame) = serde_json::from_str::<Value>(line) else {
                 return false;
             };
-            matches!(
-                frame["method"].as_str(),
-                Some("item/started" | "item/completed")
-            ) && frame["params"]["item"]["type"] == "subAgentActivity"
-                && frame["params"]["item"]["agentThreadId"]
-                    .as_str()
-                    .is_some_and(|id| !id.is_empty() && id != redact::PLACEHOLDER)
+            let Some(method) = frame["method"].as_str() else {
+                return false;
+            };
+            let notification = Notification::parse(method, frame["params"].clone());
+            let (Notification::ItemStarted(item) | Notification::ItemCompleted(item)) =
+                notification
+            else {
+                return false;
+            };
+            matches!(item.item, ThreadItem::SubAgentActivity { agent_thread_id: Some(id), .. }
+                if !id.is_empty() && id != redact::PLACEHOLDER)
         })
 }
 
@@ -971,7 +977,7 @@ mod tests {
             Value::Null,
             json!(7),
         ] {
-            let frame = json!({"method": "item/started", "params": {"item": {
+            let frame = json!({"method": "item/started", "params": {"threadId": "parent-thread", "turnId": "parent-turn", "item": {
                 "type": "subAgentActivity", "id": "child", "agentThreadId": id
             }}});
             assert!(!super::has_captured_subagent(&format!(
@@ -980,7 +986,7 @@ mod tests {
                 frame
             )));
         }
-        let frame = json!({"method": "item/completed", "params": {"item": {
+        let frame = json!({"method": "item/completed", "params": {"threadId": "parent-thread", "turnId": "parent-turn", "item": {
             "type": "subAgentActivity", "id": "child", "agentThreadId": "child-thread"
         }}});
         assert!(!super::has_captured_subagent(&format!(
@@ -996,6 +1002,19 @@ mod tests {
         assert!(!super::has_captured_subagent(
             "<<not JSON\n# agentThreadId child-thread"
         ));
+        for malformed in [
+            json!({"method": "item/started", "params": {"threadId": "parent-thread", "turnId": "parent-turn", "item": {
+                "type": "subAgentActivity", "agentThreadId": "child-thread"
+            }}}),
+            json!({"method": "item/started", "params": {"item": {
+                "type": "subAgentActivity", "id": "child-item", "agentThreadId": "child-thread"
+            }}}),
+        ] {
+            assert!(
+                !super::has_captured_subagent(&format!("{}{}", super::RECEIVED, malformed)),
+                "expected a malformed item/context not to qualify: {malformed}"
+            );
+        }
     }
 
     #[tokio::test]
