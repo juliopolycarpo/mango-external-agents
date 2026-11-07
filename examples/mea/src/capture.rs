@@ -924,6 +924,13 @@ mod tests {
         assert!(partial.contains("# incomplete capture"));
         assert!(partial.contains("account/read"));
         assert!(partial.contains("thread/start"));
+        let started: Value = partial
+            .lines()
+            .filter_map(|line| line.strip_prefix(super::SENT))
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|frame| frame["method"] == "thread/start")
+            .expect("recorded thread/start");
+        assert_eq!(started["params"]["cwd"], crate::redact::FIXTURE_CWD);
         assert!(!partial.contains("capture-canary@example.invalid"));
         assert!(!partial.contains(&*workspace.to_string_lossy()));
         assert_eq!(launcher.live_children(), 0);
