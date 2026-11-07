@@ -1,0 +1,10 @@
+{
+  "binary_sha256": "39d7432974723519de6233ff48faef3345b6fb50124d1e8a7275930829cb6102",
+  "probe_sha256": "8912e9c1d9b9a00ac7300b1db811207a3a8abec4f82c231fd5c637b58e4ce251",
+  "lock_sha256": "8e194a89da207da00f782cab8bd39c85dc7bdef8ad9851bac397dcc75ebc1c3f",
+  "harness_sha256": "b279e34637ba79fe460757435495025c2426628ba6dafe3f71e53766227afe6f",
+  "sources": {
+    "base": "f5f39b2cefb4ac4fe413bcb02bb8e1e0a3c419e4",
+    "variant": "c89d479af1c54cc937f611a79807390402ebeecc"
+  }
+}

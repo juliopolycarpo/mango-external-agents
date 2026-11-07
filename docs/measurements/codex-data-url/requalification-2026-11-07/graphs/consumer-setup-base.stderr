@@ -1,0 +1,6 @@
+    Updating crates.io index
+     Locking 4 packages to highest Rust 1.99.0 compatible versions
+      Adding mango-agent-acp v0.8.0 (/workspace/work/pr-wave/perf-249-base/crates/mango-agent-acp)
+      Adding mango-agent-claude v0.8.0 (/workspace/work/pr-wave/perf-249-base/crates/mango-agent-claude)
+      Adding mango-agent-codex v0.8.0 (/workspace/work/pr-wave/perf-249-base/crates/mango-agent-codex)
+      Adding mango-external-agents v0.8.0 (/workspace/work/pr-wave/perf-249-base/crates/mango-external-agents)

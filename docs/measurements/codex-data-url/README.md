@@ -1,5 +1,9 @@
 # Codex data-URL allocation receipt
 
+This is the historical 2026-11-04 experiment. See the
+[2026-11-07 current-main qualification](requalification-2026-11-07.md) for the rebased source,
+fresh samples and prospective 0.8 consumer graph evidence.
+
 Measured 2026-11-04 on Linux 6.18.57, x86_64 GNU, AMD EPYC 9V74 (5 available CPUs),
 Rust 1.99.0 `b940084d7`, LLVM 23.1.1. Baseline SDK:
 `b0e68ecb74e6604b2b68a2b387a23081055b74b3`. Candidate session source blob:

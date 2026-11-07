@@ -1,0 +1,12 @@
+{
+  "sdk": {
+    "equal": true,
+    "lines": 42,
+    "normalized_sha256": "5b1f4990d8a4269963439e8657b36ef40fa16334631e1d5c8300616e5397a0d8"
+  },
+  "consumer": {
+    "equal": true,
+    "lines": 593,
+    "normalized_sha256": "3474f2d5c34b69f5afeca7603fbb524100b8f8f4319958fc41853480261b5350"
+  }
+}
