@@ -44,7 +44,7 @@ echo
 
 run() { echo "## $*"; "$@"; echo; }
 
-run cargo bench --locked -p mango-external-agents --bench framing --bench events --bench redact --bench copies -- "$@"
+run cargo bench --locked -p mango-external-agents --bench framing --bench events --bench redact --bench copies --bench discovery -- "$@"
 run cargo bench --locked -p mango-agent-codex --bench pipeline --bench activity -- "$@"
 run cargo bench --locked -p mango-agent-acp --features testing --bench reducer --bench prompt -- "$@"
 run cargo bench --locked -p mango-agent-claude --bench tool_results -- "$@"

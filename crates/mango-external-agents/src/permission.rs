@@ -283,6 +283,19 @@ impl PermissionMatrix {
     /// policy, or an older build removes a pair; it cannot make an undeclared pair available.
     #[must_use]
     pub fn bounded_by(&self, declaration: &Self) -> Self {
+        self.bounded_by_inner(declaration, false)
+    }
+
+    /// The default discovery path normalizes probe identifiers before choosing declaration
+    /// fallbacks. Standalone intersection instead keeps its existing raw-id precedence.
+    pub(crate) fn normalized_bounded_by(&self, declaration: &Self) -> Self {
+        self.bounded_by_inner(declaration, true)
+    }
+
+    fn bounded_by_inner(&self, declaration: &Self, normalize_probe_first: bool) -> Self {
+        let normalized_id = |id: Option<&str>| {
+            id.and_then(|id| normalize::opaque_id(id, "permission configuration vendor id").ok())
+        };
         Self::build(|level, routing| {
             let Some(declared) = declaration.cell(level, routing) else {
                 return ConfigurationVerdict::unsupported(UnsupportedReason::Other(String::from(
@@ -294,36 +307,48 @@ impl PermissionMatrix {
                     reason: declared
                         .unsupported_reason
                         .clone()
-                        .unwrap_or(UnsupportedReason::NotOfferedByVendor),
-                    vendor_id: declared.vendor_id.clone(),
+                        .unwrap_or(UnsupportedReason::NotOfferedByVendor)
+                        .normalized(),
+                    vendor_id: normalized_id(declared.vendor_id.as_deref()),
                 };
             }
-
             let Some(probed) = self.cell(level, routing) else {
-                return ConfigurationVerdict::unsupported(UnsupportedReason::Other(String::from(
-                    "the probe did not describe this permission configuration",
-                )));
+                return ConfigurationVerdict::Unsupported {
+                    reason: UnsupportedReason::Other(String::from(if normalize_probe_first {
+                        "the matrix did not describe this permission configuration"
+                    } else {
+                        "the probe did not describe this permission configuration"
+                    })),
+                    vendor_id: if normalize_probe_first {
+                        normalized_id(declared.vendor_id.as_deref())
+                    } else {
+                        None
+                    },
+                };
+            };
+            let vendor_id = if normalize_probe_first {
+                normalized_id(probed.vendor_id.as_deref())
+                    .or_else(|| normalized_id(declared.vendor_id.as_deref()))
+            } else {
+                normalized_id(
+                    probed
+                        .vendor_id
+                        .as_deref()
+                        .or(declared.vendor_id.as_deref()),
+                )
             };
             if probed.supported {
-                return ConfigurationVerdict::Supported {
-                    vendor_id: probed
-                        .vendor_id
-                        .clone()
-                        .or_else(|| declared.vendor_id.clone()),
-                };
+                return ConfigurationVerdict::Supported { vendor_id };
             }
             ConfigurationVerdict::Unsupported {
                 reason: probed
                     .unsupported_reason
                     .clone()
-                    .unwrap_or(UnsupportedReason::NotOfferedByVendor),
-                vendor_id: probed
-                    .vendor_id
-                    .clone()
-                    .or_else(|| declared.vendor_id.clone()),
+                    .unwrap_or(UnsupportedReason::NotOfferedByVendor)
+                    .normalized(),
+                vendor_id,
             }
         })
-        .normalized()
     }
 
     /// This matrix with vendor-written ids and explanations bounded.
@@ -1297,6 +1322,53 @@ mod tests {
             Some("safe-mode"),
             "expected a safe opaque id to remain exact"
         );
+    }
+
+    #[test]
+    fn raw_intersection_preserves_id_precedence_and_missing_cell_diagnostics() {
+        let declaration = PermissionMatrix::build(|_, _| ConfigurationVerdict::Supported {
+            vendor_id: Some(String::from("declared-id")),
+        });
+        let invalid = PermissionMatrix::build(|_, _| ConfigurationVerdict::Supported {
+            vendor_id: Some(String::from("\n")),
+        });
+        assert!(
+            invalid
+                .bounded_by(&declaration)
+                .cells()
+                .iter()
+                .all(|cell| cell.vendor_id.is_none())
+        );
+        assert!(
+            invalid
+                .normalized()
+                .bounded_by(&declaration)
+                .cells()
+                .iter()
+                .all(|cell| cell.vendor_id.as_deref() == Some("declared-id"))
+        );
+
+        let missing = PermissionMatrix(Vec::new());
+        for cell in missing.bounded_by(&declaration).cells() {
+            assert!(!cell.supported);
+            assert_eq!(cell.vendor_id, None);
+            assert_eq!(
+                cell.unsupported_reason,
+                Some(UnsupportedReason::Other(String::from(
+                    "the probe did not describe this permission configuration"
+                )))
+            );
+        }
+        for cell in missing.normalized().bounded_by(&declaration).cells() {
+            assert!(!cell.supported);
+            assert_eq!(cell.vendor_id.as_deref(), Some("declared-id"));
+            assert_eq!(
+                cell.unsupported_reason,
+                Some(UnsupportedReason::Other(String::from(
+                    "the matrix did not describe this permission configuration"
+                )))
+            );
+        }
     }
 
     #[test]
