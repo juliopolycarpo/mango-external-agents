@@ -1,0 +1,9 @@
+[
+  {
+    "path": "conditions/plan.json",
+    "field": "execution.uname[1]",
+    "reason": "Omit machine name; allocation results and command artifacts unchanged.",
+    "original_sha256": "a4ecbf289dac1ca26fa0b5d222b24928ff15b4351d15ecc001884c90c3c498e9",
+    "published_sha256": "0953932112217d78a134070050e35bd67a04fefc236102afba8c2c2fd3731a26"
+  }
+]

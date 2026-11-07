@@ -1,0 +1,77 @@
+{
+  "created_at": "2026-11-07T08:40:45.947855+00:00",
+  "question": "Reducer-owned allocation retention after forwarded nested text; isolate prefix append from already-fixed finish cleanup",
+  "baseline": {
+    "sha": "1c07cd6f52098da30ae858465caa40b5f38b498f",
+    "path": "/workspace/work/pr-wave/perf-261-base",
+    "clean": true,
+    "note": "Exact rebased original221 includes end_run clear; original252 cleanup regression proven separately on actual mainf181"
+  },
+  "candidate": {
+    "sha": "045be3f73e0c245aa45adf320a1b317f2d40e289",
+    "path": "/workspace/work/pr-wave/perf-261-variant",
+    "clean": true,
+    "change": "Append only Unicode-safe fitting prefix; separator/full markers preserved; no manifests/lock/API changes"
+  },
+  "probe_sha256": "8de148885026e5b3198961eb6af72bcf3e79e85410d463cf6cc834cc992cd241",
+  "scenarios": [
+    "ordinary-ascii",
+    "ordinary-unicode",
+    "oversized-ascii",
+    "oversized-unicode",
+    "grow-then-oversized",
+    "full-then-ignored"
+  ],
+  "inputs": {
+    "ordinary-ascii": "one256-byte ASCII block",
+    "ordinary-unicode": "eight208-byte mixed-width blocks (112 codepoints each), separators included",
+    "oversized-ascii": "one2MiB ASCII block",
+    "oversized-unicode": "one2MiB four-byte Unicode block",
+    "grow-then-oversized": "256-byte prefix then2MiB ASCII block",
+    "full-then-ignored": "2MiB ASCII first block then2MiB ignored block"
+  },
+  "primary": "DHAT0.3.3 current live allocated bytes owned by public TurnReducer after all scenario records and returned event drops, while reducer remains active",
+  "gate": {
+    "every_oversized_pair": "candidate active_bytes <= 10% of baseline (>=90% reduction) in each of four oversized scenarios, each pair",
+    "ordinary": "candidate active_bytes, total_blocks and peak_bytes must not exceed paired baseline for either ordinary scenario",
+    "cleanup": "released bytes/blocks must be0 for every profile; finish current bytes/blocks must be0 for this pre-initialized synthetic workload",
+    "correctness": "serialized EventKind arrays and event counts must match between binaries for all6 scenarios;44focused tests green; full/native/review after experiment"
+  },
+  "pairs": 2,
+  "order": "pair1 each scenario baseline then candidate; pair2 each scenario candidate then baseline;24fresh process profiles serially",
+  "warmup": "one unprofiled complete run/cancel/drop in each fresh measured process; inputs parsed once before warmup/profiler; no output serialization inside profiler",
+  "validity": "all24processes exit0, exactscenario inventory, matching active/closing eventcounts, zero tracked allocation afterdrop, allrawprofiles/logs/audits kept; no exclusions or automatic retries; any changed workload/gate starts a new labeled experiment preserving attempts",
+  "budget": "30minutes setup+trials;60-second per correctness/profile process timeout; no concurrent local builds/tests while collecting profiles; processes waited/settled",
+  "metrics_limits": "allocation counts/requested live+peak heap bytes only; excludes caller-owned pre-parsed input/JSON parse; no latency, CPU, process RSS, whole-application or real-vendor claim",
+  "commands": {
+    "build": "cargo build --release --locked --manifest-path <side>/Cargo.toml (initial baseline lock generation is setup, candidate copies exact lock)",
+    "correctness": "<side>/target/release/nested-text-allocation-probe correctness",
+    "profile": "<side>/target/release/nested-text-allocation-probe profile <scenario> <attempt>.dhat.json"
+  },
+  "evidence": "/workspace/work/pr-wave/perf-262-publishable-reproduction/results",
+  "reproduction_of_plan_sha256": "5dc521a3d84b75dcfd523cf6b4dacd1570e1224ceef6241d0d5cb8b116fa8431",
+  "reference_conditions": {
+    "build": "rustc1.99.0 b940084d7 LLVM23.1.1 cargo1.99.0 x86_64-unknown-linux-gnu; default release with debug1 on both sides;dhat0.3.3 serde_json1 sha2=0.10.9; independently writable build targets; SDK manifests/locks byte-identical; isolated probe lock copied and verified identical",
+    "execution": "managed Linux6.18.57 x86_64,4CPU cgroup quota,16GiB cgroup limit; same workspace filesystem; serial processes; not nativeWindows/macOS qualification",
+    "cache": "shared warmed Cargo registry cache; separate writable build outputs; fresh process per profile, one application warmup; OS cache uncontrolled/warm, no machine-cold claim"
+  },
+  "build": {
+    "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.0\nLLVM version: 23.1.1\n",
+    "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)\nrelease: 1.99.0\ncommit-hash: 5f94df4789f005f9a352888e8355ffc645b7ed0e\ncommit-date: 2026-08-27\nhost: x86_64-unknown-linux-gnu\nlibgit2: 1.9.6 (sys:0.21.0 vendored)\nlibcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:OpenSSL/3.6.3)\nssl: OpenSSL 3.6.3 9 Jun 2026\nos: Debian 13.0.0 (trixie) [64-bit]\n",
+    "profile": "release with debug=1; same frozen probe and copied lock on both sides",
+    "compiler_wrapper_configured": false
+  },
+  "execution": {
+    "os": "Linux",
+    "kernel": "6.18.57",
+    "architecture": "x86_64",
+    "cpu_quota": "400000 100000",
+    "memory_limit": "17179869184"
+  },
+  "cache": {
+    "registry": "shared caller cache; warmth uncontrolled",
+    "build": "fresh independent target directories",
+    "application": "fresh process; one unprofiled warm-up",
+    "os": "uncontrolled; no machine-cold claim"
+  }
+}

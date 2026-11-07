@@ -856,7 +856,7 @@ tools somebody configured and report success.
 
 ## The event stream
 
-The reducer holds three properties, each with a fixture case behind it:
+The reducer holds three properties, exercised by replay and reducer tests:
 
 - **Text is delivered once.** `--include-partial-messages` carries the same output twice — as
   deltas and again as a completed block — so deltas are the source and a completed block
@@ -869,6 +869,13 @@ The reducer holds three properties, each with a fixture case behind it:
 - **Subagents stay the vendor's.** `--forward-subagent-text` tags a subagent's messages with
   `parent_tool_use_id`; those nest under the `Task` activity as accumulating detail, never
   promoted into the transcript, which would tell a user the host made a hand-off it did not make.
+  Only the prefix that fits the nested-text carry is appended, so even the first oversized
+  forwarded block cannot leave input-sized spare capacity behind bounded text. The
+  [paired allocation receipt](measurements/claude-nested-text/README.md) measures this reducer-owned
+  allocation separately from caller-owned parsed input.
+  A finished public reducer releases its nested transcript buffers after constructing closure
+  events, including cancellation and abort; retaining that reducer retains no child text.
+
 - **Unknown records are ignored, not fatal.** `system/status`, `system/thinking_tokens`,
   `system/api_retry` and `rate_limit_event` all appear on one live run, and the vocabulary keeps
   growing. Only a `result` ends the turn.

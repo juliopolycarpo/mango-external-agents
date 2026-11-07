@@ -1,0 +1,35 @@
+{
+  "toolchains": [
+    {
+      "side": "base",
+      "command": [
+        "rustc",
+        "-vV"
+      ],
+      "cwd": "/workspace/work/pr-wave/perf-261-probe/base",
+      "start": "2026-11-07T07:59:11.680243+00:00",
+      "end": "2026-11-07T07:59:11.696484+00:00",
+      "exit": 0,
+      "stdout": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.0\nLLVM version: 23.1.1\n",
+      "stderr": ""
+    },
+    {
+      "side": "variant",
+      "command": [
+        "rustc",
+        "-vV"
+      ],
+      "cwd": "/workspace/work/pr-wave/perf-261-probe/variant",
+      "start": "2026-11-07T07:59:11.715920+00:00",
+      "end": "2026-11-07T07:59:11.732598+00:00",
+      "exit": 0,
+      "stdout": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.0\nLLVM version: 23.1.1\n",
+      "stderr": ""
+    }
+  ],
+  "platform": "Linux 6.18.57 x86_64",
+  "cpu_quota": "400000 100000",
+  "memory_limit": "17179869184",
+  "normalized_metadata_sha256": "5052238d6d81dc44752e6d8556b2eb06495e71f8c96a73eb7c2e64c9452ca84c",
+  "probe_and_graph_equal": true
+}

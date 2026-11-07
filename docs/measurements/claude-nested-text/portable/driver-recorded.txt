@@ -1,0 +1,33 @@
+setup-lock-base 0
+setup-build-base 0
+setup-metadata-base 0
+setup-correctness-base 0
+setup-build-variant 0
+setup-metadata-variant 0
+setup-correctness-variant 0
+pair-1-ordinary-ascii-1-base 0
+pair-1-ordinary-ascii-2-variant 0
+pair-1-ordinary-unicode-1-base 0
+pair-1-ordinary-unicode-2-variant 0
+pair-1-oversized-ascii-1-base 0
+pair-1-oversized-ascii-2-variant 0
+pair-1-oversized-unicode-1-base 0
+pair-1-oversized-unicode-2-variant 0
+pair-1-grow-then-oversized-1-base 0
+pair-1-grow-then-oversized-2-variant 0
+pair-1-full-then-ignored-1-base 0
+pair-1-full-then-ignored-2-variant 0
+pair-2-ordinary-ascii-1-variant 0
+pair-2-ordinary-ascii-2-base 0
+pair-2-ordinary-unicode-1-variant 0
+pair-2-ordinary-unicode-2-base 0
+pair-2-oversized-ascii-1-variant 0
+pair-2-oversized-ascii-2-base 0
+pair-2-oversized-unicode-1-variant 0
+pair-2-oversized-unicode-2-base 0
+pair-2-grow-then-oversized-1-variant 0
+pair-2-grow-then-oversized-2-base 0
+pair-2-full-then-ignored-1-variant 0
+pair-2-full-then-ignored-2-base 0
+{"valid": true, "accepted": true, "samples": 24}
+Publishable current runner passed all24 profiles under missing-helper control; actual environment omits machine name.

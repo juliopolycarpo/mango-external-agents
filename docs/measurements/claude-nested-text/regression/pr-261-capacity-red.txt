@@ -1,0 +1,19 @@
+   Compiling mango-agent-claude v0.8.0 (/workspace/mango-external-agents/crates/mango-agent-claude)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.50s
+     Running unittests src/lib.rs (target/debug/deps/mango_agent_claude-05e0d81a40caa583)
+
+running 1 test
+
+thread 'reducer::tests::an_oversized_nested_block_keeps_bounded_capacity_for_each_unicode_width' (414525) panicked at crates/mango-agent-claude/src/reducer.rs:2052:17:
+expected ascii retained capacity bounded independently of the 2097152 input bytes, received 2097152 bytes against 65536
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test reducer::tests::an_oversized_nested_block_keeps_bounded_capacity_for_each_unicode_width ... FAILED
+
+failures:
+
+failures:
+    reducer::tests::an_oversized_nested_block_keeps_bounded_capacity_for_each_unicode_width
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 258 filtered out; finished in 0.10s
+
+error: test failed, to rerun pass `-p mango-agent-claude --lib`

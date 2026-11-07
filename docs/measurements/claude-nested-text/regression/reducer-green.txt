@@ -1,0 +1,52 @@
+   Compiling mango-agent-claude v0.8.0 (/workspace/mango-external-agents/crates/mango-agent-claude)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.26s
+     Running unittests src/lib.rs (target/debug/deps/mango_agent_claude-05e0d81a40caa583)
+
+running 44 tests
+test reducer::tests::a_cancel_mid_thinking_ends_the_reasoning_once ... ok
+test reducer::tests::a_block_of_exactly_the_bound_is_still_deduplicated ... ok
+test reducer::tests::a_completed_block_not_extending_what_streamed_is_emitted_whole_past_the_bound ... ok
+test reducer::tests::a_reasoning_block_already_stopped_is_not_ended_again_by_the_run ... ok
+test reducer::tests::a_reducer_without_a_bound_keeps_every_block_whole ... ok
+test reducer::tests::a_result_mid_thinking_ends_the_reasoning_before_it_completes ... ok
+test reducer::tests::a_result_subtype_nobody_documented_does_not_become_a_code ... ok
+test reducer::tests::a_full_subagent_buffer_does_not_swallow_another_subagents_text ... ok
+test reducer::tests::a_reused_call_id_starts_a_new_buffer_once_the_call_closed ... ok
+test reducer::tests::a_tool_results_body_becomes_output_content_even_when_a_denial_wins_the_detail ... ok
+test reducer::tests::a_write_calls_input_becomes_a_diff_with_no_kind_asserted ... ok
+test reducer::tests::an_abort_mid_thinking_ends_the_reasoning_before_the_error ... ok
+test reducer::tests::an_array_tool_result_closes_exactly_like_its_flattened_string ... ok
+test reducer::tests::an_array_tool_result_past_the_carry_bound_still_reports_the_cut ... ok
+test reducer::tests::an_edit_call_reports_the_file_it_modified_without_misfiling_its_two_fragments ... ok
+test reducer::tests::an_edit_missing_a_key_produces_no_diff_rather_than_an_empty_one ... ok
+test reducer::tests::an_edit_needs_both_strings_as_text_and_carries_neither ... ok
+test reducer::tests::an_errored_result_reports_only_a_subtype_the_harness_names ... ok
+test reducer::tests::a_block_larger_than_the_default_line_limit_is_deduplicated_under_a_larger_bound ... ok
+test reducer::tests::carries_the_tool_use_id_as_the_activitys_own_item_id ... ok
+test reducer::tests::delivered_reasoning_past_the_bound_is_not_kept_either ... ok
+test reducer::tests::delivered_text_past_the_bound_is_not_kept_for_the_completed_block ... ok
+test reducer::tests::ending_the_run_drops_the_text_kept_to_deduplicate_blocks ... ok
+test reducer::tests::every_block_has_its_own_bound ... ok
+test reducer::tests::every_documented_error_subtype_keeps_its_own_code ... ok
+test reducer::tests::every_open_reasoning_block_ends_when_the_run_does ... ok
+test reducer::tests::falls_back_to_other_for_a_tool_it_does_not_recognise ... ok
+test reducer::tests::finished_reducers_release_nested_text_and_full_markers ... ok
+test reducer::tests::folds_the_vendors_session_handle_into_run_init_rather_than_a_turn_event ... ok
+test reducer::tests::ignores_a_system_subtype_with_no_neutral_event_behind_it ... ok
+test reducer::tests::ignores_an_unknown_top_level_record_type ... ok
+test reducer::tests::keeps_a_cut_visible_to_the_sink_that_reports_it ... ok
+test reducer::tests::maps_bash_to_a_command_and_a_namespaced_tool_to_mcp ... ok
+test reducer::tests::names_the_subtype_when_the_vendor_explained_nothing_at_all ... ok
+test reducer::tests::names_the_vendors_own_terminal_reason_when_nothing_else_explains_the_failure ... ok
+test reducer::tests::nested_text_full_markers_preserve_empty_and_exact_boundary_blocks ... ok
+test reducer::tests::reports_a_failed_result_as_a_structured_error ... ok
+test reducer::tests::reports_a_repeated_init_again_rather_than_withholding_it ... ok
+test reducer::tests::stops_reducing_after_the_result ... ok
+test reducer::tests::surfaces_the_error_arms_own_text_instead_of_the_generic_fallback ... ok
+test reducer::tests::titles_a_call_with_the_field_a_reader_is_looking_for ... ok
+test reducer::tests::a_subagents_detail_is_byte_identical_to_cutting_after_every_block ... ok
+test reducer::tests::an_oversized_nested_block_keeps_bounded_capacity_for_each_unicode_width ... ok
+test reducer::tests::a_run_reducer_keeps_what_its_limits_can_deliver ... ok
+
+test result: ok. 44 passed; 0 failed; 0 ignored; 0 measured; 215 filtered out; finished in 0.76s
+

@@ -1,0 +1,26 @@
+[
+  {
+    "case": "pr-221-cancel-red",
+    "exit": 101,
+    "source_sha256": "db8d22d24f273db99e45dd4a02f406ea5efeb3549862fd9ea40bc252a2da53bd",
+    "expected_failure": "expected cancel to release nested buffers"
+  },
+  {
+    "case": "pr-221-abort-red",
+    "exit": 101,
+    "source_sha256": "9f770eb01f66a806b2c4ada0165cf9daa2ae092c826a4387d01b3703f8baf220",
+    "expected_failure": "expected abort to release nested buffers"
+  },
+  {
+    "case": "pr-221-result-red",
+    "exit": 101,
+    "source_sha256": "98404488778ca67d75d3e7d25333be35f4921c2f50cf15e3b60293bc5fb36986",
+    "expected_failure": "expected result to release nested buffers"
+  },
+  {
+    "case": "pr-261-capacity-red",
+    "exit": 101,
+    "source_sha256": "b8d56fb073dc7a94e37d68b815cefe2dda76a91ff7f57451e0214684e2a99fa6",
+    "expected_failure": "retained capacity bounded independently"
+  }
+]
