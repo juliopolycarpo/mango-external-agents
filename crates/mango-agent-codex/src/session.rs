@@ -4917,6 +4917,51 @@ mod tests {
         assert!(quota.pending.is_none());
     }
 
+    /// Completing one read must keep sparse updates available to its still-registered sibling.
+    #[test]
+    fn a_finished_quota_read_preserves_pending_updates_for_its_sibling() {
+        let shared = shared();
+        let first = shared.begin_quota_read();
+        let second = shared.begin_quota_read();
+        shared.quota.lock().expect("quota").pending = Some(
+            serde_json::from_value(serde_json::json!({"primary":{"usedPercent":25.0}}))
+                .expect("expected a sparse quota update"),
+        );
+        for (registered, (primary, secondary)) in
+            [first, second].into_iter().zip([(10.0, 20.0), (5.0, 15.0)])
+        {
+            let response = serde_json::from_value(serde_json::json!({"rateLimits": {
+                "primary":{"usedPercent":primary}, "secondary":{"usedPercent":secondary}
+            }}))
+            .expect("expected a full quota reading");
+            let reading = registered
+                .finish(Some(&response))
+                .baseline()
+                .expect("expected an adopted quota reading");
+            assert_eq!(
+                reading
+                    .snapshot
+                    .primary
+                    .expect("primary window")
+                    .used_percent,
+                25.0,
+                "expected both reads to preserve the newer sparse update"
+            );
+            assert_eq!(
+                reading
+                    .snapshot
+                    .secondary
+                    .expect("secondary window")
+                    .used_percent,
+                secondary,
+                "expected each adopted generation to keep its complete secondary window"
+            );
+        }
+        let quota = shared.quota.lock().expect("quota");
+        assert_eq!(quota.reads_in_flight, 0);
+        assert!(quota.pending.is_none());
+    }
+
     /// A direct-handler host with a deliberately tight request budget.
     fn shared_with_pending_limit(max_pending_requests: usize) -> Arc<Shared> {
         let host = HostContext::builder()
