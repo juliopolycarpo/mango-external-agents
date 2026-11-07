@@ -992,7 +992,9 @@ pub enum UnsupportedQuestion {
     ArbitraryForm,
     /// The vendor asked in a shape no arm of [`QuestionForm`] describes.
     UnrecognisedForm {
-        /// What the vendor called it, bounded.
+        /// The vendor's label, bounded by [`UnsupportedQuestion::normalized`].
+        ///
+        /// Available through this typed field; `Debug` and `Display` omit it from diagnostics.
         received: String,
     },
 }
@@ -1021,13 +1023,12 @@ impl UnsupportedQuestion {
 }
 
 impl fmt::Display for UnsupportedQuestion {
+    /// Describes the refusal class without logging a vendor-supplied label.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::SecretCollection => formatter.write_str("secret collection"),
             Self::ArbitraryForm => formatter.write_str("an arbitrary form"),
-            Self::UnrecognisedForm { received } => {
-                write!(formatter, "an unrecognised form {received:?}")
-            }
+            Self::UnrecognisedForm { .. } => formatter.write_str("an unrecognised form"),
         }
     }
 }
@@ -1585,6 +1586,72 @@ mod tests {
             UnsupportedQuestion::SecretCollection.to_string(),
             "secret collection"
         );
+    }
+
+    #[test]
+    fn unknown_question_form_diagnostics_omit_vendor_labels_before_and_after_normalization() {
+        const LABEL: &str = "private-vendor-question-label-canary";
+        let raw = UnsupportedQuestion::UnrecognisedForm {
+            received: LABEL.to_owned(),
+        };
+        let reasons = [("raw", raw.clone()), ("normalized", raw.normalized())];
+        let mut diagnostics = Vec::new();
+        for (stage, reason) in reasons {
+            let UnsupportedQuestion::UnrecognisedForm { received } = &reason else {
+                panic!("expected the explicit unknown-form reason");
+            };
+            assert_eq!(
+                received, LABEL,
+                "typed vendor evidence must remain available"
+            );
+            let serialized = serde_json::to_value(&reason).expect("typed reason serialization");
+            assert_eq!(
+                serialized.pointer("/unrecognised-form/received"),
+                Some(&serde_json::json!(LABEL)),
+                "explicit structured access must retain the received label"
+            );
+            diagnostics.push((stage, "Display", format!("{reason}")));
+            diagnostics.push((stage, "alternate Display", format!("{reason:#}")));
+            diagnostics.push((stage, "Debug", format!("{reason:?}")));
+            diagnostics.push((stage, "alternate Debug", format!("{reason:#?}")));
+            let outcome = QuestionOutcome::Refused { reason }
+                .normalized()
+                .expect("refusal outcome normalization");
+            diagnostics.push((stage, "containing Debug", format!("{outcome:?}")));
+            diagnostics.push((stage, "containing alternate Debug", format!("{outcome:#?}")));
+            assert_eq!(outcome.status(), InteractionStatus::Withdrawn);
+        }
+        assert_eq!(diagnostics.len(), 12);
+        let exposed: Vec<_> = diagnostics
+            .iter()
+            .filter(|(_, _, rendered)| rendered.contains(LABEL))
+            .map(|(stage, format, _)| (*stage, *format))
+            .collect();
+        assert!(
+            exposed.is_empty(),
+            "vendor question labels must stay out of diagnostic formats; exposed by {exposed:?}"
+        );
+        for (_, format, rendered) in diagnostics {
+            if format.contains("Display") {
+                assert_eq!(rendered, "an unrecognised form");
+            } else {
+                assert!(rendered.contains("UnrecognisedForm"));
+            }
+        }
+    }
+
+    #[test]
+    fn known_unsupported_question_reasons_keep_their_diagnostic_text() {
+        for (reason, expected) in [
+            (UnsupportedQuestion::SecretCollection, "secret collection"),
+            (UnsupportedQuestion::ArbitraryForm, "an arbitrary form"),
+        ] {
+            assert_eq!(format!("{reason}"), expected);
+            assert_eq!(format!("{reason:#}"), expected);
+            assert_eq!(reason.clone().normalized(), reason);
+            let outcome = QuestionOutcome::Refused { reason };
+            assert_eq!(outcome.status(), InteractionStatus::Withdrawn);
+        }
     }
 
     #[test]
