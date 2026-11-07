@@ -13,7 +13,7 @@
 //! can progress independently of a stalled physical writer or protocol handler.
 //!
 //! The `Http` arm of [`AcpSpec`] is unsupported and refused before launch. Representing an HTTP
-//! endpoint does not enable that carrier. See the crate docs for the `ring`-only TLS policy.
+//! endpoint does not enable that carrier. TLS remains `ring`-only.
 
 mod budget;
 pub(crate) use budget::{Overflow, client_options, wire_options};
