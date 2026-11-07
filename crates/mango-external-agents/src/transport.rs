@@ -155,13 +155,17 @@ impl WsSpec {
     }
 }
 
-/// Which carrier the official Agent Client Protocol client rides.
+/// Which carrier an Agent Client Protocol connection uses.
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AcpSpec {
     /// A child process's pipes, spawned through the host's launcher.
     ChildPipes(StdioSpec),
     /// An HTTP endpoint the host configured.
+    ///
+    /// Representing the endpoint does not enable an HTTP carrier. The ACP harness's transport
+    /// connector currently refuses this variant with [`crate::Error::UnsupportedTransport`]
+    /// before launching a child; only [`Self::ChildPipes`] is supported.
     ///
     /// A URL, and a URL is a place a credential hides: `https://svc:password@agent.internal` is
     /// what a host configures when the endpoint is behind basic auth. It is omitted from

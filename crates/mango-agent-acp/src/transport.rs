@@ -12,7 +12,8 @@
 //! [`Limits`](mango_external_agents::Limits). Pressure ends the connection, so native cleanup
 //! can progress independently of a stalled physical writer or protocol handler.
 //!
-//! The `Http` arm of [`AcpSpec`] is not implemented in 0.1. See the crate docs for why.
+//! The `Http` arm of [`AcpSpec`] is unsupported and refused before launch. Representing an HTTP
+//! endpoint does not enable that carrier. See the crate docs for the `ring`-only TLS policy.
 
 mod budget;
 pub(crate) use budget::{Overflow, client_options, wire_options};
@@ -55,7 +56,7 @@ impl std::fmt::Debug for LaunchedAgent {
 ///
 /// # Errors
 ///
-/// [`Error::UnsupportedTransport`] for [`AcpSpec::Http`], which 0.1 does not carry;
+/// [`Error::UnsupportedTransport`] for [`AcpSpec::Http`], before any child is launched;
 /// [`Error::HostConfiguration`] for an empty argv; [`Error::Launch`] when the host's launcher
 /// refused; [`Error::Link`] when the launcher returned a child with no stdin, after that child has
 /// been stopped; and [`Error::CleanupRequired`], carrying the child's control, when stopping it
@@ -79,9 +80,9 @@ pub async fn connect(
     vendor_environment_keys: &[&str],
 ) -> Result<LaunchedAgent> {
     let AcpSpec::ChildPipes(stdio) = spec else {
-        // Unreachable today: this crate builds only `AcpSpec::ChildPipes`, and `AcpSpec::Http`
-        // has no constructor here. `HarnessId::new("acp")` names the transport generically since
-        // `connect` is not handed a profile to name more specifically.
+        // HTTP configuration is public and representable, but this connector refuses it before
+        // touching the launcher or framing pipes. `HarnessId::new("acp")` names the transport
+        // generically since `connect` is not handed a profile to name more specifically.
         return Err(Error::UnsupportedTransport {
             harness: mango_external_agents::HarnessId::new("acp")
                 .expect("expected \"acp\" to be a valid harness id"),
