@@ -168,10 +168,27 @@ async fn expiry_answer_refusal_keeps_the_connection_and_sibling_owned() {
             "expected the initial request for {expected_id}, received {kind:?}"
         );
     }
-    assert!(
-        matches!(&kinds[2], EventKind::ApprovalResolved { interaction_id, decision }
-        if interaction_id.as_str() == "1" && decision.source == DecisionSource::Cancelled)
+    let EventKind::ApprovalResolved {
+        interaction_id,
+        decision,
+    } = &kinds[2]
+    else {
+        panic!("expected the withdrawn resolution, received {:?}", kinds[2]);
+    };
+    assert_eq!(interaction_id.as_str(), "1");
+    assert_eq!(decision.source, DecisionSource::Cancelled);
+    assert_eq!(
+        decision.option_id,
+        super::super::WITHDRAWN_OPTION_ID,
+        "expected the withdrawn option, received {}",
+        decision.option_id
     );
+    assert_eq!(
+        decision.effect,
+        mango_external_agents::PermissionEffect::Other
+    );
+    assert_eq!(decision.scope, None);
+    assert!(!decision.policy_changing);
     assert!(
         matches!(
             events.try_recv(),
