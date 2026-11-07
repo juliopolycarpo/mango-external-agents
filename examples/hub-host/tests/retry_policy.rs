@@ -374,3 +374,101 @@ async fn an_expired_hub_hint_does_not_collapse_the_backoff_to_a_spin() {
         "expected the run to have waited out every backoff, received {total:?}"
     );
 }
+
+/// Exponential growth uses Duration's range rather than stopping at a u32 multiplier.
+#[test]
+fn high_ratio_backoff_keeps_doubling_until_the_duration_cap() {
+    let policy = RetryPolicy::new(
+        Duration::from_nanos(1),
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+        Arc::new(ScriptedJitter::maximum()),
+    );
+    for (failures, nanos) in [
+        (32, 2_147_483_648),
+        (33, 4_294_967_296),
+        (36, 30_000_000_000),
+        (u32::MAX, 30_000_000_000),
+    ] {
+        assert_eq!(
+            policy.delay_for(failures, None),
+            Duration::from_nanos(nanos),
+            "failure {failures}"
+        );
+    }
+}
+
+/// Zero and extreme bounds terminate even when the failure counter is enormous.
+#[test]
+fn extreme_backoff_bounds_do_not_require_work_per_failure() {
+    for (base, cap, expected) in [
+        (Duration::ZERO, Duration::MAX, Duration::ZERO),
+        (Duration::from_nanos(1), Duration::ZERO, Duration::ZERO),
+        (Duration::from_nanos(1), Duration::MAX, Duration::MAX),
+        (
+            Duration::MAX,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ),
+    ] {
+        let policy = RetryPolicy::new(
+            base,
+            cap,
+            Duration::from_secs(1),
+            Arc::new(ScriptedJitter::maximum()),
+        );
+        assert_eq!(
+            policy.delay_for(u32::MAX, None),
+            expected,
+            "base {base:?}, cap {cap:?}"
+        );
+    }
+}
+
+/// Maximum jitter leaves the duration exact, without a float round trip above its range.
+#[test]
+fn maximum_jitter_preserves_the_maximum_duration_exactly() {
+    let policy = RetryPolicy::new(
+        Duration::MAX,
+        Duration::MAX,
+        DEADLINE,
+        Arc::new(ScriptedJitter::maximum()),
+    );
+    for failures in [0, 1, 32, 33, u32::MAX] {
+        assert_eq!(
+            policy.delay_for(failures, None),
+            Duration::MAX,
+            "failure {failures}"
+        );
+    }
+}
+
+/// A malformed injected factor cannot panic or turn a full backoff into an earlier retry.
+#[test]
+fn injected_non_finite_jitter_stays_bounded_without_panicking() {
+    for (factor, expected) in [
+        (f64::NAN, Duration::from_secs(4)),
+        (f64::NEG_INFINITY, Duration::from_secs(3)),
+        (-2.0, Duration::from_secs(3)),
+        (f64::INFINITY, Duration::from_secs(4)),
+        (2.0, Duration::from_secs(4)),
+    ] {
+        let policy = RetryPolicy::new(
+            Duration::from_secs(4),
+            CAP,
+            DEADLINE,
+            Arc::new(ScriptedJitter::at(factor)),
+        );
+        assert_eq!(policy.delay_for(1, None), expected, "factor {factor}");
+        assert_eq!(
+            policy.delay_for(1, Some(Duration::from_secs(1))),
+            expected,
+            "an earlier hint with factor {factor}"
+        );
+        assert_eq!(
+            policy.delay_for(1, Some(Duration::from_secs(20))),
+            CAP,
+            "an over-cap hint with factor {factor}"
+        );
+    }
+}

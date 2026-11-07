@@ -31,7 +31,8 @@ pub trait Jitter: Send + Sync {
     ///
     /// A factor outside the range is clamped by [`RetryPolicy::delay_for`], so an implementation
     /// that gets its arithmetic wrong lengthens or shortens a wait rather than producing a
-    /// negative duration.
+    /// negative duration. NaN leaves the full capped delay unchanged instead of accelerating a
+    /// retry or panicking during duration conversion.
     fn factor(&self) -> f64;
 }
 
@@ -226,14 +227,32 @@ impl RetryPolicy {
     /// assert_eq!(policy.delay_for(3, Some(Duration::ZERO)), Duration::from_secs(4));
     /// ```
     pub fn delay_for(&self, failures: u32, hint: Option<Duration>) -> Duration {
-        let doublings = failures.saturating_sub(1).min(u32::BITS - 1);
-        let exponential = self
-            .base
-            .checked_mul(1_u32 << doublings)
-            .unwrap_or(self.cap)
-            .min(self.cap);
-        let factor = self.jitter.factor().clamp(0.0, 1.0);
-        let computed = exponential.mul_f64(1.0 - JITTER_SPREAD + JITTER_SPREAD * factor);
+        let mut doublings = failures.saturating_sub(1);
+        let mut exponential = self.base.min(self.cap);
+        // A Duration may span more than 31 doublings. Each chunk fits the u32 multiplier;
+        // positive nanoseconds reach any Duration cap in at most four chunks, even for an
+        // enormous failure count. Zero has no growth and must not iterate over that count.
+        while doublings != 0 && !exponential.is_zero() && exponential < self.cap {
+            let chunk = doublings.min(u32::BITS - 1);
+            exponential = exponential
+                .checked_mul(1_u32 << chunk)
+                .unwrap_or(self.cap)
+                .min(self.cap);
+            doublings -= chunk;
+        }
+        let factor = self.jitter.factor();
+        let factor = if factor.is_nan() {
+            1.0
+        } else {
+            factor.clamp(0.0, 1.0)
+        };
+        let multiplier = 1.0 - JITTER_SPREAD + JITTER_SPREAD * factor;
+        // Avoid rounding Duration::MAX up past its range when maximum jitter changes nothing.
+        let computed = if multiplier == 1.0 {
+            exponential
+        } else {
+            exponential.mul_f64(multiplier)
+        };
         match hint {
             Some(hint) => hint.min(self.cap).max(computed),
             None => computed,
