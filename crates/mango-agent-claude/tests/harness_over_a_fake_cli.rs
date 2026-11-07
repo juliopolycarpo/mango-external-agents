@@ -6623,8 +6623,14 @@ mod redacted_failure {
 /// success. Keep malformed activity identity out of diagnostics and reap the owned child.
 #[tokio::test]
 async fn a_refused_activity_event_cannot_turn_into_success() {
-    for id in ["x".repeat(129), String::from(" "), String::from("\u{1}")] {
+    for id in [
+        format!("refused-id-canary{}", "x".repeat(129)),
+        String::from(" "),
+        String::from("refused-id-canary\u{1}"),
+    ] {
         let transcript = [
+            serde_json::json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}}).to_string(),
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"valid-sibling","name":"Bash","input":{"command":"pwd"}}]}}).to_string(),
             serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":id,"name":"Bash","input":{"command":"pwd"}}]}}).to_string(),
             serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"later payload must be ignored"}]}}).to_string(),
             serde_json::json!({"type":"result","subtype":"success","is_error":false}).to_string(),
@@ -6644,6 +6650,42 @@ async fn a_refused_activity_event_cannot_turn_into_success() {
             !events
                 .iter()
                 .any(|event| matches!(event, EventKind::Completed | EventKind::TextDelta { .. }))
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, EventKind::Completed | EventKind::Error { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, EventKind::ReasoningStarted))
+                && events
+                    .iter()
+                    .any(|event| matches!(event, EventKind::ReasoningEnded)),
+            "expected the open reasoning phase to close before the refusal terminal: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(event,
+                EventKind::ActivityCompleted { call_id, result }
+                    if call_id == "valid-sibling"
+                        && result.status == mango_external_agents::ActivityStatus::Cancelled)),
+            "expected the valid sibling activity to close before the refusal terminal: {events:?}"
+        );
+        if let Some(EventKind::Error { error }) = events.last() {
+            let diagnostic = format!("{error} {error:?}");
+            assert!(error.message.contains("invalid vendor data"));
+            assert!(!diagnostic.contains("refused-id-canary"));
+            assert!(!diagnostic.contains('\u{1}'));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), turn.recv())
+                .await
+                .expect("expected the refused stream to end")
+                .is_none(),
+            "expected no event after the refusal terminal"
         );
         session.close(CloseReason::Shutdown).await.expect("close");
         assert!(!launcher.a_child_is_running());
