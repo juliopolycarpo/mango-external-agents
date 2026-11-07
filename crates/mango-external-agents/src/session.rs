@@ -812,6 +812,8 @@ pub struct SessionPage {
     ///
     /// A vendor given a bounded [`SessionQuery`] never trips this. Seeing it set means the vendor
     /// returned more than it was asked for.
+    /// Normalizing an already truncated page preserves this evidence, even if its retained rows
+    /// now fit within the cap or are all refused as unusable.
     pub truncated: bool,
 }
 
@@ -871,6 +873,7 @@ impl SessionPage {
     /// Cutting the page to [`SESSION_PAGE_LIMIT`] sets [`truncated`](Self::truncated), which those
     /// per-row drops do not: a row refused as unusable is a row nothing could have shown, while a
     /// row past the cap is one the vendor sent, the host will never see, and the cursor will skip.
+    /// Existing truncation evidence is preserved when a provider or wrapper normalizes again.
     #[must_use]
     pub fn normalized(self) -> Self {
         let mut usable = self.sessions.into_iter().filter_map(|session| {
@@ -892,7 +895,7 @@ impl SessionPage {
         // its limit is noticed without the whole overrun being built first.
         let sessions: Vec<NativeSession> = usable.by_ref().take(SESSION_PAGE_LIMIT).collect();
         Self {
-            truncated: usable.next().is_some(),
+            truncated: self.truncated || usable.next().is_some(),
             sessions,
             next_cursor: self.next_cursor,
         }
@@ -1539,6 +1542,39 @@ mod tests {
         // The cursor is the vendor's and is carried as it was: dropping it would lose rows 81 and
         // beyond on top of the ones the cap already took.
         assert_eq!(page.next_cursor, Some(String::from("after-thread-79")));
+    }
+
+    /// Wrappers may normalise an already-normalised provider page without losing evidence.
+    #[test]
+    fn listing_truncation_survives_repeated_normalization() {
+        let limit = super::SESSION_PAGE_LIMIT;
+        for (count, flagged) in [
+            (80, false),
+            (2, true),
+            (0, true),
+            (2, false),
+            (limit, false),
+            (limit + 1, false),
+        ] {
+            for next_cursor in [None, Some(String::from("after-page"))] {
+                let page = SessionPage {
+                    sessions: (0..count).map(|n| row(&format!("thread_{n}"))).collect(),
+                    next_cursor,
+                    truncated: flagged,
+                }
+                .normalized();
+                let expected = flagged || count > limit;
+                assert_eq!(
+                    page.truncated, expected,
+                    "first normalization of {count} rows with incoming flag {flagged}"
+                );
+                let again = page.clone().normalized().normalized();
+                assert_eq!(
+                    again, page,
+                    "repeated normalization of {count} rows with incoming flag {flagged}"
+                );
+            }
+        }
     }
 
     /// The flag means "the cap fired", not "something was dropped". A row refused as unusable is a
