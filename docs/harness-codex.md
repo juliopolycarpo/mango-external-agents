@@ -795,7 +795,11 @@ confirms that answer and consumes its bounded acknowledgement; it cannot become 
 that spends capacity for a later approval. An accepted host or broker choice, expiry, or native
 withdrawal remains owned until its `ApprovalResolved` event is published. Terminal cleanup publishes
 that retained decision before completion, cancellation or failure; a competing answer or later
-withdrawal cannot replace the accepted source. Questions retain their own outcomes separately and
+withdrawal cannot replace the accepted source. The handler selects its audit and native reply under
+the same settlement lock: stopping before that selection records and returns a cancelled refusal;
+a choice cleanup already published keeps its matching native reply. A broker result claimed after
+stopping is refused, and a failed host-response send does not accept a choice. Questions retain
+their own outcomes separately and
 grant no authority. This is client-side timing only: it adds no app-server method or wire field
 beyond the existing [documented surface][readme].
 
