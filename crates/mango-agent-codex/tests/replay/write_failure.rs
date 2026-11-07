@@ -3,8 +3,8 @@
 use super::*;
 use mango_external_agents::{Dispatch, Error};
 
-/// The recorded handshake writes four frames before a live account read.
-const OPEN_WRITES: usize = 4;
+/// Initialize, acknowledgement, gateway readiness, account read and thread start.
+const OPEN_WRITES: usize = 5;
 
 async fn open_with_broken_next_write(fail_kill: bool) -> teardown::WatchedSession {
     let inner = Arc::new(FakeLauncher::new());

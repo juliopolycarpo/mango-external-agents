@@ -610,11 +610,10 @@ fn opencode() -> AcpProfile {
     // Captured, not verified. `mea capture --harness acp --profile opencode` sent `initialize`
     // and stopped there — the manifest beside it records `sessionOpened: false` — so this argv is
     // proved to reach an ACP handshake and nothing is claimed about a turn.
-    // The capture records no date of its own, so the day it was committed is the one fact the
-    // tree holds.
+    // Refreshed through mea capture on this date; this remains handshake-only evidence.
     .with_verification(VerificationEvidence {
-        agent_version: "1.18.30",
-        checked_on: "2026-09-17",
+        agent_version: "1.19.5",
+        checked_on: "2026-11-07",
         method: VerificationMethod::CommittedCapture,
         source: "fixtures/acp/opencode/contract",
     })

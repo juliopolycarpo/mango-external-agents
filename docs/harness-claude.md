@@ -10,14 +10,16 @@ under `fixtures/claude/contract/`.
 
 Compliance posture: see [compliance.md](compliance.md).
 
-## Public-contract refresh — 2026-11-04
+## Public-contract refresh — 2026-11-07
 
-The current public-contract pin is **2.1.278**. Its official release archive was checksum-verified
-by `scripts/install-vendor-cli.sh`, then re-captured with `mea capture`. The consumed CLI surface
-and help match 2.1.270 byte-for-byte; only the version record and its manifest digest change.
-Historical behavioral observations below retain their original versions and dates. This is not
-an authenticated turn or smoke test. The official latest-release API reported 2.1.318 on this
-date; this bounded refresh does not claim qualification for that release.
+The current public-contract pin is **2.1.318**. Its official release archive passed the
+three-day release-age policy and `scripts/install-vendor-cli.sh` verified its checksum before
+`mea capture` regenerated the contract. The CLI flag inventory adds `--desktop`; existing
+harness arguments remain present. Help descriptions and command listings also change, so help
+is not byte-identical to 2.1.270. Historical behavior observations retain their dates and versions;
+this capture is not an authenticated turn. The headless reference's current opt-in `--bare`
+wording is covered alongside the older wording; contradictory default claims and unknown text
+fail the reference watch. Source: https://code.claude.com/docs/en/headless.
 
 ## The executable and the version gate
 

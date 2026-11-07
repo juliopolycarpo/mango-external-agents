@@ -23,10 +23,11 @@ per-harness guides, which say why each surface is driven the way it is.
 `refuse` is distinct from `omit`: an omitted field is one this library read and did not carry, and a
 refused one is a request it answered "no" to. Only requests can be refused.
 
-## Claude Code — reproduction pin `claude` 2.1.278
+## Claude Code — reproduction pin `claude` 2.1.318
 
-The field observations below originated at 2.1.270. The 2026-11-04 public-contract refresh
-reproduced the same consumed CLI surface and help at 2.1.278; it was not a new authenticated turn.
+The field observations below originated at 2.1.270. The 2026-11-07 public-contract refresh adds
+`--desktop` to the flag inventory and changes help descriptions; existing harness arguments remain
+present. This is not a new authenticated turn.
 
 | Field                                                          | Enabled | Destination                     | Disposition | Reason                                                                                                                                                                            | Evidence                                                                                           |
 | -------------------------------------------------------------- | ------- | ------------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
@@ -49,11 +50,14 @@ reproduced the same consumed CLI surface and help at 2.1.278; it was not a new a
 | `uuid`                                                         | runtime | —                               | omit        | Numbers a stream record nothing addresses; the session and the turn are both already identified                                                                                   | none — recorded as a decision                                                                      |
 | `--permission-prompt-tool stdio`                               | runtime | —                               | refuse      | Real and undocumented. Driving it would make this library the answering host for every prompt                                                                                     | `docs/harness-claude.md` "Approvals: none, and why"                                                |
 
-## Codex — reproduction pin `codex` 0.155.0 (`vendor/PIN`)
+## Codex — reproduction pin `codex` 0.166.0 (`vendor/PIN`)
 
-The qualified supported minimum remains 0.154.0. Field observations and historical transcripts
-originated at that baseline; the 2026-11-04 refresh found the consumed schema unchanged at 0.155.0.
-Reproduction pins and supported minimums are separate evidence, not interchangeable versions.
+The supported minimum is 0.166.0 for the documented explicit gateway readiness handshake.
+Historical field observations and transcripts retain their original versions. The 2026-11-07
+refresh covers GCP account kinds, optional subagent model/reasoning fields and generic
+image-generation handling. `explicitGatewayOauth` is sent as true; `required` and `status` from
+`account/gatewayOAuth/read` gate all authenticated operations. Provider names and diagnostics are
+omitted. See [the harness guide](harness-codex.md#explicit-gateway-readiness) for evidence and limits.
 
 | Field                                                            | Enabled      | Destination                                            | Disposition | Reason                                                                                                                                                                               | Evidence                                                                                                |
 | ---------------------------------------------------------------- | ------------ | ------------------------------------------------------ | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------- |

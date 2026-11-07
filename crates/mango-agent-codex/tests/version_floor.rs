@@ -21,7 +21,8 @@ use mango_external_agents::{
 };
 use support::{Transcript, workspace_path};
 
-const OLD: &str = "0.150.0";
+// The former supported baseline must no longer start an app-server implicitly.
+const OLD: &str = "0.154.0";
 
 fn host(launcher: &Arc<FakeLauncher>) -> HostContext {
     host_cancelled_by(launcher, &CancelToken::new())

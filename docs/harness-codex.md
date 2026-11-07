@@ -3,21 +3,48 @@
 Drives the `codex` CLI a user already installed, through `codex app-server` — the interface OpenAI
 documents for rich clients and uses for its own VS Code extension.
 
-The current public-contract pin is `codex-cli 0.155.0`; `vendor/PIN` records the tag
-`rust-v0.155.0`. The qualified minimum remains 0.154.0. Evidence dates belong to the sections below: the interface README
-was re-read on 2026-10-22, and the version-probe documentation on 2026-10-13.
-These documentation dates do not establish a new live qualification of the CLI.
+The current public-contract pin and supported minimum are `codex-cli 0.166.0`;
+`vendor/PIN` records `rust-v0.166.0`. Older behavioral observations below retain their
+dated source versions and do not qualify current startup behavior.
 
-## Public-contract refresh — 2026-11-04
+## Public-contract refresh — 2026-11-07
 
-The official 0.155.0 release archive was checksum-verified by `scripts/install-vendor-cli.sh`.
-`mea capture` regenerated the version and initialization schemas, and `scripts/vendor-codex.sh`
-regenerated the inventory. Consumed definitions, properties, enum values and method discriminators
-are unchanged from 0.154.0, so that qualified minimum and its historical transcripts remain valid.
-A separate per-variant inventory comparison also found no field-ownership changes.
-This is an offline public-surface check, not authenticated live-turn qualification.
-The official latest-release API reported 0.166.0 on this date; this bounded refresh does not
-claim support qualification for that release.
+Official release archives for Claude 2.1.318, Codex 0.166.0 and OpenCode 1.19.5 passed
+the three-day release-age policy. Linux x64 archives passed the installer's SHA-256 gate
+before execution; hosted native lanes qualify their own platforms. `mea capture` regenerated
+all public contracts, and `scripts/vendor-codex.sh` regenerated the inventory from the CLI.
+The Codex initialize response is unchanged; initialize capabilities add explicit gateway OAuth.
+The inventory retains nineteen item families, adds GCP account support and optional subagent
+model/reasoning fields, and changes image-generation fields handled by the generic fallback.
+Decoder and named-fake tests cover those consumed changes. Public capture is not an
+authenticated vendor turn, a real subagent replay, or a publication.
+
+### Explicit gateway readiness
+
+The [0.166.0 app-server guide][gateway-readme] requires
+`initialize.capabilities.explicitGatewayOauth: true`, followed by `initialized` and a
+successful `account/gatewayOAuth/read` on **every connection**, before authenticated requests
+such as `model/list` or inference. Initialize success alone is insufficient: an older server
+can ignore an unknown capability and retain automatic browser authorization. Unsupported,
+malformed, failed or timed-out readiness reads block further requests; there is no fallback.
+This documented control raises the minimum from the historical 0.154.0 baseline to 0.166.0.
+
+The SDK and transcript recorder perform this read-only handshake. A provider without gateway
+OAuth (`required: false`) can proceed; a required gateway must report `status: succeeded`.
+Other states return `AuthRequired` with a manual CLI hint. Discovery reports that condition as
+logged out and supplies no model catalog. Unknown/error responses establish no readiness.
+Provider names, gateway diagnostics and credentials are not retained. Neither component calls
+`account/gatewayOAuth/login` or starts a browser. Success reports local credential readiness,
+not network validation. An official 0.166.0 read-only probe returned `required: false` and
+`status: null`; no model or turn was requested by that probe. Named fake tests exercise each
+entrypoint, unsupported/malformed replies, unknown states, timeouts, ordering and child cleanup.
+
+In the unreleased 0.8 minor, `InitializeCapabilities` gains optional
+`explicit_gateway_oauth`; callers constructing it can use `..Default::default()`.
+The harness always sets it to `Some(true)`. Historical recordings stay fixed and their replay
+adapter explicitly supplies synthetic current-protocol readiness, which is not capture evidence.
+
+[gateway-readme]: https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/app-server/README.md#gateway-oauth-sign-in
 
 ## The executable and the version gate
 
@@ -26,11 +53,10 @@ claim support qualification for that release.
 | Executable        | `codex`, resolved by the host (`OpenSession::with_executable`) or by name                                                            |
 | Arguments         | `app-server`, and nothing else                                                                                                       |
 | Version read from | `codex --version` before any app-server starts (discovery, session open, picker); the handshake's own `userAgent` as the second line |
-| Minimum version   | `0.154.0` (`MINIMUM_CODEX_VERSION`); current schema pin: `rust-v0.155.0`                                                             |
+| Minimum version   | `0.166.0` (`MINIMUM_CODEX_VERSION`); current schema pin: `rust-v0.166.0`                                                             |
 
-The supported floor is the qualified 0.154.0 baseline; the current reproduction pin is 0.155.0.
-Both builds were checked against the consumed public contract, which is unchanged. A pin refresh
-does not itself require raising the supported floor. A `codex` below 0.154.0 on `PATH` reports
+The supported floor and current reproduction pin are 0.166.0 because startup now requires
+explicit gateway readiness. A `codex` below 0.166.0 on `PATH` reports
 `GateVerdict::VersionTooOld` with both numbers and claims no capabilities; it never crashes, and no
 app-server is spawned for it. That holds for a session open and the short-lived picker connection
 too: they apply the same floor before they spawn `codex app-server`, because an older app-server
@@ -76,25 +102,26 @@ second line, for what `--version` could not say.
 Every method below follows the [official app-server documentation][app-server] and the
 [`codex-rs/app-server/README.md`][readme] at document revision
 `41e22fee981a63b3698df7ed36bad393cda24715` (`rust-v0.153.0`), re-read on 2026-10-22.
-The current public-contract CLI and schema pin are `rust-v0.155.0`. JSON-RPC
+The current public-contract CLI and schema pin are `rust-v0.166.0`. JSON-RPC
 2.0 over newline-delimited JSON, **without** the `"jsonrpc"` member — the README's own words:
 "bidirectional communication using JSON-RPC 2.0 messages (with the `"jsonrpc":"2.0"` header omitted
 on the wire)".
 
-| Call                            | Used for                               |
-| ------------------------------- | -------------------------------------- |
-| `initialize`, `initialized`     | The handshake, carrying `clientInfo`   |
-| `account/read`                  | Whether somebody is signed in, and how |
-| `account/rateLimits/read`       | `Session::refresh_account_usage`       |
-| `model/list`                    | `Discovery::models`                    |
-| `permissionProfile/list`        | `Discovery::permission_matrix`         |
-| `thread/start`, `thread/resume` | `Harness::open_session`                |
-| `thread/read`                   | Metadata-only resume workspace check   |
-| `thread/list`                   | Session and harness-level listing      |
-| `turn/start`                    | `Session::start_turn`                  |
-| `turn/steer`                    | `Session::steer`                       |
-| `turn/interrupt`                | `Session::cancel`                      |
-| `review/start`                  | `Session::start_review`                |
+| Call                            | Used for                                                 |
+| ------------------------------- | -------------------------------------------------------- |
+| `initialize`, `initialized`     | The handshake, carrying `clientInfo`                     |
+| `account/gatewayOAuth/read`     | Explicit gateway readiness before authenticated requests |
+| `account/read`                  | Whether somebody is signed in, and how                   |
+| `account/rateLimits/read`       | `Session::refresh_account_usage`                         |
+| `model/list`                    | `Discovery::models`                                      |
+| `permissionProfile/list`        | `Discovery::permission_matrix`                           |
+| `thread/start`, `thread/resume` | `Harness::open_session`                                  |
+| `thread/read`                   | Metadata-only resume workspace check                     |
+| `thread/list`                   | Session and harness-level listing                        |
+| `turn/start`                    | `Session::start_turn`                                    |
+| `turn/steer`                    | `Session::steer`                                         |
+| `turn/interrupt`                | `Session::cancel`                                        |
+| `review/start`                  | `Session::start_review`                                  |
 
 `Harness::list_sessions` opens a short-lived app-server connection, initializes it, asks for a
 page and closes it without starting a thread. Canceling the picker request also kills that
@@ -945,7 +972,7 @@ non-secret sign-in mode; this library does not configure, inspect or forward tho
 Future account kinds decode without retaining their payload and report `Unknown`, regardless of
 `requiresOpenaiAuth`. Malformed known account shapes remain decoder errors. The compatibility
 tests use schema-shaped responses and a named fake launcher; they do not credit a real GCP login
-or vendor turn. The separately qualified minimum remains 0.154.0.
+or vendor turn. The startup minimum is now 0.166.0 for explicit gateway readiness.
 
 In the unreleased 0.8 minor, `protocol::Account` gains `Gcp` and `Unknown` and becomes
 non-exhaustive. Callers matching this wire enum must include a wildcard arm. The core `AuthMode`

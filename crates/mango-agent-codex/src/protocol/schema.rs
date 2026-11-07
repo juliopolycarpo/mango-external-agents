@@ -19,10 +19,9 @@ pub const PIN: &str = include_str!("../../vendor/PIN");
 
 /// The oldest `codex` this harness drives.
 ///
-/// The qualified 0.154.0 baseline remains supported: refreshing the public schema pin
-/// to 0.155.0 found no consumed-surface differences. A pin refresh does not invalidate
-/// the older captured transcripts or require raising the host's version floor.
-pub const MINIMUM_CODEX_VERSION: &str = "0.154.0";
+/// Version 0.166.0 supplies the explicit gateway authorization capability and read-only
+/// readiness handshake. Older transcripts remain historical decoder evidence.
+pub const MINIMUM_CODEX_VERSION: &str = "0.166.0";
 
 #[cfg(test)]
 mod tests {
@@ -139,6 +138,20 @@ mod tests {
         assert!(!collab.contains(&serde_json::json!("agentThreadId")));
         assert!(collab.contains(&serde_json::json!("senderThreadId")));
         assert!(collab.contains(&serde_json::json!("receiverThreadIds")));
+        for field in ["model", "reasoningEffort"] {
+            assert!(
+                child["properties"]
+                    .as_array()
+                    .expect("properties")
+                    .contains(&serde_json::json!(field))
+            );
+            assert!(
+                !child["required"]
+                    .as_array()
+                    .expect("required")
+                    .contains(&serde_json::json!(field))
+            );
+        }
     }
 
     /// A refresh keeps the version stamp consistent without discarding a qualified baseline.
@@ -178,6 +191,7 @@ mod tests {
                 method::REVIEW_START,
                 method::MODEL_LIST,
                 method::ACCOUNT_READ,
+                method::GATEWAY_OAUTH_READ,
                 method::ACCOUNT_RATE_LIMITS_READ,
                 method::PERMISSION_PROFILE_LIST,
             ],
@@ -223,6 +237,15 @@ mod tests {
     #[test]
     fn the_handshake_fields_are_the_ones_the_pinned_build_declares() {
         assert_declares("InitializeParams", &["clientInfo", "capabilities"]);
+        assert_declares(
+            "InitializeCapabilities",
+            &["explicitGatewayOauth", "optOutNotificationMethods"],
+        );
+        assert_declares("GatewayOAuthReadResponse", &["required", "status"]);
+        assert_accepts(
+            "GatewayOAuthStatus",
+            &["notReady", "started", "succeeded", "failed"],
+        );
         assert_declares("ClientInfo", &["name", "title", "version"]);
         assert_declares("InitializeResponse", &["userAgent", "platformOs"]);
     }
@@ -474,7 +497,7 @@ mod tests {
     #[test]
     fn the_account_and_model_fields_are_the_ones_the_pinned_build_declares() {
         assert_declares("GetAccountResponse", &["account", "requiresOpenaiAuth"]);
-        assert_accepts("Account", &["apiKey", "chatgpt", "amazonBedrock"]);
+        assert_accepts("Account", &["apiKey", "chatgpt", "amazonBedrock", "gcp"]);
         assert_declares("ModelListParams", &["cursor", "limit"]);
         assert_declares("ModelListResponse", &["data", "nextCursor"]);
         assert_declares(

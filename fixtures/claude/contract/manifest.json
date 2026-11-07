@@ -6,8 +6,8 @@
   ],
   "reproducible": true,
   "files": {
-    "cli-surface.json": "sha256:e07152b7a1fcf53dbf5689be6720cd4fc9b008d510ba5991d103f598d033a0b2",
-    "help.txt": "sha256:ae85d661e9c086f05637ebcd868f5702b477ff6e55e2e65b8ada7807cd51a4b6",
-    "version.json": "sha256:e68a1608e0073d3298cbf82d039e7e77fc01a8a7523246a979137e20071a5b7f"
+    "cli-surface.json": "sha256:2e23ed29b3161a711d7229c826f19505c6a58d720048df67436f59a0febc5585",
+    "help.txt": "sha256:5ca3a9dac2026e56c221fdd34380c7d7d45ebbb51c1d01b7c17c75cb076a0be8",
+    "version.json": "sha256:66f2d581f18b4e08bb90087f265c582eff35201ab3086754083f5c61689936c3"
   }
 }

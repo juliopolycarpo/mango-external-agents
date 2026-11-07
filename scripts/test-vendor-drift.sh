@@ -97,49 +97,49 @@ test_archive_checksum_verification() {
 }
 
 test_every_pinned_platform_has_a_checksum() {
-  local entry
+  local registry="$repo_root/scripts/vendor-cli-pinned-sha256sums.txt"
+  local workflow="$repo_root/.github/workflows/vendor-drift.yml"
   local vendor
   local version
+  local key
   local target
   local asset
   local digest
-  for entry in \
-    'claude 2.1.270 linux-x64' \
-    'claude 2.1.270 linux-arm64' \
-    'claude 2.1.270 darwin-x64' \
-    'claude 2.1.270 darwin-arm64' \
-    'claude 2.1.270 windows-x64' \
-    'claude 2.1.270 windows-arm64' \
-    'codex 0.154.0 linux-x64' \
-    'codex 0.154.0 linux-arm64' \
-    'codex 0.154.0 darwin-x64' \
-    'codex 0.154.0 darwin-arm64' \
-    'codex 0.154.0 windows-x64' \
-    'codex 0.154.0 windows-arm64' \
-    'claude 2.1.278 linux-x64' \
-    'claude 2.1.278 linux-arm64' \
-    'claude 2.1.278 darwin-x64' \
-    'claude 2.1.278 darwin-arm64' \
-    'claude 2.1.278 windows-x64' \
-    'claude 2.1.278 windows-arm64' \
-    'codex 0.155.0 linux-x64' \
-    'codex 0.155.0 linux-arm64' \
-    'codex 0.155.0 darwin-x64' \
-    'codex 0.155.0 darwin-arm64' \
-    'codex 0.155.0 windows-x64' \
-    'codex 0.155.0 windows-arm64' \
-    'opencode 1.18.30 linux-x64' \
-    'opencode 1.18.30 linux-arm64' \
-    'opencode 1.18.30 darwin-x64' \
-    'opencode 1.18.30 darwin-arm64' \
-    'opencode 1.18.30 windows-x64' \
-    'opencode 1.18.30 windows-arm64'; do
-    read -r vendor version target <<EOF
-$entry
-EOF
-    asset=$(asset_name "$vendor" "$target")
-    digest=$(pinned_archive_digest "$vendor" "$version" "$asset")
-    assert_eq "${#digest}" '64' "pinned digest length for $vendor $target"
+
+  python3 - "$registry" <<'PYREGISTRY'
+import re
+import sys
+from pathlib import Path
+
+seen = set()
+for number, line in enumerate(Path(sys.argv[1]).read_text().splitlines(), 1):
+    if not line.strip() or line.lstrip().startswith("#"):
+        continue
+    fields = line.split()
+    assert len(fields) == 4, f"expected four registry fields at line {number}"
+    vendor, version, asset, digest = fields
+    assert vendor in {"claude", "codex", "opencode"}, f"unknown registry vendor at line {number}"
+    assert re.fullmatch(r"[0-9a-f]{64}", digest), f"invalid pinned SHA-256 at line {number}"
+    key = (vendor, version, asset)
+    assert key not in seen, f"duplicate pinned checksum entry at line {number}"
+    seen.add(key)
+PYREGISTRY
+
+  for vendor in claude codex opencode; do
+    case "$vendor" in
+      claude) key='CLAUDE_VERSION:' ;;
+      codex) key='CODEX_VERSION:' ;;
+      opencode) key='OPENCODE_VERSION:' ;;
+    esac
+    version=$(awk -v key="$key" '$1 == key { print $2 }' "$workflow")
+    if [ -z "$version" ]; then
+      fail "expected current $vendor pin in $workflow, received none"
+    fi
+    for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64 windows-x64 windows-arm64; do
+      asset=$(asset_name "$vendor" "$target")
+      digest=$(pinned_archive_digest "$vendor" "$version" "$asset")
+      assert_eq "${#digest}" '64' "pinned digest length for $vendor $version $target"
+    done
   done
 }
 

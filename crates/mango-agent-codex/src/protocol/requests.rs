@@ -42,15 +42,62 @@ pub struct InitializeParams {
 
 /// The per-connection capabilities the handshake declares.
 ///
-/// Only the opt-out list is used. The experimental API is deliberately not requested: this harness
+/// Explicit gateway authorization prevents automatic browser login. The experimental API is deliberately not requested: this harness
 /// drives the documented surface, and a field marked experimental upstream is one that can be
 /// withdrawn between two patch releases.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeCapabilities {
+    /// Disable implicit gateway browser authorization; readiness must then be read explicitly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explicit_gateway_oauth: Option<bool>,
     /// Notification methods this connection does not want, matched exactly.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub opt_out_notification_methods: Vec<String>,
+}
+
+/// Non-secret gateway readiness, without provider names or diagnostic text.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct GatewayOAuthReadResponse {
+    /// Whether the effective provider requires gateway OAuth, even when already signed in.
+    pub required: bool,
+    /// Local credential readiness; absent for providers without gateway OAuth.
+    pub status: Option<GatewayOAuthStatus>,
+}
+
+/// The gateway's local readiness, never a network authentication guarantee.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GatewayOAuthStatus {
+    /// Credentials are not available.
+    NotReady,
+    /// Authorization is in progress outside the SDK.
+    Started,
+    /// Existing credentials are locally usable.
+    Succeeded,
+    /// External authorization failed.
+    Failed,
+    /// A future state cannot establish readiness.
+    #[serde(other)]
+    Unknown,
+}
+
+impl GatewayOAuthReadResponse {
+    /// Refuses authenticated operations until the provider is locally ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AuthRequired` when a required gateway has not reported success.
+    pub fn require_ready(&self) -> mango_external_agents::Result<()> {
+        if self.required && self.status != Some(GatewayOAuthStatus::Succeeded) {
+            return Err(mango_external_agents::Error::AuthRequired {
+                login_hint: String::from(
+                    "Complete gateway authorization with the official Codex CLI, then retry. The SDK never starts login.",
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// What the app-server answers the handshake with.
@@ -960,6 +1007,43 @@ mod tests {
         TurnStatus, UserInput,
     };
 
+    #[test]
+    fn gateway_readiness_requires_a_boolean_and_local_success_when_required() {
+        for malformed in [
+            serde_json::json!({}),
+            serde_json::json!({"required": null}),
+            serde_json::json!({"required": "false"}),
+        ] {
+            assert!(serde_json::from_value::<super::GatewayOAuthReadResponse>(malformed).is_err());
+        }
+        for status in [
+            None,
+            Some("notReady"),
+            Some("started"),
+            Some("failed"),
+            Some("futureStatus"),
+            Some("succeeded"),
+        ] {
+            for required in [false, true] {
+                let response: super::GatewayOAuthReadResponse =
+                    serde_json::from_value(serde_json::json!({
+                        "required": required, "status": status,
+                        "providerName": "private-provider-canary", "error": "private-error-canary"
+                    }))
+                    .expect("documented readiness shape");
+                assert_eq!(
+                    response.require_ready().is_ok(),
+                    !required || status == Some("succeeded")
+                );
+                assert!(!format!("{response:?}").contains("canary"));
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(super::InitializeCapabilities::default()).expect("capabilities"),
+            serde_json::json!({})
+        );
+    }
+
     /// The handshake writes the host's own name and nothing it was not given.
     #[test]
     fn the_handshake_carries_the_hosts_name_and_omits_what_it_has_not_got() {
@@ -1156,7 +1240,8 @@ mod tests {
     /// the harness holds.
     #[test]
     fn reading_an_account_keeps_the_plan_and_drops_the_address() {
-        let raw = r#"{"account":{"type":"chatgpt","email":"a@example.com","planType":"plus"},
+        let raw = r#"{"account":{"type":"chatgpt","email":"a@example.com","planType":"plus",
+                                 "workspaceName":"private-workspace-canary"},
                       "requiresOpenaiAuth":true}"#;
         let response: AccountReadResponse =
             serde_json::from_str(raw).expect("expected an account response");
@@ -1173,6 +1258,7 @@ mod tests {
             !rendered.contains("example.com"),
             "expected no address anywhere in the value, received {rendered}"
         );
+        assert!(!rendered.contains("private-workspace-canary"));
     }
 
     #[test]

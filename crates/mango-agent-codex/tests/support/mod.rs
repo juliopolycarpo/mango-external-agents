@@ -239,6 +239,17 @@ impl Replay {
             return Vec::new();
         };
 
+        // Synthetic current-protocol preflight for both fake and re-exec'd children,
+        // never inserted into an archival recording. The caller's interceptor runs first.
+        if frame["method"] == "account/gatewayOAuth/read" {
+            return vec![
+                serde_json::json!({"id": frame["id"], "result": {
+                    "required": false, "status": null
+                }})
+                .to_string(),
+            ];
+        }
+
         // An answer to one of the server's own questions — an approval. The recording already
         // holds whatever followed it, under the call that was in flight at the time.
         let Some(method) = frame.get("method").and_then(Value::as_str) else {

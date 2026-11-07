@@ -8,6 +8,8 @@
 mod account_kinds;
 #[path = "replay/contracts.rs"]
 mod contracts;
+#[path = "replay/gateway.rs"]
+mod gateway;
 #[path = "replay/redaction.rs"]
 mod redaction;
 mod support;
