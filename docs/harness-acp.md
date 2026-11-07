@@ -171,6 +171,14 @@ What the handler does with the agent's traffic:
   `Limits::max_pending_requests` caps it too. Once the question is answered, withdrawn, expired,
   cancelled or swept by a close, the broker's `decide` future is dropped rather than left to run
   out the approval deadline; a broker must tolerate that, as it already must at the deadline.
+- Permission registration, announcement and native reply serialize with the owning turn's terminal
+  claim. Once prompt completion claims that terminal, a late broker, host or deadline decision
+  receives ACP's `cancelled` outcome. A request already announced to the host resolves once as
+  withdrawn before the terminal; an unannounced request produces no audit row. This follows ACP's
+  [permission cancellation](https://agentclientprotocol.com/protocol/v1/tool-calls#requesting-permission)
+  outcome and also covers a prompt that finishes before its permission request does. Withdrawal
+  keeps its audit ownership until cancellation and terminal draining can observe that resolution;
+  single-request, bulk and explicit-cancel cleanup follow the same rule.
 - Any other request is answered `-32601` (`Method not found`), and one whose `session/request_permission`
   parameters cannot be read `-32602`, with no `data`: nothing the agent sent is echoed back.
 - Any other notification is dropped without an answer.

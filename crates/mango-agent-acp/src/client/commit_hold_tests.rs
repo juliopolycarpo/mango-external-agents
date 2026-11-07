@@ -576,7 +576,10 @@ async fn an_expiry_cancel_is_not_sent_once_another_turn_is_running() {
         }
     }
 
-    running.state.cancel_expired(expired);
+    let turn = expired.turn.clone();
+    let notification = expired.cancel.clone();
+    expired.withdraw();
+    running.state.cancel_expired(turn, notification);
 
     // A marker queued after the call: whatever the call queued is written ahead of it.
     running

@@ -91,12 +91,15 @@ pub(crate) struct TurnHandle {
     /// [`AcpSession::start_turn`](crate::session::AcpSession::start_turn)'s doc comment on
     /// `native_turn_id` for why ACP has no better one to offer.
     pub(crate) generation: u64,
-    /// Set by whoever emitted this turn's terminal.
+    /// Set by whoever claims this turn's terminal.
     ///
     /// A handler holding a clone can be parked mid-frame while `close` emits the terminal on another
     /// task; resuming afterwards would put the rest of that frame's events *after* the terminal,
     /// which the core's conformance suite refuses. Checked before every emit.
     finished: Arc<AtomicBool>,
+    /// Serializes permission registration, announcement and native replies with the terminal claim.
+    /// Notification handlers keep their lock-free finished read.
+    permission_commit: Arc<Mutex<()>>,
     /// Set once this turn's host was told the agent sent an update that could not be read.
     unreadable_update_noticed: Arc<AtomicBool>,
     /// Wakes the prompt owner when native cancellation starts.
@@ -104,6 +107,15 @@ pub(crate) struct TurnHandle {
     /// A notification error belongs to this generation, never a later prompt.
     pub(crate) cancel_failure: Arc<Mutex<Option<String>>>,
     pub(crate) approvals: Arc<ApprovalEvents>,
+    #[cfg(test)]
+    withdrawal_hold: Arc<Mutex<Option<WithdrawalHold>>>,
+}
+
+/// One-use synchronous pre-audit pause representing a withdrawal thread being descheduled.
+#[cfg(test)]
+struct WithdrawalHold {
+    entered: Arc<tokio::sync::Notify>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 /// The ACP session a connection is bound to, and the one a failed load abandoned.
@@ -195,6 +207,21 @@ impl PendingApproval {
     /// is dropped with it, which is the right outcome: a resolution after the terminal is the one
     /// thing worse than no resolution.
     fn withdraw(self) {
+        #[cfg(test)]
+        {
+            let hold = self
+                .turn
+                .withdrawal_hold
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(hold) = hold {
+                hold.entered.notify_one();
+                hold.release
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("bounded withdrawal release");
+            }
+        }
         if self.announced {
             self.turn.approvals.push(EventKind::ApprovalResolved {
                 interaction_id: self.question.id().clone(),
@@ -290,13 +317,17 @@ fn withdrawn_resolution(question: &mango_external_agents::PermissionRequest) -> 
 }
 
 impl TurnHandle {
-    /// Whether this turn's terminal has already gone out.
+    /// Whether this turn's terminal has already been claimed.
     pub(crate) fn is_finished(&self) -> bool {
         self.finished.load(Ordering::Acquire)
     }
 
     /// Claims the right to emit this turn's terminal, once.
     pub(crate) fn finish(&self) -> bool {
+        let _permission = self
+            .permission_commit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         !self.finished.swap(true, Ordering::AcqRel)
     }
 }
@@ -623,10 +654,13 @@ impl SessionState {
             level,
             generation: self.generations.fetch_add(1, Ordering::Relaxed),
             finished: Arc::new(AtomicBool::new(false)),
+            permission_commit: Arc::new(Mutex::new(())),
             unreadable_update_noticed: Arc::new(AtomicBool::new(false)),
             cancellation: mango_external_agents::CancelToken::new(),
             cancel_failure: Arc::new(Mutex::new(None)),
             approvals: Arc::new(ApprovalEvents::default()),
+            #[cfg(test)]
+            withdrawal_hold: Arc::new(Mutex::new(None)),
         };
         *turn = Some(handle.clone());
         *self.lock_reducer() = Reducer::new();
@@ -720,11 +754,13 @@ impl SessionState {
         let mut cancelling = self.lock_cancel_reason();
         cancelling.get_or_insert(reason);
         let pending = self.take_pending();
-        drop(cancelling);
-        turn.cancellation.cancel();
         for pending in pending {
             pending.withdraw();
         }
+        // An answered permission can itself complete the prompt. Keep terminal draining behind
+        // this guard until every removed request has registered its audit, then wake the owner.
+        drop(cancelling);
+        turn.cancellation.cancel();
         true
     }
 
@@ -773,8 +809,12 @@ impl SessionState {
             let turn = active.clone()?;
             // These are all owned by the current turn. Capture them before releasing the slot: a
             // newly started prompt clears the reducer and may park approvals of its own.
-            let reason = self.lock_cancel_reason().take();
+            let mut cancelling = self.lock_cancel_reason();
+            let reason = cancelling.take();
             let pending = self.take_pending();
+            // A responder cannot remove a request between the reason read and this drain, then
+            // register its audit after the terminal flush found the map empty.
+            drop(cancelling);
             let closing = std::mem::take(&mut *self.lock_reducer());
             self.remember_closed_calls(&closing);
             (turn, reason, pending, closing)
@@ -970,8 +1010,10 @@ impl SessionState {
     /// leave the agent to whatever a dropped reply falls back to, so each is answered
     /// `Cancelled`, which is ACP's own outcome for a question that was withdrawn rather than refused.
     ///
-    /// Taken out from under the lock in one statement, so nothing is held while the answers go out.
+    /// Holds the cancellation guard until every removed request has registered its audit, so a
+    /// terminal drain cannot pass between removal and registration. No asynchronous I/O is held.
     pub(crate) fn withdraw_pending(&self) {
+        let _cancelling = self.lock_cancel_reason();
         for pending in self.take_pending() {
             pending.withdraw();
         }
@@ -1007,7 +1049,9 @@ impl SessionState {
             return Ok(false);
         }
         let mut parked = self.lock_pending();
-        if parked.len() >= self.limits.max_pending_requests {
+        let permission = pending.turn.permission_commit.clone();
+        let _permission = permission.lock().unwrap_or_else(PoisonError::into_inner);
+        if pending.turn.is_finished() || parked.len() >= self.limits.max_pending_requests {
             drop(parked);
             pending.reply.respond(permission::cancelled())?;
             return Ok(false);
@@ -1024,10 +1068,20 @@ impl SessionState {
         if cancelling.is_some() {
             return false;
         }
-        let mut pending = self.lock_pending();
-        let Some(pending) = pending.get_mut(id) else {
+        let mut parked = self.lock_pending();
+        let Some(pending) = parked.get_mut(id) else {
             return false;
         };
+        let permission = pending.turn.permission_commit.clone();
+        let _permission = permission.lock().unwrap_or_else(PoisonError::into_inner);
+        if pending.turn.is_finished() {
+            let pending = parked
+                .remove(id)
+                .expect("the registered permission remains locked");
+            self.touch();
+            pending.withdraw();
+            return false;
+        }
         pending.host_answerable = host_answerable;
         pending.announce();
         true
@@ -1049,8 +1103,10 @@ impl SessionState {
             return Ok(Answered::AlreadyResolved);
         };
         self.touch();
-        if cancelling.is_some() {
-            pending.respond_unresolved(permission::cancelled());
+        let permission = pending.turn.permission_commit.clone();
+        let permission = permission.lock().unwrap_or_else(PoisonError::into_inner);
+        if cancelling.is_some() || pending.turn.is_finished() {
+            pending.withdraw();
             return Ok(Answered::AlreadyResolved);
         }
         if !pending.deadline.is_elapsed() {
@@ -1069,8 +1125,12 @@ impl SessionState {
             // Released before the turn's cancellation is triggered: the prompt owner it wakes, and
             // `begin_cancellation`, take this same lock. The reason is already recorded, so a
             // late request or answer sees a cancelling turn whether or not the guard is held.
+            let turn = pending.turn.clone();
+            let notification = pending.cancel.clone();
+            pending.withdraw();
+            drop(permission);
             drop(cancelling);
-            self.cancel_expired(pending);
+            self.cancel_expired(turn, notification);
             return Ok(Answered::AlreadyResolved);
         };
         let outcome = permission::selected(option_id);
@@ -1081,11 +1141,12 @@ impl SessionState {
 
     /// Stops the turn whose question ran out of time with no way to refuse it.
     ///
-    /// The question is withdrawn, its siblings with it, and the agent is sent `session/cancel`,
+    /// The caller has already withdrawn the question under its settlement guard. Its siblings are
+    /// withdrawn too, and the agent is sent `session/cancel`,
     /// under the gate a turn starts under. That gate is what ties the cancel to this turn: the
     /// caller let go of the cancel-reason lock before coming here, so the turn can have ended
     /// and another begun in between, and a `session/cancel` sent then would stop a turn nobody
-    /// timed out. A question whose turn is no longer the running one is only withdrawn.
+    /// timed out. A question whose turn is no longer the running one needs no further cancel.
     ///
     /// A `session/cancel` the connection does not take is recorded on the turn, as a host's own
     /// cancel records it, so the turn's owner reports it and tears the connection down instead
@@ -1093,17 +1154,14 @@ impl SessionState {
     /// withdrawn either way.
     ///
     /// ```ignore
-    /// state.cancel_expired(pending);
+    /// state.cancel_expired(turn, notification);
     /// ```
-    fn cancel_expired(&self, pending: PendingApproval) {
-        let turn = pending.turn.clone();
-        let notification = pending.cancel.clone();
+    fn cancel_expired(&self, turn: TurnHandle, notification: CancelNotification) {
         let _starting = self.lock_turn_start();
         // Every resolution is queued before anything reaches the agent that could end its
         // prompt: an agent that honours `session/cancel` on the spot can finish on another
         // worker, and a resolution registered after the terminal is dropped. Nothing is chosen
         // for the agent; it hears ACP's own `Cancelled` outcome.
-        pending.withdraw();
         if !self.can_submit_prompt(&turn) {
             return;
         }
@@ -1123,11 +1181,12 @@ impl SessionState {
         &self,
         id: &str,
     ) -> agent_client_protocol_schema::v1::Result<()> {
+        let _cancelling = self.lock_cancel_reason();
         let pending = self.lock_pending().remove(id);
         match pending {
             Some(pending) => {
                 self.touch();
-                pending.respond_unresolved(permission::cancelled());
+                pending.withdraw();
                 Ok(())
             }
             None => Ok(()),
@@ -1151,10 +1210,8 @@ impl SessionState {
     /// forwarding its choice then would let an allowing option out during teardown. The question is
     /// withdrawn instead, which is what the turn's end owed it anyway.
     ///
-    /// Like the matching guard in [`on_request_permission`], this one has no test: reaching it needs a
-    /// `respond` to land between `close`'s `finish` and its `withdraw_pending`, two adjacent statements
-    /// with no await between them, and `close` has torn the transport down by the time it returns. It
-    /// is two lines of defence in depth, not a covered path.
+    /// The pending request's own turn also serializes the final native response with its terminal
+    /// claim, covering broker and deadline decisions as well as host answers.
     ///
     /// # Errors
     ///
@@ -1435,8 +1492,8 @@ async fn on_request_permission(
         return reply.respond(permission::cancelled());
     };
     if turn.is_finished() {
-        // The turn's terminal has gone out — a `close` is in progress, and its `session/close`
-        // handshake is the window this arrives in. Withdrawn rather than parked or decided: nothing
+        // The turn's terminal has been claimed. A close handshake or prompt completion may still
+        // be draining requests. Withdrawn rather than parked or decided: nothing
         // may grant a permission while the session is being torn down, and a reply parked now
         // would be left waiting when the connection goes.
         return reply.respond(permission::cancelled());
