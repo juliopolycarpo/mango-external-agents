@@ -195,12 +195,12 @@ pub(crate) struct Shared {
     /// [`PermissionBroker`](mango_external_agents::PermissionBroker), and its wire answer takes a
     /// different shape than any approval's.
     pending_questions: Mutex<HashMap<InteractionId, PendingQuestion>>,
-    /// Serializes question publication with terminal cleanup.
+    /// Serializes approval and question publication with terminal cleanup.
     ///
-    /// A host answer remains in [`Shared::pending_questions`] until its resolution reaches the
-    /// stream. A terminal takes this lock before draining that map, so either side publishes the
-    /// resolution before `Completed` can claim the stream.
-    question_settlements: Mutex<()>,
+    /// Accepted answers remain in their distinct pending maps until their resolution reaches the
+    /// stream. Terminal cleanup takes this lock before draining both maps, so each announced
+    /// interaction resolves before a terminal can claim the stream.
+    interaction_settlements: Mutex<()>,
     /// Whether this connection can accept more work.
     ///
     /// A start request that times out may already be running at the vendor, so its active slot
@@ -263,6 +263,14 @@ pub(crate) struct Shared {
     resolution_marker_gate: Mutex<Option<Arc<ResolutionMarkerGate>>>,
     #[cfg(test)]
     question_settlement_gate: Mutex<Option<Arc<ResolutionMarkerGate>>>,
+    #[cfg(test)]
+    approval_settlement_gate: Mutex<Option<Arc<ResolutionMarkerGate>>>,
+    #[cfg(test)]
+    approval_publication_gate: Mutex<Option<Arc<ResolutionMarkerGate>>>,
+    #[cfg(test)]
+    approval_answer_gate: Mutex<Option<Arc<ResolutionMarkerGate>>>,
+    #[cfg(test)]
+    approval_claim_gate: Mutex<Option<Arc<ResolutionMarkerGate>>>,
 }
 
 impl Shared {
@@ -279,7 +287,7 @@ impl Shared {
             recent_completed_turns: Mutex::new(VecDeque::new()),
             pending: Mutex::new(HashMap::new()),
             pending_questions: Mutex::new(HashMap::new()),
-            question_settlements: Mutex::new(()),
+            interaction_settlements: Mutex::new(()),
             shutting_down: AtomicBool::new(false),
             close_reason: std::sync::OnceLock::new(),
             #[cfg(test)]
@@ -308,6 +316,14 @@ impl Shared {
             resolution_marker_gate: Mutex::new(None),
             #[cfg(test)]
             question_settlement_gate: Mutex::new(None),
+            #[cfg(test)]
+            approval_settlement_gate: Mutex::new(None),
+            #[cfg(test)]
+            approval_publication_gate: Mutex::new(None),
+            #[cfg(test)]
+            approval_answer_gate: Mutex::new(None),
+            #[cfg(test)]
+            approval_claim_gate: Mutex::new(None),
         }
     }
 
@@ -1239,7 +1255,10 @@ struct PendingEntry {
     pending: PendingApproval,
     /// The request's original wall-clock expiry, translated once for every later wait.
     deadline: ApprovalDeadline,
-    answer: oneshot::Sender<Answer>,
+    /// Retained until publication, even after the handler accepts an answer.
+    answer: Option<oneshot::Sender<Answer>>,
+    settlement: Option<ApprovalDecision>,
+    announced: bool,
 }
 
 /// One round of questions the server is waiting on.
@@ -1352,7 +1371,7 @@ enum QuestionAnswer {
     /// Sent by the owner-scoped cancellation [`Shared::release_pending_for`] performs when a turn
     /// ends while a round is still open. A plain deadline never sends this:
     /// [`CodexHandler::decide_question`] notices its own expiry locally instead, the same way
-    /// [`CodexHandler::expire`] does for an approval.
+    /// [`CodexHandler::refuse_claimed`] does for an approval.
     Cancelled {
         /// Whether the caller that settled this round already recorded its audit event.
         ///
@@ -1378,9 +1397,11 @@ enum BrokerWait {
 
 /// Whether a waiting question still belongs to the turn that is resolving it.
 enum PendingTake {
-    /// The caller owns the question and removed it.
+    /// The caller claimed the approval answer slot.
     Taken,
-    /// Another path already removed the question.
+    /// Cancellation won before this handler could accept a choice.
+    Cancelled,
+    /// Another path claimed or published the approval.
     Missing,
     /// A newer turn owns the same request id.
     Foreign,
@@ -1659,8 +1680,8 @@ impl Shared {
         // once the sink holds the failure it refuses the resolutions, and the host would keep a
         // prompt nobody can answer. Held through the failure, so a request that routed to this
         // turn cannot register a new round after the drain.
-        let _settlement = self.question_settlements.lock().await;
-        self.release_pending_approvals_for(Some(&route.owner), DecisionSource::Cancelled)
+        let _settlement = self.interaction_settlements.lock().await;
+        self.release_pending_approvals_for_locked(Some(&route.owner), DecisionSource::Cancelled)
             .await;
         self.release_pending_questions_for_locked(Some(&route.owner))
             .await;
@@ -1825,14 +1846,14 @@ impl Shared {
 
     /// Ends the stream that still belongs to this start attempt.
     ///
-    /// `settlement` is the question-settlement lock, which the caller took before it settled
+    /// `settlement` is the interaction-settlement lock, which the caller took before it settled
     /// what the turn was still asking. It is kept through the claim, so a request that already
     /// routed to this turn reads `finishing` before it can announce another round, and let go
     /// there: the commit needs none of it, and a teardown that has to settle questions of its
     /// own must not wait behind a commit.
     ///
     /// ```ignore
-    /// let settlement = shared.question_settlements.lock().await;
+    /// let settlement = shared.interaction_settlements.lock().await;
     /// shared.finish_for(&route, Some("vendor-turn-1"), outcome, settlement).await;
     /// ```
     async fn finish_for(
@@ -2026,61 +2047,58 @@ impl Shared {
     /// Called when a turn is cancelled or a session closes. The waiting handler tasks answer with
     /// a refusal, which is what lets the server's own turn end instead of blocking forever.
     async fn release_pending_for(&self, owner: Option<&Arc<()>>, source: DecisionSource) {
-        self.release_pending_approvals_for(owner, source).await;
-        self.release_pending_questions_for(owner).await;
-    }
-
-    /// Settles every authority-bearing approval the server still awaits.
-    async fn release_pending_approvals_for(&self, owner: Option<&Arc<()>>, source: DecisionSource) {
-        let waiting = {
-            let mut pending = self.pending.lock().await;
-            let matching: Vec<InteractionId> = pending
-                .iter()
-                .filter(|(_, entry)| {
-                    owner.is_none_or(|owner| Arc::ptr_eq(&entry.route.owner, owner))
-                })
-                .map(|(id, _)| id.clone())
-                .collect();
-            matching
-                .into_iter()
-                .filter_map(|id| pending.remove(&id))
-                .collect::<Vec<_>>()
-        };
-        self.signal_idle_change();
-        let mut audits = Vec::with_capacity(waiting.len());
-        for entry in waiting {
-            let decision = entry.pending.refusal();
-            let option_id = decision.option_id().to_owned();
-            let _ = entry.answer.send(Answer::Chosen {
-                decision,
-                option_id: option_id.clone(),
-                source,
-                reported: true,
-            });
-            audits.push((
-                entry.route,
-                EventKind::ApprovalResolved {
-                    interaction_id: entry.pending.request.id().clone(),
-                    decision: ApprovalDecision::unresolved(option_id, source),
-                },
-            ));
-        }
-        for (route, event) in audits {
-            let _ = self.emit_for(&route, event).await;
-        }
-    }
-
-    /// Settles every question round the server is still waiting on.
-    ///
-    /// This function only ever runs as part of [`Shared::release_pending_for`]. An unanswered
-    /// round is cancelled; a round whose host answer was accepted already keeps that outcome so
-    /// it reaches the host before the caller commits its terminal.
-    async fn release_pending_questions_for(&self, owner: Option<&Arc<()>>) {
-        let _settlement = self.question_settlements.lock().await;
+        let _settlement = self.interaction_settlements.lock().await;
+        self.release_pending_approvals_for_locked(owner, source)
+            .await;
         self.release_pending_questions_for_locked(owner).await;
     }
 
-    /// Settles question rounds while the caller already holds [`Shared::question_settlements`].
+    /// Settles every authority-bearing approval the server still awaits.
+    async fn release_pending_approvals_for_locked(
+        &self,
+        owner: Option<&Arc<()>>,
+        source: DecisionSource,
+    ) {
+        let mut pending = self.pending.lock().await;
+        while let Some(id) = pending
+            .iter()
+            .find(|(_, entry)| owner.is_none_or(|owner| Arc::ptr_eq(&entry.route.owner, owner)))
+            .map(|(id, _)| id.clone())
+        {
+            let entry = pending.get_mut(&id).expect("selected under the same lock");
+            let decision = entry.pending.refusal();
+            let option_id = decision.option_id().to_owned();
+            let audited = entry
+                .settlement
+                .get_or_insert_with(|| ApprovalDecision::unresolved(option_id.clone(), source))
+                .clone();
+            if let Some(answer) = entry.answer.take() {
+                let _ = answer.send(Answer::Chosen {
+                    decision,
+                    option_id,
+                    source,
+                    reported: true,
+                });
+            }
+            if entry.announced {
+                let _ = self
+                    .emit_for(
+                        &entry.route,
+                        EventKind::ApprovalResolved {
+                            interaction_id: id.clone(),
+                            decision: audited,
+                        },
+                    )
+                    .await;
+            }
+            // No await separates successful publication from retiring its retained owner.
+            pending.remove(&id);
+        }
+        drop(pending);
+        self.signal_idle_change();
+    }
+
+    /// Settles question rounds while the caller already holds [`Shared::interaction_settlements`].
     async fn release_pending_questions_for_locked(&self, owner: Option<&Arc<()>>) {
         let waiting = {
             let mut pending = self.pending_questions.lock().await;
@@ -2118,7 +2136,7 @@ impl Shared {
 
     /// Remembers an answer only until Codex confirms the server request ended.
     ///
-    /// The confirmation can race the answer task between its pending-map removal and this call.
+    /// The confirmation can race the answer task between its answer claim and this call.
     /// In that case it already left an early marker, which this consumes instead of retaining a
     /// second marker. The acknowledgement ledger is bounded even if a future server omits the
     /// confirmation, so a long-running turn cannot retain an unbounded history of answers.
@@ -2176,23 +2194,79 @@ impl Shared {
         }
     }
 
-    /// Takes a question only when the same turn that registered it still owns it.
+    #[cfg(test)]
+    /// Pauses an approval handler before it publishes a resolution, when a race test asks.
+    async fn wait_for_approval_settlement_gate(&self) {
+        let gate = self.approval_settlement_gate.lock().await.clone();
+        if let Some(gate) = gate {
+            gate.wait_for_release().await;
+        }
+    }
+
+    #[cfg(test)]
+    /// Holds the handler at the publication boundary to exercise request-task cancellation.
+    async fn wait_for_approval_publication_gate(&self) {
+        let gate = self.approval_publication_gate.lock().await.clone();
+        if let Some(gate) = gate {
+            gate.wait_for_release().await;
+        }
+    }
+
+    #[cfg(test)]
+    /// Holds a received answer before its handler considers the route's current admissibility.
+    async fn wait_for_approval_answer_gate(&self) {
+        let gate = self.approval_answer_gate.lock().await.clone();
+        if let Some(gate) = gate {
+            gate.wait_for_release().await;
+        }
+    }
+
+    #[cfg(test)]
+    /// Holds a broker/deadline claim after deliberation but before claiming an answer slot.
+    async fn wait_for_approval_claim_gate(&self) {
+        let gate = self.approval_claim_gate.lock().await.clone();
+        if let Some(gate) = gate {
+            gate.wait_for_release().await;
+        }
+    }
+
+    /// Claims an approval's answer while retaining its audit until publication.
     async fn take_pending_for(
         &self,
         request_id: &InteractionId,
         route: &ActiveTurnRoute,
+        decision: ApprovalDecision,
     ) -> PendingTake {
+        #[cfg(test)]
+        self.wait_for_approval_claim_gate().await;
+        let _settlement = self.interaction_settlements.lock().await;
+        let admissible = self.approval_route_is_admissible(route).await;
         let mut pending = self.pending.lock().await;
-        let Some(entry) = pending.remove(request_id) else {
+        let Some(entry) = pending.get_mut(request_id) else {
             return PendingTake::Missing;
         };
-        if Arc::ptr_eq(&entry.route.owner, &route.owner) {
-            drop(pending);
-            self.signal_idle_change();
-            return PendingTake::Taken;
+        if !Arc::ptr_eq(&entry.route.owner, &route.owner) {
+            return PendingTake::Foreign;
         }
-        pending.insert(request_id.clone(), entry);
-        PendingTake::Foreign
+        let Some(answer) = entry.answer.take() else {
+            return PendingTake::Missing;
+        };
+        entry.settlement = Some(if admissible {
+            decision
+        } else {
+            ApprovalDecision::unresolved(
+                entry.pending.refusal().option_id(),
+                DecisionSource::Cancelled,
+            )
+        });
+        drop(answer);
+        drop(pending);
+        self.signal_idle_change();
+        if admissible {
+            PendingTake::Taken
+        } else {
+            PendingTake::Cancelled
+        }
     }
 }
 
@@ -2643,9 +2717,9 @@ impl CodexHandler {
                 // A request task that already routed to this turn then observes `finishing`
                 // before it can register a new host-visible round after this drain. `finish_for`
                 // lets it go once the terminal is claimed.
-                let settlement = self.shared.question_settlements.lock().await;
+                let settlement = self.shared.interaction_settlements.lock().await;
                 self.shared
-                    .release_pending_approvals_for(
+                    .release_pending_approvals_for_locked(
                         Some(&active_route.owner),
                         DecisionSource::Cancelled,
                     )
@@ -2701,6 +2775,7 @@ impl CodexHandler {
         // only handle on a protocol error, and the server would stay blocked until the deadline
         // declined on its behalf.
         let (answer, mut waiting) = oneshot::channel();
+        let publication = self.shared.interaction_settlements.lock().await;
         {
             let mut pending_entries = self.shared.pending.lock().await;
             if pending_entries.contains_key(&request_id) {
@@ -2716,7 +2791,9 @@ impl CodexHandler {
                     route: route.clone(),
                     pending: pending.clone(),
                     deadline,
-                    answer,
+                    answer: Some(answer),
+                    settlement: None,
+                    announced: false,
                 },
             );
         }
@@ -2724,19 +2801,7 @@ impl CodexHandler {
         // questions. Re-check after registration so a request that raced that drain cannot be
         // left behind to a fast broker that would otherwise grant it.
         if !self.shared.approval_route_is_admissible(&route).await {
-            let removed = self.shared.pending.lock().await.remove(&request_id);
-            if removed
-                .as_ref()
-                .is_some_and(|entry| Arc::ptr_eq(&entry.route.owner, &route.owner))
-            {
-                let decision = pending.refusal();
-                self.resolved(
-                    &route,
-                    &request_id,
-                    ApprovalDecision::unresolved(decision.option_id(), DecisionSource::Cancelled),
-                )
-                .await;
-            }
+            self.shared.pending.lock().await.remove(&request_id);
             self.shared.signal_idle_change();
             return Some(pending.refusal());
         }
@@ -2773,20 +2838,6 @@ impl CodexHandler {
             return None;
         }
 
-        // `serverRequest/resolved` can land between consuming an early marker and this point. It
-        // takes the pending entry and wakes `waiting`; do not announce a question the server has
-        // already withdrawn.
-        if !self
-            .shared
-            .pending
-            .lock()
-            .await
-            .get(&request_id)
-            .is_some_and(|entry| Arc::ptr_eq(&entry.route.owner, &route.owner))
-        {
-            return None;
-        }
-
         // The deadline is created before publication, so bounded publication cannot restart the
         // decision window while the host catches up.
         let emitted = self
@@ -2798,6 +2849,12 @@ impl CodexHandler {
                 },
             )
             .await;
+        if emitted.is_ok()
+            && let Some(entry) = self.shared.pending.lock().await.get_mut(&request_id)
+        {
+            entry.announced = true;
+        }
+        drop(publication);
         if matches!(emitted, Err(Error::LimitExceeded { .. })) {
             self.shared
                 .poison_apart(VendorError::new(
@@ -2823,18 +2880,52 @@ impl CodexHandler {
                     .await;
             }
             BrokerWait::Answer(None) => {
-                let PendingTake::Taken = self.shared.take_pending_for(&request_id, &route).await
-                else {
-                    return None;
+                let taken = self
+                    .shared
+                    .take_pending_for(
+                        &request_id,
+                        &route,
+                        ApprovalDecision::unresolved(
+                            pending.refusal().option_id(),
+                            DecisionSource::Expired,
+                        ),
+                    )
+                    .await;
+                let source = match taken {
+                    PendingTake::Taken => DecisionSource::Expired,
+                    PendingTake::Cancelled => DecisionSource::Cancelled,
+                    PendingTake::Missing | PendingTake::Foreign => return None,
                 };
-                return Some(self.expire(&pending, &route, &request_id).await);
+                return Some(
+                    self.refuse_claimed(&pending, &route, &request_id, source)
+                        .await,
+                );
             }
             BrokerWait::Broker(None) => {
-                match self.shared.take_pending_for(&request_id, &route).await {
+                match self
+                    .shared
+                    .take_pending_for(
+                        &request_id,
+                        &route,
+                        ApprovalDecision::unresolved(
+                            pending.refusal().option_id(),
+                            DecisionSource::Expired,
+                        ),
+                    )
+                    .await
+                {
                     PendingTake::Taken => {
-                        return Some(self.expire(&pending, &route, &request_id).await);
+                        return Some(
+                            self.refuse_claimed(
+                                &pending,
+                                &route,
+                                &request_id,
+                                DecisionSource::Expired,
+                            )
+                            .await,
+                        );
                     }
-                    // `respond` claims the map entry before sending its answer. The expiry race must
+                    // `respond` claims the answer slot before sending. The expiry race must
                     // wait for that already-accepted result instead of turning it into an empty reply.
                     PendingTake::Missing => {
                         let answer = waiting.await.ok()?;
@@ -2842,37 +2933,64 @@ impl CodexHandler {
                             .settle_answer(answer, &pending, &route, &request_id)
                             .await;
                     }
+                    PendingTake::Cancelled => {
+                        return Some(
+                            self.refuse_claimed(
+                                &pending,
+                                &route,
+                                &request_id,
+                                DecisionSource::Cancelled,
+                            )
+                            .await,
+                        );
+                    }
                     PendingTake::Foreign => return None,
                 }
             }
             BrokerWait::Broker(Some(None)) => {}
             BrokerWait::Broker(Some(Some(response))) => {
-                // Only if nobody answered first. Taking the entry back is what says so — a policy that
-                // deliberated while a person chose does not get to overrule them.
-                if matches!(
-                    self.shared.take_pending_for(&request_id, &route).await,
-                    PendingTake::Taken
-                ) {
-                    // A policy answering with an id this question never offered is a policy that
-                    // cannot be applied here. Refusing is the answer that grants nothing; sending the
-                    // id on would have the server refuse a frame a person already thinks was answered.
-                    let decision = pending
-                        .decision_for(&response.option_id)
-                        .unwrap_or_else(|| pending.refusal());
-                    let option_id = decision.option_id().to_owned();
-                    return self
-                        .settle_answer(
-                            Answer::Chosen {
-                                decision,
-                                option_id,
-                                source: response.source,
-                                reported: false,
-                            },
-                            &pending,
-                            &route,
-                            &request_id,
-                        )
-                        .await;
+                // A broker can claim only an answer no host has already accepted.
+                let decision = pending
+                    .decision_for(&response.option_id)
+                    .unwrap_or_else(|| pending.refusal());
+                let option_id = decision.option_id().to_owned();
+                let audited = match pending.option(&option_id) {
+                    Some(option) => ApprovalDecision::from_option(option, response.source),
+                    None => ApprovalDecision::unresolved(option_id.clone(), response.source),
+                };
+                match self
+                    .shared
+                    .take_pending_for(&request_id, &route, audited)
+                    .await
+                {
+                    PendingTake::Taken => {
+                        return self
+                            .settle_answer(
+                                Answer::Chosen {
+                                    decision,
+                                    option_id,
+                                    source: response.source,
+                                    reported: false,
+                                },
+                                &pending,
+                                &route,
+                                &request_id,
+                            )
+                            .await;
+                    }
+                    PendingTake::Cancelled => {
+                        return Some(
+                            self.refuse_claimed(
+                                &pending,
+                                &route,
+                                &request_id,
+                                DecisionSource::Cancelled,
+                            )
+                            .await,
+                        );
+                    }
+                    PendingTake::Foreign => return None,
+                    PendingTake::Missing => {}
                 }
             }
         }
@@ -2881,47 +2999,53 @@ impl CodexHandler {
         // or the host is going away. All three answer the server; none of them grants anything.
         let settled = tokio::select! {
             biased;
-            answer = waiting => answer.ok(),
+            answer = &mut waiting => answer.ok(),
             () = self.shared.host.cancel().cancelled() => None,
             () = deadline.wait() => None,
         };
 
-        let removed = self.shared.pending.lock().await.remove(&request_id);
-        if removed
-            .as_ref()
-            .is_some_and(|entry| !Arc::ptr_eq(&entry.route.owner, &route.owner))
-        {
-            if let Some(entry) = removed {
-                self.shared
-                    .pending
-                    .lock()
-                    .await
-                    .insert(request_id.clone(), entry);
-            }
-            return None;
-        }
         match settled {
             Some(answer) => {
                 self.settle_answer(answer, &pending, &route, &request_id)
                     .await
             }
             None => {
-                // Nobody chose: the shared deadline elapsed, or the host is going away.
                 let decision = pending.refusal();
                 let source = if self.shared.host.cancel().is_cancelled() {
                     DecisionSource::Cancelled
                 } else {
                     DecisionSource::Expired
                 };
-                if removed.is_some() {
-                    self.resolved(
-                        &route,
+                match self
+                    .shared
+                    .take_pending_for(
                         &request_id,
+                        &route,
                         ApprovalDecision::unresolved(decision.option_id(), source),
                     )
-                    .await;
+                    .await
+                {
+                    PendingTake::Taken => Some(
+                        self.refuse_claimed(&pending, &route, &request_id, source)
+                            .await,
+                    ),
+                    PendingTake::Cancelled => Some(
+                        self.refuse_claimed(
+                            &pending,
+                            &route,
+                            &request_id,
+                            DecisionSource::Cancelled,
+                        )
+                        .await,
+                    ),
+                    PendingTake::Missing => {
+                        // An accepted host answer or terminal cleanup already owns the sender.
+                        let answer = waiting.await.ok()?;
+                        self.settle_answer(answer, &pending, &route, &request_id)
+                            .await
+                    }
+                    PendingTake::Foreign => None,
                 }
-                Some(decision)
             }
         }
     }
@@ -2934,6 +3058,8 @@ impl CodexHandler {
         route: &ActiveTurnRoute,
         request_id: &InteractionId,
     ) -> Option<ServerAnswer> {
+        #[cfg(test)]
+        self.shared.wait_for_approval_answer_gate().await;
         match answer {
             Answer::Chosen {
                 decision,
@@ -2941,21 +3067,7 @@ impl CodexHandler {
                 source,
                 reported,
             } => {
-                if !self.shared.approval_route_is_admissible(route).await {
-                    let refusal = pending.refusal();
-                    if !reported {
-                        self.resolved(
-                            route,
-                            request_id,
-                            ApprovalDecision::unresolved(
-                                refusal.option_id(),
-                                DecisionSource::Cancelled,
-                            ),
-                        )
-                        .await;
-                    }
-                    return Some(refusal);
-                }
+                // Publication decides the audit and native reply under one interaction hold.
                 if !reported {
                     // A real choice: reported with the reach and risk of the option that won,
                     // when this harness offered one by that id.
@@ -2963,39 +3075,46 @@ impl CodexHandler {
                         Some(option) => ApprovalDecision::from_option(option, source),
                         None => ApprovalDecision::unresolved(option_id, source),
                     };
-                    self.resolved(route, request_id, audited).await;
+                    return self
+                        .resolved(route, request_id, audited, Some(decision))
+                        .await;
                 }
                 Some(decision)
             }
             Answer::ResolvedByTheServer => {
                 // Nobody here chose; the server simply stopped waiting. `cancel` is a label for
                 // the audit trail, not an option a person or a policy picked.
-                self.resolved(
-                    route,
-                    request_id,
-                    ApprovalDecision::unresolved("cancel", DecisionSource::Cancelled),
-                )
-                .await;
+                let _ = self
+                    .resolved(
+                        route,
+                        request_id,
+                        ApprovalDecision::unresolved("cancel", DecisionSource::Cancelled),
+                        None,
+                    )
+                    .await;
                 None
             }
         }
     }
 
-    /// Refuses an expired question and records the expiry before replying to the app-server.
-    async fn expire(
+    /// Refuses a claimed approval with the source that won before replying to the app-server.
+    async fn refuse_claimed(
         &self,
         pending: &PendingApproval,
         route: &ActiveTurnRoute,
         request_id: &InteractionId,
+        source: DecisionSource,
     ) -> ServerAnswer {
         let decision = pending.refusal();
-        // The deadline chose this, not a person or a policy — the audit trail says so.
-        self.resolved(
-            route,
-            request_id,
-            ApprovalDecision::unresolved(decision.option_id(), DecisionSource::Expired),
-        )
-        .await;
+        // The claim retained the authoritative expiry/cancellation outcome.
+        let _ = self
+            .resolved(
+                route,
+                request_id,
+                ApprovalDecision::unresolved(decision.option_id(), source),
+                None,
+            )
+            .await;
         decision
     }
 
@@ -3075,18 +3194,53 @@ impl CodexHandler {
         route: &ActiveTurnRoute,
         request_id: &InteractionId,
         decision: ApprovalDecision,
-    ) {
+        chosen: Option<ServerAnswer>,
+    ) -> Option<ServerAnswer> {
+        #[cfg(test)]
+        self.shared.wait_for_approval_settlement_gate().await;
+        let _settlement = self.shared.interaction_settlements.lock().await;
+        let mut pending = self.shared.pending.lock().await;
+        let Some(entry) = pending
+            .get_mut(request_id)
+            .filter(|entry| Arc::ptr_eq(&entry.route.owner, &route.owner))
+        else {
+            // Cleanup already published the retained choice; its native answer must match.
+            return chosen;
+        };
+        let chosen = if let Some(chosen) = chosen {
+            if self.shared.approval_route_is_admissible(route).await {
+                Some(chosen)
+            } else {
+                let refusal = entry.pending.refusal();
+                entry.settlement = Some(ApprovalDecision::unresolved(
+                    refusal.option_id(),
+                    DecisionSource::Cancelled,
+                ));
+                Some(refusal)
+            }
+        } else {
+            None
+        };
+        #[cfg(test)]
+        self.shared.wait_for_approval_publication_gate().await;
+        if entry.announced {
+            let _ = self
+                .shared
+                .emit_for(
+                    route,
+                    EventKind::ApprovalResolved {
+                        interaction_id: request_id.clone(),
+                        decision: entry.settlement.clone().unwrap_or(decision),
+                    },
+                )
+                .await;
+        }
+        // Keep ownership if publication is cut while acquiring the turn lock. Once it returns,
+        // removing the entry is synchronous, so cleanup cannot publish the same audit again.
+        pending.remove(request_id);
+        drop(pending);
         self.shared.signal_idle_change();
-        let _ = self
-            .shared
-            .emit_for(
-                route,
-                EventKind::ApprovalResolved {
-                    interaction_id: request_id.clone(),
-                    decision,
-                },
-            )
-            .await;
+        chosen
     }
 
     /// Puts one round of questions to a host, and waits.
@@ -3168,7 +3322,7 @@ impl CodexHandler {
             );
         }
         if !self.shared.approval_route_is_admissible(&route).await {
-            let _settlement = self.shared.question_settlements.lock().await;
+            let _settlement = self.shared.interaction_settlements.lock().await;
             let removed = self
                 .shared
                 .pending_questions
@@ -3204,7 +3358,7 @@ impl CodexHandler {
         if let Some(early_route) = early_route
             && Arc::ptr_eq(&early_route, &route.owner)
         {
-            let _settlement = self.shared.question_settlements.lock().await;
+            let _settlement = self.shared.interaction_settlements.lock().await;
             let removed = {
                 let mut pending = self.shared.pending_questions.lock().await;
                 if pending
@@ -3226,7 +3380,7 @@ impl CodexHandler {
             // A server withdrawal cannot take this entry after the question reaches the stream
             // but before it is marked announced. That makes the withdrawing side the owner of
             // the matching host resolution instead of leaving a dialog behind.
-            let _settlement = self.shared.question_settlements.lock().await;
+            let _settlement = self.shared.interaction_settlements.lock().await;
             if !self.shared.approval_route_is_admissible(&route).await {
                 self.shared
                     .pending_questions
@@ -3292,7 +3446,7 @@ impl CodexHandler {
 
         // Serialise this removal and publication with terminal cleanup. Once either side takes
         // the entry, it also puts its resolution on the stream before the terminal can claim it.
-        let _settlement = self.shared.question_settlements.lock().await;
+        let _settlement = self.shared.interaction_settlements.lock().await;
         let removed = self
             .shared
             .pending_questions
@@ -3393,24 +3547,25 @@ impl CodexHandler {
 
     /// Releases the question the server says it is no longer waiting on.
     async fn release_resolved(&self, request_key: &str, route: &ActiveTurnRoute) -> bool {
-        let entry = {
+        let question_settlement = self.shared.interaction_settlements.lock().await;
+        {
             let mut pending = self.shared.pending.lock().await;
-            let id = pending
-                .iter()
-                .find(|(_, entry)| {
-                    entry.request_key == request_key
-                        && Arc::ptr_eq(&entry.route.owner, &route.owner)
-                })
-                .map(|(id, _)| id.clone());
-            id.and_then(|id| pending.remove(&id))
-        };
-        if let Some(entry) = entry {
-            let _ = entry.answer.send(Answer::ResolvedByTheServer);
-            self.shared.signal_idle_change();
-            return true;
+            if let Some(entry) = pending.values_mut().find(|entry| {
+                entry.request_key == request_key
+                    && Arc::ptr_eq(&entry.route.owner, &route.owner)
+                    && entry.answer.is_some()
+            }) {
+                entry.settlement = Some(ApprovalDecision::unresolved(
+                    "cancel",
+                    DecisionSource::Cancelled,
+                ));
+                let answer = entry.answer.take().expect("checked under the same lock");
+                let _ = answer.send(Answer::ResolvedByTheServer);
+                self.shared.signal_idle_change();
+                return true;
+            }
         }
 
-        let question_settlement = self.shared.question_settlements.lock().await;
         let question_entry = {
             let mut pending = self.shared.pending_questions.lock().await;
             let id = pending
@@ -4314,66 +4469,71 @@ impl Session for CodexSession {
                 expected: String::from("an active turn that owns this approval"),
                 received: response.interaction_id.to_string(),
             })?;
-        let entry = {
-            let mut pending = self.shared.pending.lock().await;
-            if !pending
-                .get(&response.interaction_id)
-                .is_some_and(|entry| Arc::ptr_eq(&entry.route.owner, &route.owner))
-            {
-                None
-            } else {
-                pending.remove(&response.interaction_id)
-            }
-        };
-        let Some(entry) = entry else {
+        let _settlement = self.shared.interaction_settlements.lock().await;
+        if !self.shared.approval_route_is_admissible(&route).await {
+            return Err(Error::Protocol {
+                expected: String::from("an active turn accepting approval answers"),
+                received: response.interaction_id.to_string(),
+            });
+        }
+        let mut pending = self.shared.pending.lock().await;
+        let Some(entry) = pending.get_mut(&response.interaction_id).filter(|entry| {
+            Arc::ptr_eq(&entry.route.owner, &route.owner) && entry.answer.is_some()
+        }) else {
             return Err(Error::Protocol {
                 expected: String::from("an approval this session is still waiting on"),
                 received: response.interaction_id.to_string(),
             });
         };
-        self.shared.signal_idle_change();
         if entry.deadline.is_elapsed() {
             let decision = entry.pending.refusal();
             let option_id = decision.option_id().to_owned();
-            let _ = entry.answer.send(Answer::Chosen {
-                decision,
-                option_id,
-                source: DecisionSource::Expired,
-                reported: false,
-            });
+            entry.settlement = Some(ApprovalDecision::unresolved(
+                option_id.clone(),
+                DecisionSource::Expired,
+            ));
+            let answer = entry.answer.take().expect("checked under the same lock");
+            if answer
+                .send(Answer::Chosen {
+                    decision,
+                    option_id,
+                    source: DecisionSource::Expired,
+                    reported: false,
+                })
+                .is_err()
+            {
+                entry.settlement = None;
+            }
+            self.shared.signal_idle_change();
             return Err(Error::Protocol {
                 expected: String::from("an approval whose deadline has not expired"),
                 received: response.interaction_id.to_string(),
             });
         }
         let Some(decision) = entry.pending.decision_for(&response.option_id) else {
-            // Put back: the server is still waiting, and an id nobody offered is the caller's
-            // mistake rather than a reason to leave the vendor blocked.
-            let option_id = response.option_id.clone();
-            let mut pending = self.shared.pending.lock().await;
-            if pending.contains_key(&response.interaction_id) {
-                return Err(Error::Protocol {
-                    expected: String::from("the original approval slot to remain vacant"),
-                    received: response.interaction_id.to_string(),
-                });
-            }
-            pending.insert(response.interaction_id.clone(), entry);
             return Err(Error::Protocol {
                 expected: String::from("one of the options this approval offered"),
-                received: option_id,
+                received: response.option_id,
             });
         };
-        entry
-            .answer
-            .send(Answer::Chosen {
-                decision,
-                option_id: response.option_id,
-                source: response.source,
-                reported: false,
-            })
-            .map_err(|_| Error::Closed {
-                subject: "approval",
-            })
+        entry.settlement = Some(match entry.pending.option(&response.option_id) {
+            Some(option) => ApprovalDecision::from_option(option, response.source),
+            None => ApprovalDecision::unresolved(response.option_id.clone(), response.source),
+        });
+        let answer = entry.answer.take().expect("checked under the same lock");
+        let sent = answer.send(Answer::Chosen {
+            decision,
+            option_id: response.option_id,
+            source: response.source,
+            reported: false,
+        });
+        if sent.is_err() {
+            entry.settlement = None;
+        }
+        self.shared.signal_idle_change();
+        sent.map_err(|_| Error::Closed {
+            subject: "approval",
+        })
     }
 
     async fn answer(&self, response: QuestionResponse) -> Result<()> {
@@ -4387,7 +4547,7 @@ impl Session for CodexSession {
         let current_operation = route.operation(self.shared.session_id.clone());
         let interaction_id = response.interaction_id.clone();
 
-        let settlement = self.shared.question_settlements.lock().await;
+        let settlement = self.shared.interaction_settlements.lock().await;
         let mut pending = self.shared.pending_questions.lock().await;
         let Some(entry) = pending.get(&interaction_id) else {
             drop(pending);
@@ -4980,7 +5140,7 @@ mod tests {
         ))
     }
 
-    /// Builds the production session surface used to submit a question answer in a direct-handler
+    /// Builds the production session surface used to submit interaction answers in a direct-handler
     /// race test.
     async fn question_session(shared: Arc<Shared>) -> super::CodexSession {
         let snapshot = SessionSnapshot::opening(
@@ -4994,6 +5154,7 @@ mod tests {
         )
         .with_capabilities(SessionCapabilities::new(Capabilities {
             questions: true,
+            interactive_approvals: true,
             ..Capabilities::none()
         }));
         let state = SessionState::new(Arc::clone(shared.host.clock()), snapshot);
@@ -5018,28 +5179,43 @@ mod tests {
         super::CodexSession::new(state, shared, client, control)
     }
 
-    /// Reproduces the map removal that `Session::respond` performs before the server confirms it.
+    /// Reproduces the accepted settlement `Session::respond` retains until publication.
     async fn answer_waiting_approval(shared: &Shared) {
         loop {
-            let entry = {
+            let response = {
+                let _settlement = shared.interaction_settlements.lock().await;
                 let mut pending = shared.pending.lock().await;
-                let id = pending.keys().next().cloned();
-                id.and_then(|id| pending.remove(&id))
+                pending
+                    .values_mut()
+                    .find(|entry| entry.answer.is_some())
+                    .map(|entry| {
+                        let decision = entry.pending.refusal();
+                        let option_id = decision.option_id().to_owned();
+                        let source = mango_external_agents::DecisionSource::User;
+                        entry.settlement = Some(match entry.pending.option(&option_id) {
+                            Some(option) => {
+                                mango_external_agents::ApprovalDecision::from_option(option, source)
+                            }
+                            None => mango_external_agents::ApprovalDecision::unresolved(
+                                option_id.clone(),
+                                source,
+                            ),
+                        });
+                        (
+                            entry.answer.take().expect("checked present"),
+                            Answer::Chosen {
+                                decision,
+                                option_id,
+                                source,
+                                reported: false,
+                            },
+                        )
+                    })
             };
-            if let Some(entry) = entry {
-                let decision = entry.pending.refusal();
-                let option_id = decision.option_id().to_owned();
+            if let Some((sender, answer)) = response {
                 assert!(
-                    entry
-                        .answer
-                        .send(Answer::Chosen {
-                            decision,
-                            option_id,
-                            source: mango_external_agents::DecisionSource::User,
-                            reported: false,
-                        })
-                        .is_ok(),
-                    "expected the handler to still await the host answer"
+                    sender.send(answer).is_ok(),
+                    "expected the handler to await the answer"
                 );
                 return;
             }
@@ -5051,7 +5227,7 @@ mod tests {
     async fn answer_waiting_question(shared: &Shared) {
         loop {
             let response = {
-                let _settlement = shared.question_settlements.lock().await;
+                let _settlement = shared.interaction_settlements.lock().await;
                 let mut pending = shared.pending_questions.lock().await;
                 let id = pending.keys().next().cloned();
                 id.map(|id| {
@@ -5601,7 +5777,7 @@ mod tests {
                     cancelled: None,
                     failure: None,
                 },
-                shared.question_settlements.lock().await,
+                shared.interaction_settlements.lock().await,
             )
             .await;
 
@@ -5639,7 +5815,7 @@ mod tests {
                         cancelled: None,
                         failure: None,
                     },
-                    completed.question_settlements.lock().await,
+                    completed.interaction_settlements.lock().await,
                 )
                 .await;
         });
@@ -6171,6 +6347,572 @@ mod tests {
             .release_pending_for(None, mango_external_agents::DecisionSource::Cancelled)
             .await;
         let _ = request.await.expect("expected the question task to finish");
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ApprovalRaceSource {
+        Host,
+        HostAllow,
+        AbortedHandler,
+        Broker,
+        Expiry,
+        Withdrawal,
+        LateWithdrawal,
+        CompetingHost,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ApprovalRaceEnd {
+        Complete,
+        Cancel,
+        Fail,
+    }
+
+    /// Keeps the public answer path and native notification path real; only publication is paused.
+    async fn approval_settlement_race(source: ApprovalRaceSource, end: ApprovalRaceEnd) {
+        use mango_external_agents::{ApprovalDecision, BrokerDecision, DecisionSource};
+        let mut host = HostContext::builder()
+            .launcher(Arc::new(FakeLauncher::new()))
+            .cwd("/workspace")
+            .client_info("approval-race", "0.0.0")
+            .limits(Limits {
+                approval_timeout: if source == ApprovalRaceSource::Expiry {
+                    std::time::Duration::from_secs(1)
+                } else {
+                    std::time::Duration::from_secs(60)
+                },
+                ..Limits::default()
+            });
+        let broker = mango_external_agents::testing::RecordingBroker::new(BrokerDecision::Deny {
+            reason: String::from("test host policy"),
+        });
+        if source == ApprovalRaceSource::Broker {
+            host = host.broker(Arc::new(broker.clone()));
+        }
+        let shared = Arc::new(Shared::new(
+            host.build().expect("host"),
+            mango_external_agents::SessionId::new("chat-1"),
+        ));
+        shared.adopt_thread(String::from("thread-1"));
+        let (_turn_id, mut stream) = running(&shared, "vendor-turn-1").await;
+        let gate = ResolutionMarkerGate::closed();
+        if source == ApprovalRaceSource::AbortedHandler {
+            *shared.approval_publication_gate.lock().await = Some(Arc::clone(&gate));
+        } else {
+            *shared.approval_settlement_gate.lock().await = Some(Arc::clone(&gate));
+        }
+        let request_shared = Arc::clone(&shared);
+        let mut request = tokio::spawn(async move {
+            CodexHandler { shared: request_shared }.on_request(
+                String::from("item/commandExecution/requestApproval"),
+                serde_json::json!({"threadId":"thread-1","turnId":"vendor-turn-1","itemId":"approval-1","command":"pwd"}),
+                mango_external_agents::jsonrpc::RequestId::new(serde_json::json!(1)),
+            ).await
+        });
+        let asked = tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv())
+            .await
+            .expect("bounded announced approval")
+            .expect("announced approval");
+        let EventKind::ApprovalRequested { request: approval } = asked.kind else {
+            panic!("expected an announced approval, received {:?}", asked.kind);
+        };
+        let response = if source == ApprovalRaceSource::HostAllow {
+            approval.allow().expect("allowing choice")
+        } else {
+            approval.deny().expect("denying choice")
+        };
+        let chosen = approval
+            .options
+            .iter()
+            .find(|option| option.id == response.option_id)
+            .expect("offered choice");
+        let expected = match source {
+            ApprovalRaceSource::Broker => {
+                ApprovalDecision::from_option(chosen, DecisionSource::AutoReview)
+            }
+            ApprovalRaceSource::Expiry => {
+                ApprovalDecision::unresolved(response.option_id.clone(), DecisionSource::Expired)
+            }
+            ApprovalRaceSource::Withdrawal => {
+                ApprovalDecision::unresolved("cancel", DecisionSource::Cancelled)
+            }
+            _ => ApprovalDecision::from_option(chosen, DecisionSource::User),
+        };
+        let session = if matches!(
+            source,
+            ApprovalRaceSource::Host
+                | ApprovalRaceSource::HostAllow
+                | ApprovalRaceSource::AbortedHandler
+                | ApprovalRaceSource::LateWithdrawal
+                | ApprovalRaceSource::CompetingHost
+        ) {
+            let session = question_session(Arc::clone(&shared)).await;
+            session
+                .respond(response)
+                .await
+                .expect("public response accepts the first choice");
+            Some(session)
+        } else {
+            None
+        };
+        if source == ApprovalRaceSource::Expiry {
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        }
+        if source == ApprovalRaceSource::Withdrawal {
+            CodexHandler {
+                shared: Arc::clone(&shared),
+            }
+            .on_notification(
+                String::from("serverRequest/resolved"),
+                serde_json::json!({"threadId":"thread-1","requestId":1}),
+            )
+            .await;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_until_entered())
+            .await
+            .expect("settled approval handler reaches publication gate");
+        if source == ApprovalRaceSource::Broker {
+            assert_eq!(broker.requests().len(), 1);
+        }
+        if source == ApprovalRaceSource::AbortedHandler {
+            request.abort();
+            let cancelled = tokio::time::timeout(std::time::Duration::from_secs(5), &mut request)
+                .await
+                .expect("bounded handler cancellation")
+                .expect_err("aborted handler");
+            assert!(cancelled.is_cancelled());
+        }
+        if source == ApprovalRaceSource::LateWithdrawal {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                CodexHandler {
+                    shared: Arc::clone(&shared),
+                }
+                .on_notification(
+                    String::from("serverRequest/resolved"),
+                    serde_json::json!({"threadId":"thread-1","requestId":1}),
+                ),
+            )
+            .await
+            .expect("late withdrawal does not wait for deferred publication");
+        }
+        if source == ApprovalRaceSource::CompetingHost {
+            assert!(
+                session
+                    .as_ref()
+                    .expect("host session")
+                    .respond(approval.allow().expect("competing choice"))
+                    .await
+                    .is_err(),
+                "a competing answer must not replace the accepted choice"
+            );
+        }
+        let status = match end {
+            ApprovalRaceEnd::Complete => "completed",
+            ApprovalRaceEnd::Cancel => "interrupted",
+            ApprovalRaceEnd::Fail => "failed",
+        };
+        let mut turn = serde_json::json!({"id":"vendor-turn-1","status":status});
+        if matches!(end, ApprovalRaceEnd::Fail) {
+            turn["error"] = serde_json::json!({"message":"synthetic failure","codexErrorInfo":null,"additionalDetails":null});
+        }
+        let terminal_shared = Arc::clone(&shared);
+        let terminal = tokio::spawn(async move {
+            CodexHandler {
+                shared: terminal_shared,
+            }
+            .on_notification(
+                String::from("turn/completed"),
+                serde_json::json!({"threadId":"thread-1","turn":turn}),
+            )
+            .await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), terminal)
+            .await
+            .expect("terminal cleanup cannot depend on the gated handler")
+            .expect("terminal task");
+        gate.open();
+        if source != ApprovalRaceSource::AbortedHandler {
+            let wire_answer = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+                .await
+                .expect("bounded approval settlement")
+                .expect("request task");
+            let mango_external_agents::jsonrpc::ServerRequestOutcome::Answer(wire_answer) =
+                wire_answer
+            else {
+                panic!("expected a native approval response, received {wire_answer:?}");
+            };
+            let expected_wire = match source {
+                ApprovalRaceSource::Withdrawal => serde_json::json!({}),
+                ApprovalRaceSource::HostAllow => serde_json::json!({"decision":"accept"}),
+                _ => serde_json::json!({"decision":"decline"}),
+            };
+            assert_eq!(
+                wire_answer, expected_wire,
+                "accepted native response survives {source:?}/{end:?}"
+            );
+        }
+        let events = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut events = Vec::new();
+            while let Some(event) = stream.recv().await {
+                events.push(event.kind);
+            }
+            events
+        })
+        .await
+        .expect("bounded terminal stream");
+        let terminal_index = events
+            .iter()
+            .position(|kind| {
+                matches!(
+                    kind,
+                    EventKind::Cancelled { .. } | EventKind::Error { .. } | EventKind::Completed
+                )
+            })
+            .expect("terminal event");
+        assert!(
+            match end {
+                ApprovalRaceEnd::Complete => matches!(events[terminal_index], EventKind::Completed),
+                ApprovalRaceEnd::Cancel =>
+                    matches!(events[terminal_index], EventKind::Cancelled { .. }),
+                ApprovalRaceEnd::Fail => matches!(events[terminal_index], EventKind::Error { .. }),
+            },
+            "expected the selected native terminal kind for {end:?}, received {events:?}"
+        );
+        let resolved: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                EventKind::ApprovalResolved {
+                    interaction_id,
+                    decision,
+                } => Some((index, interaction_id, decision)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            resolved.len(),
+            1,
+            "settled announced approval must resolve exactly once before terminal; {source:?}/{end:?}: {events:?}"
+        );
+        assert!(resolved[0].0 < terminal_index);
+        assert_eq!(resolved[0].1, approval.id());
+        assert_eq!(
+            resolved[0].2, &expected,
+            "the accepted decision and source must survive terminal cleanup"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, EventKind::Completed))
+                .count(),
+            if matches!(end, ApprovalRaceEnd::Fail) {
+                0
+            } else {
+                1
+            }
+        );
+        assert!(shared.pending.lock().await.is_empty());
+    }
+
+    macro_rules! approval_race_test {
+        ($name:ident, $source:ident, $end:ident) => {
+            #[tokio::test(start_paused = true)]
+            async fn $name() {
+                approval_settlement_race(ApprovalRaceSource::$source, ApprovalRaceEnd::$end).await;
+            }
+        };
+    }
+    approval_race_test!(approval_settlement_host_before_completion, Host, Complete);
+    approval_race_test!(
+        approval_settlement_aborted_handler_before_completion,
+        AbortedHandler,
+        Complete
+    );
+    approval_race_test!(
+        approval_settlement_allow_before_completion,
+        HostAllow,
+        Complete
+    );
+    approval_race_test!(approval_settlement_allow_before_cancel, HostAllow, Cancel);
+    approval_race_test!(approval_settlement_allow_before_error, HostAllow, Fail);
+    approval_race_test!(approval_settlement_host_before_cancel, Host, Cancel);
+    approval_race_test!(approval_settlement_host_before_error, Host, Fail);
+    approval_race_test!(
+        approval_settlement_broker_before_completion,
+        Broker,
+        Complete
+    );
+    approval_race_test!(approval_settlement_broker_before_cancel, Broker, Cancel);
+    approval_race_test!(approval_settlement_broker_before_error, Broker, Fail);
+    approval_race_test!(
+        approval_settlement_expiry_before_completion,
+        Expiry,
+        Complete
+    );
+    approval_race_test!(approval_settlement_expiry_before_cancel, Expiry, Cancel);
+    approval_race_test!(approval_settlement_expiry_before_error, Expiry, Fail);
+    approval_race_test!(
+        approval_settlement_withdrawal_before_completion,
+        Withdrawal,
+        Complete
+    );
+    approval_race_test!(
+        approval_settlement_withdrawal_before_cancel,
+        Withdrawal,
+        Cancel
+    );
+    approval_race_test!(
+        approval_settlement_withdrawal_before_error,
+        Withdrawal,
+        Fail
+    );
+    approval_race_test!(
+        approval_settlement_late_withdrawal_preserves_host_choice,
+        LateWithdrawal,
+        Complete
+    );
+    approval_race_test!(
+        approval_settlement_competing_host_cannot_replace_choice,
+        CompetingHost,
+        Complete
+    );
+
+    #[derive(Clone, Copy, Debug)]
+    enum ApprovalStopTiming {
+        Accepted,
+        Published,
+        BeforeBrokerClaim,
+    }
+
+    /// Checks the accepted-answer and late-broker boundaries without manufacturing map removal.
+    async fn approval_stop_boundary(timing: ApprovalStopTiming, shutdown: bool) {
+        use mango_external_agents::{ApprovalDecision, BrokerDecision, DecisionSource};
+        let mut host = HostContext::builder()
+            .launcher(Arc::new(FakeLauncher::new()))
+            .cwd("/workspace")
+            .client_info("approval-stop", "0.0.0");
+        if matches!(timing, ApprovalStopTiming::BeforeBrokerClaim) {
+            host = host.broker(Arc::new(
+                mango_external_agents::testing::RecordingBroker::new(BrokerDecision::Allow),
+            ));
+        }
+        let shared = Arc::new(Shared::new(
+            host.build().expect("host"),
+            mango_external_agents::SessionId::new("chat-1"),
+        ));
+        shared.adopt_thread(String::from("thread-1"));
+        let (_, mut stream) = running(&shared, "vendor-turn-1").await;
+        let gate = ResolutionMarkerGate::closed();
+        if matches!(timing, ApprovalStopTiming::BeforeBrokerClaim) {
+            *shared.approval_claim_gate.lock().await = Some(Arc::clone(&gate));
+        } else {
+            *shared.approval_answer_gate.lock().await = Some(Arc::clone(&gate));
+        }
+        let request_shared = Arc::clone(&shared);
+        let request = tokio::spawn(async move {
+            CodexHandler { shared: request_shared }.on_request(
+                String::from("item/commandExecution/requestApproval"),
+                serde_json::json!({"threadId":"thread-1","turnId":"vendor-turn-1","itemId":"approval-1","command":"pwd"}),
+                mango_external_agents::jsonrpc::RequestId::new(serde_json::json!(1)),
+            ).await
+        });
+        let announced = tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv())
+            .await
+            .expect("bounded announced approval")
+            .expect("announced approval");
+        let EventKind::ApprovalRequested { request: approval } = announced.kind else {
+            panic!("expected approval, received {:?}", announced.kind);
+        };
+        let allowed = approval.allow().expect("allowing choice");
+        let expected = if !matches!(timing, ApprovalStopTiming::Published) {
+            ApprovalDecision::unresolved(
+                approval.deny().expect("deny").option_id,
+                DecisionSource::Cancelled,
+            )
+        } else {
+            let option = approval
+                .options
+                .iter()
+                .find(|option| option.id == allowed.option_id)
+                .expect("offered choice");
+            ApprovalDecision::from_option(option, DecisionSource::User)
+        };
+        let session = if !matches!(timing, ApprovalStopTiming::BeforeBrokerClaim) {
+            let session = question_session(Arc::clone(&shared)).await;
+            session
+                .respond(allowed)
+                .await
+                .expect("public choice accepted");
+            Some(session)
+        } else {
+            None
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_until_entered())
+            .await
+            .expect("bounded answer/claim boundary");
+        if shutdown {
+            shared.begin_close(mango_external_agents::CloseReason::Shutdown);
+        } else {
+            // The same turn-owned latch cancel_owner sets before draining pending approvals.
+            shared
+                .turn
+                .lock()
+                .await
+                .as_mut()
+                .expect("active turn")
+                .cancel_reason = Some(mango_external_agents::CancelReason::Requested);
+        }
+        if matches!(timing, ApprovalStopTiming::Published) {
+            shared
+                .release_pending_for(None, DecisionSource::Cancelled)
+                .await;
+            assert!(
+                shared.pending.lock().await.is_empty(),
+                "cleanup published the retained choice"
+            );
+        }
+        gate.open();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+            .await
+            .expect("bounded native answer")
+            .expect("request task");
+        let mango_external_agents::jsonrpc::ServerRequestOutcome::Answer(wire) = outcome else {
+            panic!("expected native response, received {outcome:?}");
+        };
+        let resolved = tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv())
+            .await
+            .expect("bounded resolution")
+            .expect("resolution");
+        let EventKind::ApprovalResolved { decision, .. } = resolved.kind else {
+            panic!("expected resolution, received {:?}", resolved.kind);
+        };
+        assert_eq!(
+            decision, expected,
+            "audit must follow the accepted answer boundary: {timing:?}/{shutdown}"
+        );
+        let expected_wire = if matches!(timing, ApprovalStopTiming::Published) {
+            "accept"
+        } else {
+            "decline"
+        };
+        assert_eq!(
+            wire,
+            serde_json::json!({"decision":expected_wire}),
+            "native reply must match the published approval decision: {timing:?}/{shutdown}"
+        );
+        CodexHandler { shared: Arc::clone(&shared) }.on_notification(String::from("turn/completed"),
+            serde_json::json!({"threadId":"thread-1","turn":{"id":"vendor-turn-1","status":"completed"}})).await;
+        let rest = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut events = Vec::new();
+            while let Some(event) = stream.recv().await {
+                events.push(event.kind);
+            }
+            events
+        })
+        .await
+        .expect("bounded terminal stream");
+        assert!(
+            !rest
+                .iter()
+                .any(|event| matches!(event, EventKind::ApprovalResolved { .. })),
+            "no duplicate resolution"
+        );
+        assert!(
+            rest.iter()
+                .any(|event| matches!(event, EventKind::Completed)),
+            "terminal reached"
+        );
+        assert!(shared.pending.lock().await.is_empty());
+        drop(session);
+    }
+
+    macro_rules! approval_stop_test {
+        ($name:ident, $timing:ident, $shutdown:expr) => {
+            #[tokio::test(start_paused = true)]
+            async fn $name() {
+                approval_stop_boundary(ApprovalStopTiming::$timing, $shutdown).await;
+            }
+        };
+    }
+    approval_stop_test!(approval_stop_accepted_before_cancel, Accepted, false);
+    approval_stop_test!(approval_stop_accepted_before_shutdown, Accepted, true);
+    approval_stop_test!(approval_stop_published_before_cancel, Published, false);
+    approval_stop_test!(approval_stop_published_before_shutdown, Published, true);
+    approval_stop_test!(
+        approval_stop_late_broker_after_cancel,
+        BeforeBrokerClaim,
+        false
+    );
+    approval_stop_test!(
+        approval_stop_late_broker_after_shutdown,
+        BeforeBrokerClaim,
+        true
+    );
+
+    /// A failed oneshot send is not an accepted host choice and must not audit a grant.
+    #[tokio::test(start_paused = true)]
+    async fn approval_stop_failed_host_send_is_not_an_accepted_choice() {
+        let shared = shared();
+        shared.adopt_thread(String::from("thread-1"));
+        let (_, mut stream) = running(&shared, "vendor-turn-1").await;
+        let request_shared = Arc::clone(&shared);
+        let request = tokio::spawn(async move {
+            CodexHandler { shared:request_shared }.on_request(
+            String::from("item/commandExecution/requestApproval"),
+            serde_json::json!({"threadId":"thread-1","turnId":"vendor-turn-1","itemId":"approval-1","command":"pwd"}),
+            mango_external_agents::jsonrpc::RequestId::new(serde_json::json!(1))).await
+        });
+        let asked = tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv())
+            .await
+            .expect("bounded approval")
+            .expect("approval");
+        let EventKind::ApprovalRequested { request: approval } = asked.kind else {
+            panic!("expected approval");
+        };
+        request.abort();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), request)
+                .await
+                .expect("bounded abort")
+                .expect_err("cancelled request")
+                .is_cancelled()
+        );
+        let session = question_session(Arc::clone(&shared)).await;
+        assert!(
+            matches!(
+                session.respond(approval.allow().expect("allow")).await,
+                Err(mango_external_agents::Error::Closed { .. })
+            ),
+            "dead receiver refuses the response"
+        );
+        assert!(
+            shared
+                .pending
+                .lock()
+                .await
+                .values()
+                .all(|entry| entry.settlement.is_none()),
+            "failed send cannot accept an allow"
+        );
+        CodexHandler { shared:Arc::clone(&shared) }.on_notification(String::from("turn/completed"),serde_json::json!({"threadId":"thread-1","turn":{"id":"vendor-turn-1","status":"completed"}})).await;
+        let expected = mango_external_agents::ApprovalDecision::unresolved(
+            approval.deny().expect("deny").option_id,
+            mango_external_agents::DecisionSource::Cancelled,
+        );
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv())
+            .await
+            .expect("bounded resolution")
+            .expect("resolution");
+        assert!(
+            matches!(first.kind,EventKind::ApprovalResolved { decision,.. } if decision==expected)
+        );
+        assert!(matches!(
+            stream.recv().await.expect("terminal").kind,
+            EventKind::Completed
+        ));
+        assert!(stream.recv().await.is_none());
+        assert!(shared.pending.lock().await.is_empty());
     }
 
     /// A terminal cannot overtake the resolution of an answer [`Session::answer`] accepted.
@@ -7226,10 +7968,10 @@ mod tests {
 
         /// Waits until the handler is inside `turn/completed`, parked on the lock the test holds.
         ///
-        /// It takes the question-settlement lock first, so that lock being taken is the sign.
+        /// It takes the interaction-settlement lock first, so that lock being taken is the sign.
         async fn handler_parked_in_completion(shared: &Shared) {
             for _ in 0..10_000 {
-                if shared.question_settlements.try_lock().is_err() {
+                if shared.interaction_settlements.try_lock().is_err() {
                     return;
                 }
                 tokio::task::yield_now().await;
@@ -10708,7 +11450,7 @@ mod tests {
                             cancelled: None,
                             failure: None,
                         },
-                        finishing.question_settlements.lock().await,
+                        finishing.interaction_settlements.lock().await,
                     )
                     .await;
             });

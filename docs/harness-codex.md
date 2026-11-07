@@ -325,7 +325,7 @@ hold is out, an end that would cancel the handler waits for the stretch for up t
 
 The stretch takes this session's locks and publishes without blocking. It never waits on the
 app-server or the host. A poisoned session's interrupt does wait, so the handler sends it before
-it asks for the hold. The handler also lets the question-settlement lock go at the claim, so a
+it asks for the hold. The handler also lets the interaction-settlement lock go at the claim, so a
 teardown that has questions to settle does not queue behind a commit.
 
 The handler asks for the hold before the claim. If the client has already decided to cancel, it
@@ -792,8 +792,16 @@ question is answered `decline` — never `cancel`, which would stop a turn a dea
 stopping. `serverRequest/resolved` releases a question the server stopped waiting on, so the task
 composing a reply does not outlive the question. The same notification after this client replied
 confirms that answer and consumes its bounded acknowledgement; it cannot become an early marker
-that spends capacity for a later approval. This is client-side timing only: it adds no app-server
-method or wire field beyond the existing [documented surface][readme].
+that spends capacity for a later approval. An accepted host or broker choice, expiry, or native
+withdrawal remains owned until its `ApprovalResolved` event is published. Terminal cleanup publishes
+that retained decision before completion, cancellation or failure; a competing answer or later
+withdrawal cannot replace the accepted source. The handler selects its audit and native reply under
+the same settlement lock: stopping before that selection records and returns a cancelled refusal;
+a choice cleanup already published keeps its matching native reply. A broker result claimed after
+stopping is refused, and a failed host-response send does not accept a choice. Questions retain
+their own outcomes separately and
+grant no authority. This is client-side timing only: it adds no app-server method or wire field
+beyond the existing [documented surface][readme].
 
 ### Debug output
 
