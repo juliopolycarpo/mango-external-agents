@@ -63,7 +63,12 @@ too: they apply the same floor before they spawn `codex app-server`, because an 
 creates sqlite state, an installation id and system skills under `CODEX_HOME` merely by starting.
 They refuse with `Error::VersionGate { found, minimum }` and launch nothing but the version command.
 
-A `--version` line nobody can parse is `GateVerdict::Unknown`, not a refusal: a CLI that changed
+An executable that started but printed no readable version is `GateVerdict::Unknown`.
+Discovery reports `NotInstalled` for the launcher's typed `Error::Launch` unavailability;
+host policy, resource and cancellation refusals remain typed errors, including their dispatch
+and any cleanup control. Opening and listing stop after every failed version-probe launch,
+without attempting an app-server. A `--version` line nobody can parse is
+`GateVerdict::Unknown`, not a refusal: a CLI that changed
 the shape of its version output has not stopped working, and the host may still choose to try.
 
 Where the version comes from, in order:
@@ -76,8 +81,9 @@ Where the version comes from, in order:
    including one taken from a `PATH` lookup (which names no file, and `PATH` can resolve to another
    one inside the receipt's 300 s window), vouches for nothing and the probe below runs.
 2. Otherwise one `codex --version`, run for the executable the session will spawn. That is one extra
-   short process per open and per picker call (two launches instead of one, no more). A launcher
-   that cannot start it leaves the app-server launch to report that.
+   short process per open and per picker call (two launches instead of one, no more). A refused
+   probe returns the launcher's typed error, preserving dispatch and any cleanup control, without
+   starting an app-server. Only a started probe with no comparable version proceeds as `Unknown`.
 
 A probe that never answers is bounded: at most the host's `request_timeout` for the read, then the
 process stop (`kill_grace` + `kill_grace` + `shutdown_timeout` + `shutdown_timeout`, which is

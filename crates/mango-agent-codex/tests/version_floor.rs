@@ -17,12 +17,218 @@ use mango_agent_codex::{CodexHarness, MINIMUM_CODEX_VERSION};
 use mango_external_agents::testing::{FakeLauncher, FakeProcess};
 use mango_external_agents::{
     CancelToken, Discovery, DiscoveryReceipt, DiscoveryReceiptMeasurements, EnvSource, Error,
-    ExecutablePath, GateVerdict, Harness, HarnessId, HostContext, OpenSession, SessionQuery,
+    ExecutablePath, GateVerdict, Harness, HarnessId, HostContext, OpenSession, ProcessLauncher,
+    SessionQuery,
 };
 use support::{Transcript, workspace_path};
 
 // The former supported baseline must no longer start an app-server implicitly.
 const OLD: &str = "0.154.0";
+
+/// A host that refuses the version child but would otherwise permit an app-server launch.
+struct RefusingVersionLauncher {
+    inner: Arc<FakeLauncher>,
+    error: Error,
+    attempts: std::sync::Mutex<Vec<mango_external_agents::LaunchSpec>>,
+}
+
+#[async_trait::async_trait]
+impl mango_external_agents::ProcessLauncher for RefusingVersionLauncher {
+    async fn spawn(
+        &self,
+        spec: mango_external_agents::LaunchSpec,
+    ) -> mango_external_agents::Result<mango_external_agents::ManagedProcess> {
+        self.attempts
+            .lock()
+            .expect("launch attempts")
+            .push(spec.clone());
+        if spec.argv.get(1).map(String::as_str) == Some("--version") {
+            return Err(self.error.clone());
+        }
+        self.inner.spawn(spec).await
+    }
+}
+
+fn refusing_host(launcher: Arc<RefusingVersionLauncher>) -> HostContext {
+    HostContext::builder()
+        .launcher(launcher)
+        .cwd(workspace_path())
+        .client_info("version-refusal-test", "0.0.1")
+        .limits(mango_external_agents::Limits {
+            request_timeout: Duration::from_secs(2),
+            ..Default::default()
+        })
+        .build()
+        .expect("expected a refusal-test host")
+}
+
+#[tokio::test]
+async fn a_refused_version_probe_never_starts_an_app_server_for_open_or_listing() {
+    for operation in ["open", "list"] {
+        let inner = Arc::new(FakeLauncher::new());
+        inner.push(app_server_claiming(MINIMUM_CODEX_VERSION));
+        let launcher = Arc::new(RefusingVersionLauncher {
+            inner: inner.clone(),
+            error: Error::LimitExceeded {
+                subject: "host children",
+                limit: 1,
+                received: 2,
+            }
+            .with_dispatch(mango_external_agents::Dispatch::NotSubmitted),
+            attempts: std::sync::Mutex::new(Vec::new()),
+        });
+        let host = refusing_host(launcher.clone());
+        let harness = CodexHarness::new();
+        let error = if operation == "open" {
+            match harness
+                .open_session(&host, OpenSession::new("refused-version"))
+                .await
+            {
+                Ok(session) => {
+                    session
+                        .close(mango_external_agents::CloseReason::Requested)
+                        .await
+                        .expect("settle an unexpectedly started fake session");
+                    None
+                }
+                Err(error) => Some(error),
+            }
+        } else {
+            harness
+                .list_sessions(&host, SessionQuery::default())
+                .await
+                .err()
+        };
+        assert_eq!(
+            launcher.attempts.lock().expect("attempts").len(),
+            1,
+            "expected {operation} to stop at the refused version probe without an app-server launch"
+        );
+        let error = error.expect("expected the host's version-probe refusal");
+        assert!(matches!(
+            error.cause(),
+            Error::LimitExceeded {
+                subject: "host children",
+                limit: 1,
+                received: 2
+            }
+        ));
+        assert_eq!(
+            error.dispatch(),
+            mango_external_agents::Dispatch::NotSubmitted
+        );
+        assert!(inner.launches().is_empty());
+        assert_eq!(inner.live_children(), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_host_policy_refusal_is_not_reported_as_an_absent_executable() {
+    for account in [false, true] {
+        let launcher = Arc::new(RefusingVersionLauncher {
+            inner: Arc::new(FakeLauncher::new()),
+            error: Error::LimitExceeded {
+                subject: "host children",
+                limit: 1,
+                received: 2,
+            }
+            .with_dispatch(mango_external_agents::Dispatch::NotSubmitted),
+            attempts: std::sync::Mutex::new(Vec::new()),
+        });
+        let host = refusing_host(launcher.clone());
+        let harness = CodexHarness::new();
+        let error = if account {
+            let key = mango_agent_codex::account::AccountFingerprintKey::new(b"synthetic-host-key")
+                .expect("test fingerprint key");
+            harness.discover_with_account(&host, &key).await.err()
+        } else {
+            harness.discover(&host).await.err()
+        }
+        .expect("expected a typed host refusal, not an absent-executable discovery");
+        assert!(matches!(
+            error.cause(),
+            Error::LimitExceeded {
+                subject: "host children",
+                limit: 1,
+                received: 2
+            }
+        ));
+        assert_eq!(
+            error.dispatch(),
+            mango_external_agents::Dispatch::NotSubmitted
+        );
+        assert_eq!(launcher.attempts.lock().expect("attempts").len(), 1);
+    }
+}
+
+/// A failed probe can still own cleanup; no public entrypoint may replace that with absence.
+#[tokio::test]
+async fn a_version_probe_spawn_failure_preserves_its_recovery_control_in_every_entrypoint() {
+    let owner = FakeLauncher::new();
+    owner.push(FakeProcess::responding(|_| Vec::new()));
+    let child = owner
+        .spawn(mango_external_agents::LaunchSpec {
+            argv: vec![String::from("owned-recovery-fixture")],
+            cwd: workspace_path(),
+            env: Default::default(),
+            stdin: false,
+            hide_window: true,
+        })
+        .await
+        .expect("expected a test-owned recovery control");
+    let control = child.control.clone();
+    for operation in ["open", "list", "discover", "account"] {
+        let inner = Arc::new(FakeLauncher::new());
+        let launcher = Arc::new(RefusingVersionLauncher {
+            inner: inner.clone(),
+            error: Error::CleanupRequired {
+                control: control.clone(),
+                source: Box::new(Error::Launch {
+                    program: String::from("codex"),
+                    message: String::from("synthetic launch cleanup incomplete"),
+                }),
+            }
+            .with_dispatch(mango_external_agents::Dispatch::AcceptanceUnknown),
+            attempts: std::sync::Mutex::new(Vec::new()),
+        });
+        let host = refusing_host(launcher.clone());
+        let harness = CodexHarness::new();
+        let error = match operation {
+            "open" => harness
+                .open_session(&host, OpenSession::new("recovery"))
+                .await
+                .err(),
+            "list" => harness
+                .list_sessions(&host, SessionQuery::default())
+                .await
+                .err(),
+            "discover" => harness.discover(&host).await.err(),
+            _ => {
+                let key = mango_agent_codex::account::AccountFingerprintKey::new(b"synthetic-key")
+                    .expect("test fingerprint key");
+                harness.discover_with_account(&host, &key).await.err()
+            }
+        }
+        .expect("expected the probe's original cleanup failure");
+        assert!(matches!(error.cause(), Error::Launch { message, .. }
+            if message == "synthetic launch cleanup incomplete"));
+        assert_eq!(
+            error.dispatch(),
+            mango_external_agents::Dispatch::AcceptanceUnknown
+        );
+        assert!(Arc::ptr_eq(
+            &error.cleanup_control().expect("recovery control"),
+            &control
+        ));
+        assert_eq!(launcher.attempts.lock().expect("attempts").len(), 1);
+        assert!(inner.launches().is_empty());
+    }
+    control
+        .kill(mango_external_agents::CancelReason::Requested)
+        .await
+        .expect("settle the test-owned recovery child");
+    assert_eq!(owner.live_children(), 0);
+}
 
 fn host(launcher: &Arc<FakeLauncher>) -> HostContext {
     host_cancelled_by(launcher, &CancelToken::new())
@@ -187,24 +393,32 @@ async fn an_unparseable_version_proceeds_and_the_handshake_decides() {
     assert_version_gate(result.as_ref().err(), "0.147.0");
 }
 
-/// An executable the launcher cannot start has no version to refuse: the app-server launch that
-/// follows is the one that reports it.
+/// The failed version launch itself is returned; there is no second launch to report it again.
 #[tokio::test]
-async fn a_version_probe_that_cannot_launch_leaves_the_launch_to_report_it() {
-    let launcher = Arc::new(FakeLauncher::new());
-    let host = host(&launcher);
+async fn a_version_probe_that_cannot_launch_returns_that_error_without_a_second_attempt() {
+    let inner = Arc::new(FakeLauncher::new());
+    let launcher = Arc::new(RefusingVersionLauncher {
+        inner: inner.clone(),
+        error: Error::Launch {
+            program: String::from("codex"),
+            message: String::from("synthetic executable unavailable"),
+        },
+        attempts: std::sync::Mutex::new(Vec::new()),
+    });
+    let host = refusing_host(launcher.clone());
 
     let result = CodexHarness::new()
         .open_session(&host, OpenSession::new("chat-1"))
         .await;
 
-    assert_launched(&launcher, &[]);
+    assert_eq!(launcher.attempts.lock().expect("attempts").len(), 1);
+    assert_launched(&inner, &[]);
     assert!(
         matches!(
             result.as_ref().err().map(Error::cause),
-            Some(Error::Launch { .. })
+            Some(Error::Launch { message, .. }) if message == "synthetic executable unavailable"
         ),
-        "expected a launch failure from the app-server launch | received {:?}",
+        "expected the original version-probe launch failure | received {:?}",
         result.as_ref().err()
     );
 }
@@ -505,4 +719,84 @@ async fn the_picker_on_a_current_build_costs_one_version_probe_and_one_app_serve
         .await;
 
     assert_launched(&launcher, &["codex --version", "codex app-server"]);
+}
+
+/// Starting an executable establishes its presence even if its banner cannot establish a version.
+#[tokio::test]
+async fn an_installed_unparseable_or_empty_version_is_unknown_not_absent() {
+    for banner in ["codex-cli unknown", "", "a changed banner"] {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(FakeProcess::transcript([banner]));
+        let found = CodexHarness::new()
+            .discover(&host(&launcher))
+            .await
+            .expect("discovery");
+        assert_eq!(
+            found.gate,
+            GateVerdict::Unknown,
+            "installed banner {banner:?}"
+        );
+        assert_eq!(found.version, None);
+        assert_eq!(launcher.live_children(), 0);
+        assert_launched(&launcher, &["codex --version"]);
+    }
+    let launcher = Arc::new(FakeLauncher::new());
+    let found = CodexHarness::new()
+        .discover(&host(&launcher))
+        .await
+        .expect("discovery");
+    assert_eq!(found.gate, GateVerdict::NotInstalled);
+}
+
+/// A named source whose installed process cannot supply a readable version stream.
+struct UnreadableVersion;
+#[async_trait::async_trait]
+impl mango_external_agents::ByteSource for UnreadableVersion {
+    async fn next_chunk(&mut self) -> mango_external_agents::Result<Option<Vec<u8>>> {
+        Err(Error::Link {
+            peer: String::from("version stdout"),
+            message: String::from("a read failure (BrokenPipe)"),
+        })
+    }
+}
+struct UnreadableVersionLauncher(Arc<FakeLauncher>);
+#[async_trait::async_trait]
+impl mango_external_agents::ProcessLauncher for UnreadableVersionLauncher {
+    async fn spawn(
+        &self,
+        spec: mango_external_agents::LaunchSpec,
+    ) -> mango_external_agents::Result<mango_external_agents::ManagedProcess> {
+        let mut child = self.0.spawn(spec).await?;
+        child.stdout = Box::new(UnreadableVersion);
+        Ok(child)
+    }
+}
+
+#[tokio::test]
+async fn an_installed_unreadable_or_silent_probe_is_unknown_and_reaped() {
+    for unreadable in [true, false] {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(FakeProcess::responding(|_| Vec::new()));
+        let port: Arc<dyn mango_external_agents::ProcessLauncher> = if unreadable {
+            Arc::new(UnreadableVersionLauncher(Arc::clone(&launcher)))
+        } else {
+            launcher.clone()
+        };
+        let host = HostContext::builder()
+            .launcher(port)
+            .cwd(workspace_path())
+            .client_info("test", "0.0.1")
+            .limits(mango_external_agents::Limits {
+                request_timeout: Duration::from_millis(1),
+                ..Default::default()
+            })
+            .build()
+            .expect("host");
+        let found = CodexHarness::new()
+            .discover(&host)
+            .await
+            .expect("discovery");
+        assert_eq!(found.gate, GateVerdict::Unknown);
+        assert_eq!(launcher.live_children(), 0);
+    }
 }
