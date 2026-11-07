@@ -16,7 +16,49 @@ validate_reference() {
     printf 'expected Claude headless reference file %s, received none\n' "$reference" >&2
     return 2
   fi
-  if grep -Fq 'Without it, <code>claude -p</code> loads the same' "$reference"; then
+  if python3 - "$reference" <<'PY'; then
+import re
+import sys
+from html.parser import HTMLParser
+from pathlib import Path
+
+
+class VisibleReference(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.hidden = 0
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"script", "style", "pre"}:
+            self.hidden += 1
+
+    def handle_endtag(self, tag):
+        if tag in {"script", "style", "pre"}:
+            self.hidden = max(0, self.hidden - 1)
+
+    def handle_data(self, data):
+        if not self.hidden:
+            self.parts.append(data)
+
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+source = re.sub(r"(?ms)^[ \t]*```[^\n]*\n.*?^[ \t]*```[ \t]*(?:\n|$)", " ", source)
+visible = VisibleReference()
+visible.feed(source.replace("`", ""))
+visible.close()
+text = " ".join(" ".join(visible.parts).split())
+assertions = (
+    "Without it, claude -p loads the same",
+    "Without it, claude -p discovers and loads them as an interactive session would",
+)
+changed_default = re.search(
+    r"(?:--bare|bare(?: mode)?) (?:is(?: now)?|has become) (?:the )?default\b",
+    text,
+    re.IGNORECASE,
+)
+sys.exit(0 if not changed_default and any(assertion in text for assertion in assertions) else 1)
+PY
     echo 'Claude reference still describes --bare as opt-in'
     return 0
   fi

@@ -237,7 +237,21 @@ test_claude_bare_reference() {
   local reference="$test_root/claude-headless.html"
   printf '%s\n' 'Without it, <code>claude -p</code> loads the same context as an interactive session.' > "$reference"
   validate_reference "$reference" >/dev/null
+  printf '%s\n' 'Without it, `claude -p` discovers and loads them as an interactive session would. --bare will become the default for -p in a future release.' > "$reference"
+  validate_reference "$reference" >/dev/null
+  printf '%s\n' 'Without it, <code>claude&nbsp;-p</code>' 'discovers and loads them as an interactive session would.' > "$reference"
+  validate_reference "$reference" >/dev/null
   printf '%s\n' 'bare mode is now the default.' > "$reference"
+  expect_status 1 validate_reference "$reference"
+  printf '%s\n' 'Without it, <code>claude -p</code> loads the same context as an interactive session.' 'Bare mode is now the default.' > "$reference"
+  expect_status 1 validate_reference "$reference"
+  printf '%s\n' '<script>Without it, <code>claude -p</code> loads the same context.</script>' '<style>Without it, claude -p discovers and loads them as an interactive session would.</style>' > "$reference"
+  expect_status 1 validate_reference "$reference"
+  printf '%s\n' '<pre>Without it, <code>claude -p</code> loads the same context.</pre>' > "$reference"
+  expect_status 1 validate_reference "$reference"
+  printf '%s\n' '```text' 'Without it, <code>claude -p</code> loads the same context.' '```' > "$reference"
+  expect_status 1 validate_reference "$reference"
+  printf '%s\n' 'The opt-in guarantee has unknown replacement wording.' > "$reference"
   expect_status 1 validate_reference "$reference"
   expect_status 2 validate_reference "$reference/missing"
 }
