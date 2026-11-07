@@ -70,9 +70,9 @@ impl StdinFailure {
 #[derive(Clone, Debug, Default)]
 pub struct Announcer {
     state: Arc<Mutex<AnnouncerState>>,
-    /// Pauses immediately before publication so attachment can cross that boundary in a test.
+    /// Lets attachment cross an observed miss; publication must then decide from fresh state.
     #[cfg(test)]
-    before_publish: Option<Arc<PublicationGate>>,
+    after_miss: Option<Arc<PublicationGate>>,
 }
 
 #[cfg(test)]
@@ -110,18 +110,22 @@ impl Announcer {
     /// Puts one line on the child's stdout, as a peer announcing something would.
     pub fn announce(&self, line: impl Into<String>) {
         let line = line.into();
+        // Attachment and delivery are one publication: a child cannot drain the pending queue
+        // between the lookup and enqueue, and a live line cannot overtake that pending drain.
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         #[cfg(test)]
-        if let Some(gate) = &self.before_publish {
+        if let Some(gate) = self.after_miss.as_ref().filter(|_| state.child.is_none()) {
+            // Only the installed test seam releases the publication guard. Re-read after the
+            // forced overlap rather than enqueueing against the now-stale observation.
+            drop(state);
             gate.entered.send(()).expect("publication observer");
             gate.resume
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .expect("publication release within the test bound");
+            state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         }
-        // Attachment and delivery are one publication: a child cannot drain the pending queue
-        // between the lookup and enqueue, and a live line cannot overtake that pending drain.
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         match state.child.as_ref() {
             Some(child) => child.announce([line]),
             None => state.pending.push(line),
@@ -706,7 +710,7 @@ mod tests {
         );
     }
 
-    /// Attach completes while publication is held, without relying on scheduler races.
+    /// Attach completes after a missed lookup; publication must recheck before enqueueing.
     #[tokio::test]
     async fn an_announcement_crossing_attachment_is_delivered_in_order() {
         let (entered, observed) = std::sync::mpsc::channel();
@@ -715,17 +719,18 @@ mod tests {
         let announcer = Announcer::new();
         announcer.announce("before");
         let mut paused = announcer.clone();
-        paused.before_publish = Some(std::sync::Arc::new(super::PublicationGate {
+        paused.after_miss = Some(std::sync::Arc::new(super::PublicationGate {
             entered,
             resume: std::sync::Mutex::new(released),
         }));
         let publishing = std::thread::spawn(move || {
             paused.announce("crossing");
             finished.send(()).expect("publisher completion observer");
+            paused
         });
         observed
             .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("publisher reached the publication boundary");
+            .expect("publisher observed an unattached child");
         let launcher = FakeLauncher::new();
         launcher.push(FakeProcess::responding(|_| Vec::new()).announcing(announcer.clone()));
         let child = launcher.spawn(spec(&["fake"])).await.expect("child");
@@ -733,8 +738,9 @@ mod tests {
         completed
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("publisher completed within the test bound");
-        publishing.join().expect("publisher");
-        announcer.announce("after");
+        let published = publishing.join().expect("publisher");
+        // A live publication must not enter the missed-lookup gate again.
+        published.announce("after");
         let mut lines = LineStream::new(child.stdout, LineLimits::default());
         let mut received = Vec::new();
         for _ in 0..3 {
