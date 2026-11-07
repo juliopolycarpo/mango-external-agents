@@ -4779,12 +4779,12 @@ async fn host_shutdown_marks_a_pending_approval_as_cancelled() {
 
 /// A host shutdown resolves an open question round exactly once, like a turn cancellation does.
 ///
-/// `release_pending_for` sends `QuestionAnswer::Cancelled { reported: true }` on the pending
-/// entry's oneshot ahead of a shutdown, and the waiter's `select!` is biased toward `waiting`, so
-/// it takes that oneshot arm rather than the nobody-answered `None` arm; the `reported` bit is
-/// what stops it from publishing a second time. Unlike the unit test for this path, the schedule
-/// here is not forced — it exercises the same exactly-once guarantee under whichever ordering the
-/// real runtime picks.
+/// `release_pending_for` wakes the waiter with `QuestionAnswer::Cancelled` ahead of shutdown.
+/// The pending entry owns publication until cleanup commits its outcome, then cleanup removes
+/// it synchronously. The waiter finds no entry and cannot publish a duplicate. If cleanup is
+/// interrupted before publication, the retained entry lets the waiter finish that outcome.
+/// Unlike the causal unit tests, this test exercises the exactly-once guarantee under whichever
+/// ordering the real runtime picks.
 #[tokio::test]
 async fn host_shutdown_resolves_an_open_question_round_exactly_once() {
     let transcript = Transcript::load("turn");
