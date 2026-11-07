@@ -81,8 +81,9 @@ Where the version comes from, in order:
    including one taken from a `PATH` lookup (which names no file, and `PATH` can resolve to another
    one inside the receipt's 300 s window), vouches for nothing and the probe below runs.
 2. Otherwise one `codex --version`, run for the executable the session will spawn. That is one extra
-   short process per open and per picker call (two launches instead of one, no more). A launcher
-   that cannot start it leaves the app-server launch to report that.
+   short process per open and per picker call (two launches instead of one, no more). A refused
+   probe returns the launcher's typed error, preserving dispatch and any cleanup control, without
+   starting an app-server. Only a started probe with no comparable version proceeds as `Unknown`.
 
 A probe that never answers is bounded: at most the host's `request_timeout` for the read, then the
 process stop (`kill_grace` + `kill_grace` + `shutdown_timeout` + `shutdown_timeout`, which is

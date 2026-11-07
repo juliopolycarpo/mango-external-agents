@@ -588,9 +588,9 @@ fn vouched_version(
 ///
 /// The build's version is the host's [`DiscoveryReceipt`] when it vouches for the executable being
 /// launched (see [`vouched_version`]), and otherwise one `codex --version`, the same short-lived
-/// process discovery runs. A `--version` line nobody can parse and an executable that will not run
-/// both proceed: the first is [`GateVerdict::Unknown`], and the second is reported by the launch
-/// that follows.
+/// process discovery runs. A started probe whose banner cannot be parsed proceeds as
+/// [`GateVerdict::Unknown`]. A probe the launcher refuses returns that error without starting an
+/// app-server, preserving its cause, dispatch and any cleanup control.
 ///
 /// The host's cancel token is read after the probe, so a shutdown that arrived while a silent
 /// binary held the probe open does not go on to start an app-server.
