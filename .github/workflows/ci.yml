@@ -48,6 +48,7 @@ jobs:
       - run: cargo doc --no-deps --workspace --all-features --locked
         env:
           RUSTDOCFLAGS: -D warnings
+      - run: scripts/test-check-tls.sh
       - run: scripts/check-tls.sh
       - run: scripts/check-standalone.sh
 
