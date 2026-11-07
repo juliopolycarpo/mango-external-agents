@@ -154,7 +154,11 @@ The control record separates the helper shim's exit **127** from the reproducer'
 It records an explicit post-run shim probe's argv, stderr and timestamps separately from the
 historical pre-run record, whose original bytes remain alongside it. That later probe does
 not replace or restamp the pre-run control. Each successful runner result points to its own
-31-command audit, accepted 24-profile summary and archived terminal log. The ownership and
+31-command audit and accepted 24-profile summary. The original validation-driver record is
+preserved unchanged as `driver-recorded.txt`; its trailing success sentence is the outer
+driver's note, not output from the reproducer script. `reproducer-output-derived.txt` removes
+that note and is explicitly a derived view, not an independent stdout capture. Each control
+record hashes both views and identifies the outer-driver note separately. The ownership and
 condition-recording validations use the same explicit separation.
 
 Historical validations retain their exact script identities separately:

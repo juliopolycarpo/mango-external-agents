@@ -24,8 +24,17 @@
     "accepted": true,
     "attempts": "attempts.jsonl",
     "summary": "summary.json",
-    "stdout": "runner.stdout",
-    "stdout_sha256": "60690ddc8457e3b1625f22a3c276676e093369e1faccb62efca20a3eb859812e",
     "reproducer_sha256": "cab8be8380195be9e4641e5563e7a48c0f54577a1f7f723b9b87186bf122d4f3"
+  },
+  "driver_record": {
+    "path": "driver-recorded.txt",
+    "sha256": "60690ddc8457e3b1625f22a3c276676e093369e1faccb62efca20a3eb859812e",
+    "source": "Original validation-driver record, preserved unchanged. The last line is the outer driver validation message, not output from the reproducer script.",
+    "trailing_driver_note": "Full current portable reproduction passed while the cloud-only helper was unavailable."
+  },
+  "reproducer_output": {
+    "path": "reproducer-output-derived.txt",
+    "sha256": "c249b7bc4301537e7d9166d2712d900e6a4af9f6fdb8dbacececf919c1ab1d8c",
+    "derivation": "Driver record with the final outer-driver note removed. This is an explicitly derived view, not an independent stdout capture."
   }
 }

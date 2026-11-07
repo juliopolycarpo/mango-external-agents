@@ -8,13 +8,13 @@
     },
     {
       "path": "README.md",
-      "bytes": 12675,
-      "sha256": "fb4b2bd3a2e903e4f1cb56a31fc77435a8dcc362ff044275c0af37ea09419415"
+      "bytes": 13042,
+      "sha256": "8547914c50999781655e4002bfd92d43a9ccd2b0029ce8f8c83671ed49b1de13"
     },
     {
       "path": "archive-index.json",
-      "bytes": 95618,
-      "sha256": "9548b608606ec7d2400da2ec663ee0712cbf4c7debf5be6c673fe31d46c057ac"
+      "bytes": 96158,
+      "sha256": "a50263274f5073014938f977060f7be31cdea62015f6ef857ca2c58a734d887c"
     },
     {
       "path": "base-Cargo.toml.txt",
@@ -25,6 +25,11 @@
       "path": "conditions/attempts.jsonl",
       "bytes": 22698,
       "sha256": "b8f3d4e1c35a8ad94fabbbc5cae6c4cd5bfe19eb13e2e256d4629c94fb0043a5"
+    },
+    {
+      "path": "conditions/driver-recorded.txt",
+      "bytes": 1150,
+      "sha256": "3d2537de02574d20e3269c4d6096dff54d849e0b23e9e40f14ddca896202ce5b"
     },
     {
       "path": "conditions/identities.json",
@@ -38,8 +43,8 @@
     },
     {
       "path": "conditions/missing-helper-control.json",
-      "bytes": 1231,
-      "sha256": "fa863feb8533864b99232ec7295815b2aacb559bb40ebf04c671f07c657e0945"
+      "bytes": 1860,
+      "sha256": "778af9dd599432e0da19e75eb2c374b678251670184e8699a6d0794c0f812f22"
     },
     {
       "path": "conditions/plan.json",
@@ -52,9 +57,9 @@
       "sha256": "3007d92806ca1f0708ba984b7f2bd165ca8c0acbd24347cfff9668bffb49545b"
     },
     {
-      "path": "conditions/runner.stdout",
-      "bytes": 1150,
-      "sha256": "3d2537de02574d20e3269c4d6096dff54d849e0b23e9e40f14ddca896202ce5b"
+      "path": "conditions/reproducer-output-derived.txt",
+      "bytes": 1044,
+      "sha256": "c249b7bc4301537e7d9166d2712d900e6a4af9f6fdb8dbacececf919c1ab1d8c"
     },
     {
       "path": "conditions/setup-correctness-base.stdout",
@@ -87,6 +92,11 @@
       "sha256": "97d740013a00ca67b2f3dc9064c0448942d93aaef55782968592f3118600f49d"
     },
     {
+      "path": "ownership/driver-recorded.txt",
+      "bytes": 1131,
+      "sha256": "60690ddc8457e3b1625f22a3c276676e093369e1faccb62efca20a3eb859812e"
+    },
+    {
       "path": "ownership/identities.json",
       "bytes": 1414,
       "sha256": "a5764956c3cfd3e04335e89ce0b5968bda204a2a9f536a1e187721f8bf7b718a"
@@ -98,8 +108,8 @@
     },
     {
       "path": "ownership/missing-helper-control.json",
-      "bytes": 1231,
-      "sha256": "1f886bda9ccdd359dc448bafc5706fbb6abe29ac475984f8deda1c57c470621e"
+      "bytes": 1841,
+      "sha256": "d230e5b361427079be3efeb3382c902363dfdb14e61d75a4a5617f77c0215c83"
     },
     {
       "path": "ownership/plan.json",
@@ -112,9 +122,9 @@
       "sha256": "793066d0e229b84049e219af1dd2a55b9616e93786fe350282abe54603b42b40"
     },
     {
-      "path": "ownership/runner.stdout",
-      "bytes": 1131,
-      "sha256": "60690ddc8457e3b1625f22a3c276676e093369e1faccb62efca20a3eb859812e"
+      "path": "ownership/reproducer-output-derived.txt",
+      "bytes": 1044,
+      "sha256": "c249b7bc4301537e7d9166d2712d900e6a4af9f6fdb8dbacececf919c1ab1d8c"
     },
     {
       "path": "ownership/setup-correctness-base.stdout",
@@ -142,6 +152,11 @@
       "sha256": "5b7096b7ebeb89dc4bff793f3f924e2eea48c6b3585769436d42686403581fb0"
     },
     {
+      "path": "portable/driver-recorded.txt",
+      "bytes": 1162,
+      "sha256": "88976925262bcee2471eb2030f591fef1108f77311edcda951d9e5095bb1f552"
+    },
+    {
       "path": "portable/identities.json",
       "bytes": 1414,
       "sha256": "a579fda4fd3a12336b136f11381915bb4b4c744a186d131ae23b448b244f3f15"
@@ -153,8 +168,8 @@
     },
     {
       "path": "portable/missing-helper-control.json",
-      "bytes": 1231,
-      "sha256": "3f9c5c1816269a74634b0380c15943c01d65f8e6293504a47bd15f159779e4f6"
+      "bytes": 1872,
+      "sha256": "af71608acec9866de38b0a313a2e5ed0535afa8d3f83a70a0b58b0f6493eb67f"
     },
     {
       "path": "portable/plan.json",
@@ -167,9 +182,9 @@
       "sha256": "503eb10c8da482fb0ec8e32f5269b4866d038e74a6709f257bb0ee1e70b134c8"
     },
     {
-      "path": "portable/runner.stdout",
-      "bytes": 1162,
-      "sha256": "88976925262bcee2471eb2030f591fef1108f77311edcda951d9e5095bb1f552"
+      "path": "portable/reproducer-output-derived.txt",
+      "bytes": 1044,
+      "sha256": "c249b7bc4301537e7d9166d2712d900e6a4af9f6fdb8dbacececf919c1ab1d8c"
     },
     {
       "path": "portable/setup-correctness-base.stdout",
@@ -233,8 +248,8 @@
     },
     {
       "path": "raw-evidence.tar.gz",
-      "bytes": 853329,
-      "sha256": "c73524a495a738cfefbb1efac1aa8f07177cc8a2ca135691a3544680707d32b9"
+      "bytes": 854419,
+      "sha256": "d171e83a929c5407604981765ba1692f7c58233e93bb40c37f8c005fa9f8a173"
     },
     {
       "path": "redactions.json",

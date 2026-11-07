@@ -24,8 +24,17 @@
     "accepted": true,
     "attempts": "attempts.jsonl",
     "summary": "summary.json",
-    "stdout": "runner.stdout",
-    "stdout_sha256": "3d2537de02574d20e3269c4d6096dff54d849e0b23e9e40f14ddca896202ce5b",
     "reproducer_sha256": "cfab99c75112d44d426da3f4bfb123eef4e8760999ae07ff5329953778e56493"
+  },
+  "driver_record": {
+    "path": "driver-recorded.txt",
+    "sha256": "3d2537de02574d20e3269c4d6096dff54d849e0b23e9e40f14ddca896202ce5b",
+    "source": "Original validation-driver record, preserved unchanged. The last line is the outer driver validation message, not output from the reproducer script.",
+    "trailing_driver_note": "Final portable runner passed all24 profiles under missing-helper control and recorded actual environment."
+  },
+  "reproducer_output": {
+    "path": "reproducer-output-derived.txt",
+    "sha256": "c249b7bc4301537e7d9166d2712d900e6a4af9f6fdb8dbacececf919c1ab1d8c",
+    "derivation": "Driver record with the final outer-driver note removed. This is an explicitly derived view, not an independent stdout capture."
   }
 }
