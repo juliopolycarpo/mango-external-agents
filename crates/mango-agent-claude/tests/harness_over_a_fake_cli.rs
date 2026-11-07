@@ -6618,3 +6618,125 @@ mod redacted_failure {
         );
     }
 }
+
+/// An event refused at the core boundary is a failed turn, even when later native output claims
+/// success. Keep malformed activity identity out of diagnostics and reap the owned child.
+#[tokio::test]
+async fn a_refused_activity_event_cannot_turn_into_success() {
+    for id in [
+        format!("refused-id-canary{}", "x".repeat(129)),
+        String::from(" "),
+        String::from("refused-id-canary\u{1}"),
+    ] {
+        let transcript = [
+            serde_json::json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}}).to_string(),
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"valid-sibling","name":"Bash","input":{"command":"pwd"}}]}}).to_string(),
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":id,"name":"Bash","input":{"command":"pwd"}}]}}).to_string(),
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"later payload must be ignored"}]}}).to_string(),
+            serde_json::json!({"type":"result","subtype":"success","is_error":false}).to_string(),
+        ].join("\n");
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::replaying(&transcript)));
+        let session = open(&launcher).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("bad-activity", "work"))
+            .await
+            .expect("turn");
+        let events = drain(&mut turn).await;
+        assert!(
+            matches!(events.last(), Some(EventKind::Error { error }) if error.code.as_str() == "claude-event-refused"),
+            "expected a refused event to fail, received {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EventKind::Completed | EventKind::TextDelta { .. }))
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, EventKind::Completed | EventKind::Error { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, EventKind::ReasoningStarted))
+                && events
+                    .iter()
+                    .any(|event| matches!(event, EventKind::ReasoningEnded)),
+            "expected the open reasoning phase to close before the refusal terminal: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(event,
+                EventKind::ActivityCompleted { call_id, result }
+                    if call_id == "valid-sibling"
+                        && result.status == mango_external_agents::ActivityStatus::Cancelled)),
+            "expected the valid sibling activity to close before the refusal terminal: {events:?}"
+        );
+        if let Some(EventKind::Error { error }) = events.last() {
+            let diagnostic = format!("{error} {error:?}");
+            assert!(error.message.contains("invalid vendor data"));
+            assert!(!diagnostic.contains("refused-id-canary"));
+            assert!(!diagnostic.contains('\u{1}'));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), turn.recv())
+                .await
+                .expect("expected the refused stream to end")
+                .is_none(),
+            "expected no event after the refusal terminal"
+        );
+        session.close(CloseReason::Shutdown).await.expect("close");
+        assert!(!launcher.a_child_is_running());
+    }
+}
+
+/// A saved native conversation cannot qualify continuation after its transcript was refused.
+#[tokio::test]
+async fn a_refused_activity_taints_continuation_after_a_graceful_stop() {
+    let native = "22222222-3333-4444-5555-666666666666";
+    let launcher = Arc::new(
+        FakeClaudeCli::new()
+            .with_graceful_interrupt()
+            .with_turn(Run::Stalls {
+                lines: vec![
+                    serde_json::json!({"type":"system","subtype":"init","session_id":native}).to_string(),
+                    serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"x".repeat(129),"name":"Bash","input":{"command":"pwd"}}]}}).to_string(),
+                ],
+            }),
+    );
+    let session = open(&launcher).await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("refused-graceful", "work"))
+        .await
+        .expect("expected a turn");
+    let events = drain(&mut turn).await;
+    assert!(matches!(events.last(), Some(EventKind::Error { error })
+        if error.code.as_str() == "claude-event-refused"));
+    assert_eq!(session.ids().native_session_id, native);
+    let at_terminal = session.snapshot().resumability;
+    session
+        .cancel(CancelReason::Requested)
+        .await
+        .expect("expected the owned graceful cleanup to settle");
+    assert_eq!(launcher.graceful_interrupts(), 1);
+    assert!(!launcher.a_child_is_running());
+    assert_eq!(
+        session.snapshot().resumability,
+        mango_external_agents::Resumability::UnfinishedTurn,
+        "expected a refused transcript to stay tainted after graceful cleanup"
+    );
+    assert_eq!(
+        at_terminal,
+        mango_external_agents::Resumability::UnfinishedTurn
+    );
+    let error = session
+        .start_turn(TurnRequest::new("refused-continuation", "must not resume"))
+        .await
+        .expect_err("expected the refused transcript to forbid continuation");
+    assert_eq!(error.dispatch(), Dispatch::NotSubmitted);
+    assert!(matches!(error.cause(), Error::Cancelled { .. }));
+    assert_eq!(launcher.turn_argvs().len(), 1);
+    session.close(CloseReason::Shutdown).await.expect("close");
+}

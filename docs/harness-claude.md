@@ -309,31 +309,30 @@ live turn, because that needs a signed-in account and this library never logs in
 instead: `SessionSnapshot::resumability`, a non-exhaustive `Resumability`. A `SessionSubscription`
 wakes for every change.
 
-| Value            | Meaning for Claude                                                                                                                            | Strict resume      |
-| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
-| `Unknown`        | No turn has finished yet, a turn is running, a stop is pending, or a strict resume no turn has confirmed. No evidence either way.             | no                 |
-| `Resumable`      | `system/init` proved the conversation exists, and its latest turn finished with the vendor's `result` or was stopped by a graceful interrupt. | yes                |
-| `UnfinishedTurn` | A turn ended with no `result` and no clean interrupt: the child was force-terminated, died, went silent, or a stop did not complete.          | no; open a new one |
-| `Unverified`     | A strict resume was not confirmed: another handle, or the CLI ended before `system/init`.                                                     | no; open a new one |
+| Value            | Meaning for Claude                                                                                                                                                      | Strict resume      |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
+| `Unknown`        | No turn has finished yet, a turn is running, a stop is pending, or a strict resume no turn has confirmed. No evidence either way.                                       | no                 |
+| `Resumable`      | The transcript was accepted, `system/init` proved the conversation exists, and its latest turn finished with the vendor's `result` or a graceful interrupt.             | yes                |
+| `UnfinishedTurn` | A transcript event was refused, or a turn ended with no `result` and no clean interrupt: the child was force-terminated, died, went silent, or a stop did not complete. | no; open a new one |
+| `Unverified`     | A strict resume was not confirmed: another handle, or the CLI ended before `system/init`.                                                                               | no; open a new one |
 
 **The rule for a host is exactly: strict-resume only on `Resumable`.** Every other value, `Unknown`
 included, means "do not rely on this conversation without another reason".
 
-`Resumable` describes a conversation at rest. It is published when the vendor finishes a turn (its
-`result` record, success or failure) or takes a graceful interrupt, and it is withdrawn the moment
+`Resumable` describes a conversation at rest whose transcript was accepted. It is published when
+the vendor finishes a turn (its `result` record, success or failure) or takes a graceful interrupt,
+and it is withdrawn the moment
 the next turn is admitted. A host that stores what it reads and then crashes mid-turn has therefore
 stored `Unknown`, not `Resumable`, and nothing more is needed from its recovery record to be safe.
 Likewise a freshly opened session that resumes a conversation whose last turn finished reads
 `Unknown` until its first turn finishes: the harness has verified nothing yet.
 
-Only a turn the vendor finished leaves the conversation `Resumable`, whatever the host's control
-later answers about the child. A finished turn whose child cannot be reaped stays `Resumable`; the
-process is owed cleanup, and that is the `CleanupRequired` the stop returns. A tainted value keeps
-its first cause. It is wider than the refusal `start_turn` gives, which is unchanged: a kill or an
-unconfirmed resume refuses later turns with `Error::Cancelled`, so those values last for the
-session, while a child that died or a silent stream publishes `UnfinishedTurn` and leaves the
-session usable. A later turn the vendor finishes on that session publishes `Resumable` again, since
-the conversation's latest turn is then finished.
+An accepted native `result` keeps the conversation `Resumable` even if its child cannot be reaped.
+The process is owed cleanup, reported by the stop's `CleanupRequired`. A tainted value keeps its
+first cause. A kill, an unconfirmed resume or a refused transcript event also refuses later turns
+with `Error::Cancelled`, so its verdict lasts for the session. A child that died or a silent stream
+publishes `UnfinishedTurn` and leaves the session usable. A later turn the vendor finishes on that
+session publishes `Resumable` again, since the conversation's latest turn is then finished.
 
 How each ending reads. "Terminal" is the snapshot read on the turn's terminal event; "stop
 returned" is after `cancel` (or `close`) returns; "closed" is after `close`. The terminal of a
@@ -348,6 +347,7 @@ while a stop is pending the value is `Unknown`, never a `Resumable` the stop may
 | Later turn finished after an unfinished one                           | `Resumable`                   | n/a              | `Resumable`      |
 | Child died mid-turn after `system/init` (exit 143, 1, 0)              | `UnfinishedTurn`              | n/a              | `UnfinishedTurn` |
 | Idle timeout or unreadable stream after `system/init`                 | `UnfinishedTurn`              | n/a              | `UnfinishedTurn` |
+| Transcript event refused, including after a graceful interrupt        | `UnfinishedTurn`              | `UnfinishedTurn` | `UnfinishedTurn` |
 | Child died before any `system/init` (control with graceful interrupt) | `Unknown`                     | n/a              | `Unknown`        |
 | `cancel` after the child had already exited (control said delivered)  | `Unknown` or `UnfinishedTurn` | `UnfinishedTurn` | `UnfinishedTurn` |
 | `cancel` that interrupted gracefully                                  | `Unknown` or `Resumable`      | `Resumable`      | `Resumable`      |
@@ -855,6 +855,14 @@ does not map is refused as host configuration. Accepting either would run every 
 tools somebody configured and report success.
 
 ## The event stream
+
+An event the core refuses during normalisation fails the turn with `claude-event-refused`.
+The pump ignores later vendor payload, stops the owned child and settles admission; it does not
+turn a dropped activity into a successful transcript. Before publishing the failure it marks the
+conversation `UnfinishedTurn` and refuses later turns. That verdict survives a graceful interrupt:
+saved native history does not qualify a transcript the host could not accept. Ordinary user
+cancellation retains its existing resumability rules. Receiver abandonment and bounded stream
+overflow keep their own terminal behavior.
 
 The reducer holds three properties, exercised by replay and reducer tests:
 
