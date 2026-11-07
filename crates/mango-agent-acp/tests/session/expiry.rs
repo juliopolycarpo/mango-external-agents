@@ -121,9 +121,7 @@ async fn the_deadline_reuses_one_clock_read_despite_a_backward_jump() {
     // Past the advertised 10s deadline, but short of the 15s a stray second clock read would
     // stretch it to.
     tokio::time::advance(Duration::from_secs(11)).await;
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
+    wait_rejection(&launcher).await;
     assert!(
         launcher
             .written()
@@ -153,9 +151,7 @@ async fn an_unanswered_approval_expires_without_host_cancellation() {
         }
     };
     tokio::time::advance(Duration::from_secs(121)).await;
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
+    wait_rejection(&launcher).await;
     let writes = launcher.written();
     assert!(
         writes
@@ -459,22 +455,20 @@ async fn an_expired_unrefusable_approval_stops_an_agent_that_ignores_the_cancel(
     }
     let limits = Limits::default();
     tokio::time::advance(Duration::from_secs(121)).await;
-    // One second at a time, so a failure says how long the turn outlived the deadline.
     let bound = limits.kill_grace + limits.shutdown_timeout + Duration::from_secs(1);
-    let mut events = Vec::new();
-    let mut ended = false;
-    let mut waited = Duration::ZERO;
-    while waited <= bound && !ended {
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
-        while let Ok(event) = turn.try_recv() {
-            ended |= event.is_terminal();
-            events.push(event.kind);
-        }
-        tokio::time::advance(Duration::from_secs(1)).await;
-        waited += Duration::from_secs(1);
-    }
+    let began = tokio::time::Instant::now();
+    let events = tokio::time::timeout(bound, drain(&mut turn))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "expected the expiry terminal within {bound:?}, received {:?}",
+                launcher.written()
+            )
+        });
+    let waited = began.elapsed();
+    let ended = events
+        .iter()
+        .any(|kind| matches!(kind, EventKind::Completed | EventKind::Error { .. }));
     let live = launcher.live_children();
     assert!(
         ended && live == 0,
@@ -529,18 +523,16 @@ async fn a_full_event_channel_does_not_postpone_the_wire_deadline() {
         .start_turn(TurnRequest::new("expiry", "run it"))
         .await
         .expect("turn");
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(Duration::from_secs(1), broker.wait_for_requests(1))
+        .await
+        .expect("expected the permission to reach the broker");
     assert_eq!(
         broker.requests().len(),
         1,
         "expected the permission handler to reach the full channel"
     );
     tokio::time::advance(Duration::from_secs(120)).await;
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
+    wait_rejection(&launcher).await;
     assert!(
         launcher
             .written()
@@ -769,23 +761,18 @@ async fn a_stale_answer_cannot_cross_a_reused_wire_id_onto_a_later_question() {
         ))
         .await
         .expect("expected the stale reply to be accepted rather than erroring");
-    for _ in 0..64 {
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        !outcome_lines(&launcher)
-            .iter()
-            .any(|line| line.contains("\"optionId\":\"allow\"")),
-        "expected the stale reply not to grant the second, unrelated question, received {:?}",
-        outcome_lines(&launcher)
-    );
-
-    // The second question is still genuinely open, and its own answer still reaches the agent.
     session
         .respond(second.deny().expect("expected a refusing option"))
         .await
         .expect("expected the second question to remain answerable");
     let events = drain(&mut turn).await;
+    assert!(
+        !outcome_lines(&launcher)
+            .iter()
+            .any(|line| line.contains("\"optionId\":\"allow\"")),
+        "expected the stale reply not to grant the sibling after its outcome settled, received {:?}",
+        outcome_lines(&launcher)
+    );
     assert!(
         events.iter().any(
             |event| matches!(event, EventKind::ApprovalResolved { decision, .. }
@@ -890,11 +877,105 @@ async fn open_idle(
     (session, launcher)
 }
 
-/// Lets every task that the last time step woke run to its next await.
-async fn settle() {
-    for _ in 0..200 {
-        tokio::task::yield_now().await;
-    }
+/// Observes a completed input line without assuming how many scheduler turns its writer needs.
+async fn wait_wire(launcher: &FakeLauncher, expected: &str, matches: impl Fn(&str) -> bool) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let written = launcher.written();
+            if written.iter().any(|line| matches(line)) {
+                return;
+            }
+            launcher.wait_for_written(written.len() + 1).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "expected {expected} on the wire, received {:?}",
+            launcher.written()
+        )
+    });
+}
+
+async fn wait_prompt(launcher: &FakeLauncher) {
+    wait_wire(launcher, "session/prompt", |line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .is_ok_and(|frame| frame["method"] == "session/prompt")
+    })
+    .await;
+}
+
+async fn wait_rejection(launcher: &FakeLauncher) {
+    wait_wire(launcher, "the expiry rejection", |line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .is_ok_and(|frame| frame["result"]["outcome"]["optionId"] == "reject")
+    })
+    .await;
+}
+
+async fn wait_cancel(launcher: &FakeLauncher) {
+    wait_wire(launcher, "session/cancel", |line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .is_ok_and(|frame| frame["method"] == "session/cancel")
+    })
+    .await;
+}
+
+/// Drives the paused clock through an interval while failing on an early terminal.
+async fn active_for(turn: &mut TurnStream, duration: Duration) {
+    let observation = tokio::time::timeout(duration, async {
+        loop {
+            let event = turn
+                .recv()
+                .await
+                .expect("expected an active turn during observation");
+            assert!(
+                !event.is_terminal(),
+                "expected an active turn for {duration:?}, received {:?}",
+                event.kind
+            );
+        }
+    })
+    .await;
+    assert!(
+        observation.is_err(),
+        "expected the observation interval to elapse"
+    );
+}
+
+async fn wait_text(turn: &mut TurnStream, expected: &str) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let event = turn.recv().await.expect("expected a text receipt");
+            assert!(
+                !event.is_terminal(),
+                "expected text {expected}, received {:?}",
+                event.kind
+            );
+            if matches!(event.kind, EventKind::TextDelta { text } if text.contains(expected)) {
+                return;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("expected text receipt {expected}"));
+}
+
+/// The peer handles notifications before the following unknown request. Its error reply is a
+/// processing barrier that neither opens a dialog nor reports agent progress.
+async fn idle_barrier(
+    launcher: &FakeLauncher,
+    announcer: &mango_external_agents::testing::Announcer,
+    id: u32,
+) {
+    announcer.announce(
+        serde_json::json!({"jsonrpc":"2.0", "id":id, "method":"__test/idle_barrier"}).to_string(),
+    );
+    wait_wire(launcher, "the idle processing barrier", |line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .is_ok_and(|frame| frame["id"] == id && frame["error"]["code"] == -32601)
+    })
+    .await;
 }
 
 fn cancel_sent(launcher: &FakeLauncher) -> bool {
@@ -933,9 +1014,8 @@ async fn a_silent_agent_is_cancelled_at_the_idle_deadline() {
         .start_turn(TurnRequest::new("idle", "go quiet"))
         .await
         .expect("expected a turn");
-    settle().await;
-    tokio::time::advance(idle - Duration::from_secs(1)).await;
-    settle().await;
+    wait_prompt(&launcher).await;
+    active_for(&mut turn, idle - Duration::from_secs(1)).await;
     assert!(
         !cancel_sent(&launcher),
         "expected no cancel before the idle deadline, received {:?}",
@@ -943,7 +1023,7 @@ async fn a_silent_agent_is_cancelled_at_the_idle_deadline() {
     );
 
     tokio::time::advance(Duration::from_secs(2)).await;
-    settle().await;
+    wait_cancel(&launcher).await;
     let events = drain(&mut turn).await;
     assert!(
         cancel_sent(&launcher),
@@ -977,7 +1057,7 @@ async fn each_update_restarts_the_idle_deadline() {
         .start_turn(TurnRequest::new("idle", "keep talking"))
         .await
         .expect("expected a turn");
-    settle().await;
+    wait_prompt(&launcher).await;
     for round in 0..6 {
         tokio::time::advance(Duration::from_secs(3)).await;
         announcer.announce(
@@ -994,7 +1074,7 @@ async fn each_update_restarts_the_idle_deadline() {
             })
             .to_string(),
         );
-        settle().await;
+        wait_text(&mut turn, &format!("still here {round}")).await;
     }
     assert!(
         !cancel_sent(&launcher),
@@ -1003,7 +1083,7 @@ async fn each_update_restarts_the_idle_deadline() {
     );
 
     tokio::time::advance(idle + Duration::from_secs(1)).await;
-    settle().await;
+    wait_cancel(&launcher).await;
     let events = drain(&mut turn).await;
     assert!(
         timed_out(&events),
@@ -1031,9 +1111,9 @@ async fn nine_seconds_of(update: &serde_json::Value) -> (&'static str, Vec<Event
         .start_turn(TurnRequest::new("idle", "keep talking"))
         .await
         .expect("expected a turn");
-    settle().await;
-    for _ in 0..9 {
-        tokio::time::advance(Duration::from_secs(1)).await;
+    wait_prompt(&launcher).await;
+    for round in 0..9 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
         announcer.announce(
             serde_json::json!({
                 "jsonrpc": "2.0",
@@ -1042,7 +1122,7 @@ async fn nine_seconds_of(update: &serde_json::Value) -> (&'static str, Vec<Event
             })
             .to_string(),
         );
-        settle().await;
+        idle_barrier(&launcher, &announcer, 10_000 + round).await;
     }
     // Read before draining: a drain lets the paused clock run on to the deadline regardless.
     let state = match cancel_sent(&launcher) {
@@ -1140,8 +1220,7 @@ async fn a_pending_approval_pauses_the_idle_deadline() {
             break request;
         }
     };
-    tokio::time::advance(idle * 6).await;
-    settle().await;
+    active_for(&mut turn, idle * 6).await;
     assert!(
         !cancel_sent(&launcher),
         "expected the approval, not the idle deadline, to own this wait, received {:?}",
@@ -1188,7 +1267,8 @@ async fn the_idle_deadline_resumes_once_an_approval_expires() {
         }
     }
     tokio::time::advance(approval + Duration::from_secs(1)).await;
-    settle().await;
+    wait_rejection(&launcher).await;
+    active_for(&mut turn, Duration::from_secs(1)).await;
     assert!(
         launcher
             .written()
@@ -1204,7 +1284,7 @@ async fn the_idle_deadline_resumes_once_an_approval_expires() {
     );
 
     tokio::time::advance(idle + Duration::from_secs(1)).await;
-    settle().await;
+    wait_cancel(&launcher).await;
     let events = drain(&mut turn).await;
     assert!(
         cancel_sent(&launcher),

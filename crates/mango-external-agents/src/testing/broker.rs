@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
+use tokio::sync::Notify;
 
 use crate::host::Clock;
 use crate::permission::{BrokerDecision, PermissionBroker, PermissionRequest};
@@ -21,6 +22,7 @@ use crate::permission::{BrokerDecision, PermissionBroker, PermissionRequest};
 pub struct RecordingBroker {
     decision: BrokerDecision,
     requests: Arc<Mutex<Vec<PermissionRequest>>>,
+    requested: Arc<Notify>,
 }
 
 impl RecordingBroker {
@@ -29,6 +31,7 @@ impl RecordingBroker {
         Self {
             decision,
             requests: Arc::new(Mutex::new(Vec::new())),
+            requested: Arc::new(Notify::new()),
         }
     }
 
@@ -39,6 +42,26 @@ impl RecordingBroker {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
+
+    /// Waits until at least `count` questions have reached this broker.
+    ///
+    /// Bound the wait in tests where failure could prevent the question from arriving.
+    pub async fn wait_for_requests(&self, count: usize) {
+        loop {
+            let mut requested = std::pin::pin!(self.requested.notified());
+            requested.as_mut().enable();
+            let ready = self
+                .requests
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len()
+                >= count;
+            if ready {
+                return;
+            }
+            requested.await;
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -48,6 +71,7 @@ impl PermissionBroker for RecordingBroker {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(request.clone());
+        self.requested.notify_waiters();
         self.decision.clone()
     }
 }
@@ -139,6 +163,48 @@ mod tests {
         assert!(matches!(decision, BrokerDecision::Deny { .. }));
         assert_eq!(broker.requests().len(), 1);
         assert_eq!(broker.requests()[0].id().as_str(), "req-1");
+    }
+
+    #[tokio::test]
+    async fn request_waiters_acknowledge_recorded_questions_and_wake_every_waiter() {
+        use std::future::Future;
+        use std::task::Poll;
+        let broker = RecordingBroker::new(BrokerDecision::Ask);
+        broker.wait_for_requests(0).await;
+        let mut tasks = Vec::new();
+        let mut ready = Vec::new();
+        for _ in 0..2 {
+            let observed = broker.clone();
+            let (registered, receiver) = tokio::sync::oneshot::channel();
+            ready.push(receiver);
+            tasks.push(tokio::spawn(async move {
+                let mut wait = std::pin::pin!(observed.wait_for_requests(1));
+                std::future::poll_fn(|cx| {
+                    assert!(wait.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                registered.send(()).expect("waiting test");
+                wait.await;
+            }));
+        }
+        for registered in ready {
+            registered.await.expect("waiter registration");
+        }
+        assert!(tasks.iter().all(|task| !task.is_finished()));
+        assert!(matches!(
+            broker.decide(&request()).await,
+            BrokerDecision::Ask
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for task in tasks {
+                task.await.expect("notified waiter");
+            }
+        })
+        .await
+        .expect("every registered waiter must wake");
+        broker.wait_for_requests(1).await;
+        assert_eq!(broker.requests().len(), 1);
     }
 
     #[test]
