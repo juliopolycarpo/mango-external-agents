@@ -2,9 +2,10 @@
 """Reject dependency declarations that bypass the workspace's version and feature policy.
 
 Members inherit each dependency with ``workspace = true`` and choose their own additive features.
-The workspace chooses versions and default features, and cannot impose features on every member.
-The sole exception is the exact, feature-free ``agent-client-protocol-schema`` pin in the ACP
-manifest. No other manifest or workspace entry may name that crate.
+The workspace chooses versions and default features; members cannot explicitly request ``default``.
+These checks govern manifest entries, not Cargo's feature unification across dependency edges.
+The sole exception is the exact, feature-free ``agent-client-protocol-schema`` registry pin in the
+ACP manifest. No other manifest or workspace entry may name that crate.
 
 Usage: check-workspace-dependencies.py ROOT_MANIFEST MEMBER_MANIFEST...
 """
@@ -50,9 +51,7 @@ def member_offenders(path, schema_manifest):
                     and isinstance(version, str)
                     and EXACT_VERSION.fullmatch(version) is not None
                     and spec.get("default-features") is False
-                    and "features" not in spec
-                    and "default_features" not in spec
-                    and not spec.get("workspace")
+                    and set(spec) == {"version", "default-features"}
                 )
                 if not valid_schema:
                     yield "schema", line
@@ -60,7 +59,11 @@ def member_offenders(path, schema_manifest):
             inherits = isinstance(spec, dict) and spec.get("workspace") is True
             if not inherits:
                 yield "inheritance", line
-            elif "default-features" in spec or "default_features" in spec:
+            elif (
+                "default-features" in spec
+                or "default_features" in spec
+                or (isinstance(spec.get("features"), list) and "default" in spec["features"])
+            ):
                 yield "defaults", line
 
 
@@ -92,11 +95,11 @@ def main(arguments):
     )
     expectations = {
         "inheritance": "expected each member dependency to use workspace = true, received:",
-        "defaults": "expected inherited dependencies to omit default-features so the workspace "
-        "controls defaults, received:",
+        "defaults": "expected inherited dependencies to omit default-features and the default "
+        "feature so the workspace controls defaults, received:",
         "features": "expected workspace dependency entries to omit features, received:",
         "schema": f"expected {SCHEMA} only as an exact pin with default-features = false and "
-        "no features in crates/mango-agent-acp/Cargo.toml [dependencies], received:",
+        "no other keys in crates/mango-agent-acp/Cargo.toml [dependencies], received:",
     }
     for kind, expectation in expectations.items():
         lines = [line for found_kind, line in found if found_kind == kind]
