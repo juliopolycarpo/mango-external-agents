@@ -31,7 +31,7 @@ use mango_external_agents::session::{
 use mango_external_agents::state::SessionStatus;
 use mango_external_agents::{
     Capability, Dispatch, Error, EventSink, HostContext, PermissionResponse, ProcessControl,
-    Result, SessionLifecycle, TurnStream,
+    Result, SessionLifecycle, StructureClose, TurnStream,
 };
 
 use crate::client::{
@@ -1465,6 +1465,30 @@ fn detach_retry_cancel_cleanup(
     });
 }
 
+/// Drains what the reducer still owes in order. The selected terminal has its own reserve.
+pub(crate) async fn emit_terminal_activity_events(
+    sink: &EventSink,
+    mut reducer: reducer::Reducer,
+    status: ActivityStatus,
+) {
+    for event in reducer.finish_with(status) {
+        let result = match event {
+            EventKind::ActivityUpdated { call_id, update } => {
+                sink.emit_closing_activity_update(call_id, update).await
+            }
+            EventKind::ActivityCompleted { call_id, result } => {
+                sink.emit_close(StructureClose::activity(call_id, result))
+                    .await
+            }
+            EventKind::ReasoningEnded => sink.emit_close(StructureClose::reasoning()).await,
+            _ => unreachable!("the reducer only emits activity updates and closes at turn end"),
+        };
+        if result.is_err() {
+            break;
+        }
+    }
+}
+
 /// How one ACP turn ends, decided before anything is emitted.
 ///
 /// Deciding first is what lets the calls the agent left running close with a status that agrees
@@ -1495,10 +1519,8 @@ impl Ending {
     /// ```ignore
     /// Ending::Complete.emit(&turn.sink, reducer).await;
     /// ```
-    async fn emit(self, sink: &EventSink, mut reducer: reducer::Reducer) {
-        for kind in reducer.finish_with(self.call_status()) {
-            let _ = sink.emit(kind).await;
-        }
+    async fn emit(self, sink: &EventSink, reducer: reducer::Reducer) {
+        emit_terminal_activity_events(sink, reducer, self.call_status()).await;
         let _ = match self {
             Self::Complete => sink.complete().await,
             Self::Cancel(reason) => sink.cancel(reason).await,

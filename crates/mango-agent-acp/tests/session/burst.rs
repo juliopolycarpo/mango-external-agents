@@ -129,20 +129,17 @@ const STALLED_BURST: usize = 48;
 async fn terminal_committed_while_unread(
     turn: &TurnStream,
 ) -> mango_external_agents::TerminalStatus {
-    let waited = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Some(status) = turn.terminal_status() {
-                return status;
-            }
-            tokio::task::yield_now().await;
+    let began = std::time::Instant::now();
+    loop {
+        if let Some(status) = turn.terminal_status() {
+            return status;
         }
-    })
-    .await;
-    waited.unwrap_or_else(|_| {
-        panic!(
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
             "expected a committed terminal while the host is not reading | received: none within 5s"
-        )
-    })
+        );
+        tokio::task::yield_now().await;
+    }
 }
 
 /// A burst of updates directly followed by the prompt response, to a host that has stopped reading:
@@ -194,6 +191,143 @@ async fn a_burst_ending_in_the_prompt_response_reaches_a_stalled_host_whole_and_
         "expected live children after close: 0 | received: {}",
         launcher.live_children()
     );
+}
+
+/// Hold an activity update on the paused clock so it only reaches the sink during terminal drain.
+#[tokio::test(start_paused = true)]
+async fn an_unread_turn_keeps_its_terminal_when_activity_cleanup_reaches_capacity() {
+    let mut mismatches = Vec::new();
+    for (stop_reason, invalid_call, terminal, terminal_events) in [
+        (
+            "end_turn",
+            false,
+            mango_external_agents::TerminalStatus::Completed,
+            vec!["Completed"],
+        ),
+        (
+            "cancelled",
+            false,
+            mango_external_agents::TerminalStatus::Cancelled {
+                reason: CancelReason::Requested,
+            },
+            vec!["Cancelled", "Completed"],
+        ),
+        (
+            "end_turn",
+            true,
+            mango_external_agents::TerminalStatus::Failed {
+                code: mango_external_agents::ErrorCode::from_static("acp-refused-event"),
+            },
+            vec!["acp-refused-event"],
+        ),
+    ] {
+        for capacity in 2..=5 {
+            let mut updates = vec![serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "running",
+                "title": "Read notes",
+                "kind": "read",
+                "status": "in_progress"
+            })];
+            if capacity > 2 {
+                for title in ["First update", "Coalesced update"] {
+                    updates.push(serde_json::json!({
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "running",
+                        "title": title
+                    }));
+                }
+            }
+            if invalid_call {
+                updates.push(serde_json::json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": " ",
+                    "title": "Invalid call id",
+                    "status": "in_progress"
+                }));
+            }
+            let (session, launcher) = open_with(
+                FakeAcpAgent::new()
+                    .with_updates(updates)
+                    .with_stop_reason(stop_reason),
+                Limits {
+                    turn_channel_capacity: capacity,
+                    ..Limits::default()
+                },
+            )
+            .await;
+            let mut turn = session
+                .start_turn(TurnRequest::new("turn-1", "read the notes"))
+                .await
+                .expect("expected a turn");
+            let status = terminal_committed_while_unread(&turn).await;
+            let events = drain(&mut turn).await;
+            session
+                .close(CloseReason::Requested)
+                .await
+                .expect("expected a clean close");
+            assert_eq!(
+                launcher.live_children(),
+                0,
+                "expected no live child after close"
+            );
+            if status != terminal {
+                mismatches.push(format!(
+                    "expected terminal {terminal:?} at capacity {capacity} | received {status:?}"
+                ));
+                continue;
+            }
+            let mut expected = vec!["TurnStarted", "ActivityStarted"];
+            if capacity > 2 {
+                expected.push("First update");
+            }
+            if capacity > 3 {
+                expected.push("Coalesced update");
+            }
+            if capacity > 4 {
+                expected.push(match terminal {
+                    mango_external_agents::TerminalStatus::Completed => "ActivityCompleted",
+                    mango_external_agents::TerminalStatus::Cancelled { .. } => "ActivityCancelled",
+                    _ => "ActivityFailed",
+                });
+            }
+            expected.extend(terminal_events.iter().copied());
+            let received: Vec<_> = events
+                .iter()
+                .map(|event| match event {
+                    EventKind::TurnStarted { .. } => "TurnStarted",
+                    EventKind::ActivityStarted { call_id, .. } if call_id == "running" => {
+                        "ActivityStarted"
+                    }
+                    EventKind::ActivityUpdated { call_id, update } if call_id == "running" => {
+                        update.title.as_deref().expect("expected the updated title")
+                    }
+                    EventKind::ActivityCompleted { call_id, result } if call_id == "running" => {
+                        match result.status {
+                            mango_external_agents::ActivityStatus::Completed => "ActivityCompleted",
+                            mango_external_agents::ActivityStatus::Cancelled => "ActivityCancelled",
+                            mango_external_agents::ActivityStatus::Failed => "ActivityFailed",
+                            _ => {
+                                panic!("expected a terminal activity status | received {result:?}")
+                            }
+                        }
+                    }
+                    EventKind::Cancelled {
+                        reason: CancelReason::Requested,
+                    } => "Cancelled",
+                    EventKind::Completed => "Completed",
+                    EventKind::Error { error } => error.code.as_str(),
+                    other => panic!("expected terminal cleanup events | received {other:?}"),
+                })
+                .collect();
+            if received != expected {
+                mismatches.push(format!(
+                    "expected {expected:?} before and at {terminal:?} at capacity {capacity} | received {received:?}"
+                ));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
 /// Opens a session under `limits`, runs one turn against `agent`, and asserts the turn ends with a

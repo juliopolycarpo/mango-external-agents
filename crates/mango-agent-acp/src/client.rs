@@ -1491,9 +1491,8 @@ async fn on_unreadable_update(state: &Arc<SessionState>) {
 /// work before it releases the generation. That owner adds nothing to a terminal it did not write,
 /// so what the turn still owes is settled here first, in the order the prompt owner would have
 /// used: the questions still waiting are withdrawn and their resolutions flushed, the calls,
-/// reasoning and plan the agent left running are closed as failed, and only then does the terminal
-/// commit. A host therefore never sees a transcript that ends with an activity still running or a
-/// question still waiting.
+/// reasoning and plan the agent left running are closed as failed where the payload budget
+/// permits, and then the reserved terminal commits.
 async fn report_refused_event(state: &SessionState, turn: &TurnHandle, error: &Error) {
     if !matches!(error, Error::InvalidVendorValue { .. }) || turn.sink.is_terminal() {
         return;
@@ -1505,14 +1504,13 @@ async fn report_refused_event(state: &SessionState, turn: &TurnHandle, error: &E
     if turn.sink.is_terminal() {
         return;
     }
-    let Some((_, _, mut closing)) = state.prepare_terminal(turn, TerminalPublisher::RefusedEvent)
+    let Some((_, _, closing)) = state.prepare_terminal(turn, TerminalPublisher::RefusedEvent)
     else {
         return;
     };
     let _ = turn.approvals.flush(&turn.sink).await;
-    for kind in closing.finish_with(ActivityStatus::Failed) {
-        let _ = turn.sink.emit(kind).await;
-    }
+    crate::session::emit_terminal_activity_events(&turn.sink, closing, ActivityStatus::Failed)
+        .await;
     let _ = turn
         .sink
         .fail(VendorError::new(
