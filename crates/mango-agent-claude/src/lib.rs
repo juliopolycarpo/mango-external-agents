@@ -57,6 +57,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scratch_allocation_skips_existing_directories_and_files() {
+        use std::sync::atomic::AtomicU64;
+
+        let parent = crate::test_support::private_scratch("collision-parent");
+        let candidate =
+            |index| parent.join(format!("mea-collision-{}-{index}", std::process::id()));
+        let directory = candidate(0);
+        let file = candidate(1);
+        crate::test_support::private_directory(&directory);
+        std::fs::write(&file, b"retained fixture").expect("expected to create the collision file");
+        let next = AtomicU64::new(0);
+        let allocated = std::panic::catch_unwind(|| {
+            crate::test_support::private_scratch_with_counter(&parent, "collision", &next)
+        });
+        assert!(
+            allocated.is_ok(),
+            "expected allocation to skip existing candidates {} and {} | received a panic",
+            directory.display(),
+            file.display()
+        );
+        let allocated = allocated.expect("expected a fresh scratch directory");
+        assert_eq!(allocated, candidate(2));
+        assert!(
+            directory.is_dir(),
+            "expected the pre-existing directory to remain"
+        );
+        assert_eq!(
+            std::fs::read(&file).expect("expected the collision file"),
+            b"retained fixture"
+        );
+        std::fs::remove_dir_all(parent).expect("expected to remove the test's private parent");
+    }
+
     /// The shared scratch helper, checked where it is compiled once. Under `umask 002` a plain
     /// `create_dir` made a group-writable root, which the harness refuses for an MCP artifact.
     #[test]

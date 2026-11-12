@@ -826,10 +826,28 @@ impl ByteSink for FakeStdin {
 /// The caller removes it; a test that leaves one behind leaves an empty private directory.
 pub fn private_scratch(label: &str) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let index = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("mea-{label}-{}-{index}", std::process::id()));
-    private_directory(&path);
-    path
+    private_scratch_with_counter(&std::env::temp_dir(), label, &NEXT)
+}
+
+/// Allocates a scratch root with a caller-owned counter so collisions can be reproduced.
+pub(crate) fn private_scratch_with_counter(
+    parent: &std::path::Path,
+    label: &str,
+    next: &std::sync::atomic::AtomicU64,
+) -> PathBuf {
+    loop {
+        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = parent.join(format!("mea-{label}-{}-{index}", std::process::id()));
+        match try_private_directory(&path) {
+            Ok(()) => return path,
+            // A failed earlier run can leave this name behind before its PID is reused.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!(
+                "expected to create a fresh private scratch directory {} | received: {error}",
+                path.display()
+            ),
+        }
+    }
 }
 
 /// Creates `path` as an owner-only directory whatever the process umask is.
@@ -837,18 +855,23 @@ pub fn private_scratch(label: &str) -> PathBuf {
 /// For a test that needs a directory with a name of its own choosing inside a
 /// [`private_scratch`] root, and needs the harness to accept it as a scratch root.
 pub fn private_directory(path: &std::path::Path) {
+    if let Err(error) = try_private_directory(path) {
+        panic!(
+            "expected to create the private directory {} | received: {error}",
+            path.display()
+        );
+    }
+}
+
+/// Atomically creates an owner-only directory, leaving collision handling to its caller.
+fn try_private_directory(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(not(unix))]
     let builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    if let Err(error) = builder.create(path) {
-        panic!(
-            "expected to create the private directory {} | received: {error}",
-            path.display()
-        );
-    }
+    builder.create(path)
 }
 
 /// A host whose launcher is this fake, with a frozen clock and the ordinary caps.
