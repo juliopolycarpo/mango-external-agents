@@ -837,7 +837,10 @@ pub fn private_scratch(label: &str) -> PathBuf {
 /// For a test that needs a directory with a name of its own choosing inside a
 /// [`private_scratch`] root, and needs the harness to accept it as a scratch root.
 pub fn private_directory(path: &std::path::Path) {
+    #[cfg(unix)]
     let mut builder = std::fs::DirBuilder::new();
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     if let Err(error) = builder.create(path) {
