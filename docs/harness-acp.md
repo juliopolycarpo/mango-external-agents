@@ -329,8 +329,10 @@ cannot in general be kept off the next turn. One case is handled: a `tool_call_u
 `session/request_permission`, for a call the previous turn's terminal closed while the agent still
 had it running is the previous turn's. The update is dropped without a word, since it is the tail of
 a turn the host already saw end and a notice would point at the turn now running; the question is
-answered `cancelled`. At most 256 such call ids are remembered, from the last terminal only. Any
-other late frame, a text chunk say, is the running turn's.
+answered `cancelled`. The [permission handler](https://agentclientprotocol.com/protocol/v1/tool-calls#requesting-permission)
+captures the active turn before checking those call IDs. If the captured turn ends during the handoff,
+the request cannot reach its replacement. At most 256 such call IDs are remembered, from the last
+terminal only. Any other late frame, a text chunk say, is the running turn's.
 
 A turn ends as `Cancelled` in two cases. The agent answered its prompt with
 `stop_reason: cancelled`, which is believed and reported as `Requested` when no reason was
