@@ -401,6 +401,18 @@ expect_workspace_rejection root.toml target-own-version.toml 'target-own-version
 expect_workspace_rejection featured-root.toml inherits.toml 'featured-root.toml: [workspace.dependencies] shared = ' "'features': ['extra']"
 expect_workspace_rejection root.toml crates/mango-agent-claude/Cargo.toml 'mango-agent-claude/Cargo.toml: [dependencies] agent-client-protocol-schema = ' "=1.0.0"
 expect_workspace_rejection schema-root.toml inherits.toml 'schema-root.toml: [workspace.dependencies] agent-client-protocol-schema = ' "=1.0.0"
+printf '[workspace.dependencies]\n\n[patch.crates-io]\nagent-client-protocol-schema = { path = "fork" }\n' > "$workspace_fixture/schema-patch-root.toml"
+expect_workspace_rejection schema-patch-root.toml inherits.toml 'schema-patch-root.toml: [patch.crates-io] agent-client-protocol-schema = ' "'path': 'fork'"
+printf '[workspace.dependencies]\n\n[patch."https://example.invalid/index"]\nschema-alias = { package = "agent-client-protocol-schema", path = "fork" }\n' > "$workspace_fixture/schema-patch-root.toml"
+expect_workspace_rejection schema-patch-root.toml inherits.toml 'schema-patch-root.toml: [patch.https://example.invalid/index] schema-alias = ' "'package': 'agent-client-protocol-schema'"
+for replacement in 'agent-client-protocol-schema:1.0.0' 'agent-client-protocol-schema@1.0.0' 'https://example.invalid/index#agent-client-protocol-schema@1.0.0' 'https://example.invalid/index#agent-client-protocol-schema:1.0.0' 'https://example.invalid/agent-client-protocol-schema#1.0.0'; do
+  printf '[workspace.dependencies]\n\n[replace]\n"%s" = { path = "fork" }\n' "$replacement" > "$workspace_fixture/schema-replace-root.toml"
+  expect_workspace_rejection schema-replace-root.toml inherits.toml 'schema-replace-root.toml: [replace] ' "$replacement"
+done
+printf '[workspace.dependencies]\n\n[patch.crates-io]\nother = { path = "fork" }\n' > "$workspace_fixture/allowed-patch-root.toml"
+python3 scripts/check-workspace-dependencies.py "$workspace_fixture/allowed-patch-root.toml" "$workspace_fixture/inherits.toml"
+printf '[workspace.dependencies]\n\n[replace]\n"other:1.0.0" = { path = "fork" }\n"https://example.invalid/agent-client-protocol-schema#other@1.0.0" = { path = "fork" }\n' > "$workspace_fixture/allowed-replace-root.toml"
+python3 scripts/check-workspace-dependencies.py "$workspace_fixture/allowed-replace-root.toml" "$workspace_fixture/inherits.toml"
 printf '[workspace.dependencies]\nschema-alias = { package = "agent-client-protocol-schema", version = "=1.0.0" }\n' > "$workspace_fixture/schema-alias-root.toml"
 expect_workspace_rejection schema-alias-root.toml inherits.toml 'schema-alias-root.toml: [workspace.dependencies] schema-alias = ' "'package': 'agent-client-protocol-schema'"
 printf '[dependencies]\nschema-alias = { package = "agent-client-protocol-schema", version = "=1.0.0", default-features = false }\n' > "$workspace_fixture/crates/mango-agent-claude/Cargo.toml"

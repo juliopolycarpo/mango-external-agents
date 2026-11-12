@@ -6,7 +6,8 @@ The workspace chooses versions and default features; members cannot explicitly r
 Dependency feature forwarding in ``[features]`` follows the same rules. These checks govern
 manifest entries, not Cargo's feature unification across dependency edges.
 The sole exception is the exact, feature-free ``agent-client-protocol-schema`` registry pin in the
-ACP manifest. No other manifest or workspace entry may name that crate.
+ACP manifest. No other manifest or workspace entry may name that crate, and root patches and
+replacements cannot override it. Cargo configuration outside these manifests is not checked.
 
 Usage: check-workspace-dependencies.py ROOT_MANIFEST MEMBER_MANIFEST...
 """
@@ -87,7 +88,8 @@ def member_offenders(path, schema_manifest, workspace_schema_names):
 
 def workspace_offenders(path):
     """Yields a reason and declaration for each disallowed workspace dependency entry."""
-    entries = load(path).get("workspace", {}).get("dependencies", {})
+    manifest = load(path)
+    entries = manifest.get("workspace", {}).get("dependencies", {})
     for name, spec in entries.items():
         line = f"{path}: [workspace.dependencies] {name} = {spec}"
         package = spec.get("package", name) if isinstance(spec, dict) else name
@@ -95,6 +97,23 @@ def workspace_offenders(path):
             yield "schema", line
         if isinstance(spec, dict) and "features" in spec:
             yield "features", line
+
+    for registry, patches in manifest.get("patch", {}).items():
+        for name, spec in patches.items():
+            package = spec.get("package", name) if isinstance(spec, dict) else name
+            if name == SCHEMA or package == SCHEMA:
+                yield "schema", f"{path}: [patch.{registry}] {name} = {spec}"
+
+    for package_id, spec in manifest.get("replace", {}).items():
+        source, separator, fragment = package_id.partition("#")
+        if separator and fragment[:1].isdigit():
+            # A version-only fragment takes its package name from the URL's last segment.
+            name = source.rstrip("/").rsplit("/", 1)[-1]
+        else:
+            name = fragment if separator else source
+            name = name.split("@", 1)[0].split(":", 1)[0]
+        if name == SCHEMA:
+            yield "schema", f"{path}: [replace] {package_id} = {spec}"
 
 
 def main(arguments):
@@ -125,7 +144,7 @@ def main(arguments):
         "features": "expected workspace dependency entries to omit features, received:",
         "schema": f"expected {SCHEMA} only as an exact pin with default-features = false and "
         "no other keys in crates/mango-agent-acp/Cargo.toml [dependencies] and no forwarded "
-        "schema features, received:",
+        "schema features, root patches or replacements, received:",
     }
     for kind, expectation in expectations.items():
         lines = [line for found_kind, line in found if found_kind == kind]
