@@ -107,8 +107,8 @@ def workspace_offenders(path):
     for package_id, spec in manifest.get("replace", {}).items():
         source, separator, fragment = package_id.partition("#")
         if separator and fragment[:1].isdigit():
-            # A version-only fragment takes its package name from the URL's last segment.
-            name = source.rstrip("/").rsplit("/", 1)[-1]
+            # A version-only fragment takes its package name from the URL path, before any query.
+            name = source.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
         else:
             name = fragment if separator else source
             name = name.split("@", 1)[0].split(":", 1)[0]

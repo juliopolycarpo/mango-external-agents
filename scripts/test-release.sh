@@ -405,13 +405,13 @@ printf '[workspace.dependencies]\n\n[patch.crates-io]\nagent-client-protocol-sch
 expect_workspace_rejection schema-patch-root.toml inherits.toml 'schema-patch-root.toml: [patch.crates-io] agent-client-protocol-schema = ' "'path': 'fork'"
 printf '[workspace.dependencies]\n\n[patch."https://example.invalid/index"]\nschema-alias = { package = "agent-client-protocol-schema", path = "fork" }\n' > "$workspace_fixture/schema-patch-root.toml"
 expect_workspace_rejection schema-patch-root.toml inherits.toml 'schema-patch-root.toml: [patch.https://example.invalid/index] schema-alias = ' "'package': 'agent-client-protocol-schema'"
-for replacement in 'agent-client-protocol-schema:1.0.0' 'agent-client-protocol-schema@1.0.0' 'https://example.invalid/index#agent-client-protocol-schema@1.0.0' 'https://example.invalid/index#agent-client-protocol-schema:1.0.0' 'https://example.invalid/agent-client-protocol-schema#1.0.0'; do
+for replacement in 'agent-client-protocol-schema:1.0.0' 'agent-client-protocol-schema@1.0.0' 'https://example.invalid/index#agent-client-protocol-schema@1.0.0' 'https://example.invalid/index#agent-client-protocol-schema:1.0.0' 'https://example.invalid/agent-client-protocol-schema#1.0.0' 'git+https://example.invalid/agent-client-protocol-schema?branch=main#1.0.0' 'git+https://example.invalid/agent-client-protocol-schema?rev=0123456789abcdef0123456789abcdef01234567#1.0.0'; do
   printf '[workspace.dependencies]\n\n[replace]\n"%s" = { path = "fork" }\n' "$replacement" > "$workspace_fixture/schema-replace-root.toml"
   expect_workspace_rejection schema-replace-root.toml inherits.toml 'schema-replace-root.toml: [replace] ' "$replacement"
 done
 printf '[workspace.dependencies]\n\n[patch.crates-io]\nother = { path = "fork" }\n' > "$workspace_fixture/allowed-patch-root.toml"
 python3 scripts/check-workspace-dependencies.py "$workspace_fixture/allowed-patch-root.toml" "$workspace_fixture/inherits.toml"
-printf '[workspace.dependencies]\n\n[replace]\n"other:1.0.0" = { path = "fork" }\n"https://example.invalid/agent-client-protocol-schema#other@1.0.0" = { path = "fork" }\n' > "$workspace_fixture/allowed-replace-root.toml"
+printf '[workspace.dependencies]\n\n[replace]\n"other:1.0.0" = { path = "fork" }\n"https://example.invalid/agent-client-protocol-schema#other@1.0.0" = { path = "fork" }\n"git+https://example.invalid/other?branch=main#1.0.0" = { path = "fork" }\n' > "$workspace_fixture/allowed-replace-root.toml"
 python3 scripts/check-workspace-dependencies.py "$workspace_fixture/allowed-replace-root.toml" "$workspace_fixture/inherits.toml"
 printf '[workspace.dependencies]\nschema-alias = { package = "agent-client-protocol-schema", version = "=1.0.0" }\n' > "$workspace_fixture/schema-alias-root.toml"
 expect_workspace_rejection schema-alias-root.toml inherits.toml 'schema-alias-root.toml: [workspace.dependencies] schema-alias = ' "'package': 'agent-client-protocol-schema'"
