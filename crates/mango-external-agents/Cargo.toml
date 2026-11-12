@@ -38,33 +38,33 @@ launcher-tokio = [
 testing = []
 
 [dependencies]
-async-trait = "0.1.92"
-ring = { version = "0.17.14", default-features = false, features = ["std"] }
-serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
-serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
-tokio = { version = "1.53.3", default-features = false, features = ["macros", "rt", "sync", "time"] }
+async-trait.workspace = true
+ring = { workspace = true, features = ["std"] }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
-futures-util = { version = "0.3.34", default-features = false, features = ["sink"], optional = true }
+futures-util = { workspace = true, features = ["sink"], optional = true }
 # TLS is `ring` everywhere: named here with no default features, so the provider is this crate's
 # choice rather than whatever a transitive default would have picked.
-rustls = { version = "0.23.46", default-features = false, features = ["logging", "ring", "std", "tls12"], optional = true }
-tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"], optional = true }
+rustls = { workspace = true, features = ["logging", "ring", "std", "tls12"], optional = true }
+tokio-tungstenite = { workspace = true, features = ["connect", "handshake", "rustls-tls-native-roots"], optional = true }
 
 # Signals for the default launcher's escalation. `unsafe_code` is forbidden in this workspace, so
 # the process-group signal goes through a safe binding rather than a raw `libc::kill`.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.3", default-features = false, features = ["process", "signal"], optional = true }
+nix = { workspace = true, features = ["process", "signal"], optional = true }
 
 # Windows jobs provide containment that a child PID cannot: a process is suspended before the
 # outer Job owns it, and resumed only after the inner Job is ready. The outer Job's safe process
 # list proves it is empty, so a leader's exit cannot make a surviving helper look reaped.
 [target.'cfg(windows)'.dependencies]
-process-wrap = { version = "10.0.0", default-features = false, features = ["creation-flags", "job-object", "kill-on-drop", "tokio1"], optional = true }
-win32job = { version = "2.1.0", default-features = false, optional = true }
-windows = { version = "0.62.2", default-features = false, features = ["Win32_System_Threading"], optional = true }
+process-wrap = { workspace = true, features = ["creation-flags", "job-object", "kill-on-drop", "tokio1"], optional = true }
+win32job = { workspace = true, optional = true }
+windows = { workspace = true, features = ["Win32_System_Threading"], optional = true }
 
 [dev-dependencies]
-tokio = { version = "1.53.3", default-features = false, features = ["macros", "net", "rt-multi-thread", "test-util"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }
 
 # Non-gating benchmarks: plain `harness = false` binaries with no extra dependencies. Run them with
 # `cargo bench -p mango-external-agents`; see docs/benchmarks.md.

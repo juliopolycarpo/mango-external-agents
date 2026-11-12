@@ -17,8 +17,8 @@ name = "mea"
 path = "src/main.rs"
 
 [dependencies]
-async-trait = "0.1.92"
-clap = { version = "4.6.6", features = ["derive"] }
+async-trait.workspace = true
+clap = { workspace = true, features = ["derive"] }
 mango-agent-acp.workspace = true
 mango-agent-claude.workspace = true
 mango-agent-codex.workspace = true
@@ -28,14 +28,14 @@ mango-external-agents = { workspace = true, features = ["launcher-tokio", "stdio
 
 # The fixture digests are SHA-256, from the crypto this workspace already ships: TLS is `ring`
 # everywhere, so hashing a captured file adds a call rather than a dependency.
-ring = "0.17.14"
+ring = { workspace = true, features = ["std"] }
 
-serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
-tempfile = "3.27.0"
-tokio = { version = "1.53.3", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
+serde_json = { workspace = true, features = ["std"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [dev-dependencies]
 # `mea turn --cancel-after` is driven end to end against the scripted ACP agent.
 mango-agent-acp = { workspace = true, features = ["testing"] }
 mango-external-agents = { workspace = true, features = ["testing"] }
-tokio = { version = "1.53.3", default-features = false, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util"] }

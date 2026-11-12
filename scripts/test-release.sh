@@ -361,6 +361,34 @@ trap - EXIT
 scripts/check-dev-dependencies.sh >/dev/null
 echo 'dev-dependency packaging checks passed'
 
+# A third-party version is written once, in [workspace.dependencies]. A member that names its own
+# is refused, the schema crate AGENTS.md keeps inside mango-agent-acp excepted, and so is a
+# workspace entry that lists features, because no member could take them off again.
+workspace_fixture=$(mktemp -d)
+trap 'rm -rf "$workspace_fixture"' EXIT
+printf '[workspace.dependencies]\nshared = { version = "1.0", default-features = false }\nplain = "2.0"\n' > "$workspace_fixture/root.toml"
+printf '[workspace.dependencies]\nshared = { version = "1.0", features = ["extra"] }\n' > "$workspace_fixture/featured-root.toml"
+printf '[dependencies]\nshared = { workspace = true, features = ["extra"] }\nplain.workspace = true\nagent-client-protocol-schema = "=1.0.0"\n\n[target.x.dev-dependencies]\nshared.workspace = true\n' > "$workspace_fixture/inherits.toml"
+printf '[dependencies]\nshared = { workspace = true }\n\n[dev-dependencies]\nplain = "2.0"\n' > "$workspace_fixture/own-version.toml"
+python3 scripts/check-workspace-dependencies.py "$workspace_fixture/root.toml" "$workspace_fixture/inherits.toml"
+expect_workspace_rejection() {
+  local root=$1 member=$2 expected=$3
+  if python3 scripts/check-workspace-dependencies.py "$workspace_fixture/$root" "$workspace_fixture/$member" 2>"$workspace_fixture/rejection.err"; then
+    echo "expected rejection of $root with $member, received success" >&2
+    exit 1
+  fi
+  grep -q "$expected" "$workspace_fixture/rejection.err" || {
+    echo "expected the rejection to contain '$expected', received: $(cat "$workspace_fixture/rejection.err")" >&2
+    exit 1
+  }
+}
+expect_workspace_rejection root.toml own-version.toml 'own-version.toml: \[dev-dependencies\] plain = 2.0'
+expect_workspace_rejection featured-root.toml inherits.toml 'featured-root.toml: \[workspace.dependencies\] shared = '
+rm -rf "$workspace_fixture"
+trap - EXIT
+python3 scripts/check-workspace-dependencies.py Cargo.toml crates/*/Cargo.toml examples/*/Cargo.toml
+echo 'workspace dependency checks passed'
+
 # A crate README's install requirement follows the release rule: `major.minor` for a release, the
 # full version for a pre-release. 0.3.0 shipped "0.1", which no 0.3 release satisfies. Every
 # refusal has to name the README, the value it carries and the value it should carry.
@@ -432,7 +460,8 @@ expect_readme_refusal not-a-version "expected a version like 0.3.1 or 0.4.0-rc.1
 # `check-versions.sh` is what `check.sh`, CI and the release workflow run, so the README rule has to
 # be wired into it: a workspace in lockstep at 0.3.1 whose README says "0.1" must not pass.
 mkdir -p "$readme_fixture/tree/scripts" "$readme_fixture/tree/crates/demo" "$readme_fixture/tree/examples/demo-host"
-cp scripts/check-versions.sh scripts/check-readme-requirements.sh scripts/check-consumer-pin.sh "$readme_fixture/tree/scripts/"
+cp scripts/check-versions.sh scripts/check-readme-requirements.sh scripts/check-consumer-pin.sh \
+  scripts/check-workspace-dependencies.py "$readme_fixture/tree/scripts/"
 mkdir -p "$readme_fixture/tree/tests/standalone-current"
 printf '[dependencies]\nmango-demo = { version = "=0.3.1", default-features = false }\n' > "$readme_fixture/tree/tests/standalone-current/Cargo.toml"
 printf '[workspace.package]\nversion = "0.3.1"\n\n[workspace.dependencies]\nmango-demo = { path = "crates/demo", version = "0.3.1" }\n' > "$readme_fixture/tree/Cargo.toml"
