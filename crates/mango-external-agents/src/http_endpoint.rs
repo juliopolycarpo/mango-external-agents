@@ -6,8 +6,8 @@
 //! cannot encode, is refused here, before a vendor process can observe it.
 //!
 //! The grammar is deliberately narrower than RFC 3986: an ASCII `http` or `https` URL whose host
-//! is a registered name or a bracketed IPv6 literal. Every harness applies the same one, so a
-//! server one vendor accepts is not refused by the next. The tests hold it against the `http`
+//! is a registered name or a bracketed IPv6 literal. The ACP and Codex harnesses apply the same
+//! grammar. The tests hold it against the `http`
 //! crate, which the harnesses used before: nothing accepted here is something that crate refuses.
 
 /// The longest URL [`is_http_url`] reads, in bytes.
@@ -122,10 +122,10 @@ fn is_authority(authority: &str) -> bool {
         let Some((literal, after_host)) = bracketed.split_once(']') else {
             return false;
         };
-        // Eight groups have seven colons between them; an IPv4 tail brings its own dots.
+        // Eight groups have seven separators; `::` can add an eighth colon at either end.
         let is_ipv6_literal = !literal.is_empty()
             && literal.len() <= 45
-            && literal.bytes().filter(|byte| *byte == b':').count() <= 7
+            && literal.bytes().filter(|byte| *byte == b':').count() <= 8
             && literal
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() || matches!(byte, b':' | b'.'));
@@ -229,6 +229,9 @@ mod tests {
             "http://[::1]/mcp",
             "http://[2001:db8::1]:8080/mcp",
             "http://[::ffff:192.0.2.1]/mcp",
+            "http://[::1:2:3:4:5:6:7]/mcp",
+            "http://[1:2:3:4:5:6:7::]/mcp",
+            "http://[::ffff:0:0:0:0:0:1]/mcp",
         ] {
             assert!(
                 is_http_url(url),
@@ -263,6 +266,10 @@ mod tests {
             "https://[::1/mcp",
             "https://[]/mcp",
             "https://[::1]x/mcp",
+            "https://[::1:2:3:4:5:6:7:8]/mcp",
+            "https://[fe80::1%25eth0]/mcp",
+            "https://docs.example/{\"a\":1}",
+            "https://docs.example/\"q\"",
             "https://docs.exämple/mcp",
             "https://docs.example/mcp/é",
         ] {
