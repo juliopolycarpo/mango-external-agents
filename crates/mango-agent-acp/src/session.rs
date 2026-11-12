@@ -1474,7 +1474,9 @@ pub(crate) async fn emit_terminal_activity_events(
     for event in reducer.finish_with(status) {
         let result = match event {
             EventKind::ActivityUpdated { call_id, update } => {
-                sink.emit_closing_activity_update(call_id, update).await
+                // The smaller activity close can still fit if the update exceeded the byte budget.
+                let _ = sink.emit_closing_activity_update(call_id, update).await;
+                continue;
             }
             EventKind::ActivityCompleted { call_id, result } => {
                 sink.emit_close(StructureClose::activity(call_id, result))

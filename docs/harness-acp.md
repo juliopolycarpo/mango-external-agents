@@ -420,9 +420,9 @@ the order the agent opened its calls. It closes with the status that agrees with
 `Completed` for a completed turn, `Cancelled` for a cancelled one and `Failed` for a failed one — a
 call nobody saw finish did not demonstrably succeed. The plan activity completes either way; it is
 the display of the plan, and the turn ending is what ends it. The harness queues any coalesced
-update ahead of its activity close. If either event exceeds the remaining payload budget, ACP
-stops emitting the remaining updates and closes and commits the selected terminal through its
-reserve. The host can close all remaining activities and reasoning phases when it reads that
+update ahead of its activity close when the update fits. ACP can skip an oversized update and
+still queue its smaller close. Once a close reaches the payload limit, ACP commits the selected
+terminal through its reserve. The host can close all remaining activities and reasoning phases when it reads that
 terminal. See the [ACP v1 prompt turn](https://agentclientprotocol.com/protocol/v1/prompt-turn#stop-reasons)
 and the SDK's [lifecycle contract](lifecycle.md).
 

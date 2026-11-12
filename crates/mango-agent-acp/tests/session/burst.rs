@@ -330,6 +330,74 @@ async fn an_unread_turn_keeps_its_terminal_when_activity_cleanup_reaches_capacit
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
+/// The unread stream has room for a small close even when a coalesced output does not fit.
+#[tokio::test(start_paused = true)]
+async fn a_coalesced_update_over_the_byte_budget_does_not_hide_the_activity_close() {
+    let updates = vec![
+        serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "running",
+            "title": "Read notes",
+            "kind": "read",
+            "status": "in_progress"
+        }),
+        serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "running",
+            "title": "Reading"
+        }),
+        serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "running",
+            "content": [{"type": "content", "content": {"type": "text", "text": "x".repeat(4096)}}]
+        }),
+    ];
+    let (session, launcher) = open_with(
+        FakeAcpAgent::new().with_updates(updates),
+        Limits {
+            turn_channel_capacity: 8,
+            turn_buffer_bytes: 8192,
+            ..Limits::default()
+        },
+    )
+    .await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "read the notes"))
+        .await
+        .expect("expected a turn");
+    let status = terminal_committed_while_unread(&turn).await;
+    let events = drain(&mut turn).await;
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected a clean close");
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected no live child after close"
+    );
+    assert_eq!(
+        status,
+        mango_external_agents::TerminalStatus::Completed,
+        "expected the selected terminal Completed | received {status:?}"
+    );
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventKind::TurnStarted { .. },
+                EventKind::ActivityStarted { call_id: start, .. },
+                EventKind::ActivityUpdated { call_id: first, update },
+                EventKind::ActivityCompleted { call_id: close, result },
+                EventKind::Completed
+            ] if start == "running" && first == start && close == start
+                && update.title.as_deref() == Some("Reading")
+                && result.status == mango_external_agents::ActivityStatus::Completed
+        ),
+        "expected the small update and activity close ahead of Completed | received {events:?}"
+    );
+}
+
 /// Opens a session under `limits`, runs one turn against `agent`, and asserts the turn ends with a
 /// transport budget error naming `received` and `expected`, then that the session closes with no
 /// live child.

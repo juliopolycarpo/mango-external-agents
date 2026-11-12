@@ -369,17 +369,16 @@ impl EventSink {
 
     /// Publishes a coalesced update just before closing an activity at the end of a turn.
     ///
-    /// Like [`Self::emit_close`], this queues bounded payload without committing a terminal
-    /// when the queue has no room. If it returns an error, stop publishing the remaining
-    /// updates and closes and commit the turn's own terminal. Use [`Self::emit`] for updates
-    /// during a running turn.
+    /// Queues bounded payload without committing a terminal when the queue has no room.
+    /// The caller can still offer the activity close, which may fit in fewer bytes.
+    /// Use [`Self::emit`] for updates during a running turn.
     pub async fn emit_closing_activity_update(
         &self,
         call_id: String,
         update: ActivityUpdate,
     ) -> Result<()> {
         self.buffer
-            .push_close(self.event(EventKind::ActivityUpdated { call_id, update })?)
+            .push(self.event(EventKind::ActivityUpdated { call_id, update })?)
     }
 
     /// Commits cancellation and its compatibility terminal together, even when the queue is full.
