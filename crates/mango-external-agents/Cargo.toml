@@ -60,7 +60,7 @@ nix = { version = "0.31.3", default-features = false, features = ["process", "si
 # list proves it is empty, so a leader's exit cannot make a surviving helper look reaped.
 [target.'cfg(windows)'.dependencies]
 process-wrap = { version = "10.0.0", default-features = false, features = ["creation-flags", "job-object", "kill-on-drop", "tokio1"], optional = true }
-win32job = { version = "2.0.3", default-features = false, optional = true }
+win32job = { version = "2.1.0", default-features = false, optional = true }
 windows = { version = "0.62.2", default-features = false, features = ["Win32_System_Threading"], optional = true }
 
 [dev-dependencies]
