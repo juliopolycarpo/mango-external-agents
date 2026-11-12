@@ -1219,8 +1219,10 @@ it does not change the vendor wire, prompt capability checks, or per-attachment 
   of control and bidi characters, and may start with `-` because it is the MCP server's own argv,
   sent as JSON and never parsed as an agent option (the core argv rule that refuses a leading `-`
   is unchanged, and Claude and Codex apply no MCP argument check at all); server-only environment
-  entries must have valid shapes; and an HTTP endpoint must parse as an absolute `http` or `https` URI with a host and valid
-  port. Header names and values are checked before launch. The mapping follows
+  entries must have valid shapes; and an HTTP endpoint must be an absolute ASCII `http` or `https`
+  URL with a host, a valid port when one is written, no user information and no fragment. Header
+  names and values are checked before launch. The core `http_endpoint` module holds that grammar,
+  and the Codex harness applies the same one. The mapping follows
   [ACP v1 session setup](https://agentclientprotocol.com/protocol/v1/session-setup).
   ACP-over-HTTP remains unrelated and unsupported.
 - **Model selection.** ACP v1's documented session configuration surface carries model and

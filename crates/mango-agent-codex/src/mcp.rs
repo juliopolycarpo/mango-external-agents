@@ -1,7 +1,6 @@
 //! Host MCP entries as app-server's per-thread configuration override.
 
-use http::header::{HeaderName, HeaderValue};
-use mango_external_agents::{Error, McpServer, McpTransport, Result};
+use mango_external_agents::{Error, McpServer, McpTransport, Result, http_endpoint};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -29,9 +28,13 @@ pub(crate) fn override_for(servers: &[McpServer]) -> Result<Option<BTreeMap<Stri
                 json!({"command": command, "args": args, "env": env})
             }
             McpTransport::Http { url, headers }
-                if valid_http_mcp_url(url)
-                    && headers.keys().all(|name| valid_header_name(name))
-                    && headers.values().all(|value| valid_header_value(value)) =>
+                if http_endpoint::is_http_url(url)
+                    && headers
+                        .keys()
+                        .all(|name| http_endpoint::is_http_field_name(name))
+                    && headers
+                        .values()
+                        .all(|value| http_endpoint::is_http_field_value(value)) =>
             {
                 json!({"url": url, "http_headers": headers})
             }
@@ -56,49 +59,34 @@ pub(crate) fn override_for(servers: &[McpServer]) -> Result<Option<BTreeMap<Stri
     )])))
 }
 
-/// Whether an MCP endpoint is an absolute HTTP URL that the app-server can safely pass through.
-fn valid_http_mcp_url(url: &str) -> bool {
-    let Ok(uri) = url.parse::<http::Uri>() else {
-        return false;
-    };
-    let Some(authority) = uri.authority() else {
-        return false;
-    };
-    let host = authority.host();
-    let Some(after_host) = authority.as_str().strip_prefix(host) else {
-        return false;
-    };
-    matches!(uri.scheme_str(), Some("http" | "https"))
-        && !host.is_empty()
-        && !authority.as_str().contains('@')
-        && (after_host.is_empty()
-            || (after_host.starts_with(':') && authority.port_u16().is_some()))
-        && !url.contains('#')
-        && url
-            .chars()
-            .all(|character| !character.is_control() && !character.is_whitespace())
-}
-
-/// HTTP field names use the library's token grammar; no whitespace or separator can change one.
-fn valid_header_name(name: &str) -> bool {
-    HeaderName::from_bytes(name.as_bytes()).is_ok()
-}
-
-/// HTTP field values must be serializable by the HTTP library that validates their syntax.
-fn valid_header_value(value: &str) -> bool {
-    HeaderValue::from_str(value).is_ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn header_names_reject_separators_and_whitespace() {
-        assert!(valid_header_name("X-Docs_Key"));
-        assert!(!valid_header_name("X Docs"));
-        assert!(!valid_header_name("X:Docs"));
-        assert!(!valid_header_name(""));
+        let with_header = |name: &str| {
+            [McpServer {
+                name: String::from("remote"),
+                transport: McpTransport::Http {
+                    url: String::from("https://docs.example/mcp"),
+                    headers: BTreeMap::from([(String::from(name), String::from("value"))]),
+                },
+            }]
+        };
+        assert!(matches!(
+            override_for(&with_header("X-Docs_Key")),
+            Ok(Some(_))
+        ));
+        for name in ["X Docs", "X:Docs", ""] {
+            assert!(
+                matches!(
+                    override_for(&with_header(name)),
+                    Err(Error::HostConfiguration { .. })
+                ),
+                "expected header name {name:?} to be refused before launch | received an override"
+            );
+        }
     }
 
     #[test]

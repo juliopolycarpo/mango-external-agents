@@ -29,7 +29,6 @@ use agent_client_protocol_schema::v1::{
     McpServerHttp, McpServerStdio, NewSessionRequest, NoticeCapabilities,
     SessionConfigOptionsCapabilities, SessionId as AcpSessionId, SessionModeState,
 };
-use http::header::{HeaderName, HeaderValue};
 use mango_external_agents::configuration::{
     Configuration, ConfigurationCatalog, ConfigurationState,
 };
@@ -44,7 +43,7 @@ use mango_external_agents::{
     AcpSpec, AuthState, Capabilities, CapabilityCeiling, DiscoveredCapabilities, Discovery,
     DiscoveryReceipt, Error, ExecutablePath, GateVerdict, Harness, HarnessDescriptor,
     HarnessIdentity, HostContext, LaunchSpec, LineLimits, LineStream, Result, SessionId, StdioSpec,
-    process::ProcessCleanupGuard,
+    http_endpoint, process::ProcessCleanupGuard,
 };
 
 use crate::client::{self, SessionState};
@@ -336,18 +335,16 @@ fn validate_mcp_servers(servers: &[McpServer]) -> Result<()> {
                     });
                 }
             }
-            McpTransport::Http { url, .. } if !is_http_mcp_url(url) => {
+            McpTransport::Http { url, .. } if !http_endpoint::is_http_url(url) => {
                 return Err(Error::HostConfiguration {
-                    expected: "an absolute http or https MCP URL without control characters",
+                    expected: "an absolute http or https MCP URL without user information, a fragment, whitespace or control characters",
                     received: String::from("an invalid HTTP MCP URL"),
                 });
             }
             McpTransport::Http { headers, .. } => {
                 if headers.iter().any(|(name, value)| {
-                    HeaderName::from_bytes(name.as_bytes()).is_err()
-                        || HeaderValue::from_str(value).is_err()
-                        || value.contains('\r')
-                        || value.contains('\n')
+                    !http_endpoint::is_http_field_name(name)
+                        || !http_endpoint::is_http_field_value(value)
                 }) {
                     return Err(Error::HostConfiguration {
                         expected: "valid HTTP MCP header names and values without line breaks",
@@ -364,29 +361,6 @@ fn validate_mcp_servers(servers: &[McpServer]) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Whether a host-provided MCP endpoint has the scheme and authority ACP can pass through.
-fn is_http_mcp_url(url: &str) -> bool {
-    let Ok(uri) = url.parse::<http::Uri>() else {
-        return false;
-    };
-    let Some(authority) = uri.authority() else {
-        return false;
-    };
-    let host = authority.host();
-    let Some(after_host) = authority.as_str().strip_prefix(host) else {
-        return false;
-    };
-    matches!(uri.scheme_str(), Some("http" | "https"))
-        && !host.is_empty()
-        && !authority.as_str().contains('@')
-        && (after_host.is_empty()
-            || (after_host.starts_with(':') && authority.port_u16().is_some()))
-        && !url.contains('#')
-        && url
-            .chars()
-            .all(|character| !character.is_control() && !character.is_whitespace())
 }
 
 #[async_trait::async_trait]

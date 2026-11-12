@@ -733,7 +733,6 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
- "http",
  "mango-external-agents",
  "serde",
  "serde_json",
@@ -757,7 +756,6 @@ name = "mango-agent-codex"
 version = "0.8.0"
 dependencies = [
  "async-trait",
- "http",
  "mango-external-agents",
  "ring",
  "serde",
@@ -771,6 +769,7 @@ version = "0.8.0"
 dependencies = [
  "async-trait",
  "futures-util",
+ "http",
  "nix",
  "process-wrap",
  "ring",
