@@ -361,29 +361,65 @@ trap - EXIT
 scripts/check-dev-dependencies.sh >/dev/null
 echo 'dev-dependency packaging checks passed'
 
-# A third-party version is written once, in [workspace.dependencies]. A member that names its own
-# is refused, the schema crate AGENTS.md keeps inside mango-agent-acp excepted, and so is a
-# workspace entry that lists features, because no member could take them off again.
+# Third-party requirements are inherited from the root. ACP alone owns the exact schema pin;
+# members cannot change workspace default features, and workspace entries cannot add features.
 workspace_fixture=$(mktemp -d)
 trap 'rm -rf "$workspace_fixture"' EXIT
+mkdir -p "$workspace_fixture/crates/mango-agent-acp" "$workspace_fixture/crates/mango-agent-claude"
 printf '[workspace.dependencies]\nshared = { version = "1.0", default-features = false }\nplain = "2.0"\n' > "$workspace_fixture/root.toml"
 printf '[workspace.dependencies]\nshared = { version = "1.0", features = ["extra"] }\n' > "$workspace_fixture/featured-root.toml"
-printf '[dependencies]\nshared = { workspace = true, features = ["extra"] }\nplain.workspace = true\nagent-client-protocol-schema = "=1.0.0"\n\n[target.x.dev-dependencies]\nshared.workspace = true\n' > "$workspace_fixture/inherits.toml"
+printf '[workspace.dependencies]\nagent-client-protocol-schema = "=1.0.0"\n' > "$workspace_fixture/schema-root.toml"
+printf '[dependencies]\nshared = { workspace = true, features = ["extra"] }\nplain.workspace = true\n\n[target.x.dev-dependencies]\nshared.workspace = true\n' > "$workspace_fixture/inherits.toml"
+printf '[dependencies]\nagent-client-protocol-schema = { version = "=1.0.0", default-features = false }\n' > "$workspace_fixture/crates/mango-agent-acp/Cargo.toml"
+printf '[dependencies]\nagent-client-protocol-schema = "=1.0.0"\n' > "$workspace_fixture/crates/mango-agent-claude/Cargo.toml"
 printf '[dependencies]\nshared = { workspace = true }\n\n[dev-dependencies]\nplain = "2.0"\n' > "$workspace_fixture/own-version.toml"
-python3 scripts/check-workspace-dependencies.py "$workspace_fixture/root.toml" "$workspace_fixture/inherits.toml"
+printf '[target.x.dependencies]\nplain = "2.0"\n' > "$workspace_fixture/target-own-version.toml"
+printf '[dependencies]\nshared = { workspace = true, default-features = true }\n' > "$workspace_fixture/default-override.toml"
+python3 scripts/check-workspace-dependencies.py "$workspace_fixture/root.toml" "$workspace_fixture/inherits.toml" "$workspace_fixture/crates/mango-agent-acp/Cargo.toml"
 expect_workspace_rejection() {
-  local root=$1 member=$2 expected=$3
+  local root=$1 member=$2 expected=$3 received=$4 reason
+  case "$root:$member" in
+    schema-*:*) reason="expected agent-client-protocol-schema only as an exact pin" ;;
+    *:crates/mango-agent-*) reason="expected agent-client-protocol-schema only as an exact pin" ;;
+    *:default-override.toml) reason="expected inherited dependencies to omit default-features" ;;
+    featured-root.toml:*) reason="expected workspace dependency entries to omit features" ;;
+    *) reason="expected each member dependency to use workspace = true" ;;
+  esac
   if python3 scripts/check-workspace-dependencies.py "$workspace_fixture/$root" "$workspace_fixture/$member" 2>"$workspace_fixture/rejection.err"; then
     echo "expected rejection of $root with $member, received success" >&2
     exit 1
   fi
-  grep -q "$expected" "$workspace_fixture/rejection.err" || {
-    echo "expected the rejection to contain '$expected', received: $(cat "$workspace_fixture/rejection.err")" >&2
-    exit 1
-  }
+  for required in "$expected" "$received" "$reason"; do
+    grep -Fq "$required" "$workspace_fixture/rejection.err" || {
+      echo "expected the rejection to contain '$required', received: $(cat "$workspace_fixture/rejection.err")" >&2
+      exit 1
+    }
+  done
 }
-expect_workspace_rejection root.toml own-version.toml 'own-version.toml: \[dev-dependencies\] plain = 2.0'
-expect_workspace_rejection featured-root.toml inherits.toml 'featured-root.toml: \[workspace.dependencies\] shared = '
+expect_workspace_rejection root.toml own-version.toml 'own-version.toml: [dev-dependencies] plain = 2.0' "2.0"
+expect_workspace_rejection root.toml target-own-version.toml 'target-own-version.toml: [target.x.dependencies] plain = 2.0' "2.0"
+expect_workspace_rejection featured-root.toml inherits.toml 'featured-root.toml: [workspace.dependencies] shared = ' "'features': ['extra']"
+expect_workspace_rejection root.toml crates/mango-agent-claude/Cargo.toml 'mango-agent-claude/Cargo.toml: [dependencies] agent-client-protocol-schema = ' "=1.0.0"
+expect_workspace_rejection schema-root.toml inherits.toml 'schema-root.toml: [workspace.dependencies] agent-client-protocol-schema = ' "=1.0.0"
+printf '[workspace.dependencies]\nschema-alias = { package = "agent-client-protocol-schema", version = "=1.0.0" }\n' > "$workspace_fixture/schema-alias-root.toml"
+expect_workspace_rejection schema-alias-root.toml inherits.toml 'schema-alias-root.toml: [workspace.dependencies] schema-alias = ' "'package': 'agent-client-protocol-schema'"
+printf '[dependencies]\nschema-alias = { package = "agent-client-protocol-schema", version = "=1.0.0", default-features = false }\n' > "$workspace_fixture/crates/mango-agent-claude/Cargo.toml"
+expect_workspace_rejection root.toml crates/mango-agent-claude/Cargo.toml 'mango-agent-claude/Cargo.toml: [dependencies] schema-alias = ' "'package': 'agent-client-protocol-schema'"
+expect_workspace_rejection root.toml default-override.toml 'default-override.toml: [dependencies] shared = ' "True"
+printf '[target.x.dependencies]\nshared = { workspace = true, default-features = false }\n' > "$workspace_fixture/default-override.toml"
+expect_workspace_rejection root.toml default-override.toml 'default-override.toml: [target.x.dependencies] shared = ' "False"
+printf '[dependencies]\nshared = { workspace = true, default_features = true }\n' > "$workspace_fixture/default-override.toml"
+expect_workspace_rejection root.toml default-override.toml 'default-override.toml: [dependencies] shared = ' "True"
+printf '[dependencies]\nagent-client-protocol-schema = { version = "=1.0.0", default-features = false, features = ["unstable"] }\n' > "$workspace_fixture/crates/mango-agent-acp/Cargo.toml"
+expect_workspace_rejection root.toml crates/mango-agent-acp/Cargo.toml 'mango-agent-acp/Cargo.toml: [dependencies] agent-client-protocol-schema = ' "unstable"
+printf '[dependencies]\nagent-client-protocol-schema = { version = "1.0.0", default-features = false }\n' > "$workspace_fixture/crates/mango-agent-acp/Cargo.toml"
+expect_workspace_rejection root.toml crates/mango-agent-acp/Cargo.toml 'mango-agent-acp/Cargo.toml: [dependencies] agent-client-protocol-schema = ' "1.0.0"
+printf '[dependencies]\nagent-client-protocol-schema = { version = "=1", default-features = false }\n' > "$workspace_fixture/crates/mango-agent-acp/Cargo.toml"
+expect_workspace_rejection root.toml crates/mango-agent-acp/Cargo.toml 'mango-agent-acp/Cargo.toml: [dependencies] agent-client-protocol-schema = ' "=1"
+printf '[dependencies]\nagent-client-protocol-schema = { package = "other-schema", version = "=1.0.0", default-features = false }\n' > "$workspace_fixture/crates/mango-agent-acp/Cargo.toml"
+expect_workspace_rejection root.toml crates/mango-agent-acp/Cargo.toml 'mango-agent-acp/Cargo.toml: [dependencies] agent-client-protocol-schema = ' "'package': 'other-schema'"
+printf '[dependencies]\nagent-client-protocol-schema = { version = "=1.0.0" }\n' > "$workspace_fixture/crates/mango-agent-acp/Cargo.toml"
+expect_workspace_rejection root.toml crates/mango-agent-acp/Cargo.toml 'mango-agent-acp/Cargo.toml: [dependencies] agent-client-protocol-schema = ' "=1.0.0"
 rm -rf "$workspace_fixture"
 trap - EXIT
 python3 scripts/check-workspace-dependencies.py Cargo.toml crates/*/Cargo.toml examples/*/Cargo.toml
