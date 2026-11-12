@@ -395,10 +395,15 @@ fn ask_line(id: u32) -> String {
 
 /// A permission request about the specified agent call.
 fn ask_line_for(id: u32, call_id: &str) -> String {
+    ask_line_for_session(id, call_id, "session-1")
+}
+
+/// A permission request with an explicit native session id.
+fn ask_line_for_session(id: u32, call_id: &str, native_session_id: &str) -> String {
     serde_json::json!({
         "jsonrpc": "2.0", "id": id, "method": "session/request_permission",
         "params": {
-            "sessionId": "session-1",
+            "sessionId": native_session_id,
             "toolCall": { "toolCallId": call_id, "title": "Run tests" },
             "options": [
                 { "optionId": "allow", "name": "Allow", "kind": "allow_once" },
@@ -417,13 +422,16 @@ pub(super) struct PermissionTurnHold {
 
 impl PermissionTurnHold {
     /// A synchronous pause models thread preemption without introducing a cancellation point.
-    pub(super) fn wait(self) {
-        self.entered
-            .send(())
-            .expect("expected the permission routing observer");
-        self.release
-            .recv_timeout(Duration::from_secs(10))
-            .expect("expected to release the permission handoff within 10s");
+    pub(super) fn wait_if_armed(gate: &std::sync::Mutex<Option<Self>>) {
+        let hold = gate.lock().expect("expected the routing gate").take();
+        if let Some(hold) = hold {
+            hold.entered
+                .send(())
+                .expect("expected the permission routing observer");
+            hold.release
+                .recv_timeout(Duration::from_secs(10))
+                .expect("expected to release the permission handoff within 10s");
+        }
     }
 }
 
@@ -469,7 +477,7 @@ async fn a_permission_crossing_turn_release_cannot_reach_the_replacement_prompt(
     let (entered, entered_rx) = tokio::sync::oneshot::channel();
     let (release, release_rx) = std::sync::mpsc::channel();
     *state
-        .permission_turn_hold
+        .permission_closed_call_hold
         .lock()
         .expect("expected the routing gate") = Some(PermissionTurnHold {
         entered,
@@ -570,6 +578,146 @@ async fn a_permission_crossing_turn_release_cannot_reach_the_replacement_prompt(
             1
         ),
         "expected reused call's permission 98 brokered and shown once on turn-2 | received {fresh}, broker turns {fresh_broker_turns:?} and {approvals} approval events",
+    );
+}
+
+/// A permission admitted while the native session is unbound cannot borrow its first prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_permission_crossing_native_binding_cannot_reach_the_first_prompt() {
+    let broker = Arc::new(RecordingBroker::new(BrokerDecision::Deny {
+        reason: String::from("test refusal"),
+    }));
+    let Launch {
+        launcher,
+        host,
+        state,
+        agent,
+        framed,
+    } = launch_with(None, None, Limits::default(), Some(broker.clone())).await;
+    let connection = Arc::new(drive(framed, Arc::clone(&state)));
+    let profile =
+        crate::profile::builtin_profile("cursor").expect("expected the built-in Cursor profile");
+    let opening = super::submit(
+        &connection,
+        agent_client_protocol_schema::v1::NewSessionRequest::new(host.cwd()),
+    )
+    .expect("expected to submit session/new");
+    let new_session = native_message(&launcher, 0).await;
+    assert_eq!(new_session["method"], "session/new");
+
+    let (entered, entered_rx) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    *state
+        .permission_session_hold
+        .lock()
+        .expect("expected the routing gate") = Some(PermissionTurnHold {
+        entered,
+        release: release_rx,
+    });
+
+    agent.announce(
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": new_session["id"], "result": { "sessionId": "session-2" }
+        })
+        .to_string(),
+    );
+    agent.announce(ask_line_for(99, "foreign-call"));
+    tokio::time::timeout(Duration::from_secs(5), entered_rx)
+        .await
+        .expect("expected the real foreign permission handoff within 5s")
+        .expect("expected the foreign handoff to enter the gate");
+    assert!(
+        state.turn().is_none() && state.lock_native_session().bound.is_none(),
+        "expected permission 99 to arrive before native binding and first-prompt admission"
+    );
+
+    // The reply preceded the permission on the wire. Its owner can finish opening while
+    // the notification worker is paused in permission routing.
+    let opened = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::await_sent(&connection, &profile, opening),
+    )
+    .await
+    .expect("expected the ordered session/new reply within 5s")
+    .expect("expected session/new to succeed");
+    state.bind_native_session(opened.session_id.clone());
+    state
+        .core_state
+        .set_native_session_id(opened.session_id.to_string());
+    let session = crate::session::AcpSession::new(
+        profile,
+        host,
+        Arc::clone(&state),
+        state.core_state.clone(),
+        connection,
+        opened.session_id,
+        agent_client_protocol_schema::v1::AgentCapabilities::default(),
+        opened.modes,
+    );
+    let mut first = session
+        .start_turn(TurnRequest::new("turn-1", "run tests"))
+        .await
+        .expect("expected the first prompt to start");
+    let first_prompt = native_message(&launcher, 1).await;
+    assert_eq!(first_prompt["method"], "session/prompt");
+    assert_eq!(first_prompt["params"]["sessionId"], "session-2");
+
+    release
+        .send(())
+        .expect("expected to release the foreign handoff");
+    let foreign = native_message(&launcher, 2).await;
+    let foreign_requests = broker.requests().len();
+    agent.announce(ask_line_for_session(100, "bound-call", "session-2"));
+    let bound = native_message(&launcher, 3).await;
+    let brokered = broker.requests().len();
+    agent.announce(prompt_end(&first_prompt));
+    until("the first prompt's slot to be released", || {
+        state.turn().is_none()
+    })
+    .await;
+    assert_eq!(first.terminal_status(), Some(TerminalStatus::Completed));
+    let approvals = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut approvals = 0;
+        while let Some(event) = first.recv().await {
+            approvals += usize::from(matches!(event.kind, EventKind::ApprovalRequested { .. }));
+        }
+        approvals
+    })
+    .await
+    .expect("expected to drain the first prompt's stream within 5s");
+    session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected to close the fake session");
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected no fake child left after close"
+    );
+
+    assert_eq!(
+        (
+            foreign["id"].as_u64(),
+            &foreign["result"]["outcome"],
+            foreign_requests
+        ),
+        (Some(99), &serde_json::json!({"outcome": "cancelled"}), 0),
+        "expected pre-bind permission 99 cancelled without a broker request | received {foreign} and {foreign_requests} broker requests",
+    );
+    assert_eq!(
+        (
+            bound["id"].as_u64(),
+            &bound["result"]["outcome"],
+            brokered,
+            approvals
+        ),
+        (
+            Some(100),
+            &serde_json::json!({"outcome": "selected", "optionId": "reject"}),
+            1,
+            1
+        ),
+        "expected bound permission 100 brokered and shown once | received {bound}, {brokered} broker requests and {approvals} approval events",
     );
 }
 

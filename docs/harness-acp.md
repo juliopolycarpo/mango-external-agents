@@ -330,7 +330,9 @@ cannot in general be kept off the next turn. One case is handled: a `tool_call_u
 had it running is the previous turn's. The update is dropped without a word, since it is the tail of
 a turn the host already saw end and a notice would point at the turn now running; the question is
 answered `cancelled`. The [permission handler](https://agentclientprotocol.com/protocol/v1/tool-calls#requesting-permission)
-captures the active turn before checking those call IDs. If the captured turn ends during the handoff,
+captures the active turn before checking the native session and closed call IDs. A request without a
+turn receives `cancelled` even if [session creation](https://agentclientprotocol.com/protocol/v1/session-setup#creating-a-session)
+finishes and the first prompt starts during the handoff. If the captured turn ends during the handoff,
 the request cannot reach its replacement. At most 256 such call IDs are remembered, from the last
 terminal only. Any other late frame, a text chunk say, is the running turn's.
 

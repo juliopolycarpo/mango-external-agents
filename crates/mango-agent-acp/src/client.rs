@@ -426,7 +426,9 @@ pub(crate) struct SessionState {
     /// Source of [`Self::mint_approval_id`]'s ids. Separate from `generations`, which stamps turns.
     next_approval: AtomicU64,
     #[cfg(test)]
-    permission_turn_hold: Mutex<Option<commit_hold_tests::PermissionTurnHold>>,
+    permission_session_hold: Mutex<Option<commit_hold_tests::PermissionTurnHold>>,
+    #[cfg(test)]
+    permission_closed_call_hold: Mutex<Option<commit_hold_tests::PermissionTurnHold>>,
     /// Bumped on every frame the agent sends and every change to the pending questions, so the
     /// idle deadline restarts on progress and re-reads whether a question is still open.
     activity: tokio::sync::watch::Sender<u64>,
@@ -480,7 +482,9 @@ impl SessionState {
             pending: Mutex::new(HashMap::new()),
             next_approval: AtomicU64::new(0),
             #[cfg(test)]
-            permission_turn_hold: Mutex::new(None),
+            permission_session_hold: Mutex::new(None),
+            #[cfg(test)]
+            permission_closed_call_hold: Mutex::new(None),
             activity: tokio::sync::watch::channel(0).0,
             native_session: Mutex::new(NativeBinding::default()),
             peer: OnceLock::new(),
@@ -1544,28 +1548,24 @@ async fn on_request_permission(
     request: RequestPermissionRequest,
     reply: PermissionReply,
 ) -> agent_client_protocol_schema::v1::Result<()> {
+    // Capture the turn before checking the native session and closed calls. A handoff
+    // with no turn cannot attach to the first prompt after binding. If a captured turn
+    // finishes during either check, its settlement seal still refuses the request.
+    let turn = state.turn();
     if !state.serves(&request.session_id) {
         // Another session's question. Refused rather than shown: this host's answer would grant
         // work in a conversation it never opened.
         return reply.respond(permission::cancelled());
     }
-    // Capture the turn before reading the closed calls. If it finishes during the lookup,
-    // its own settlement seal still rejects this request, even after the slot is reused.
-    let turn = state.turn();
     #[cfg(test)]
-    if let Some(hold) = state
-        .permission_turn_hold
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .take()
-    {
-        hold.wait();
-    }
+    commit_hold_tests::PermissionTurnHold::wait_if_armed(&state.permission_session_hold);
     if state.closed_call(&request.tool_call.tool_call_id) {
         // About a call the previous turn's terminal closed: that turn's question, arriving
         // after it ended. Withdrawn, as it would have been had it arrived a moment earlier.
         return reply.respond(permission::cancelled());
     }
+    #[cfg(test)]
+    commit_hold_tests::PermissionTurnHold::wait_if_armed(&state.permission_closed_call_hold);
     let id = state.mint_approval_id();
     let Some(turn) = turn else {
         // No turn: nobody is reading, and an unanswered request would hold the agent forever.
