@@ -369,7 +369,7 @@ mkdir -p "$workspace_fixture/crates/mango-agent-acp" "$workspace_fixture/crates/
 printf '[workspace.dependencies]\nshared = { version = "1.0", default-features = false }\nplain = "2.0"\n' > "$workspace_fixture/root.toml"
 printf '[workspace.dependencies]\nshared = { version = "1.0", features = ["extra"] }\n' > "$workspace_fixture/featured-root.toml"
 printf '[workspace.dependencies]\nagent-client-protocol-schema = "=1.0.0"\n' > "$workspace_fixture/schema-root.toml"
-printf '[dependencies]\nshared = { workspace = true, features = ["std"] }\nplain.workspace = true\n\n[target.x.dev-dependencies]\nshared.workspace = true\n' > "$workspace_fixture/inherits.toml"
+printf '[dependencies]\nshared = { workspace = true, features = ["std"], optional = true }\nplain.workspace = true\n\n[features]\ndefault = ["shared/std"]\nweak = ["shared?/std"]\n\n[target.x.dev-dependencies]\nshared.workspace = true\n' > "$workspace_fixture/inherits.toml"
 printf '[dependencies]\nagent-client-protocol-schema = { version = "=1.0.0", default-features = false }\n' > "$workspace_fixture/crates/mango-agent-acp/Cargo.toml"
 printf '[dependencies]\nagent-client-protocol-schema = "=1.0.0"\n' > "$workspace_fixture/crates/mango-agent-claude/Cargo.toml"
 printf '[dependencies]\nshared = { workspace = true }\n\n[dev-dependencies]\nplain = "2.0"\n' > "$workspace_fixture/own-version.toml"
@@ -381,7 +381,7 @@ expect_workspace_rejection() {
   case "$root:$member" in
     schema-*:*) reason="expected agent-client-protocol-schema only as an exact pin" ;;
     *:crates/mango-agent-*) reason="expected agent-client-protocol-schema only as an exact pin" ;;
-    *:default-override.toml) reason="expected inherited dependencies to omit default-features" ;;
+    *:default-override.toml|*:default-feature-forward.toml) reason="expected inherited dependencies to omit default-features" ;;
     featured-root.toml:*) reason="expected workspace dependency entries to omit features" ;;
     *) reason="expected each member dependency to use workspace = true" ;;
   esac
@@ -414,6 +414,18 @@ printf '[dependencies]\nshared = { workspace = true, features = ["std", "default
 expect_workspace_rejection root.toml default-override.toml 'default-override.toml: [dependencies] shared = ' "'default'"
 printf '[target.x.dev-dependencies]\nshared = { workspace = true, features = ["default"] }\n' > "$workspace_fixture/default-override.toml"
 expect_workspace_rejection root.toml default-override.toml 'default-override.toml: [target.x.dev-dependencies] shared = ' "'default'"
+printf '[dependencies]\nshared = { workspace = true, optional = true }\n\n[features]\ndefault = ["shared/default"]\n' > "$workspace_fixture/default-feature-forward.toml"
+expect_workspace_rejection root.toml default-feature-forward.toml 'default-feature-forward.toml: [features] default = ' "shared/default"
+printf '[dependencies]\nshared = { workspace = true, optional = true }\n\n[features]\ndefault = ["dep:shared", "shared?/default"]\n' > "$workspace_fixture/default-feature-forward.toml"
+expect_workspace_rejection root.toml default-feature-forward.toml 'default-feature-forward.toml: [features] default = ' "shared?/default"
+for forward in 'agent-client-protocol-schema/unstable' 'agent-client-protocol-schema?/unstable' 'agent-client-protocol-schema/std'; do
+  printf '[dependencies]\nagent-client-protocol-schema = { version = "=1.0.0", default-features = false }\n\n[features]\nextra = ["%s"]\n' "$forward" > "$workspace_fixture/crates/mango-agent-acp/Cargo.toml"
+  expect_workspace_rejection root.toml crates/mango-agent-acp/Cargo.toml 'mango-agent-acp/Cargo.toml: [features] extra = ' "$forward"
+done
+printf '[dependencies]\nschema-alias = { package = "agent-client-protocol-schema", version = "=1.0.0", default-features = false }\n\n[features]\nextra = ["schema-alias?/unstable"]\n' > "$workspace_fixture/crates/mango-agent-claude/Cargo.toml"
+expect_workspace_rejection root.toml crates/mango-agent-claude/Cargo.toml 'mango-agent-claude/Cargo.toml: [features] extra = ' 'schema-alias?/unstable'
+printf '[dependencies]\nschema-alias.workspace = true\n\n[features]\nextra = ["schema-alias/unstable"]\n' > "$workspace_fixture/schema-alias-forward.toml"
+expect_workspace_rejection schema-alias-root.toml schema-alias-forward.toml 'schema-alias-forward.toml: [features] extra = ' 'schema-alias/unstable'
 printf '[dependencies]\nagent-client-protocol-schema = { version = "=1.0.0", default-features = false, features = ["unstable"] }\n' > "$workspace_fixture/crates/mango-agent-acp/Cargo.toml"
 expect_workspace_rejection root.toml crates/mango-agent-acp/Cargo.toml 'mango-agent-acp/Cargo.toml: [dependencies] agent-client-protocol-schema = ' "unstable"
 printf '[dependencies]\nagent-client-protocol-schema = { version = "1.0.0", default-features = false }\n' > "$workspace_fixture/crates/mango-agent-acp/Cargo.toml"

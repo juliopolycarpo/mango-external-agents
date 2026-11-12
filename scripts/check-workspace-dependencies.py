@@ -3,7 +3,8 @@
 
 Members inherit each dependency with ``workspace = true`` and choose their own additive features.
 The workspace chooses versions and default features; members cannot explicitly request ``default``.
-These checks govern manifest entries, not Cargo's feature unification across dependency edges.
+Dependency feature forwarding in ``[features]`` follows the same rules. These checks govern
+manifest entries, not Cargo's feature unification across dependency edges.
 The sole exception is the exact, feature-free ``agent-client-protocol-schema`` registry pin in the
 ACP manifest. No other manifest or workspace entry may name that crate.
 
@@ -35,13 +36,16 @@ def dependency_tables(manifest):
             yield f"target.{target}.{kind}", body.get(kind, {})
 
 
-def member_offenders(path, schema_manifest):
-    """Yields a reason and declaration for each member dependency that violates the policy."""
-    for label, table in dependency_tables(load(path)):
+def member_offenders(path, schema_manifest, workspace_schema_names):
+    """Yields a reason and declaration for each member entry that violates the policy."""
+    manifest = load(path)
+    schema_names = {SCHEMA} | workspace_schema_names
+    for label, table in dependency_tables(manifest):
         for name, spec in table.items():
             line = f"{path}: [{label}] {name} = {spec}"
             package = spec.get("package", name) if isinstance(spec, dict) else name
             if name == SCHEMA or package == SCHEMA:
+                schema_names.add(name)
                 version = spec.get("version") if isinstance(spec, dict) else None
                 valid_schema = (
                     Path(path).resolve() == schema_manifest
@@ -64,6 +68,20 @@ def member_offenders(path, schema_manifest):
                 or "default_features" in spec
                 or (isinstance(spec.get("features"), list) and "default" in spec["features"])
             ):
+                yield "defaults", line
+
+    for feature_name, forwards in manifest.get("features", {}).items():
+        if not isinstance(forwards, list):
+            continue  # Cargo reports malformed feature tables.
+        for forward in forwards:
+            if not isinstance(forward, str) or "/" not in forward:
+                continue
+            dependency, feature = forward.split("/", 1)
+            dependency = dependency.removesuffix("?")
+            line = f"{path}: [features] {feature_name} = {forward}"
+            if dependency in schema_names:
+                yield "schema", line
+            elif feature == "default":
                 yield "defaults", line
 
 
@@ -89,9 +107,16 @@ def main(arguments):
         return 2
     root, members = arguments[0], arguments[1:]
     schema_manifest = Path(root).resolve().parent / "crates/mango-agent-acp/Cargo.toml"
+    workspace = load(root).get("workspace", {}).get("dependencies", {})
+    workspace_schema_names = {
+        name for name, spec in workspace.items()
+        if name == SCHEMA or (isinstance(spec, dict) and spec.get("package") == SCHEMA)
+    }
     found = list(workspace_offenders(root))
     found.extend(
-        offender for member in members for offender in member_offenders(member, schema_manifest)
+        offender
+        for member in members
+        for offender in member_offenders(member, schema_manifest, workspace_schema_names)
     )
     expectations = {
         "inheritance": "expected each member dependency to use workspace = true, received:",
@@ -99,7 +124,8 @@ def main(arguments):
         "feature so the workspace controls defaults, received:",
         "features": "expected workspace dependency entries to omit features, received:",
         "schema": f"expected {SCHEMA} only as an exact pin with default-features = false and "
-        "no other keys in crates/mango-agent-acp/Cargo.toml [dependencies], received:",
+        "no other keys in crates/mango-agent-acp/Cargo.toml [dependencies] and no forwarded "
+        "schema features, received:",
     }
     for kind, expectation in expectations.items():
         lines = [line for found_kind, line in found if found_kind == kind]
