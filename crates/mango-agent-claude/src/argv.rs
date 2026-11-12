@@ -221,9 +221,49 @@ pub fn is_vendor_session_id(id: &str) -> bool {
     groups.next().is_none()
 }
 
+/// Mints the UUID a new session proposes with `--session-id`, and names its scratch directory.
+///
+/// A version 4 UUID: 122 bits from the operating system's random source, through the `ring` the
+/// core already links for its own digest, so this is a call rather than a dependency. The shape is
+/// the one [`is_vendor_session_id`] accepts, because the CLI documents `--session-id` as taking a
+/// valid UUID and refuses anything else.
+///
+/// The random source failing is not something a turn can work around, so it is a typed refusal
+/// before anything is launched and never a weaker id.
+pub(crate) fn mint_uuid() -> Result<String> {
+    let mut bytes = [0_u8; 16];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut bytes).map_err(|_| {
+        Error::HostConfiguration {
+            expected: "16 bytes from the operating system's random source for a new session id",
+            received: String::from("a random source that returned none"),
+        }
+    })?;
+    Ok(format_uuid_v4(bytes))
+}
+
+/// Renders sixteen bytes as a version 4, RFC 4122 variant UUID in the 8-4-4-4-12 text form.
+///
+/// The version nibble and the two variant bits are overwritten, which is what makes any sixteen
+/// bytes a valid version 4 UUID; the other 122 bits are the caller's.
+fn format_uuid_v4(mut bytes: [u8; 16]) -> String {
+    use std::fmt::Write as _;
+
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let mut text = String::with_capacity(36);
+    for (index, byte) in bytes.iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            text.push('-');
+        }
+        // Writing to a `String` cannot fail.
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{TurnArgv, is_vendor_session_id};
+    use super::{TurnArgv, format_uuid_v4, is_vendor_session_id, mint_uuid};
     use crate::permissions::CliMode;
 
     const SESSION: &str = "11111111-2222-3333-4444-555555555555";
@@ -623,5 +663,49 @@ mod tests {
                 "expected {accepted:?} to be usable"
             );
         }
+    }
+
+    #[test]
+    fn any_sixteen_bytes_format_as_a_version_4_uuid_in_the_8_4_4_4_12_form() {
+        assert_eq!(
+            format_uuid_v4([0x00; 16]),
+            "00000000-0000-4000-8000-000000000000"
+        );
+        assert_eq!(
+            format_uuid_v4([0xff; 16]),
+            "ffffffff-ffff-4fff-bfff-ffffffffffff"
+        );
+        assert_eq!(
+            format_uuid_v4([
+                0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba,
+                0xdc, 0xfe
+            ]),
+            "01234567-89ab-4def-9032-547698badcfe"
+        );
+    }
+
+    #[test]
+    fn a_minted_uuid_is_one_the_cli_accepts_and_is_not_minted_twice() {
+        let first = mint_uuid().expect("expected the operating system's random source to answer");
+        let second = mint_uuid().expect("expected the operating system's random source to answer");
+        for minted in [&first, &second] {
+            assert!(
+                is_vendor_session_id(minted),
+                "expected a UUID in the 8-4-4-4-12 form | received {minted:?}"
+            );
+            assert_eq!(
+                minted.as_bytes()[14],
+                b'4',
+                "expected the version nibble 4 | received {minted:?}"
+            );
+            assert!(
+                matches!(minted.as_bytes()[19], b'8' | b'9' | b'a' | b'b'),
+                "expected the RFC 4122 variant (8, 9, a or b) | received {minted:?}"
+            );
+        }
+        assert_ne!(
+            first, second,
+            "expected two mints to differ | received the same UUID twice"
+        );
     }
 }
