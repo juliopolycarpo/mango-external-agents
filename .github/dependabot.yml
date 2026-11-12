@@ -1,0 +1,23 @@
+# Workflow actions are pinned by commit SHA with the release tag in a trailing comment. Dependabot
+# rewrites both, so a pin moves by a reviewed pull request and never by a mutable tag.
+#
+# Cargo is deliberately absent. The committed Cargo.lock changes only by a reviewed commit, and
+# the weekly `Fresh dependencies` workflow already resolves the newest compatible tree and reports
+# what it would break.
+#
+# The title is `ci(deps): bump …`, which scripts/check-pr-title.sh accepts: `ci` is a type
+# cliff.toml parses and `deps` is a scope AGENTS.md lists.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: tuesday
+    commit-message:
+      prefix: ci
+      include: scope
+    # One pull request a week for every action, so a run of small bumps is reviewed together.
+    groups:
+      actions:
+        patterns: ["*"]
