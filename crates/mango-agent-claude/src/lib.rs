@@ -56,4 +56,32 @@ mod tests {
             "expected the published id to be the one the descriptor registers under"
         );
     }
+
+    /// The shared scratch helper, checked where it is compiled once. Under `umask 002` a plain
+    /// `create_dir` made a group-writable root, which the harness refuses for an MCP artifact.
+    #[test]
+    fn a_test_scratch_root_is_private_whatever_the_umask_and_never_shared() {
+        let first = crate::test_support::private_scratch("scratch-helper");
+        let second = crate::test_support::private_scratch("scratch-helper");
+        assert_ne!(
+            first, second,
+            "expected two calls to name two directories | received the same path twice"
+        );
+        #[cfg(unix)]
+        for root in [&first, &second] {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(root)
+                .expect("expected the scratch root to exist")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o700,
+                "expected an owner-only scratch root (0o700) | received {mode:#o}"
+            );
+        }
+        for root in [first, second] {
+            std::fs::remove_dir(root).expect("expected to remove the empty scratch root");
+        }
+    }
 }

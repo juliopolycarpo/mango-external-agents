@@ -166,8 +166,7 @@ fn a_close_lost_inside_the_removal_after_the_child_was_reaped_demands_no_cleanup
             .expect("expected a runtime")
     };
     let opening = runtime();
-    let scratch = std::env::temp_dir().join(format!("mea-lost-close-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir(&scratch).expect("expected a scratch root");
+    let scratch = support::private_scratch("lost-close");
     let arrived = Arc::new(tokio::sync::Notify::new());
     let (release, released) = std::sync::mpsc::channel::<()>();
     let launcher =
@@ -291,8 +290,7 @@ fn a_close_that_never_ran_over_a_session_without_a_turn_removes_its_artifact() {
             .expect("expected a runtime")
     };
     let opening = runtime();
-    let scratch = std::env::temp_dir().join(format!("mea-unrun-close-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir(&scratch).expect("expected a scratch root");
+    let scratch = support::private_scratch("unrun-close");
     let launcher = Arc::new(FakeClaudeCli::new());
     let session = opening.block_on(async {
         let file = crate::mcp::ConfigFile::write(

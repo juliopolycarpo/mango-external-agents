@@ -829,7 +829,7 @@ mod tests {
     async fn refuses_a_scratch_path_the_turn_argv_could_not_carry() {
         let root = tempdir();
         let scratch = root.join("holds\na newline");
-        std::fs::create_dir(&scratch).expect("expected a host-owned scratch directory");
+        crate::test_support::private_directory(&scratch);
 
         let error = ConfigFile::write(&servers(), &scratch)
             .await
@@ -1242,7 +1242,7 @@ mod tests {
     #[tokio::test]
     async fn formatting_a_config_file_does_not_reveal_its_scratch_path() {
         let scratch = tempdir().join("customer-secret");
-        std::fs::create_dir(&scratch).expect("expected a host-owned scratch directory");
+        crate::test_support::private_directory(&scratch);
         let file = ConfigFile::write(&servers(), &scratch)
             .await
             .expect("expected a file")
@@ -1562,8 +1562,6 @@ mod tests {
 
     /// A directory of this test's own, so a run never touches another's.
     fn tempdir() -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("mea-mcp-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).expect("expected a scratch directory");
-        path
+        crate::test_support::private_scratch("mcp")
     }
 }

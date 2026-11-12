@@ -815,6 +815,39 @@ impl ByteSink for FakeStdin {
     }
 }
 
+/// A scratch root of this test's own under the system temporary directory.
+///
+/// Owner-only whatever the process umask is. `std::fs::create_dir` under `umask 002`, the default
+/// for a user on Debian and Ubuntu, makes a group-writable directory, and the harness refuses a
+/// scratch root another user could replace: the tests that wanted a usable root then failed on the
+/// refusal instead of on what they assert. The name carries the process id and a per-process
+/// counter, so two tests, and two test binaries, never share one.
+///
+/// The caller removes it; a test that leaves one behind leaves an empty private directory.
+pub fn private_scratch(label: &str) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let index = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("mea-{label}-{}-{index}", std::process::id()));
+    private_directory(&path);
+    path
+}
+
+/// Creates `path` as an owner-only directory whatever the process umask is.
+///
+/// For a test that needs a directory with a name of its own choosing inside a
+/// [`private_scratch`] root, and needs the harness to accept it as a scratch root.
+pub fn private_directory(path: &std::path::Path) {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    if let Err(error) = builder.create(path) {
+        panic!(
+            "expected to create the private directory {} | received: {error}",
+            path.display()
+        );
+    }
+}
+
 /// A host whose launcher is this fake, with a frozen clock and the ordinary caps.
 pub fn host(launcher: Arc<FakeClaudeCli>) -> HostContext {
     host_under(launcher, Limits::default())
