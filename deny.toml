@@ -1,5 +1,5 @@
 # cargo-deny policy — https://embarkstudios.github.io/cargo-deny/
-# Checked by `cargo deny check` in CI and in scripts/check.sh.
+# Checked by `cargo deny check -D unmatched-skip -D unnecessary-skip` in CI and scripts/check.sh.
 
 [graph]
 # Every target the release plans build; bans are checked against all of them so a
@@ -74,10 +74,10 @@ deny = [
   { crate = "blocking", reason = "the host owns the pipes; no blocking thread pool" },
 ]
 # The older of each pair, by major line, so a patch release of the same line does not need an edit
-# here. Remove an entry when the crate that brings it moves on; cargo-deny warns once it matches
-# nothing.
+# here. Remove an entry when the crate that brings it moves on; the gates deny skips that match
+# nothing or a crate with only one version.
 skip = [
-  { crate = "getrandom@0.2", reason = "ring 0.17 is on getrandom 0.2; rand and uuid are on 0.4" },
+  { crate = "getrandom@0.2", reason = "ring 0.17 is on getrandom 0.2; rand and tempfile are on 0.4" },
   { crate = "windows-sys@0.52", reason = "ring 0.17 is on windows-sys 0.52; tokio, mio and rustix are on 0.61" },
   { crate = "thiserror@1", reason = "win32job 2 is on thiserror 1; tungstenite is on 2" },
   { crate = "thiserror-impl@1", reason = "the derive half of thiserror 1, for win32job 2" },
