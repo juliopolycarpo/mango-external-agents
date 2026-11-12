@@ -450,8 +450,9 @@ Both became stable in v1 with schema 1.11 and are sent only to a client that adv
 this one does (see [Client capabilities](#client-capabilities)). Neither has a `/protocol/v1` page
 yet; the references are the RFDs for [session notices](https://agentclientprotocol.com/rfds/session-notices)
 and [session compaction](https://agentclientprotocol.com/rfds/session-compaction), and the
-`Notice`, `CompactionUpdate` and `CompactionSummaryChunk` types of `agent-client-protocol-schema`
-1.11.0. Both pages were read on 2026-10-10.
+`Notice`, `CompactionUpdate` and `CompactionSummaryChunk` types of `agent-client-protocol-schema`,
+pinned at 1.17.0. Both pages were read on 2026-10-10, and the session-notices RFD again on
+2026-11-12, when it recorded notices as stabilized in v1 and still linked no `/protocol/v1` page.
 
 **Both are vendor-written text for display only.** A notice and a compaction summary are words the
 agent produced. A host shows them and never feeds them to its own model as instructions; see
@@ -1225,6 +1226,12 @@ it does not change the vendor wire, prompt capability checks, or per-attachment 
   and Claude and Codex apply the same one. The mapping follows
   [ACP v1 session setup](https://agentclientprotocol.com/protocol/v1/session-setup).
   ACP-over-HTTP remains unrelated and unsupported.
+- **System prompt.** ACP v1 documents a `systemPrompt` on `session/new`, `session/load` and
+  `session/resume`, offered by an agent that advertises `sessionCapabilities.systemPrompt`
+  ([session setup](https://agentclientprotocol.com/protocol/v1/session-setup), read on 2026-11-12;
+  stable in the schema crate from 1.17). The harness sends none: `OpenSession` has no system
+  prompt, and the agent's own instructions are left as the agent ships them. The capability is
+  read off the wire and not surfaced.
 - **Model selection.** ACP v1's documented session configuration surface carries model and
   reasoning selectors when an agent offers them. The harness never invents a static model catalog;
   it exposes the live negotiated catalog and refuses a model or effort mapping that is missing or
