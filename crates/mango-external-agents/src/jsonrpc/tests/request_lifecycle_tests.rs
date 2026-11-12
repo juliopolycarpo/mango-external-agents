@@ -696,42 +696,46 @@ async fn an_ordered_request_outside_the_pending_budget_still_needs_an_ordered_pl
 /// write never begun. Every write resolves, and nothing reaches the link after its close.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn frames_queued_while_another_thread_closes_are_each_refused_or_written_whole() {
-    // The close has to land among the frames for a run to show anything. Almost every run
-    // does; a few more are allowed before giving up on seeing one.
-    let mut seen = Vec::new();
-    for _ in 0..50 {
-        let (written, refused) = frames_queued_around_a_close().await;
-        seen.push((written, refused));
-        if written > 0 && refused > 0 {
-            return;
-        }
-    }
-    panic!(
-        "expected a run with frames on both sides of the close: (written > 0, refused > 0) | received {seen:?}"
-    );
-}
-
-/// One run: how many frames were written and how many refused.
-async fn frames_queued_around_a_close() -> (usize, usize) {
     const CALLERS: usize = 6;
     const ROUNDS: usize = 40;
-    let link = ScriptedLink::new();
-    let handler = RecordingHandler::arc(None);
+    let held_tag = (CALLERS * ROUNDS) as u64;
+    let notification_tag = held_tag + 1;
+    let request_tag = held_tag + 2;
     let mut roomy = options();
     roomy.max_pending_requests = usize::MAX;
     // Machine time, on a machine that may be busy: the close is not what is being timed.
     roomy.shutdown_timeout = Duration::from_secs(30);
-    let client = Arc::new(Client::connect(
-        link.clone().into_link(),
-        Arc::clone(&handler) as Arc<dyn PeerHandler>,
-        roomy,
-    ));
+    let gated = gated(roomy, WireOptions::new());
+    let client = Arc::clone(&gated.client);
+    let link = gated.link.clone();
+
+    // Hold the writer inside a tagged send. The notification behind it must drain before the
+    // link closes; the request behind it must fail unwritten when close seals the queue.
+    let mut held = client
+        .submit_notification("hold", json!({"tag": held_tag}))
+        .expect("expected the held notification queued");
+    until("the tagged write to start", || held.started()).await;
+    let mut before_notification = client
+        .submit_notification("before", json!({"tag": notification_tag}))
+        .expect("expected the notification queued behind the held write");
+    let (mut before_request, before_reply) = client
+        .submit_request("before", json!({"tag": request_tag}), RequestOptions::new())
+        .expect("expected the request queued behind the held write")
+        .into_parts();
+    assert!(
+        !before_notification.started() && !before_request.started(),
+        "expected both queued writes to wait behind the held frame | received notification started: {}, request started: {}",
+        before_notification.started(),
+        before_request.started()
+    );
     let go = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
+    let first_caller_queued = Arc::new(tokio::sync::Notify::new());
 
     let mut callers = Vec::new();
     for caller in 0..CALLERS {
         let client = Arc::clone(&client);
         let go = Arc::clone(&go);
+        let first_caller_queued = Arc::clone(&first_caller_queued);
         callers.push(tokio::spawn(async move {
             go.wait().await;
             // (tag, is a request, outcome of the write, whether the write began)
@@ -749,6 +753,13 @@ async fn frames_queued_around_a_close() -> (usize, usize) {
                     } else {
                         client.submit_notification("note", params)
                     };
+                    if caller == 0 && round == 0 {
+                        assert!(
+                            queued.is_ok(),
+                            "expected the first caller's notification queued before close | received {queued:?}"
+                        );
+                        first_caller_queued.notify_one();
+                    }
                     match queued {
                         Err(refused) => fates.push((tag, false, Err(refused), false)),
                         Ok(mut written) => {
@@ -790,11 +801,73 @@ async fn frames_queued_around_a_close() -> (usize, usize) {
         }));
     }
     go.wait().await;
-    tokio::task::yield_now().await;
-    client.close().await.expect("expected a clean close");
+    // One racing caller must queue while the writer is held. The other callers may race close.
+    // Its write cannot finish before the queue is sealed, so its later frames are refused.
+    within("the first caller to queue", first_caller_queued.notified()).await;
+    let closing = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.close().await })
+    };
+    until("the close to seal the queue", || client.is_closed()).await;
+    let early = link.sent();
+    assert!(
+        early.is_empty(),
+        "expected the held writer to remain blocked when close seals the queue | received {early:?}"
+    );
 
+    // These calls bypass the public closed-flag check, as a caller that saw the flag open
+    // just before close would. The sealed queue must refuse both kinds of frame itself.
+    let late_notification = client.queue_notification("late", json!({"tag": request_tag + 1}));
+    assert!(
+        matches!(&late_notification, Err(Error::Closed { subject: "link" })),
+        "expected the late notification refused by the sealed queue: Err(Closed(link)) | received {late_notification:?}"
+    );
+    let late_request = client.queue_request(
+        "late",
+        json!({"tag": request_tag + 2}),
+        RequestOptions::new(),
+    );
+    assert!(
+        matches!(&late_request, Err(Error::Closed { subject: "link" })),
+        "expected the late request refused by the sealed queue: Err(Closed(link)) | received {late_request:?}"
+    );
+
+    gated.gate.add_permits(1);
+    within("the held write", &mut held)
+        .await
+        .expect("expected the in-progress notification written whole");
+    within("the queued notification", &mut before_notification)
+        .await
+        .expect("expected the notification queued before close written whole");
+    assert!(
+        held.started() && before_notification.started(),
+        "expected both successful notification writes to have started | received held: {}, queued: {}",
+        held.started(),
+        before_notification.started()
+    );
+    let before_result = within("the queued request's write", &mut before_request).await;
+    assert!(
+        matches!(&before_result, Err(Error::Closed { subject: "link" })),
+        "expected the queued request refused by close: Err(Closed(link)) | received {before_result:?}"
+    );
+    assert!(
+        !before_request.started(),
+        "expected the refused queued request's write never started | received started"
+    );
+    let (cause, _) = failure(within("the queued request's reply", before_reply).await);
+    assert_eq!(
+        cause,
+        CallFailureCause::Ended(ConnectionEnd::Closed),
+        "expected the queued request's reply ended by close | received {cause:?}"
+    );
+    within("the close", closing)
+        .await
+        .expect("expected the closing task to finish")
+        .expect("expected a clean close");
+
+    let mut written_frames = 0;
     let mut refused_frames = 0;
-    let mut written_tags = std::collections::HashSet::new();
+    let mut written_tags = std::collections::HashSet::from([held_tag, notification_tag]);
     for caller in callers {
         let fates = within("a caller", caller)
             .await
@@ -807,6 +880,7 @@ async fn frames_queued_around_a_close() -> (usize, usize) {
                         "expected a written frame's write to have begun: true | received false for {tag}"
                     );
                     written_tags.insert(tag);
+                    written_frames += 1;
                 }
                 Err(refused) => {
                     refused_frames += 1;
@@ -841,7 +915,10 @@ async fn frames_queued_around_a_close() -> (usize, usize) {
         (frames.len(), &written_tags),
         "expected the wire to hold exactly the frames reported written, each once"
     );
-    (written_tags.len(), refused_frames)
+    assert!(
+        written_frames > 0 && refused_frames > 0,
+        "expected racing callers to have both written and refused frames | received ({written_frames}, {refused_frames})"
+    );
 }
 
 /// A frame that comes after the peer has gone, or after it passed an inbound budget, is turned
