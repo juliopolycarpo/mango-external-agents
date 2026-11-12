@@ -423,6 +423,54 @@ async fn no_session_lifecycle_request_carries_a_system_prompt() {
     }
 }
 
+/// An agent's stable `sessionCapabilities.systemPrompt` field is ignored because the host has no
+/// operation that can supply that prompt.
+#[tokio::test]
+async fn system_prompt_session_capability_is_not_surfaced() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(
+        FakeAcpAgent::new()
+            .with_agent_capabilities(Some(serde_json::json!({
+                "loadSession": true,
+                "promptCapabilities": { "image": true, "embeddedContext": true },
+                "sessionCapabilities": { "systemPrompt": {} },
+            })))
+            .process(),
+    );
+    let session = AcpHarness::builtin("cursor")
+        .expect("expected Cursor profile")
+        .open_session(
+            &host(launcher),
+            mango_external_agents::OpenSession::new("system-prompt-capability"),
+        )
+        .await
+        .expect("expected the ACP session to open");
+
+    let expected = SessionCapabilities::new(Capabilities {
+        structured_streaming: true,
+        reasoning_stream: true,
+        interactive_approvals: true,
+        resume: true,
+        images: true,
+        usage_reporting: true,
+        cancellation: true,
+        configuration_catalog: true,
+        session_configuration: true,
+        mcp_passthrough: true,
+        configuration: true,
+        ..Capabilities::none()
+    });
+    assert_eq!(
+        session.snapshot().capabilities,
+        expected,
+        "expected unsupported systemPrompt capability to leave host capabilities unchanged"
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected close");
+}
+
 /// A resumed remote session runs under the directory the current host authorized.
 ///
 /// Its saved ACP id is opaque history, not authority to reuse the directory from a prior hub.

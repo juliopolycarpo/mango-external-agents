@@ -14,8 +14,8 @@ use mango_agent_acp::AcpHarness;
 use mango_agent_acp::testing::FakeAcpAgent;
 use mango_external_agents::testing::FakeLauncher;
 use mango_external_agents::{
-    CloseReason, Error, GateVerdict, Harness, HostContext, LaunchSpec, ManagedProcess,
-    ProcessLauncher, Result,
+    Capabilities, CloseReason, Error, GateVerdict, Harness, HostContext, LaunchSpec,
+    ManagedProcess, ProcessLauncher, Result, SessionCapabilities,
 };
 
 /// A program available from one entry on the fixture `PATH`.
