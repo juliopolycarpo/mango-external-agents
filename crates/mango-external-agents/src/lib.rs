@@ -30,6 +30,7 @@ pub mod stream;
 pub mod testing;
 pub mod transport;
 pub mod transports;
+pub mod version;
 
 pub use configuration::{
     Configuration, ConfigurationCatalog, ConfigurationCategory, ConfigurationChange,

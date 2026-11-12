@@ -52,10 +52,7 @@ enum SurveyRefusal {
 }
 
 /// Classifies a help probe without treating a changed or unreadable surface as a version claim.
-fn classify_surface(
-    surface: Option<&CliSurface>,
-    version: Option<&semver::Version>,
-) -> Option<SurveyRefusal> {
+fn classify_surface(surface: Option<&CliSurface>, version: Option<&str>) -> Option<SurveyRefusal> {
     let Some(surface) = surface else {
         return if version.is_some_and(|version| !version::is_supported(Some(version))) {
             Some(SurveyRefusal::VersionTooOld)
@@ -151,7 +148,7 @@ impl ClaudeHarness {
 
         // A build that cannot be driven is not asked who is signed in: the answer would be true and
         // useless, and it costs a third process launch to learn.
-        if let Some(refusal) = classify_surface(surface.as_ref(), version.as_ref()) {
+        if let Some(refusal) = classify_surface(surface.as_ref(), version.as_deref()) {
             return Ok(Survey {
                 banner: Some(banner),
                 version,
@@ -227,7 +224,7 @@ impl ClaudeHarness {
             GateVerdict::VersionTooOld { .. }
             | GateVerdict::MissingRequiredSurface { .. }
             | GateVerdict::Usable
-            | GateVerdict::Unknown => classify_surface(surface.as_ref(), version.as_ref()),
+            | GateVerdict::Unknown => classify_surface(surface.as_ref(), version.as_deref()),
             _ => Some(SurveyRefusal::UnreadableHelp),
         };
         let account_kind = match receipt.discovery.auth {
@@ -274,7 +271,7 @@ impl ClaudeHarness {
 #[derive(Default)]
 struct Survey {
     banner: Option<String>,
-    version: Option<semver::Version>,
+    version: Option<String>,
     /// Why this build cannot be driven, when it cannot.
     refusal: Option<SurveyRefusal>,
     authentication: Authentication,
@@ -320,7 +317,7 @@ impl Survey {
         .text;
         match &self.version {
             Some(version) if version::parse(&shown).as_ref() != Some(version) => {
-                Some(version.to_string())
+                Some(version.clone())
             }
             _ => Some(shown),
         }
@@ -329,8 +326,7 @@ impl Survey {
     /// The version as a host should read it: what the CLI reported, bounded by the core.
     fn found(&self) -> String {
         self.version
-            .as_ref()
-            .map(semver::Version::to_string)
+            .clone()
             .or_else(|| self.reported())
             .unwrap_or_else(|| String::from("an unreadable version"))
     }
@@ -716,7 +712,7 @@ mod tests {
             "expected the reported line to be redacted | received {reported:?}"
         );
         assert_eq!(
-            crate::version::parse(&reported).map(|version| version.to_string()),
+            crate::version::parse(&reported),
             Some(String::from("2.1.270")),
             "expected the reported line to keep its version | received {reported:?}"
         );

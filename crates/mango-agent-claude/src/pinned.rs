@@ -196,8 +196,12 @@ mod tests {
 
     #[test]
     fn the_pinned_minimum_is_a_version_this_harness_can_compare() {
-        let parsed = crate::version::parse(MINIMUM_VERSION).expect("expected a parseable pin");
-        assert_eq!(parsed, crate::version::minimum());
+        assert_eq!(
+            crate::version::parse(MINIMUM_VERSION).as_deref(),
+            Some(MINIMUM_VERSION),
+            "expected the pin to read as a three-component Claude Code version"
+        );
+        assert!(crate::version::is_supported(Some(MINIMUM_VERSION)));
     }
 
     #[test]

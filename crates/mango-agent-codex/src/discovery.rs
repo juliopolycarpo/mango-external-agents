@@ -6,6 +6,7 @@
 //! never asks for a token refresh, and has no login method anywhere.
 
 use mango_external_agents::discovery::{AuthMode, AuthState, GateVerdict};
+use mango_external_agents::version::{self, Comparison};
 
 use crate::protocol::requests::Account;
 
@@ -65,31 +66,29 @@ pub fn parse_user_agent_version(user_agent: &str) -> Option<String> {
 
 /// Whether `found` is at least `minimum`.
 ///
-/// Compared as dotted numbers, with any pre-release suffix dropped: `0.155.0-alpha.3` is treated
-/// as `0.155.0`, which is the reading that matters here — an alpha of a newer minor carries the
-/// newer protocol. A component that is not a number makes the whole comparison unanswerable, which
-/// the caller reports as [`GateVerdict::Unknown`].
+/// The core's [`version::compare`](mango_external_agents::version::compare) as the `Option` this
+/// crate's callers match on: dotted numbers with any pre-release suffix dropped, so
+/// `0.155.0-alpha.3` is treated as `0.155.0`, which is the reading that matters here: an alpha
+/// of a newer minor carries the newer protocol. A component that is not a number makes the whole
+/// comparison unanswerable, which the caller reports as [`GateVerdict::Unknown`].
+///
+/// # Example
+///
+/// ```
+/// use mango_agent_codex::discovery::meets_minimum;
+///
+/// assert_eq!(meets_minimum("0.153.4", "0.153.0"), Some(true));
+/// assert_eq!(meets_minimum("0.152.9", "0.153.0"), Some(false));
+/// assert_eq!(meets_minimum("0.155.0-alpha.3", "0.155.0"), Some(true));
+/// assert_eq!(meets_minimum("nightly", "0.153.0"), None);
+/// ```
 #[must_use]
 pub fn meets_minimum(found: &str, minimum: &str) -> Option<bool> {
-    let parts = |version: &str| -> Option<Vec<u64>> {
-        version
-            .split('-')
-            .next()?
-            .split('.')
-            .map(|part| part.parse::<u64>().ok())
-            .collect()
-    };
-    let (found, minimum) = (parts(found)?, parts(minimum)?);
-    let width = found.len().max(minimum.len());
-    let at = |parts: &[u64], index: usize| parts.get(index).copied().unwrap_or(0);
-    for index in 0..width {
-        match at(&found, index).cmp(&at(&minimum, index)) {
-            std::cmp::Ordering::Less => return Some(false),
-            std::cmp::Ordering::Greater => return Some(true),
-            std::cmp::Ordering::Equal => {}
-        }
+    match version::compare(found, minimum) {
+        Comparison::AtLeast => Some(true),
+        Comparison::Below => Some(false),
+        Comparison::Unknown => None,
     }
-    Some(true)
 }
 
 /// The verdict for a build that reported `version`.
