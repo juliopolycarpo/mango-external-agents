@@ -12,7 +12,7 @@ pub use buffer::EventReceiver;
 use tokio::sync::mpsc;
 
 use crate::error::{Error, Result, VendorError};
-use crate::event::{AgentEvent, EventKind, SessionId, StructureClose, TurnId};
+use crate::event::{ActivityUpdate, AgentEvent, EventKind, SessionId, StructureClose, TurnId};
 use crate::host::Clock;
 use crate::operation::{AttemptId, Dispatch, OperationRef};
 use crate::session::CancelReason;
@@ -365,6 +365,20 @@ impl EventSink {
     /// ```
     pub async fn emit_close(&self, close: StructureClose) -> Result<()> {
         self.buffer.push_close(self.event(EventKind::from(close))?)
+    }
+
+    /// Publishes a coalesced update just before closing an activity at the end of a turn.
+    ///
+    /// Queues bounded payload without committing a terminal when the queue has no room.
+    /// The caller can still offer the activity close, which may fit in fewer bytes.
+    /// Use [`Self::emit`] for updates during a running turn.
+    pub async fn emit_closing_activity_update(
+        &self,
+        call_id: String,
+        update: ActivityUpdate,
+    ) -> Result<()> {
+        self.buffer
+            .push(self.event(EventKind::ActivityUpdated { call_id, update })?)
     }
 
     /// Commits cancellation and its compatibility terminal together, even when the queue is full.
