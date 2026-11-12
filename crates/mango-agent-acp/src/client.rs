@@ -97,9 +97,11 @@ pub(crate) struct TurnHandle {
     /// task; resuming afterwards would put the rest of that frame's events *after* the terminal,
     /// which the core's conformance suite refuses. Checked before every emit.
     finished: Arc<AtomicBool>,
-    /// Serializes permission registration, announcement and native replies with the terminal claim.
-    /// Notification handlers keep their lock-free finished read.
-    permission_commit: Arc<Mutex<()>>,
+    /// Serializes permission settlement with the terminal claim and remembers the first drain.
+    permission_settlement: Arc<Mutex<PermissionSettlement>>,
+    /// Orders a refused update's terminal against prompt and close publication. A refusal can
+    /// publish first while the prompt retains responsibility for native cleanup and slot release.
+    terminal_publication: Arc<tokio::sync::Mutex<()>>,
     /// Set once this turn's host was told the agent sent an update that could not be read.
     unreadable_update_noticed: Arc<AtomicBool>,
     /// Wakes the prompt owner when native cancellation starts.
@@ -109,6 +111,19 @@ pub(crate) struct TurnHandle {
     pub(crate) approvals: Arc<ApprovalEvents>,
     #[cfg(test)]
     withdrawal_hold: Arc<Mutex<Option<WithdrawalHold>>>,
+}
+
+#[derive(PartialEq, Eq)]
+enum PermissionSettlement {
+    Open,
+    Sealed,
+    Drained,
+}
+
+#[derive(PartialEq, Eq)]
+enum TerminalPublisher {
+    TurnOwner,
+    RefusedEvent,
 }
 
 /// One-use synchronous pre-audit pause representing a withdrawal thread being descheduled.
@@ -322,13 +337,29 @@ impl TurnHandle {
         self.finished.load(Ordering::Acquire)
     }
 
-    /// Claims the right to emit this turn's terminal, once.
+    /// Claims the turn owner's terminal path and slot release, once.
+    ///
+    /// A refused update that already started draining may still publish the terminal first.
     pub(crate) fn finish(&self) -> bool {
-        let _permission = self
-            .permission_commit
+        let mut settlement = self
+            .permission_settlement
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        if *settlement == PermissionSettlement::Open {
+            *settlement = PermissionSettlement::Sealed;
+        }
         !self.finished.swap(true, Ordering::AcqRel)
+    }
+
+    /// Claims cleanup, then waits for an earlier refused update to publish its terminal.
+    ///
+    /// The caller must finish any connection shutdown wait before taking this guard. A
+    /// notification whose refusal is waiting for the same guard may hold off that shutdown.
+    pub(crate) async fn claim_terminal(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        if !self.finish() {
+            return None;
+        }
+        Some(self.terminal_publication.lock().await)
     }
 }
 
@@ -654,7 +685,8 @@ impl SessionState {
             level,
             generation: self.generations.fetch_add(1, Ordering::Relaxed),
             finished: Arc::new(AtomicBool::new(false)),
-            permission_commit: Arc::new(Mutex::new(())),
+            permission_settlement: Arc::new(Mutex::new(PermissionSettlement::Open)),
+            terminal_publication: Arc::new(tokio::sync::Mutex::new(())),
             unreadable_update_noticed: Arc::new(AtomicBool::new(false)),
             cancellation: mango_external_agents::CancelToken::new(),
             cancel_failure: Arc::new(Mutex::new(None)),
@@ -789,40 +821,64 @@ impl SessionState {
             .is_some_and(|current| current.generation == handle.generation)
     }
 
-    /// Ends this turn, and only this turn.
+    /// Takes the matched turn's cancellation reason and any reducer it still owes.
     ///
     /// What a `session/prompt` task calls. Its own turn may already have been ended by a `close`, and
     /// a *later* turn may have started in the meantime — so an unconditional take would let a task
     /// that answered late end, and emit the terminal of, a conversation that is not its own.
     ///
-    /// Hands back the turn's own reducer rather than its closing events: what the calls the agent
-    /// left running end as depends on the terminal, which the caller decides after this returns.
+    /// Hands back the reducer rather than its closing events because the caller decides their
+    /// status. If a refused update already took the reducer, only the cancellation reason remains.
     pub(crate) fn prepare_terminal_matching(
         &self,
         handle: &TurnHandle,
     ) -> Option<(TurnHandle, Option<CancelReason>, Reducer)> {
-        let (turn, reason, pending, closing) = {
-            let active = self.lock_turn();
-            if active.as_ref()?.generation != handle.generation {
-                return None;
-            }
-            let turn = active.clone()?;
-            // These are all owned by the current turn. Capture them before releasing the slot: a
-            // newly started prompt clears the reducer and may park approvals of its own.
-            let mut cancelling = self.lock_cancel_reason();
-            let reason = cancelling.take();
-            let pending = self.take_pending();
-            // A responder cannot remove a request between the reason read and this drain, then
-            // register its audit after the terminal flush found the map empty.
-            drop(cancelling);
-            let closing = std::mem::take(&mut *self.lock_reducer());
-            self.remember_closed_calls(&closing);
-            (turn, reason, pending, closing)
+        self.prepare_terminal(handle, TerminalPublisher::TurnOwner)
+    }
+
+    fn prepare_terminal(
+        &self,
+        handle: &TurnHandle,
+        publisher: TerminalPublisher,
+    ) -> Option<(TurnHandle, Option<CancelReason>, Reducer)> {
+        let active = self.lock_turn();
+        let turn = active.as_ref()?;
+        if turn.generation != handle.generation {
+            return None;
+        }
+        // These are all owned by the current turn. Capture them before releasing the slot: a
+        // newly started prompt clears the reducer and may park approvals of its own.
+        let mut cancelling = self.lock_cancel_reason();
+        let mut settlement = turn
+            .permission_settlement
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if publisher == TerminalPublisher::RefusedEvent && turn.is_finished() {
+            return None;
+        }
+        let drained = *settlement == PermissionSettlement::Drained;
+        *settlement = PermissionSettlement::Drained;
+        drop(settlement);
+        let reason = if publisher == TerminalPublisher::TurnOwner {
+            cancelling.take()
+        } else {
+            // The refusal publishes failure. The first cancellation reason still belongs to
+            // the owner that will perform native cleanup.
+            None
         };
-        for pending in pending {
+        if drained {
+            // A refusal already recorded the calls it closed. Preserve those ids for the next
+            // turn, which uses them to distinguish a late frame from its own work.
+            return Some((turn.clone(), reason, Reducer::new()));
+        }
+        for pending in self.take_pending() {
             pending.withdraw();
         }
-        Some((turn, reason, closing))
+        // A second terminal drain must see the audit before it finds the pending map empty.
+        drop(cancelling);
+        let closing = std::mem::take(&mut *self.lock_reducer());
+        self.remember_closed_calls(&closing);
+        Some((turn.clone(), reason, closing))
     }
 
     /// Keeps the ids of the calls `closing` still holds open, in place of the ones kept at the
@@ -946,8 +1002,7 @@ impl SessionState {
         }
     }
 
-    /// The events and session facts one frame produces for `turn`, computed under the guard because
-    /// the reducer is pure.
+    /// The events and session facts one frame produces for `turn`, computed under the reducer guard.
     ///
     /// `turn` is the owner the caller read before getting here, and it may have ended since: its
     /// terminal is claimed before its slot is released, and the slot is released before a later
@@ -956,15 +1011,22 @@ impl SessionState {
     /// next turn then owns, to be closed there as a call its host never saw start. So such a frame
     /// contributes only its session facts. The claim is read under the reducer's own guard, which
     /// is what the next turn's reset waits for, so a turn that has replaced `turn` is always seen
-    /// as ended here.
+    /// as ended here. Late-call routing also runs under this guard, so an update cannot forget
+    /// a remembered call ID after the turn that received it ended.
     fn reduce(
         &self,
         turn: &TurnHandle,
         notification: SessionNotification,
     ) -> (Vec<EventKind>, Vec<SessionFact>) {
         let mut reducer = self.lock_reducer();
-        if turn.is_finished() {
+        if turn.is_finished() || turn.sink.is_terminal() {
             return (Vec::new(), Reducer::session_facts(notification.update));
+        }
+        if self.is_late_for_a_closed_call(&notification.update) {
+            return (Vec::new(), Vec::new());
+        }
+        if is_progress(&notification.update) {
+            self.touch();
         }
         // Tokio's clock rather than the host's: this instant only spaces a running call's updates,
         // and a runtime with paused time has to see that spacing move with it.
@@ -1049,9 +1111,11 @@ impl SessionState {
             return Ok(false);
         }
         let mut parked = self.lock_pending();
-        let permission = pending.turn.permission_commit.clone();
-        let _permission = permission.lock().unwrap_or_else(PoisonError::into_inner);
-        if pending.turn.is_finished() || parked.len() >= self.limits.max_pending_requests {
+        let settlement = pending.turn.permission_settlement.clone();
+        let settlement = settlement.lock().unwrap_or_else(PoisonError::into_inner);
+        if *settlement != PermissionSettlement::Open
+            || parked.len() >= self.limits.max_pending_requests
+        {
             drop(parked);
             pending.reply.respond(permission::cancelled())?;
             return Ok(false);
@@ -1072,9 +1136,9 @@ impl SessionState {
         let Some(pending) = parked.get_mut(id) else {
             return false;
         };
-        let permission = pending.turn.permission_commit.clone();
-        let _permission = permission.lock().unwrap_or_else(PoisonError::into_inner);
-        if pending.turn.is_finished() {
+        let settlement = pending.turn.permission_settlement.clone();
+        let settlement = settlement.lock().unwrap_or_else(PoisonError::into_inner);
+        if *settlement != PermissionSettlement::Open {
             let pending = parked
                 .remove(id)
                 .expect("the registered permission remains locked");
@@ -1103,9 +1167,9 @@ impl SessionState {
             return Ok(Answered::AlreadyResolved);
         };
         self.touch();
-        let permission = pending.turn.permission_commit.clone();
-        let permission = permission.lock().unwrap_or_else(PoisonError::into_inner);
-        if cancelling.is_some() || pending.turn.is_finished() {
+        let settlement = pending.turn.permission_settlement.clone();
+        let settlement = settlement.lock().unwrap_or_else(PoisonError::into_inner);
+        if cancelling.is_some() || *settlement != PermissionSettlement::Open {
             pending.withdraw();
             return Ok(Answered::AlreadyResolved);
         }
@@ -1128,7 +1192,7 @@ impl SessionState {
             let turn = pending.turn.clone();
             let notification = pending.cancel.clone();
             pending.withdraw();
-            drop(permission);
+            drop(settlement);
             drop(cancelling);
             self.cancel_expired(turn, notification);
             return Ok(Answered::AlreadyResolved);
@@ -1341,13 +1405,6 @@ async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotif
     // Capture the current owner before anything is reduced. Facts may arrive between turns; their
     // publication must not attach turn events to a newly admitted generation.
     let turn = state.turn();
-    // The tail of a turn that has already ended is neither this turn's event nor its progress.
-    if turn.is_some() && state.is_late_for_a_closed_call(&notification.update) {
-        return;
-    }
-    if is_progress(&notification.update) {
-        state.touch();
-    }
     // No turn owns this frame (a `session/load` replay, or a frame between turns): its events would
     // be dropped, so only its session facts are read and the turn reducer is not fed, which keeps a
     // long history from leaving open calls behind for the next turn to reset. A notice or a
@@ -1355,6 +1412,9 @@ async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotif
     // agent may not rely on it being shown, and a compaction that is still running when the next
     // turn starts opens there on its next frame, without the summary sent in between.
     let Some(turn) = turn else {
+        if is_progress(&notification.update) {
+            state.touch();
+        }
         for fact in Reducer::session_facts(notification.update) {
             state.apply_fact(fact);
         }
@@ -1441,11 +1501,17 @@ async fn report_refused_event(state: &SessionState, turn: &TurnHandle, error: &E
     // From taking what the turn owes to committing its terminal in one piece: see
     // `hold_terminal_commit`. Nothing below waits on the agent or on the host's reader.
     let _hold = state.hold_terminal_commit().await;
-    if let Some((_, _, mut closing)) = state.prepare_terminal_matching(turn) {
-        let _ = turn.approvals.flush(&turn.sink).await;
-        for kind in closing.finish_with(ActivityStatus::Failed) {
-            let _ = turn.sink.emit(kind).await;
-        }
+    let _publication = turn.terminal_publication.lock().await;
+    if turn.sink.is_terminal() {
+        return;
+    }
+    let Some((_, _, mut closing)) = state.prepare_terminal(turn, TerminalPublisher::RefusedEvent)
+    else {
+        return;
+    };
+    let _ = turn.approvals.flush(&turn.sink).await;
+    for kind in closing.finish_with(ActivityStatus::Failed) {
+        let _ = turn.sink.emit(kind).await;
     }
     let _ = turn
         .sink

@@ -1115,8 +1115,12 @@ impl Session for AcpSession {
             // fails only if the receiving half of the stream is already gone, and the stream is built
             // in this function and handed to the caller after it returns, so nothing can have dropped
             // it yet. It is the correct release for a path that exists as defence in depth.
-            if let Some((turn, _, _)) = self.connection_state.prepare_terminal_matching(&handle) {
-                let _ = turn.finish();
+            if handle.finish()
+                && self
+                    .connection_state
+                    .prepare_terminal_matching(&handle)
+                    .is_some()
+            {
                 self.connection_state.release_turn_matching(&handle);
             }
             if self.lifecycle.is_closed() {
@@ -1152,10 +1156,12 @@ impl Session for AcpSession {
                     // Nothing was queued: the frame was over the outgoing budget as the
                     // connection measured it. The turn is over before it reached the agent, so
                     // its slot is released the way the failed `TurnStarted` above releases it.
-                    if let Some((turn, _, _)) =
-                        self.connection_state.prepare_terminal_matching(&handle)
+                    if handle.finish()
+                        && self
+                            .connection_state
+                            .prepare_terminal_matching(&handle)
+                            .is_some()
                     {
-                        let _ = turn.finish();
                         self.connection_state.release_turn_matching(&handle);
                     }
                     return Err(error);
@@ -1283,9 +1289,9 @@ impl Session for AcpSession {
             // Matched, not taken: a `close` may have ended this turn already, and a *later* turn may
             // have started since, so an unconditional take would terminate a conversation that is not
             // this prompt's.
-            if !handle.finish() {
+            let Some(_publication) = handle.claim_terminal().await else {
                 return;
-            }
+            };
             let Some((turn, cancel_reason, closing)) = state.prepare_terminal_matching(&handle)
             else {
                 return;
@@ -1441,12 +1447,12 @@ fn detach_retry_cancel_cleanup(
 ) {
     tokio::spawn(async move {
         let cleanup_error = connection.wait_shutdown().await.err();
+        let Some(_publication) = handle.claim_terminal().await else {
+            return;
+        };
         let Some((turn, _, closing)) = state.prepare_terminal_matching(&handle) else {
             return;
         };
-        if !turn.finish() {
-            return;
-        }
         let message = cleanup_error.map_or_else(
             || String::from("ACP session/cancel could not be queued after prompt admission"),
             |error| format!("ACP process cleanup failed: {error}"),
@@ -1714,29 +1720,26 @@ async fn finish_close(
     connection.begin_shutdown(reason.into());
     let result = connection.wait_shutdown().await;
     let mut result = result;
-    if let Some(handle) = ending
-        && let Some((turn, _, closing)) = state.prepare_terminal_matching(&handle)
-    {
-        // Terminal commitment is reserved in the core stream, so neither a full transcript nor a
-        // dropped initiating close future can prevent this task from settling its owned turn.
-        let owned = turn.finish();
-        if owned {
-            let _ = turn.approvals.flush(&turn.sink).await;
-            let ending = match &result {
-                // A budget that already failed the link is why the turn ended, even when a
-                // host close raced its cleanup and took the terminal over.
-                Ok(()) => match connection.overflow() {
-                    Some(overflow) => Ending::Fail(overflow_failure(overflow)),
-                    None => Ending::Cancel(reason.into()),
-                },
-                Err(error) => {
-                    Ending::Fail(link_failure(format!("ACP process cleanup failed: {error}")))
-                }
-            };
-            ending.emit(&turn.sink, closing).await;
-        }
-        if owned {
-            state.release_turn_matching(&handle);
+    if let Some(handle) = ending {
+        if let Some(_publication) = handle.claim_terminal().await {
+            if let Some((turn, _, closing)) = state.prepare_terminal_matching(&handle) {
+                // Terminal commitment is reserved in the core stream, so neither a full transcript
+                // nor a dropped initiating close future can prevent this task from settling its turn.
+                let _ = turn.approvals.flush(&turn.sink).await;
+                let ending = match &result {
+                    // A budget that already failed the link is why the turn ended, even when a
+                    // host close raced its cleanup and took the terminal over.
+                    Ok(()) => match connection.overflow() {
+                        Some(overflow) => Ending::Fail(overflow_failure(overflow)),
+                        None => Ending::Cancel(reason.into()),
+                    },
+                    Err(error) => {
+                        Ending::Fail(link_failure(format!("ACP process cleanup failed: {error}")))
+                    }
+                };
+                ending.emit(&turn.sink, closing).await;
+                state.release_turn_matching(&handle);
+            }
         } else if result.is_ok() {
             // The prompt task claimed this terminal and releases the slot once it is written.
             // After a failed cleanup it deliberately keeps the slot, so there is nothing to wait

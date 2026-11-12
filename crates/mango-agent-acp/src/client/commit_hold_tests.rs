@@ -19,9 +19,10 @@ use std::time::{Duration, Instant};
 
 use mango_external_agents::testing::{Announcer, FakeLauncher, FakeProcess};
 use mango_external_agents::{
-    ActivityStatus, AttemptId, CancelReason, CancelToken, Configuration, EventKind, EventReceiver,
-    EventSink, HarnessIdentity, HostContext, LaunchSpec, Limits, ProcessLauncher, SessionIds,
-    SessionSnapshot, TerminalStatus, TransportKind, TransportSelection, TurnId,
+    ActivityStatus, AttemptId, CancelReason, CancelToken, CloseReason, Configuration, EventKind,
+    EventReceiver, EventSink, HarnessIdentity, HostContext, LaunchSpec, Limits, ProcessLauncher,
+    Session, SessionIds, SessionSnapshot, TerminalStatus, TransportKind, TransportSelection,
+    TurnId,
 };
 
 use super::{ConnectionHandle, SessionId, SessionState, TurnHandle, drive};
@@ -321,13 +322,75 @@ async fn a_close_during_the_refusal_commit_waits_for_it() {
     running.assert_the_refusal_was_committed("a close");
 }
 
+/// Close joins teardown while the prompt owner is between claiming and preparing its terminal.
+/// The losing close must wait for the slot without removing the winner's activity or reason.
+#[tokio::test(start_paused = true)]
+async fn a_close_that_loses_the_terminal_claim_preserves_the_prompts_drain() {
+    let running = RunningTurn::start().await;
+    running.agent.announce(running_call("call-owned-by-prompt"));
+    until("the prompt's running call reduced", || {
+        running.state.open_call_count() == 1
+    })
+    .await;
+    assert!(
+        running.state.begin_cancellation(CancelReason::Requested),
+        "expected the prompt still owns the slot"
+    );
+    assert!(
+        running.turn.finish(),
+        "expected the prompt's terminal claim"
+    );
+
+    let session = crate::session::AcpSession::new(
+        crate::profile::builtin_profile("cursor").expect("expected the built-in Cursor profile"),
+        running.host.clone(),
+        Arc::clone(&running.state),
+        running.state.core_state.clone(),
+        Arc::clone(&running.connection),
+        agent_client_protocol_schema::v1::SessionId::new("session-1"),
+        agent_client_protocol_schema::v1::AgentCapabilities::default(),
+        None,
+    );
+    let closed = session.close(CloseReason::Shutdown).await;
+    assert!(
+        matches!(
+            closed,
+            Err(mango_external_agents::Error::Timeout { ref operation, after })
+                if operation.starts_with("ACP turn slot release") && after == running.host.limits().shutdown_timeout
+        ),
+        "expected close to wait for the prompt's slot release | received {closed:?}"
+    );
+    let (turn, reason, closing) = running
+        .state
+        .prepare_terminal_matching(&running.turn)
+        .expect("expected the prompt's turn still installed");
+    let calls = closing.open_call_ids().collect::<Vec<_>>();
+    turn.sink
+        .cancel(reason.unwrap_or(CancelReason::Shutdown))
+        .await
+        .expect("expected the prompt's cancellation terminal");
+    running.state.release_turn_matching(&turn);
+
+    let received = (reason, calls.as_slice());
+    let expected = (Some(CancelReason::Requested), &["call-owned-by-prompt"][..]);
+    assert_eq!(
+        received, expected,
+        "expected close to leave the first cancel reason and open activity to the prompt owner | received {received:?}"
+    );
+}
+
 /// A `session/request_permission` line under `id`, offering one way to allow and one to refuse.
 fn ask_line(id: u32) -> String {
+    ask_line_for(id, "call-ask")
+}
+
+/// A permission request about the specified agent call.
+fn ask_line_for(id: u32, call_id: &str) -> String {
     serde_json::json!({
         "jsonrpc": "2.0", "id": id, "method": "session/request_permission",
         "params": {
             "sessionId": "session-1",
-            "toolCall": { "toolCallId": "call-ask", "title": "Run tests" },
+            "toolCall": { "toolCallId": call_id, "title": "Run tests" },
             "options": [
                 { "optionId": "allow", "name": "Allow", "kind": "allow_once" },
                 { "optionId": "reject", "name": "Reject", "kind": "reject_once" },
@@ -335,6 +398,329 @@ fn ask_line(id: u32) -> String {
         }
     })
     .to_string()
+}
+
+/// The handler may be descheduled after the core refused a frame, while the prompt claims
+/// the terminal. The resumed handler cannot replace that terminal or drain its open calls.
+#[tokio::test]
+async fn a_refusal_after_the_prompt_claim_preserves_the_prompts_terminal() {
+    let mut running = RunningTurn::start().await;
+    running.agent.announce(running_call("call-owned-by-prompt"));
+    until("the prompt's running call reduced", || {
+        running.state.open_call_count() == 1
+    })
+    .await;
+    let error = mango_external_agents::Error::InvalidVendorValue {
+        field: "activity call id",
+        received: String::from("   "),
+    };
+    assert!(
+        running.state.begin_cancellation(CancelReason::Requested),
+        "expected the prompt still owns the slot"
+    );
+    assert!(
+        running.turn.finish(),
+        "expected the prompt's terminal claim"
+    );
+    super::report_refused_event(&running.state, &running.turn, &error).await;
+
+    let (turn, reason, mut closing) = running
+        .state
+        .prepare_terminal_matching(&running.turn)
+        .expect("expected the prompt's turn still installed");
+    for kind in closing.finish_with(ActivityStatus::Cancelled) {
+        let _ = turn.sink.emit(kind).await;
+    }
+    let _ = turn
+        .sink
+        .cancel(reason.unwrap_or(CancelReason::Shutdown))
+        .await;
+    running.state.release_turn_matching(&turn);
+    running
+        .connection
+        .shutdown(CancelReason::Shutdown)
+        .await
+        .expect("expected the fake connection to shut down");
+
+    let received = (
+        reason,
+        running.events.terminal_status(),
+        running.closes_and_terminal(),
+    );
+    let expected = (
+        Some(CancelReason::Requested),
+        Some(TerminalStatus::Cancelled {
+            reason: CancelReason::Requested,
+        }),
+        vec![String::from("completed call-owned-by-prompt Cancelled")],
+    );
+    assert_eq!(
+        received, expected,
+        "expected the claimed prompt to keep its first reason and close its activity | received {received:?}"
+    );
+}
+
+/// Once the refusal starts draining, the prompt can claim cleanup but must wait for that
+/// failure to be published before continuing to its own terminal path.
+#[tokio::test]
+async fn the_prompt_owner_waits_for_a_refusal_that_already_started_draining() {
+    let mut running = RunningTurn::start().await;
+    let turn = running.turn.clone();
+    let delivery = running.park_the_refusal_mid_commit().await;
+    let mut claim = std::pin::pin!(turn.claim_terminal());
+    let first_poll = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(claim.as_mut(), cx))
+    })
+    .await;
+    let waited = first_poll.is_pending();
+    drop(delivery);
+    let publication = match first_poll {
+        std::task::Poll::Ready(publication) => publication,
+        std::task::Poll::Pending => tokio::time::timeout(Duration::from_secs(5), claim)
+            .await
+            .expect("expected the prompt owner to continue after the refusal"),
+    }
+    .expect("expected the prompt owner to claim cleanup");
+    let terminal_at_claim = running.outcome();
+    drop(publication);
+    until("the refused terminal committed", || {
+        running.turn.sink.is_terminal()
+    })
+    .await;
+    running.assert_the_refusal_was_committed("the invalid update");
+    running.state.release_turn_matching(&turn);
+    running
+        .connection
+        .shutdown(CancelReason::Shutdown)
+        .await
+        .expect("expected the fake connection to shut down");
+    assert_eq!(
+        (waited, terminal_at_claim.as_str()),
+        (true, "acp-refused-event"),
+        "expected the prompt to wait for the refusal's terminal | received waited {waited}, terminal {terminal_at_claim:?}"
+    );
+}
+
+/// A refusal closes the agent's running call while the prompt still owns its slot.
+/// The prompt's cleanup must preserve that call ID to refuse a late permission on the next turn.
+#[tokio::test]
+async fn prompt_cleanup_preserves_call_ids_closed_by_the_refused_event() {
+    let mut running = RunningTurn::start().await;
+    drop(running.park_the_refusal_mid_commit().await);
+    until("the refused terminal committed", || {
+        running.turn.sink.is_terminal()
+    })
+    .await;
+    running.assert_the_refusal_was_committed("the invalid update");
+    let late_call = serde_json::from_value(serde_json::json!({
+        "sessionId": "session-1",
+        "update": { "sessionUpdate": "tool_call", "toolCallId": "call-0", "title": "Late call" }
+    }))
+    .expect("expected a late tool call");
+    super::on_session_update(&running.state, late_call).await;
+    assert_eq!(
+        running.state.open_call_count(),
+        0,
+        "expected late call-0 to leave the old turn's reducer empty"
+    );
+    assert!(
+        running.turn.finish(),
+        "expected the old prompt's cleanup claim"
+    );
+    assert!(
+        running
+            .state
+            .prepare_terminal_matching(&running.turn)
+            .is_some()
+    );
+    running.state.release_turn_matching(&running.turn);
+    let (next, _events) = begin_turn(&running.host, &running.state);
+    let delivery = next.approvals.hold_delivery().await;
+
+    running.agent.announce(ask_line_for(96, "call-0"));
+    until("permission 96 either replied or parked", || {
+        !running.launcher.written().is_empty() || running.state.pending_count() != 0
+    })
+    .await;
+    let parked = running.state.pending_count();
+    running.state.withdraw_pending();
+    drop(delivery);
+    tokio::time::timeout(Duration::from_secs(5), running.launcher.wait_for_written(1))
+        .await
+        .expect("expected native reply for permission 96 within 5s");
+    let reply: serde_json::Value = serde_json::from_str(&running.launcher.written()[0])
+        .expect("expected a JSON-RPC reply for permission 96");
+    running
+        .connection
+        .shutdown(CancelReason::Shutdown)
+        .await
+        .expect("expected the fake connection to shut down");
+
+    assert_eq!(
+        (parked, reply["id"].as_u64(), &reply["result"]["outcome"]),
+        (0, Some(96), &serde_json::json!({ "outcome": "cancelled" })),
+        "expected a late permission for closed call-0 cancelled before the next turn can park it | received {parked} parked and {reply}"
+    );
+}
+
+/// The notification worker can handle another permission before the prompt owner releases
+/// the refused turn. Holding delivery keeps an incorrectly parked question alive until its
+/// real expiry, which would otherwise be able to send a selected refusal after the terminal.
+#[tokio::test(start_paused = true)]
+async fn a_permission_after_a_refused_event_terminal_is_cancelled_before_expiry() {
+    let approval_timeout = Duration::from_secs(1);
+    let mut running = RunningTurn::start_with(
+        None,
+        None,
+        Limits {
+            approval_timeout,
+            ..hold_limits()
+        },
+    )
+    .await;
+    drop(running.park_the_refusal_mid_commit().await);
+    until("the refused terminal committed", || {
+        running.turn.sink.is_terminal()
+    })
+    .await;
+    running.assert_the_refusal_was_committed("the invalid update");
+    assert!(
+        !running.turn.is_finished() && running.state.turn().is_some(),
+        "expected the refused turn still awaiting prompt-owner cleanup"
+    );
+
+    let delivery = running.turn.approvals.hold_delivery().await;
+    running.agent.announce(ask_line(94));
+    let native_reply = || {
+        running
+            .launcher
+            .written()
+            .iter()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|message| message["id"] == 94)
+    };
+    until("permission 94 either replied or parked", || {
+        native_reply().is_some() || running.state.pending_count() != 0
+    })
+    .await;
+    let parked = running.state.pending_count();
+    if parked != 0 {
+        tokio::time::advance(approval_timeout).await;
+    }
+    until("native reply for permission 94", || {
+        native_reply().is_some()
+    })
+    .await;
+    let reply = native_reply().expect("expected a JSON-RPC reply for permission 94");
+    drop(delivery);
+    running
+        .connection
+        .shutdown(CancelReason::Shutdown)
+        .await
+        .expect("expected the fake connection to shut down");
+
+    assert_eq!(
+        (parked, reply["result"]["outcome"].clone()),
+        (0, serde_json::json!({ "outcome": "cancelled" })),
+        "expected permission 94 cancelled without parking or selecting an option | received {parked} parked and {reply}"
+    );
+}
+
+/// While a refused event drains an announced permission, another terminal may be ready.
+/// The real withdrawal pauses before audit registration, where the competing terminal
+/// used to see an empty map and commit without the resolution.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_event_keeps_its_terminal_drain_owned_until_audited() {
+    let mut running = RunningTurn::start().await;
+    running.agent.announce(ask_line(95));
+    let question = tokio::time::timeout(Duration::from_secs(5), running.events.recv())
+        .await
+        .expect("expected the permission event within 5s")
+        .expect("expected an open stream");
+    let EventKind::ApprovalRequested { request } = question.kind else {
+        panic!("expected approval requested for permission 95 | received {question:?}");
+    };
+    let interaction_id = request.id().clone();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let (release, release_rx) = std::sync::mpsc::channel();
+    *running
+        .turn
+        .withdrawal_hold
+        .lock()
+        .expect("expected the withdrawal gate") = Some(super::WithdrawalHold {
+        entered: Arc::clone(&entered),
+        release: release_rx,
+    });
+    running.agent.announce(running_call("   "));
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("expected refusal to remove the real permission before registering its audit");
+    assert_eq!(
+        running.state.pending_count(),
+        0,
+        "expected permission 95 removed from the pending map while its audit is paused"
+    );
+    let guard_available = match running.state.cancel_reason.try_lock() {
+        Ok(_) => true,
+        Err(std::sync::TryLockError::WouldBlock) => false,
+        Err(error) => panic!("expected a healthy cancellation guard | received {error}"),
+    };
+    if guard_available {
+        assert!(running.turn.finish(), "expected the competing prompt owner");
+        assert!(
+            running
+                .state
+                .prepare_terminal_matching(&running.turn)
+                .is_some(),
+            "expected the real prompt owner to prepare its terminal"
+        );
+        running
+            .turn
+            .approvals
+            .flush(&running.turn.sink)
+            .await
+            .expect("expected the prompt owner to flush its approvals");
+        running
+            .turn
+            .sink
+            .complete()
+            .await
+            .expect("expected the competing terminal");
+    }
+    release
+        .send(())
+        .expect("expected to release the withdrawal");
+    until("native reply for permission 95", || {
+        running.launcher.written().iter().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line).is_ok_and(|message| {
+                message["id"] == 95
+                    && message["result"]["outcome"] == serde_json::json!({"outcome":"cancelled"})
+            })
+        })
+    })
+    .await;
+    let remaining = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut remaining = Vec::new();
+        while let Some(event) = running.events.recv().await {
+            remaining.push(event.kind);
+        }
+        remaining
+    })
+    .await
+    .expect("expected the stream to reach its terminal within 5s");
+    running
+        .connection
+        .shutdown(CancelReason::Shutdown)
+        .await
+        .expect("expected the fake connection to shut down");
+    assert!(
+        matches!(
+            remaining.as_slice(),
+            [EventKind::ApprovalResolved { interaction_id: resolved, decision }, EventKind::Error { .. } | EventKind::Completed]
+                if resolved == &interaction_id && decision.source == mango_external_agents::DecisionSource::Cancelled
+        ),
+        "expected one cancelled approval resolution for {interaction_id} before the terminal | received {remaining:?}"
+    );
 }
 
 /// A host that answers a question after the connection ended under it, and before the turn's
