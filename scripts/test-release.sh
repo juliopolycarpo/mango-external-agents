@@ -313,6 +313,20 @@ for rejected in dropped dotted target; do
     exit 1
   }
 done
+# A dev-dependency that repeats its [dependencies] entry adds nothing and is a second version
+# requirement to keep in step. One that turns on a feature of its own is a different entry.
+printf '[dependencies]\nplain = "1.0"\ntabled = { version = "1.0", default-features = false }\n\n[dev-dependencies]\nplain = { version = "1.0", features = ["extra"] }\ntabled = { version = "1.0", features = ["extra"] }\n' > "$dev_fixture/widened.toml"
+printf '[dependencies]\nsibling = "1.0"\n\n[dev-dependencies]\nsibling = { version = "1.0" }\n' > "$dev_fixture/repeated.toml"
+scripts/check-dev-dependencies.sh "$dev_fixture/widened.toml" >/dev/null
+if scripts/check-dev-dependencies.sh "$dev_fixture/repeated.toml" >/dev/null 2>"$dev_fixture/repeated.err"; then
+  echo "expected rejection of the dev-dependency that repeats [dependencies] in repeated.toml, received success" >&2
+  exit 1
+fi
+grep -q "differ from the \[dependencies\] entry" "$dev_fixture/repeated.err" &&
+  grep -q "repeated.toml: \[dev-dependencies\] sibling = " "$dev_fixture/repeated.err" || {
+  echo "expected the rejection to name repeated.toml, the dependency and the redundancy, received: $(cat "$dev_fixture/repeated.err")" >&2
+  exit 1
+}
 rm -rf "$dev_fixture"
 trap - EXIT
 scripts/check-dev-dependencies.sh >/dev/null
