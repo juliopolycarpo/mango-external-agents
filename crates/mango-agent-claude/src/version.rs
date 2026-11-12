@@ -75,10 +75,52 @@ fn parse_claude_line(line: &str) -> Option<String> {
 fn parse_version_tokens(line: &str) -> Option<String> {
     line.split_whitespace().find_map(|token| {
         let token = token.strip_prefix('v').unwrap_or(token);
+        let core = token.split(['-', '+']).next().unwrap_or(token);
         let is_claude_version = token.starts_with(|first: char| first.is_ascii_digit())
-            && components(token).is_some_and(|numbers| numbers.len() == 3);
+            && components(core).is_some_and(|numbers| numbers.len() == 3)
+            && core
+                .split('.')
+                .all(|component| component == "0" || !component.starts_with('0'))
+            && valid_semver_suffix(&token[core.len()..]);
         is_claude_version.then(|| token.to_owned())
     })
+}
+
+/// Accepts only SemVer pre-release and build metadata after Claude's three numeric components.
+fn valid_semver_suffix(suffix: &str) -> bool {
+    if suffix.is_empty() {
+        return true;
+    }
+
+    let (prerelease, build) = if let Some(metadata) = suffix.strip_prefix('+') {
+        (None, Some(metadata))
+    } else if let Some(prerelease) = suffix.strip_prefix('-') {
+        match prerelease.split_once('+') {
+            Some((prerelease, metadata)) => (Some(prerelease), Some(metadata)),
+            None => (Some(prerelease), None),
+        }
+    } else {
+        return false;
+    };
+    if build.is_some_and(|metadata| !valid_semver_identifiers(metadata, false)) {
+        return false;
+    }
+    prerelease.is_none_or(|identifiers| valid_semver_identifiers(identifiers, true))
+}
+
+/// Checks dot-separated SemVer identifiers, including the numeric pre-release zero rule.
+fn valid_semver_identifiers(identifiers: &str, prerelease: bool) -> bool {
+    !identifiers.is_empty()
+        && identifiers.split('.').all(|identifier| {
+            !identifier.is_empty()
+                && identifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && (!prerelease
+                    || !identifier.bytes().all(|byte| byte.is_ascii_digit())
+                    || identifier == "0"
+                    || !identifier.starts_with('0'))
+        })
 }
 
 /// Whether an observed version may drive this harness.
@@ -110,7 +152,9 @@ pub fn is_supported(observed: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_supported, parse, parse_incomplete};
+    use super::{
+        is_supported, parse, parse_incomplete, valid_semver_identifiers, valid_semver_suffix,
+    };
     use crate::pinned::MINIMUM_VERSION;
 
     #[test]
@@ -181,6 +225,8 @@ mod tests {
             "2.x.270 (Claude Code)",
             "(2.1.270) Claude Code",
             "2.1.270abc (Claude Code)",
+            "2.1.200-api_key=fixture-secret (Claude Code)",
+            "2.01.270 (Claude Code)",
             "-2.1.270 (Claude Code)",
             "+2.1.270 (Claude Code)",
         ] {
@@ -195,6 +241,34 @@ mod tests {
             Some("2.1.270"),
             "expected the two-component token to be skipped for the three-component one"
         );
+    }
+
+    #[test]
+    fn semver_suffix_accepts_prerelease_and_build_metadata() {
+        for suffix in ["", "-beta.1", "+build.7", "-beta.1+build.7"] {
+            assert!(
+                valid_semver_suffix(suffix),
+                "expected {suffix:?} to be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn semver_suffix_rejects_empty_identifiers_and_extra_separators() {
+        for suffix in ["-", "-beta.", "-beta..1", "+", "+build.", "-beta+one+two"] {
+            assert!(
+                !valid_semver_suffix(suffix),
+                "expected {suffix:?} to be invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn semver_identifiers_apply_numeric_prerelease_zero_rules() {
+        assert!(valid_semver_identifiers("alpha.0", true));
+        assert!(!valid_semver_identifiers("alpha.01", true));
+        assert!(valid_semver_identifiers("01", false));
+        assert!(!valid_semver_identifiers("alpha_1", false));
     }
 
     #[test]

@@ -66,7 +66,7 @@ pub fn parse_user_agent_version(user_agent: &str) -> Option<String> {
 
 /// Whether `found` is at least `minimum`.
 ///
-/// The core's [`version::compare`](mango_external_agents::version::compare) as the `Option` this
+/// The core's [`version::compare`] as the `Option` this
 /// crate's callers match on: dotted numbers with any pre-release suffix dropped, so
 /// `0.155.0-alpha.3` is treated as `0.155.0`, which is the reading that matters here: an alpha
 /// of a newer minor carries the newer protocol. A component that is not a number makes the whole
