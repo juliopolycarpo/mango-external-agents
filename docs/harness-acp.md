@@ -605,6 +605,16 @@ to reset. `current_mode_update` produces no fact on either path. A frame the cli
 that has since claimed its terminal is treated the same way, so it cannot leave a call open in the
 reducer of the turn that replaced it.
 
+Before `session/new` identifies its session, the harness retains early command and configuration
+facts by their `sessionId` and applies only those matching the returned ID. Matching configuration
+notifications take precedence over the opening response. The pending facts share the host's
+`turn_buffer_bytes` byte limit and the larger of `turn_channel_capacity` and
+`max_pending_requests` for their count. If either limit is exceeded, opening fails with
+`LimitExceeded` and the child is shut down. The binding and turn owner are captured together, so
+an opening update cannot enter the first turn. An update admitted under a failed load cannot restore
+facts after fallback. ACP specifies the returned ID in [session setup](https://agentclientprotocol.com/protocol/v1/session-setup)
+and the session-scoped updates in [prompt turn](https://agentclientprotocol.com/protocol/v1/prompt-turn#session-updates).
+
 A `session/load` answered with `"result": null` resumes the session with no modes and no
 configuration options: `LoadSessionResponse` has no required field, and this harness reads a
 null result as the empty object before it decodes it. `session/set_mode` and `session/close` read
@@ -617,8 +627,9 @@ naming a `sessionId` other than the one `session/new` or `session/load` returned
 session's: the update is dropped, and the request is answered with ACP's `Cancelled` outcome
 rather than shown to a host that never opened that conversation. A resume binds to the requested
 id before `session/load` is sent. If the load fails and `ResumeMode::Fallback` opens a fresh session,
-the failed id is refused from then on, and whatever its replay already announced (commands,
-configuration options) is cleared rather than inherited by the new session.
+its replayed commands and configuration are cleared. An update admitted under the failed load is
+discarded even if it finishes after fallback. The new session can reuse the failed id: facts arriving
+during its open are retained until its response identifies the session.
 
 A withdrawn question resolves on both sides. The agent hears ACP's own `Cancelled` outcome; a host
 that was shown the prompt hears `ApprovalResolved` with `DecisionSource::Cancelled` and an option id

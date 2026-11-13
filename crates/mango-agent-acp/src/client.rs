@@ -133,11 +133,21 @@ struct WithdrawalHold {
     release: std::sync::mpsc::Receiver<()>,
 }
 
+#[cfg(test)]
+struct UpdateAdmissionHold {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
 /// The ACP session a connection is bound to, and the one a failed load abandoned.
 #[derive(Debug, Default)]
 struct NativeBinding {
     bound: Option<agent_client_protocol_schema::v1::SessionId>,
     abandoned: Option<agent_client_protocol_schema::v1::SessionId>,
+    generation: u64,
+    pending: Vec<(agent_client_protocol_schema::v1::SessionId, SessionFact)>,
+    pending_bytes: usize,
+    overflow: Option<(&'static str, usize, usize)>,
 }
 
 /// Gives a finished turn's slot back, on a connection that may already have ended.
@@ -428,6 +438,8 @@ pub(crate) struct SessionState {
     #[cfg(test)]
     permission_session_hold: Mutex<Option<commit_hold_tests::PermissionTurnHold>>,
     #[cfg(test)]
+    update_admission_hold: Mutex<Option<UpdateAdmissionHold>>,
+    #[cfg(test)]
     permission_closed_call_hold: Mutex<Option<commit_hold_tests::PermissionTurnHold>>,
     /// Bumped on every frame the agent sends and every change to the pending questions, so the
     /// idle deadline restarts on progress and re-reads whether a question is still open.
@@ -483,6 +495,8 @@ impl SessionState {
             next_approval: AtomicU64::new(0),
             #[cfg(test)]
             permission_session_hold: Mutex::new(None),
+            #[cfg(test)]
+            update_admission_hold: Mutex::new(None),
             #[cfg(test)]
             permission_closed_call_hold: Mutex::new(None),
             activity: tokio::sync::watch::channel(0).0,
@@ -550,14 +564,32 @@ impl SessionState {
 
     /// Binds this connection to one ACP session: the one being loaded, or the one opened.
     pub(crate) fn bind_native_session(&self, id: agent_client_protocol_schema::v1::SessionId) {
-        self.lock_native_session().bound = Some(id);
+        let mut binding = self.lock_native_session();
+        binding.bound = Some(id.clone());
+        for (session_id, fact) in std::mem::take(&mut binding.pending) {
+            if session_id == id {
+                self.apply_fact(fact);
+            }
+        }
+        binding.pending_bytes = 0;
+    }
+
+    pub(crate) fn opening_overflow(&self) -> Option<Error> {
+        self.lock_native_session()
+            .overflow
+            .take()
+            .map(|(subject, limit, received)| Error::LimitExceeded {
+                subject,
+                limit,
+                received,
+            })
     }
 
     /// Gives up on the session a failed `session/load` named, before a fallback opens a new one.
     ///
-    /// Frames naming it are refused from here on. And whatever its replay already announced — a
-    /// command catalog, configuration options — was that session's state, not the one the host is
-    /// about to get, so it is cleared rather than inherited.
+    /// Updates admitted under that binding are invalidated. Its replayed command and configuration
+    /// catalogs are cleared; new updates are held until the fallback names its session, which may
+    /// reuse the same id.
     ///
     /// ```ignore
     /// state.bind_native_session(loading.clone());
@@ -565,10 +597,12 @@ impl SessionState {
     /// state.abandon_native_session();
     /// ```
     pub(crate) fn abandon_native_session(&self) {
-        {
-            let mut binding = self.lock_native_session();
-            binding.abandoned = binding.bound.take();
-        }
+        let mut binding = self.lock_native_session();
+        binding.abandoned = binding.bound.take();
+        binding.generation = binding.generation.wrapping_add(1);
+        binding.pending.clear();
+        binding.pending_bytes = 0;
+        binding.overflow = None;
         let mut revision = self.lock_catalog_revision();
         *revision = revision.wrapping_add(1);
         self.core_state.update(|snapshot| {
@@ -589,12 +623,8 @@ impl SessionState {
     /// Once bound, only for the bound id. Before that, for any id except one a failed load
     /// abandoned: a fallback's `session/new` has not named its session yet.
     ///
-    /// Accepting frames before the bind is deliberate. ACP sends session-scoped traffic ahead of
-    /// the open's own response: `session/load` replays the conversation as `session/update`
-    /// notifications before it answers, and Cursor announces its command catalog while
-    /// `session/new` is still in flight. Dropping them would lose that session state. Nothing
-    /// before the bind can reach a turn or a host: no turn exists yet, so an update produces only
-    /// session facts and a permission request is answered `Cancelled`.
+    /// ACP can send session-scoped traffic before the opening response. Updates retain bounded
+    /// facts until the returned id is known; permission requests are answered `Cancelled`.
     fn serves(&self, id: &agent_client_protocol_schema::v1::SessionId) -> bool {
         let binding = self.lock_native_session();
         match &binding.bound {
@@ -1406,34 +1436,94 @@ fn is_progress(update: &SessionUpdate) -> bool {
 /// work before it releases this generation; freeing the slot here would let a second prompt onto a
 /// wire that has no way to tell two turns apart. The nonblocking sink makes later frames fail fast.
 async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotification) {
-    // Not this session's: neither transcript nor session state, and not progress either.
-    if !state.serves(&notification.session_id) {
-        return;
-    }
-    // Capture the current owner before anything is reduced. Facts may arrive between turns; their
-    // publication must not attach turn events to a newly admitted generation.
-    let turn = state.turn();
-    // No turn owns this frame (a `session/load` replay, or a frame between turns): its events would
-    // be dropped, so only its session facts are read and the turn reducer is not fed, which keeps a
-    // long history from leaving open calls behind for the next turn to reset. A notice or a
-    // compaction update that arrives here is therefore dropped whole: a notice is live and the
-    // agent may not rely on it being shown, and a compaction that is still running when the next
-    // turn starts opens there on its next frame, without the summary sent in between.
-    let Some(turn) = turn else {
-        if is_progress(&notification.update) {
-            state.touch();
+    // Read ownership under the binding lock, before a bind can hand the session to its first turn.
+    // A fallback may reopen the abandoned id, so its new-generation updates wait for the bind.
+    let (generation, turn) = {
+        let binding = state.lock_native_session();
+        if binding
+            .bound
+            .as_ref()
+            .is_some_and(|id| id != &notification.session_id)
+        {
+            return;
         }
-        for fact in Reducer::session_facts(notification.update) {
+        (binding.generation, state.turn())
+    };
+    #[cfg(test)]
+    if let Some(hold) = state
+        .update_admission_hold
+        .lock()
+        .expect("expected update gate")
+        .take()
+    {
+        let _ = hold.entered.send(());
+        hold.release
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("expected update gate release within 5s");
+    }
+    let events = {
+        let mut binding = state.lock_native_session();
+        if binding.generation != generation
+            || binding
+                .bound
+                .as_ref()
+                .is_some_and(|id| id != &notification.session_id)
+        {
+            return;
+        }
+        if binding.bound.is_none() && turn.is_none() {
+            // The frame is bounded before parsing; use its encoded size and the host's queued
+            // message and byte budgets to bound retained opening facts as well.
+            let bytes = serde_json::to_vec(&notification).map_or(usize::MAX, |frame| frame.len());
+            let facts = Reducer::session_facts(notification.update);
+            if !facts.is_empty() {
+                let count_limit = state
+                    .limits
+                    .turn_channel_capacity
+                    .max(state.limits.max_pending_requests);
+                let received_count = binding.pending.len().saturating_add(facts.len());
+                let received_bytes = binding.pending_bytes.saturating_add(bytes);
+                if received_count > count_limit {
+                    binding.overflow.get_or_insert((
+                        "opening session facts",
+                        count_limit,
+                        received_count,
+                    ));
+                } else if received_bytes > state.limits.turn_buffer_bytes {
+                    binding.overflow.get_or_insert((
+                        "bytes of opening session facts",
+                        state.limits.turn_buffer_bytes,
+                        received_bytes,
+                    ));
+                } else {
+                    binding.pending_bytes = received_bytes;
+                    binding.pending.extend(
+                        facts
+                            .into_iter()
+                            .map(|fact| (notification.session_id.clone(), fact)),
+                    );
+                }
+            }
+            return;
+        }
+        let Some(turn) = turn.as_ref() else {
+            if is_progress(&notification.update) {
+                state.touch();
+            }
+            for fact in Reducer::session_facts(notification.update) {
+                state.apply_fact(fact);
+            }
+            return;
+        };
+        let (events, facts) = state.reduce(turn, notification);
+        for fact in facts {
             state.apply_fact(fact);
         }
+        events
+    };
+    let Some(turn) = turn else {
         return;
     };
-    let (events, facts) = state.reduce(&turn, notification);
-    // Published before the turn events: a session fact is true the moment the agent announced it,
-    // not only once a host has read every event that preceded it on this turn's own stream.
-    for fact in facts {
-        state.apply_fact(fact);
-    }
     for kind in events {
         // Re-checked each time round: close can commit the terminal after reduction, and no later
         // event may follow it.
@@ -3079,6 +3169,222 @@ mod tests {
             }))
         }
 
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn opening_update_does_not_enter_first_turn_after_admission() {
+            let (state, host) = state();
+            let state = Arc::new(state);
+            let (entered, observed) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            *state.update_admission_hold.lock().expect("expected gate") =
+                Some(super::super::UpdateAdmissionHold {
+                    entered,
+                    release: released,
+                });
+            let task = tokio::spawn({
+                let state = Arc::clone(&state);
+                async move {
+                    crate::client::on_session_update(&state, running_call(0)).await;
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(3), observed)
+                .await
+                .expect("expected update admission within 3s")
+                .expect("expected gate observer");
+            state.bind_native_session(agent_client_protocol_schema::v1::SessionId::new(
+                "session-1",
+            ));
+            state
+                .begin_turn(super::sink(&host, "first"), None)
+                .expect("expected first turn");
+            release.send(()).expect("expected gate release");
+            task.await.expect("expected handler completion");
+            let calls = state.open_call_count();
+            assert_eq!(
+                calls, 0,
+                "expected opening update's first-turn open calls: 0 | received: {calls}"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn abandoned_load_update_does_not_restore_cleared_facts() {
+            let (state, _) = state();
+            let state = Arc::new(state);
+            state.bind_native_session(agent_client_protocol_schema::v1::SessionId::new(
+                "session-1",
+            ));
+            let (entered, observed) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            *state.update_admission_hold.lock().expect("expected gate") =
+                Some(super::super::UpdateAdmissionHold {
+                    entered,
+                    release: released,
+                });
+            let task = tokio::spawn({
+                let state = Arc::clone(&state);
+                async move {
+                    crate::client::on_session_update(&state, notification(serde_json::json!({
+                    "sessionUpdate": "available_commands_update", "availableCommands": [{"name":"stale", "description":"stale"}]
+                }))).await;
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(3), observed)
+                .await
+                .expect("expected update admission within 3s")
+                .expect("expected gate observer");
+            state.abandon_native_session();
+            state.bind_native_session(agent_client_protocol_schema::v1::SessionId::new("fresh"));
+            release.send(()).expect("expected gate release");
+            task.await.expect("expected handler completion");
+            let snapshot = state.core_state.snapshot();
+            let commands: Vec<_> = snapshot
+                .commands
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect();
+            assert!(
+                commands.is_empty(),
+                "expected fresh commands: [] | received: {commands:?}"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn abandoned_load_update_cannot_restore_facts_when_fallback_reuses_id() {
+            let (state, _) = state();
+            let state = Arc::new(state);
+            state.bind_native_session(agent_client_protocol_schema::v1::SessionId::new(
+                "session-1",
+            ));
+            let (entered, observed) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            *state.update_admission_hold.lock().expect("expected gate") =
+                Some(super::super::UpdateAdmissionHold {
+                    entered,
+                    release: released,
+                });
+            let task = tokio::spawn({
+                let state = Arc::clone(&state);
+                async move {
+                    crate::client::on_session_update(&state, notification(serde_json::json!({
+                    "sessionUpdate": "available_commands_update", "availableCommands": [{"name":"stale", "description":"stale"}]
+                }))).await;
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(3), observed)
+                .await
+                .expect("expected update admission within 3s")
+                .expect("expected gate observer");
+            state.abandon_native_session();
+            state.bind_native_session(agent_client_protocol_schema::v1::SessionId::new(
+                "session-1",
+            ));
+            release.send(()).expect("expected gate release");
+            task.await.expect("expected handler completion");
+            let snapshot = state.core_state.snapshot();
+            let commands: Vec<_> = snapshot
+                .commands
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect();
+            assert!(
+                commands.is_empty(),
+                "expected fresh commands: [] | received: {commands:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn opening_facts_respect_count_and_byte_budgets() {
+            let host = mango_external_agents::HostContext::builder()
+                .launcher(Arc::new(mango_external_agents::testing::FakeLauncher::new()))
+                .cwd(std::env::temp_dir())
+                .client_info("bounds-test", "1")
+                .limits(mango_external_agents::Limits {
+                    turn_channel_capacity: 1,
+                    max_pending_requests: 1,
+                    turn_buffer_bytes: 1024,
+                    ..Default::default()
+                })
+                .build()
+                .expect("expected host");
+            let state = Arc::new(super::super::SessionState::new(
+                super::SessionId::new("session-1"),
+                &host,
+                mango_external_agents::Configuration::default(),
+                super::core_state(),
+            ));
+            for name in ["first", "second"] {
+                crate::client::on_session_update(&state, notification(serde_json::json!({
+                    "sessionUpdate": "available_commands_update", "availableCommands": [{"name": name, "description": "command"}]
+                }))).await;
+            }
+            let binding = state.lock_native_session();
+            let count = binding.pending.len();
+            let bytes = binding.pending_bytes;
+            assert_eq!(
+                count, 1,
+                "expected retained opening facts: 1 | received: {count}"
+            );
+            assert!(
+                bytes <= 1024,
+                "expected retained opening bytes <= 1024 | received: {bytes}"
+            );
+            drop(binding);
+            state.bind_native_session(agent_client_protocol_schema::v1::SessionId::new(
+                "session-1",
+            ));
+            let overflow = state.opening_overflow();
+            assert!(
+                matches!(
+                    overflow,
+                    Some(mango_external_agents::Error::LimitExceeded {
+                        subject: "opening session facts",
+                        limit: 1,
+                        received: 2
+                    })
+                ),
+                "expected opening fact limit: 1, received: 2 | received: {overflow:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn opening_facts_over_byte_budget_fail_opening() {
+            let host = mango_external_agents::HostContext::builder()
+                .launcher(Arc::new(mango_external_agents::testing::FakeLauncher::new()))
+                .cwd(std::env::temp_dir())
+                .client_info("byte-bound-test", "1")
+                .limits(mango_external_agents::Limits {
+                    turn_buffer_bytes: 1024,
+                    ..Default::default()
+                })
+                .build()
+                .expect("expected host");
+            let state = Arc::new(super::super::SessionState::new(
+                super::SessionId::new("session-1"),
+                &host,
+                mango_external_agents::Configuration::default(),
+                super::core_state(),
+            ));
+            let frame = notification(
+                serde_json::json!({"sessionUpdate":"available_commands_update",
+                "availableCommands":[{"name":"large", "description":"x".repeat(1024)}]}),
+            );
+            let size = serde_json::to_vec(&frame)
+                .expect("expected encodable frame")
+                .len();
+            crate::client::on_session_update(&state, frame).await;
+            assert!(
+                state.lock_native_session().pending.is_empty(),
+                "expected no retained oversized fact"
+            );
+            state.bind_native_session(agent_client_protocol_schema::v1::SessionId::new(
+                "session-1",
+            ));
+            let overflow = state.opening_overflow();
+            assert!(
+                matches!(overflow, Some(mango_external_agents::Error::LimitExceeded { subject: "bytes of opening session facts", limit: 1024, received }) if received == size),
+                "expected opening byte limit: 1024, received: {size} | received: {overflow:?}"
+            );
+        }
+
         /// `session/load` replays a whole history while no turn exists. Those frames build events that
         /// are dropped, so they must not also leave a call open in the reducer until the next turn.
         #[tokio::test]
@@ -3101,6 +3407,9 @@ mod tests {
         async fn replayed_session_facts_are_still_applied_when_no_turn_exists() {
             let (state, _) = state();
             let state = Arc::new(state);
+            state.bind_native_session(agent_client_protocol_schema::v1::SessionId::new(
+                "session-1",
+            ));
             crate::client::on_session_update(&state, running_call(0)).await;
             crate::client::on_session_update(
                 &state,
