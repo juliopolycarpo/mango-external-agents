@@ -103,4 +103,6 @@ done
 [ $status -eq 0 ] || exit $status
 
 echo
+run scripts/test-packages.sh
+
 echo "✓ publication dry-run passed for ${#crates[@]} crates"
