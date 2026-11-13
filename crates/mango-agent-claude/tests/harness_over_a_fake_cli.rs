@@ -3,24 +3,241 @@
 mod support;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use mango_agent_claude::ClaudeHarness;
-use mango_external_agents::testing::FrozenClock;
+use mango_external_agents::testing::{FakeLauncher, FakeProcess, FrozenClock};
 use mango_external_agents::{
     ApprovalRouting, AuthMode, AuthState, ByteSink, CancelReason, CancelToken, CloseReason,
     Configuration, ConfigurationChange, ConfigurationOptionId, ConfigurationPatch,
     ConfigurationValue, DiscoveryReceipt, DiscoveryReceiptMeasurements, Dispatch, Error, EventKind,
-    ExecutablePath, GateVerdict, Harness, HarnessId, HostContext, InteractionId, LaunchSpec,
-    Limits, LineLimits, ManagedProcess, OpenSession, PermissionLevel, PermissionResponse,
-    ProcessControl, ProcessLauncher, Result, ResumeMode, Session, SessionStatus, TurnRequest,
-    TurnStream,
+    ExecutablePath, ExitStatus, GateVerdict, Harness, HarnessId, HostContext, InteractionId,
+    LaunchSpec, Limits, LineLimits, ManagedProcess, OpenSession, PermissionLevel,
+    PermissionResponse, ProcessControl, ProcessLauncher, Result, ResumeMode, Session,
+    SessionStatus, TurnRequest, TurnStream,
 };
 use support::{
     FakeClaudeCli, HELP_2_1_227, HELP_2_1_270, READ_TURN, Run, SIGNED_OUT, SpawnGate, host,
     host_under, value_after,
 };
+
+/// Refuses one probe with a host error after preceding scripted probes have completed.
+struct RefusingProbeLauncher {
+    inner: FakeLauncher,
+    refuse_at: usize,
+    attempts: AtomicUsize,
+    kills: Arc<AtomicUsize>,
+    waits: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ProcessLauncher for RefusingProbeLauncher {
+    async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        if attempt == self.refuse_at {
+            return Err(Error::Closed {
+                subject: "host probe launcher",
+            }
+            .with_dispatch(Dispatch::NotSubmitted));
+        }
+        let mut child = self.inner.spawn(spec).await?;
+        assert_eq!(
+            self.inner.live_children(),
+            1,
+            "expected a live probe at launch"
+        );
+        child.stdin = Some(Box::new(ProbeStdin));
+        child.control = Arc::new(ObservedProbeControl {
+            inner: child.control,
+            kills: Arc::clone(&self.kills),
+            waits: Arc::clone(&self.waits),
+        });
+        Ok(child)
+    }
+}
+
+struct ProbeStdin;
+
+#[async_trait::async_trait]
+impl ByteSink for ProbeStdin {
+    async fn write_all(&mut self, _: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    async fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct ObservedProbeControl {
+    inner: Arc<dyn ProcessControl>,
+    kills: Arc<AtomicUsize>,
+    waits: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ProcessControl for ObservedProbeControl {
+    fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
+    fn stderr_tail(&self) -> String {
+        self.inner.stderr_tail()
+    }
+    async fn kill(&self, reason: CancelReason) -> Result<()> {
+        self.kills.fetch_add(1, Ordering::SeqCst);
+        self.inner.kill(reason).await
+    }
+    async fn wait(&self) -> Result<ExitStatus> {
+        let result = self.inner.wait().await;
+        self.waits.fetch_add(1, Ordering::SeqCst);
+        result
+    }
+}
+
+fn no_probe_response(_: &str) -> Vec<String> {
+    Vec::new()
+}
+
+fn refusing_probe(refuse_at: usize) -> Arc<RefusingProbeLauncher> {
+    let inner = FakeLauncher::new();
+    let closed_stdout = CancelToken::new();
+    closed_stdout.cancel();
+    inner.push(
+        FakeProcess::responding(no_probe_response)
+            .with_greeting(["2.1.270 (Claude Code)"])
+            .ending_stdout_when(closed_stdout.clone()),
+    );
+    inner.push(
+        FakeProcess::responding(no_probe_response)
+            .with_greeting(HELP_2_1_270.lines())
+            .ending_stdout_when(closed_stdout),
+    );
+    Arc::new(RefusingProbeLauncher {
+        inner,
+        refuse_at,
+        attempts: AtomicUsize::new(0),
+        kills: Arc::new(AtomicUsize::new(0)),
+        waits: Arc::new(AtomicUsize::new(0)),
+    })
+}
+
+fn assert_probe_refusal(error: &Error) {
+    assert!(
+        matches!(
+            error.cause(),
+            Error::Closed {
+                subject: "host probe launcher"
+            }
+        ),
+        "expected the host launcher refusal | received {error:?}"
+    );
+    assert_eq!(
+        error.dispatch(),
+        Dispatch::NotSubmitted,
+        "expected the launcher's dispatch annotation | received {error:?}"
+    );
+}
+
+async fn assert_discovery_refusal(refuse_at: usize) {
+    let launcher = refusing_probe(refuse_at);
+    let context = host_under(launcher.clone(), Limits::default());
+    let error = ClaudeHarness::new()
+        .discover(&context)
+        .await
+        .expect_err("expected the host probe launcher refusal");
+    assert_probe_refusal(&error);
+    assert_eq!(
+        launcher.attempts.load(Ordering::SeqCst),
+        refuse_at,
+        "expected discovery to stop at refused probe {refuse_at}"
+    );
+    assert_eq!(
+        launcher.inner.live_children(),
+        0,
+        "expected all children before refused probe {refuse_at} to be cleaned up"
+    );
+    assert_eq!(
+        launcher.kills.load(Ordering::SeqCst),
+        refuse_at - 1,
+        "expected each live child before probe {refuse_at} to be killed"
+    );
+    assert_eq!(
+        launcher.waits.load(Ordering::SeqCst),
+        refuse_at - 1,
+        "expected each child before probe {refuse_at} to be reaped"
+    );
+}
+
+#[tokio::test]
+async fn discovery_propagates_version_probe_refusal() {
+    assert_discovery_refusal(1).await;
+}
+
+#[tokio::test]
+async fn discovery_propagates_help_probe_refusal() {
+    assert_discovery_refusal(2).await;
+}
+
+#[tokio::test]
+async fn discovery_propagates_auth_probe_refusal() {
+    assert_discovery_refusal(3).await;
+}
+
+#[tokio::test]
+async fn discovery_recognizes_a_silent_version_probe_as_installed() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(FakeProcess::transcript(Vec::<String>::new()));
+    launcher.push(FakeProcess::transcript(HELP_2_1_270.lines()));
+    launcher.push(FakeProcess::transcript([SIGNED_OUT]));
+    let context = host_under(launcher.clone(), Limits::default());
+    let discovery = ClaudeHarness::new()
+        .discover(&context)
+        .await
+        .expect("expected discovery of a started CLI");
+    assert_ne!(
+        discovery.gate,
+        GateVerdict::NotInstalled,
+        "expected a silent started CLI to be installed | received {:?}",
+        discovery.gate
+    );
+}
+
+#[tokio::test]
+async fn receipt_open_propagates_a_fresh_help_probe_refusal() {
+    let launcher = refusing_probe(1);
+    let context = host_under(launcher.clone(), Limits::default());
+    let harness = ClaudeHarness::new();
+    let mut request = OpenSession::new("chat-1");
+    // Obtain an installed discovery from the normal fake before binding it to this host.
+    let discovery = harness
+        .discover(&host(Arc::new(FakeClaudeCli::new())))
+        .await
+        .expect("expected installed discovery");
+    if let Some(executable) = &discovery.executable {
+        request = request.with_executable(ExecutablePath::resolved(executable.clone()));
+    }
+    let receipt = DiscoveryReceipt::new(HarnessId::claude(), discovery, context.now())
+        .with_executable_fingerprint("same-test-binary")
+        .with_environment_fingerprint("same-test-environment")
+        .with_authorization_fingerprint("same-test-authorization")
+        .bind_to_open(
+            harness.descriptor(),
+            &context,
+            &request,
+            DiscoveryReceiptMeasurements::new()
+                .with_executable_fingerprint("same-test-binary")
+                .with_environment_fingerprint("same-test-environment")
+                .with_authorization_fingerprint("same-test-authorization"),
+        )
+        .expect("expected current receipt evidence to match");
+    let error = harness
+        .open_session(&context, request.with_discovery(receipt))
+        .await
+        .map(|_| ())
+        .expect_err("expected the fresh help probe refusal");
+    assert_probe_refusal(&error);
+    assert_eq!(launcher.attempts.load(Ordering::SeqCst), 1);
+}
 
 /// A session several tasks can hold, for the tests that race two of its methods.
 async fn shared(launcher: &Arc<FakeClaudeCli>) -> Arc<dyn Session> {

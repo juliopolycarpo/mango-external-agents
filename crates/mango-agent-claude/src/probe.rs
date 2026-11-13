@@ -2,23 +2,18 @@
 //!
 //! Three probes exist — `--version`, `--help` and `auth status` — and all three are read-only,
 //! non-secret surfaces the vendor documents. None of them takes input, so stdin is closed the
-//! moment the child is up: a CLI that waits for input otherwise holds the probe open until the
-//! timeout, and a probe that timed out is indistinguishable from a binary that is not there.
+//! moment the child is up, so a CLI waiting for input does not hold the probe open.
 //!
-//! A probe answers one of three things, and they are not interchangeable. `Probed::Nothing` is a
-//! spawn that failed or a child that printed nothing: not established. `Probed::Whole` is output
-//! the child finished writing. `Probed::Incomplete` is output that a read error, the size cap or
-//! the timeout cut short: the child ran, and the complete lines it wrote are kept, but nothing may
-//! be concluded from what is missing. That is deliberate and is not the same as "the binary has no
-//! options": a cut-off `--help` must not look like a vendor that removed everything, so
-//! `output` reads anything but `Whole` as `None` and callers fall back rather than narrowing. A
-//! caller for which the lines that did arrive are still evidence, such as the version banner,
-//! reads them through the crate-private `read`. `Error::CleanupRequired` is the exception to all
-//! of this: the host must receive its process control rather than silently losing a child it has
-//! to reconcile.
+//! A launch refusal establishes that the child did not start. A started child that printed
+//! nothing still proves the CLI was present, but has no output to parse. `Probed::Whole` is
+//! output the child finished writing; `Probed::Incomplete` keeps the complete lines before a
+//! read error, size cap or timeout. A cut-off `--help` must not look like a vendor that removed
+//! options, so `output` accepts only `Whole`. Callers that can use partial lines, such as a
+//! version banner, use the crate-private `read`. Cleanup failures and other host errors reach
+//! the caller with their original controls and dispatch annotations.
 
 use mango_external_agents::{
-    CancelReason, ExecutablePath, HostContext, LinkReceiver, ProcessCleanupGuard, Result,
+    CancelReason, Error, ExecutablePath, HostContext, LinkReceiver, ProcessCleanupGuard, Result,
     StdioSpec, transports::stdio,
 };
 
@@ -38,8 +33,10 @@ const OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
 /// What one probe established about the child's stdout.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Probed {
-    /// The spawn failed, or the child printed nothing before it closed stdout or the timeout hit.
-    Nothing,
+    /// The launcher could not start the child.
+    NotStarted,
+    /// The child started but produced no complete lines.
+    StartedEmpty,
     /// A read error, the size cap or the timeout cut the output short. Holds the complete lines
     /// that arrived before, joined by newlines; empty when the failure came before the first line.
     Incomplete(String),
@@ -48,14 +45,15 @@ pub(crate) enum Probed {
 }
 
 impl Probed {
-    /// The complete lines that arrived, whether or not the output ended cleanly.
+    /// The complete lines that arrived, or an empty string if the child started silently.
     ///
     /// For a caller whose answer does not depend on what came after them: a version banner names
     /// its version on a line that either arrived whole or did not, and a status document is either
     /// a complete JSON object or is not parsed at all.
     pub(crate) fn lines(self) -> Option<String> {
         match self {
-            Self::Nothing => None,
+            Self::NotStarted => None,
+            Self::StartedEmpty => Some(String::new()),
             Self::Incomplete(text) | Self::Whole(text) => Some(text),
         }
     }
@@ -83,7 +81,7 @@ pub async fn output(
 ) -> Result<Option<String>> {
     Ok(match read(host, executable, arguments).await? {
         Probed::Whole(text) => Some(text),
-        Probed::Nothing | Probed::Incomplete(_) => None,
+        Probed::NotStarted | Probed::StartedEmpty | Probed::Incomplete(_) => None,
     })
 }
 
@@ -106,7 +104,10 @@ pub(crate) async fn read(
     {
         Ok(transport) => transport,
         Err(error) if error.cleanup_control().is_some() => return Err(error),
-        Err(_) => return Ok(Probed::Nothing),
+        Err(error) if matches!(error.cause(), Error::Launch { .. }) => {
+            return Ok(Probed::NotStarted);
+        }
+        Err(error) => return Err(error),
     };
     let cleanup =
         ProcessCleanupGuard::new(transport.control, *host.limits(), CancelReason::Shutdown);
@@ -130,9 +131,8 @@ pub(crate) async fn read(
     Ok(match end {
         Ok(End::Closed) => captured.whole(),
         Ok(End::Failed | End::OverCap) => Probed::Incomplete(captured.text),
-        // A child that never spoke before the timeout is still "nothing", as it always was.
         Err(_) if captured.any => Probed::Incomplete(captured.text),
-        Err(_) => Probed::Nothing,
+        Err(_) => Probed::StartedEmpty,
     })
 }
 
@@ -150,7 +150,7 @@ impl Captured {
         if self.any {
             Probed::Whole(self.text)
         } else {
-            Probed::Nothing
+            Probed::StartedEmpty
         }
     }
 }
@@ -195,11 +195,12 @@ mod tests {
     use super::{Captured, End, OUTPUT_LIMIT_BYTES, PROGRAM, Probed, collect, output, read};
     use mango_external_agents::testing::{FakeLauncher, FakeProcess};
     use mango_external_agents::{
-        CancelReason, EnvSource, Error, ExecutablePath, ExitStatus, HostContext, LaunchSpec,
-        Limits, LineLimits, LinkReceiver, ManagedProcess, ProcessControl, ProcessLauncher, Result,
+        ByteSink, CancelReason, Dispatch, EnvSource, Error, ExecutablePath, ExitStatus,
+        HostContext, LaunchSpec, Limits, LineLimits, LinkReceiver, ManagedProcess, ProcessControl,
+        ProcessLauncher, Result,
     };
     use std::collections::VecDeque;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     fn host<L: ProcessLauncher + 'static>(launcher: Arc<L>) -> HostContext {
         HostContext::builder()
@@ -464,7 +465,7 @@ mod tests {
         let (_, none) = gather(&mut ScriptedReceiver::lines([]), 64).await;
         assert_eq!(
             none.whole(),
-            Probed::Nothing,
+            Probed::StartedEmpty,
             "expected a child that wrote nothing to yield no text"
         );
         let (_, empty) = gather(&mut ScriptedReceiver::lines([""]), 64).await;
@@ -600,26 +601,240 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_reports_a_silent_child_and_a_failed_spawn_as_nothing() {
+    async fn a_silent_child_proves_the_probe_started() {
         let silent = Arc::new(FakeLauncher::new());
         silent.push(FakeProcess::transcript(Vec::<String>::new()));
+        let result = read(
+            &host(Arc::clone(&silent)),
+            &ExecutablePath::default(),
+            &["--version"],
+        )
+        .await
+        .expect("expected a completed probe");
         assert_eq!(
-            read(&host(silent), &ExecutablePath::default(), &["--version"])
-                .await
-                .expect("expected a completed probe"),
-            Probed::Nothing
+            result.lines(),
+            Some(String::new()),
+            "expected a started child with no output to retain evidence of launch"
         );
+        assert_eq!(silent.live_children(), 0);
+    }
 
-        let unspawnable = Arc::new(FakeLauncher::new());
+    fn no_probe_response(_: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    struct PendingProbeLauncher(Arc<FakeLauncher>);
+
+    struct PendingProbeStdin;
+
+    #[async_trait::async_trait]
+    impl ByteSink for PendingProbeStdin {
+        async fn write_all(&mut self, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessLauncher for PendingProbeLauncher {
+        async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
+            let mut child = self.0.spawn(spec).await?;
+            assert_eq!(self.0.live_children(), 1, "expected a live silent child");
+            child.stdin = Some(Box::new(PendingProbeStdin));
+            Ok(child)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_timeout_proves_the_probe_started() {
+        let fake = Arc::new(FakeLauncher::new());
+        fake.push(FakeProcess::responding(no_probe_response));
+        let result = read(
+            &host(Arc::new(PendingProbeLauncher(Arc::clone(&fake)))),
+            &ExecutablePath::default(),
+            &["--version"],
+        )
+        .await
+        .expect("expected a timed-out probe to complete cleanup");
         assert_eq!(
-            read(
-                &host(unspawnable),
-                &ExecutablePath::default(),
-                &["--version"]
-            )
+            result.lines(),
+            Some(String::new()),
+            "expected a silent timeout to retain evidence of launch"
+        );
+        assert_eq!(
+            fake.live_children(),
+            0,
+            "expected the live child to be killed"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn public_output_distinguishes_silence_from_an_empty_line() {
+        let fake = Arc::new(FakeLauncher::new());
+        fake.push(FakeProcess::responding(no_probe_response));
+        let silent = output(
+            &host(Arc::new(PendingProbeLauncher(Arc::clone(&fake)))),
+            &ExecutablePath::default(),
+            &["--version"],
+        )
+        .await
+        .expect("expected silent probe cleanup");
+        assert_eq!(
+            silent, None,
+            "expected no complete line from a silent timeout"
+        );
+        assert_eq!(fake.live_children(), 0);
+
+        let empty_line = Arc::new(FakeLauncher::new());
+        empty_line.push(FakeProcess::transcript([""]));
+        let printed = output(
+            &host(empty_line),
+            &ExecutablePath::default(),
+            &["--version"],
+        )
+        .await
+        .expect("expected complete empty line");
+        assert_eq!(
+            printed.as_deref(),
+            Some(""),
+            "expected one complete empty line"
+        );
+    }
+
+    struct PolicyRefusalLauncher;
+
+    #[async_trait::async_trait]
+    impl ProcessLauncher for PolicyRefusalLauncher {
+        async fn spawn(&self, _: LaunchSpec) -> Result<ManagedProcess> {
+            Err(Error::HostConfiguration {
+                expected: "an authorized working directory",
+                received: String::from("unauthorized directory"),
+            }
+            .with_dispatch(Dispatch::NotSubmitted))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wrapped_host_policy_refusal_reaches_the_caller() {
+        let error = read(
+            &host(Arc::new(PolicyRefusalLauncher)),
+            &ExecutablePath::default(),
+            &["--version"],
+        )
+        .await
+        .expect_err("expected the host policy refusal");
+        assert!(
+            matches!(error.cause(), Error::HostConfiguration {
+            expected: "an authorized working directory", received
+        } if received == "unauthorized directory"),
+            "expected the host policy refusal | received {error:?}"
+        );
+        assert_eq!(
+            error.dispatch(),
+            Dispatch::NotSubmitted,
+            "expected the host dispatch annotation | received {error:?}"
+        );
+    }
+
+    struct CleanupRequiredLaunch {
+        inner: Arc<FakeLauncher>,
+        control: Mutex<Option<Arc<dyn ProcessControl>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessLauncher for CleanupRequiredLaunch {
+        async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
+            let child = self.inner.spawn(spec).await?;
+            *self.control.lock().expect("expected control lock") = Some(Arc::clone(&child.control));
+            Err(Error::CleanupRequired {
+                control: child.control,
+                source: Box::new(Error::Launch {
+                    program: String::from("claude"),
+                    message: String::from("failed after launch"),
+                }),
+            }
+            .with_dispatch(Dispatch::NotSubmitted))
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_control_takes_precedence_over_a_wrapped_launch_error() {
+        let fake = Arc::new(FakeLauncher::new());
+        fake.push(FakeProcess::responding(no_probe_response));
+        let launcher = Arc::new(CleanupRequiredLaunch {
+            inner: Arc::clone(&fake),
+            control: Mutex::new(None),
+        });
+        let error = read(
+            &host(Arc::clone(&launcher)),
+            &ExecutablePath::default(),
+            &["--version"],
+        )
+        .await
+        .expect_err("expected the host-owned cleanup refusal");
+        assert!(
+            matches!(error.cause(), Error::Launch { .. }),
+            "expected the underlying launch error | received {error:?}"
+        );
+        assert_eq!(error.dispatch(), Dispatch::NotSubmitted);
+        let carried = error
+            .cleanup_control()
+            .expect("expected the host cleanup control");
+        let original = launcher
+            .control
+            .lock()
+            .expect("expected control lock")
+            .clone()
+            .expect("expected the original control");
+        assert!(
+            Arc::ptr_eq(&carried, &original),
+            "expected the original host control"
+        );
+        assert_eq!(
+            fake.live_children(),
+            1,
+            "expected the child to await host cleanup"
+        );
+        carried
+            .kill(CancelReason::Shutdown)
             .await
-            .expect("expected an unavailable probe"),
-            Probed::Nothing
+            .expect("expected host cleanup");
+        carried.wait().await.expect("expected host reap");
+        assert_eq!(
+            fake.live_children(),
+            0,
+            "expected host cleanup to end the child"
+        );
+    }
+
+    struct WrappedMissingLauncher;
+
+    #[async_trait::async_trait]
+    impl ProcessLauncher for WrappedMissingLauncher {
+        async fn spawn(&self, _: LaunchSpec) -> Result<ManagedProcess> {
+            Err(Error::Launch {
+                program: String::from("claude"),
+                message: String::from("missing"),
+            }
+            .with_dispatch(Dispatch::NotSubmitted))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wrapped_launch_error_means_the_probe_did_not_start() {
+        let result = read(
+            &host(Arc::new(WrappedMissingLauncher)),
+            &ExecutablePath::default(),
+            &["--version"],
+        )
+        .await
+        .expect("expected an unavailable probe");
+        assert_eq!(
+            result.lines(),
+            None,
+            "expected a failed spawn to have no started child"
         );
     }
 

@@ -68,14 +68,20 @@ concludes from the lines that did arrive differs:
   wrapper's own preamble may be the one that was lost. Otherwise, and when no line arrived, the CLI
   is installed with an unreadable version and the gate comes from `--help`, as for an unparseable
   banner. Discovery then reports no `version` at all rather than the lines that arrived, so a
-  receipt never hands a wrapper's number back to opening as if it were Claude Code's. Only a spawn that failed or a child that printed nothing
-  reports the CLI as not installed, and opening is never refused as "a CLI that reported no
-  version" for a read that failed part way.
+  receipt never hands a wrapper's number back to opening as if it were Claude Code's. A child
+  that starts but prints nothing also counts as installed with an unreadable version. Opening is
+  never refused as "a CLI that reported no version" for a read that failed part way.
 - `auth status` gives the lines that arrived to the same parser as a complete read, which trusts
   only a whole JSON object. A status document that arrived complete keeps its answer, so a
   signed-in account keeps `auto` even if later output failed. A document cut off inside the object
   is not parsed and the answer is unknown authentication, which leaves `auto` unavailable, as for
   any unknown account.
+
+A probe whose underlying error is `Error::Launch` contributes no output; a version probe with that
+error reports `GateVerdict::NotInstalled`. Other host errors reach the caller with their typed cause
+and dispatch annotation. A cleanup failure retains its host-owned process control even when its
+underlying cause is `Error::Launch`. The public probe output returns `None` when no complete line
+arrived and `Some("")` when the complete output is one empty line.
 
 Anthropic's [CLI reference](https://code.claude.com/docs/en/cli-reference.md#cli-flags) cautions
 that `claude --help` does not list every supported flag. This harness deliberately applies the
