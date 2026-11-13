@@ -3,5 +3,5 @@
     "codex",
     "--version"
   ],
-  "output": "codex-cli 0.166.0"
+  "output": "codex-cli 0.167.1"
 }

@@ -10,8 +10,8 @@
     "initialize-response.schema.json"
   ],
   "files": {
-    "initialize-params.schema.json": "sha256:b55124e7c0f36a1789396daa5578217a92be67f053903696236686e59f6f212e",
+    "initialize-params.schema.json": "sha256:c608ff6bdd94e661423dca9b44cd1dcea7eac610f74e1310284c61eab64280bc",
     "initialize-response.schema.json": "sha256:62ad689c2cb6379913c1d72749cfd8de5089d35760214123518eb92eef11acc9",
-    "version.json": "sha256:41905dd47df10207045d9e76d31ea1d4032accafc06f4c4dd0072563fd02e092"
+    "version.json": "sha256:0f5229209b6825e82b40cedb055aaf4f220d43b83c69f0e56e8d2a944ca5cbb7"
   }
 }
