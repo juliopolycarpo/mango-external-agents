@@ -33,6 +33,9 @@ run scripts/test-package-admission.sh
 run python3 scripts/test-package-fixtures.py
 run scripts/package-fixtures.py --check
 run scripts/check-dev-dependencies.sh
+run python3 scripts/test-resolved-acp-schema.py
+run python3 scripts/test-resolved-acp-schema-config.py
+run python3 scripts/check-resolved-acp-schema.py
 run scripts/check-bench-runner.sh
 run scripts/test-bench-runner.sh
 run scripts/test-consumer-pin.sh
