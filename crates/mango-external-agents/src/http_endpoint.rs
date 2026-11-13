@@ -122,14 +122,7 @@ fn is_authority(authority: &str) -> bool {
         let Some((literal, after_host)) = bracketed.split_once(']') else {
             return false;
         };
-        // Eight groups have seven separators; `::` can add an eighth colon at either end.
-        let is_ipv6_literal = !literal.is_empty()
-            && literal.len() <= 45
-            && literal.bytes().filter(|byte| *byte == b':').count() <= 8
-            && literal
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() || matches!(byte, b':' | b'.'));
-        if !is_ipv6_literal {
+        if literal.parse::<std::net::Ipv6Addr>().is_err() {
             return false;
         }
         (literal, after_host)
@@ -227,6 +220,8 @@ mod tests {
             "https://docs_internal.example:8443/v1/mcp?tenant=a&mode=b%20c",
             "http://127.0.0.1:65535/mcp",
             "http://[::1]/mcp",
+            "http://[::1]:0/mcp",
+            "http://[::1]:65535/mcp",
             "http://[2001:db8::1]:8080/mcp",
             "http://[::ffff:192.0.2.1]/mcp",
             "http://[::1:2:3:4:5:6:7]/mcp",
@@ -265,6 +260,13 @@ mod tests {
             "https://docs.example:80:90/mcp",
             "https://[::1/mcp",
             "https://[]/mcp",
+            "https://[abc]/mcp",
+            "https://[1::2::3]/mcp",
+            "https://[1:2:3:4:5:6:7:8:9]/mcp",
+            "https://[12345::1]/mcp",
+            "https://[::ffff:192.0.2.256]/mcp",
+            "https://[::1]:/mcp",
+            "https://[::1]:65536/mcp",
             "https://[::1]x/mcp",
             "https://[::1:2:3:4:5:6:7:8]/mcp",
             "https://[fe80::1%25eth0]/mcp",
