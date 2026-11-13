@@ -26,6 +26,8 @@ if [ "$skip_format" = false ]; then
   run dprint check
 fi
 run scripts/test-release.sh
+run scripts/test-prerelease-toolchain.sh
+run scripts/test-prerelease-package.sh
 run scripts/test-vendor-drift.sh
 run scripts/test-package-admission.sh
 run python3 scripts/test-package-fixtures.py

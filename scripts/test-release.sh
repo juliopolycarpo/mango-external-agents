@@ -2,10 +2,18 @@
 # Regression coverage for tag-only dispatch and mismatched release versions.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-[[ "$(scripts/release-version.sh refs/tags/v0.1.0)" == '0.1.0' ]]
-[[ "$(scripts/release-version.sh refs/tags/v0.2.0-rc.1 0.2.0-rc.1)" == '0.2.0-rc.1' ]]
-for ref in refs/heads/main refs/heads/v0.1.0 refs/tags/v0.1 refs/tags/v0.1.0-canary.1; do
-  if scripts/release-version.sh "$ref" 0.1.0; then
+for version in 0.1.0 0.2.0-rc.1 1.2.3-0.alpha-01 18446744073709551615.0.0; do
+  actual=$(scripts/release-version.sh "refs/tags/v$version" "$version")
+  if [ "$actual" != "$version" ]; then
+    echo "expected version '$version', received '$actual'" >&2
+    exit 1
+  fi
+done
+for ref in refs/heads/main refs/heads/v0.1.0 refs/tags/v0.1 refs/tags/v0.1.0-canary.1 \
+  refs/tags/v01.1.0 refs/tags/v1.01.0 refs/tags/v1.0.01 refs/tags/v1.0.0-01 \
+  refs/tags/v1.0.0-rc..1 refs/tags/v1.0.0-rc. refs/tags/v1.0.0+build \
+  refs/tags/v18446744073709551616.0.0; do
+  if scripts/release-version.sh "$ref"; then
     echo "expected rejection of non-release ref, received success for $ref" >&2
     exit 1
   fi

@@ -88,7 +88,9 @@ ordinary documentation PR.
 For every release, run `scripts/check.sh`, `scripts/check-publish.sh --list` and
 `scripts/check-msrv-features.sh --locked` on the intended release sources. Verify crate docs with
 `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked`.
-The isolated feature check needs the declared minimum Rust toolchain installed.
+The isolated feature check needs the declared minimum Rust toolchain installed. `scripts/check.sh`
+also runs the extracted core package unit tests with an isolated prerelease version, using the
+checkout’s selected Rust toolchain.
 
 `scripts/check-publish.sh` wraps `cargo publish --workspace --dry-run --locked`. The workspace dry
 run stages local crate dependencies, so it verifies the four packages together. It also verifies

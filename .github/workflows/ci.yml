@@ -44,6 +44,10 @@ jobs:
       - run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
       - run: cargo hack clippy --feature-powerset --depth 2 --all-targets --locked -p mango-external-agents -- -D warnings
       - run: cargo nextest run --workspace --all-features --locked
+      - if: matrix.os == 'ubuntu-latest'
+        run: |
+          scripts/test-prerelease-toolchain.sh
+          scripts/test-prerelease-package.sh
       - run: cargo test --doc --workspace --all-features --locked
       - run: cargo doc --no-deps --workspace --all-features --locked
         env:
