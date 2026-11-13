@@ -8,6 +8,8 @@ manifest entries, not Cargo's feature unification across dependency edges.
 The sole exception is the exact, feature-free ``agent-client-protocol-schema`` registry pin in the
 ACP manifest. No other manifest or workspace entry may name that crate, and root patches and
 replacements cannot override it. Cargo configuration outside these manifests is not checked.
+A third-party workspace entry no member takes is refused too, so a floor cannot outlive the last
+crate that needed it.
 
 Usage: check-workspace-dependencies.py ROOT_MANIFEST MEMBER_MANIFEST...
 """
@@ -35,6 +37,21 @@ def dependency_tables(manifest):
     for target, body in manifest.get("target", {}).items():
         for kind in kinds:
             yield f"target.{target}.{kind}", body.get(kind, {})
+
+
+def used_names(path):
+    """The dependency names a member manifest declares in any of its dependency tables."""
+    return {name for _, table in dependency_tables(load(path)) for name in table}
+
+
+def unused_offenders(root, members):
+    """Yields a declaration for each third-party workspace entry that no member declares."""
+    used = set().union(*(used_names(member) for member in members))
+    entries = load(root).get("workspace", {}).get("dependencies", {})
+    for name, spec in entries.items():
+        in_workspace = isinstance(spec, dict) and "path" in spec
+        if not in_workspace and name != SCHEMA and name not in used:
+            yield "unused", f"{root}: [workspace.dependencies] {name} = {spec}"
 
 
 def member_offenders(path, schema_manifest, workspace_schema_names):
@@ -132,6 +149,7 @@ def main(arguments):
         if name == SCHEMA or (isinstance(spec, dict) and spec.get("package") == SCHEMA)
     }
     found = list(workspace_offenders(root))
+    found.extend(unused_offenders(root, members))
     found.extend(
         offender
         for member in members
@@ -142,6 +160,8 @@ def main(arguments):
         "defaults": "expected inherited dependencies to omit default-features and the default "
         "feature so the workspace controls defaults, received:",
         "features": "expected workspace dependency entries to omit features, received:",
+        "unused": "expected every third-party workspace dependency to be declared by a member, "
+        "received an entry no member takes:",
         "schema": f"expected {SCHEMA} only as an exact pin with default-features = false and "
         "no other keys in crates/mango-agent-acp/Cargo.toml [dependencies] and no forwarded "
         "schema features, root patches or replacements, received:",

@@ -383,6 +383,7 @@ expect_workspace_rejection() {
     *:crates/mango-agent-*) reason="expected agent-client-protocol-schema only as an exact pin" ;;
     *:default-override.toml|*:default-feature-forward.toml) reason="expected inherited dependencies to omit default-features" ;;
     featured-root.toml:*) reason="expected workspace dependency entries to omit features" ;;
+    unused-root.toml:*) reason="expected every third-party workspace dependency to be declared by a member" ;;
     *) reason="expected each member dependency to use workspace = true" ;;
   esac
   if python3 scripts/check-workspace-dependencies.py "$workspace_fixture/$root" "$workspace_fixture/$member" 2>"$workspace_fixture/rejection.err"; then
@@ -396,6 +397,8 @@ expect_workspace_rejection() {
     }
   done
 }
+printf '[workspace.dependencies]\nshared = { version = "1.0", default-features = false }\nplain = "2.0"\nstale = "3.0"\nsibling = { path = "crates/sibling", version = "1.0.0" }\n' > "$workspace_fixture/unused-root.toml"
+expect_workspace_rejection unused-root.toml inherits.toml 'unused-root.toml: [workspace.dependencies] stale = ' "3.0"
 expect_workspace_rejection root.toml own-version.toml 'own-version.toml: [dev-dependencies] plain = 2.0' "2.0"
 expect_workspace_rejection root.toml target-own-version.toml 'target-own-version.toml: [target.x.dependencies] plain = 2.0' "2.0"
 expect_workspace_rejection featured-root.toml inherits.toml 'featured-root.toml: [workspace.dependencies] shared = ' "'features': ['extra']"
