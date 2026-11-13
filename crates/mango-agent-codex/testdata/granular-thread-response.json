@@ -1,0 +1,32 @@
+{
+  "approvalPolicy": {
+    "granular": {
+      "mcp_elicitations": true,
+      "request_permissions": false,
+      "rules": false,
+      "sandbox_approval": true,
+      "skill_approval": false
+    }
+  },
+  "approvalsReviewer": "user",
+  "cwd": "/workspace",
+  "model": "gpt-observed",
+  "modelProvider": "openai",
+  "reasoningEffort": "medium",
+  "sandbox": { "type": "workspaceWrite" },
+  "thread": {
+    "cliVersion": "0.166.0",
+    "createdAt": 1,
+    "cwd": "/workspace",
+    "ephemeral": false,
+    "id": "01900000-0000-7000-8000-000000000001",
+    "modelProvider": "openai",
+    "preview": "",
+    "projectId": null,
+    "sessionId": "01900000-0000-7000-8000-000000000002",
+    "source": "appServer",
+    "status": { "type": "idle" },
+    "turns": [],
+    "updatedAt": 1
+  }
+}

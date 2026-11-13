@@ -37,10 +37,10 @@ pub use notifications::{
 };
 pub use requests::{
     Account, AccountReadResponse, AskForApproval, ClientInfo, InitializeParams, InitializeResponse,
-    Model, ModelListParams, ModelListResponse, RateLimitsReadResponse, ReasoningEffortOption,
-    ReviewStartParams, ReviewStartResponse, ReviewTarget, SandboxMode, ThreadListParams,
-    ThreadListResponse, ThreadStartParams, ThreadStartResponse, ThreadSummary, TurnHandle,
-    TurnStartParams, TurnStatus, TurnSteerParams, TurnSteerResponse, UserInput,
+    Model, ModelListParams, ModelListResponse, ObservedApprovalPolicy, RateLimitsReadResponse,
+    ReasoningEffortOption, ReviewStartParams, ReviewStartResponse, ReviewTarget, SandboxMode,
+    ThreadListParams, ThreadListResponse, ThreadStartParams, ThreadStartResponse, ThreadSummary,
+    TurnHandle, TurnStartParams, TurnStatus, TurnSteerParams, TurnSteerResponse, UserInput,
 };
 
 /// The methods this harness calls, exactly as the app-server spells them.

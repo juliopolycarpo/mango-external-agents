@@ -1110,6 +1110,116 @@ impl ResumeSuccessServer {
     }
 }
 
+/// A synthetic 0.166.0 schema-shaped response, used for both opening methods.
+struct GranularApprovalServer;
+
+impl GranularApprovalServer {
+    fn process() -> FakeProcess {
+        let workspace = workspace_path().to_string_lossy().into_owned();
+        let mut response: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/granular-thread-response.json"))
+                .expect("expected a complete schema-shaped thread response");
+        response["cwd"] = workspace.clone().into();
+        response["thread"]["cwd"] = workspace.clone().into();
+        Transcript::load("handshake").as_process_intercepting(move |frame| {
+            if frame["method"] == "thread/read" {
+                return Some(vec![
+                    serde_json::json!({
+                        "id": frame["id"],
+                        "result": {"thread": {"id": frame["params"]["threadId"], "cwd": workspace}},
+                    })
+                    .to_string(),
+                ]);
+            }
+            matches!(
+                frame["method"].as_str(),
+                Some("thread/start" | "thread/resume")
+            )
+            .then(|| vec![serde_json::json!({"id": frame["id"], "result": response}).to_string()])
+        })
+    }
+}
+
+async fn open_with_granular_approval_policy(resumed: bool) {
+    let native_id = "01900000-0000-7000-8000-000000000001";
+    {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(GranularApprovalServer::process());
+        let (host, launcher) = with_launcher(launcher, None);
+        let mut request = OpenSession::new("chat-1");
+        request.configuration = ConfigurationPatch::new()
+            .model(ConfigurationChange::Set(String::from("gpt-requested")))
+            .effort(ConfigurationChange::Set(String::from("high")));
+        if resumed {
+            request = request.resuming(native_id, mango_external_agents::ResumeMode::Strict);
+        }
+        let session = CodexHarness::new()
+            .open_session(&host, request)
+            .await
+            .expect("expected a thread with granular approval policy to open");
+        assert_eq!(session.ids().native_session_id, native_id);
+        let snapshot = session.snapshot();
+        assert_eq!(snapshot.resumed, resumed);
+        assert_eq!(
+            snapshot.configuration.accepted.model.as_deref(),
+            Some("gpt-requested")
+        );
+        assert_eq!(
+            snapshot.configuration.accepted.effort.as_deref(),
+            Some("high")
+        );
+        assert_eq!(snapshot.configuration.accepted.level, None);
+        assert_eq!(
+            snapshot.configuration.observed.model.as_deref(),
+            Some("gpt-observed")
+        );
+        assert_eq!(
+            snapshot.configuration.observed.effort.as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            snapshot.configuration.observed.routing,
+            Some(ApprovalRouting::User)
+        );
+        assert_eq!(snapshot.configuration.observed.level, None);
+        let frames = launcher.written();
+        let method = if resumed {
+            "thread/resume"
+        } else {
+            "thread/start"
+        };
+        let frame: serde_json::Value = serde_json::from_str(
+            frames
+                .iter()
+                .find(|line| line.contains(method))
+                .expect("expected thread request"),
+        )
+        .expect("expected JSON request");
+        assert!(frame["params"].get("approvalPolicy").is_none());
+        assert!(frame["params"].get("approvalsReviewer").is_none());
+        assert!(frame["params"].get("sandbox").is_none());
+        session
+            .close(CloseReason::Shutdown)
+            .await
+            .expect("expected session cleanup");
+        assert_eq!(
+            launcher.live_children(),
+            0,
+            "expected the child to be reaped"
+        );
+    }
+}
+
+#[tokio::test]
+async fn granular_approval_policy_opens_without_changing_host_authority() {
+    open_with_granular_approval_policy(false).await;
+}
+
+#[tokio::test]
+async fn granular_approval_policy_resumes_without_changing_host_authority() {
+    open_with_granular_approval_policy(true).await;
+}
+
 #[tokio::test]
 async fn resumed_codex_thread_receives_the_same_host_mcp_override() {
     let launcher = Arc::new(FakeLauncher::new());

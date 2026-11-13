@@ -671,7 +671,9 @@ app-server returned while opening the thread. A successful turn override clears 
 only for the axis it actually superseded, because `turn/start` does not report the setting it used.
 An older delayed success cannot clear an observation a newer generation already owns. A patch axis
 left at `keep` retains the last host selection, or the user's Codex defaults if there has been no
-selection.
+selection. The [app-server][app-server] thread response can report a granular approval policy.
+The harness accepts it without retaining its fields, and does not infer a host `PermissionLevel`
+from the policy alone. Outgoing choices remain the three values in the table above.
 Native reviews inherit the same current settings. Hosts use the shared `Session` trait and need
 no Codex-specific permission state machine.
 
@@ -1257,7 +1259,7 @@ The [crate README](../crates/mango-agent-codex/README.md#host-tests) describes t
 - Claude-style plan structure has no counterpart; `plan` is freeform text at this pin.
 - `PermissionLevel` sends `AskForApproval::Never` (`never`) for read-only/full access and
   `AskForApproval::OnRequest` (`on-request`) for default access. `Untrusted` is modeled but
-  never sent by this mapping; the vendor's `granular` variant is neither sent nor modeled.
+  never sent by this mapping; the vendor's `granular` variant is accepted on responses only.
 - `thread/fork`, thread archival, the queue and the realtime families are not driven.
 - Vendor steering refusals other than "no active turn" and "cannot steer a review/compact turn"
   retain the vendor error; native reviews are rejected locally as `TurnNotSteerable`.
