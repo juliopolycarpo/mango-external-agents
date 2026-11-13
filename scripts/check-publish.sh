@@ -6,10 +6,10 @@
 # immutable on crates.io once it lands, and the four here publish in lockstep, so one bad manifest
 # strands the other three at a version nobody can depend on.
 #
-# This runs the same gate on any head, and adds the check the workflow's dry-run cannot make: that
-# every file each crate actually ships is one the repository meant to ship. A dry-run proves the
-# package builds; it does not tell you a fixture directory, a scratch file or a vendored schema
-# silently joined the tarball.
+# This runs the same gate on any head, checks for README and licence files and unwanted build,
+# scratch or environment paths, then runs the tests from extracted archives. Crate-local fixture
+# copies and the vendored Codex schema are intended package contents; a successful library build
+# alone does not prove the shipped tests can find what they read.
 #
 # Usage: scripts/check-publish.sh [--list]   # --list also prints each crate's packaged files
 set -euo pipefail

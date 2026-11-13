@@ -97,15 +97,22 @@ README and licence without build, scratch or environment files. Run it on a clea
 `cargo package --list` refuses sources with uncommitted changes. Inspect the packaged files before
 publishing; a registry artifact is immutable.
 
-**The three harness crates' tarballs are not standalone test packages.** Their tests read the
-repository's `fixtures/` directory, outside every crate. Some includes are compiled only for tests;
-other fixtures are opened at run time. A packaged library build can pass while those tests fail to
-compile or run outside the checkout. Fixtures produced by `mea capture` remain in their canonical,
-digest-guarded directories; do not copy them into packages. Excluding `tests/` and `benches/` would
-not fix test-only includes in `src/`. Distribution packagers running harness tests should use a
-checkout of the release tag. The original investigation is preserved in
+Each crate ships the fixture bytes its tests and benchmarks read. Captures produced by
+`mea capture` remain canonical under the repository's `fixtures/` directory, with their existing
+manifest digests. Run `scripts/package-fixtures.py` after a capture changes and commit the derived
+crate-local copies with that change. `scripts/package-fixtures.py --check` rejects missing, stale
+or extra copies; `scripts/check.sh` and CI run that check.
+
+The publication gate runs `scripts/test-packages.sh`: it extracts all four archives outside the
+repository and runs their tests without a root-fixture fallback. Before the new core version is
+published, the helper patches each extracted archive's core dependency only to the extracted core
+archive. The selected Rust toolchain follows the tests outside the checkout.
+
+For pre-commit archive testing, `scripts/test-packages.sh --allow-dirty` explicitly tests working-tree
+bytes. Release qualification uses the clean-tree publication gate above. The earlier missing-fixture
+investigation remains in
 [the packaged-test documentation change](https://github.com/juliopolycarpo/mango-external-agents/pull/74);
-its failure counts are historical, not release gates.
+its failure counts describe the historical layout.
 
 Run `mea doctor` and a harmless `mea turn` against Claude, Codex and Cursor on the maintainer's
 Linux and Windows installations. Pinned CI covers Linux, macOS and Windows public contracts;
