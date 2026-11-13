@@ -1,0 +1,7 @@
+{
+  "command": [
+    "opencode",
+    "--version"
+  ],
+  "output": "1.19.5"
+}

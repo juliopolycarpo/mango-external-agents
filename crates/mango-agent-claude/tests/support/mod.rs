@@ -28,7 +28,7 @@ use mango_external_agents::{
 use tokio::sync::Notify;
 
 /// The `--help` a fake build prints unless a test says otherwise.
-pub const DEFAULT_HELP: &str = include_str!("../../../../fixtures/claude/help/2.1.260.txt");
+pub const DEFAULT_HELP: &str = include_str!("../../fixtures/claude/help/2.1.260.txt");
 
 /// The `--version` banner a fake build prints unless a test says otherwise.
 pub const DEFAULT_VERSION: &str = "2.1.270 (Claude Code)";
@@ -40,14 +40,14 @@ pub const SIGNED_IN: &str = r#"{"loggedIn":true,"authMethod":"claude.ai","apiPro
 pub const SIGNED_OUT: &str = r#"{"loggedIn":false}"#;
 
 /// A captured `read a file` turn, replayed byte for byte across every test that needs one.
-pub const READ_TURN: &str = include_str!("../../../../fixtures/claude/transcripts/read-turn.jsonl");
+pub const READ_TURN: &str = include_str!("../../fixtures/claude/transcripts/read-turn.jsonl");
 
 /// An excerpt from before `--effort` and `--permission-prompts` existed, which is what proves an
 /// older build keeps working with those features off.
-pub const HELP_2_1_227: &str = include_str!("../../../../fixtures/claude/help/2.1.227.txt");
+pub const HELP_2_1_227: &str = include_str!("../../fixtures/claude/help/2.1.227.txt");
 
 /// The whole surface of a real build, which is where `--mcp-config` is actually declared.
-pub const HELP_2_1_270: &str = include_str!("../../../../fixtures/claude/help/2.1.270.txt");
+pub const HELP_2_1_270: &str = include_str!("../../fixtures/claude/help/2.1.270.txt");
 
 /// A turn's spawn, held open for as long as a test needs the window it makes.
 ///

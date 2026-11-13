@@ -1,0 +1,13 @@
+{
+  "format": 1,
+  "profile": "grok",
+  "probe": "initialize",
+  "reproducible": false,
+  "sessionOpened": false,
+  "capturedFrom": "grok 1.0.30 (04b7ffed98c6) [stable]",
+  "capturedAt": "2026-09-19",
+  "files": {
+    "initialize.json": "sha256:dd15ce3b44b5e9cc2b68eccfb23322799262870bd20761a2c2b2b5f9bd6fdc47",
+    "version.json": "sha256:1bb87aebac59d659d762f1f31d0b791a68485d2d4a3ed4b9bdbfd9b54071daeb"
+  }
+}

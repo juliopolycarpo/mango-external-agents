@@ -91,7 +91,7 @@ impl Transcript {
     /// asserting against a transcript nobody recorded.
     pub fn load(name: &str) -> Self {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/codex")
+            .join("fixtures/codex")
             .join(format!("{name}.jsonl"));
         let raw = std::fs::read_to_string(&path).unwrap_or_else(|error| {
             panic!(

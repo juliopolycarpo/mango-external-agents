@@ -15,8 +15,7 @@ use mango_external_agents::{
 };
 use support::READ_TURN;
 
-const DENIED_WRITE: &str =
-    include_str!("../../../fixtures/claude/transcripts/denied-write-turn.jsonl");
+const DENIED_WRITE: &str = include_str!("../fixtures/claude/transcripts/denied-write-turn.jsonl");
 
 /// One run's events, plus the last thing the run said about itself.
 struct Replay {

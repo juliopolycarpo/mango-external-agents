@@ -2,6 +2,7 @@
 # Apply every auto-fix the checks would complain about.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+scripts/package-fixtures.py
 cargo fmt --all
 dprint fmt
 cargo clippy --workspace --all-targets --all-features --fix --allow-dirty --allow-staged -- -D warnings

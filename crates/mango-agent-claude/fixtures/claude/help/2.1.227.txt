@@ -1,0 +1,47 @@
+Usage: claude [options] [command] [prompt]
+
+Claude Code - starts an interactive session by default, use -p/--print for
+non-interactive output
+
+Arguments:
+  prompt                                Your prompt
+
+Options:
+  --add-dir <directories...>            Additional directories to allow tool
+                                        access to
+  --allowedTools, --allowed-tools <tools...>
+      Comma or space-separated list of tool names to allow (e.g. "Bash(git *)
+      Edit")
+  --forward-subagent-text               Forward subagent text and thinking
+                                        blocks as assistant/user messages with
+                                        parent_tool_use_id set (only works with
+                                        --print and --output-format=stream-json)
+  --include-partial-messages            Include partial message chunks as they
+                                        arrive (only works with --print and
+                                        --output-format=stream-json)
+  --input-format <format>               Input format (only works with --print):
+                                        "text" (default), or "stream-json"
+                                        (realtime streaming input) (choices:
+                                        "text", "stream-json")
+  --model <model>                       Model for the current session.
+  --output-format <format>              Output format (only works with --print):
+                                        "text" (default), "json" (single
+                                        result), or "stream-json" (realtime
+                                        streaming) (choices: "text", "json",
+                                        "stream-json")
+  --permission-mode <mode>              Permission mode to use for the session
+                                        (choices: "acceptEdits", "auto",
+                                        "bypassPermissions", "manual",
+                                        "dontAsk", "plan")
+  -p, --print                           Print response and exit (useful for
+                                        pipes).
+  -r, --resume [sessionId]              Resume a conversation.
+  --session-id <uuid>                   Use a specific session ID for the
+                                        conversation (must be a valid UUID)
+  -v, --version                         Output the version number
+  --verbose                             Override verbose mode setting from
+                                        config
+
+Commands:
+  auth <subcommand>                     Manage authentication
+  mcp                                   Configure and manage MCP servers

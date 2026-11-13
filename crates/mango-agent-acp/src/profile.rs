@@ -931,7 +931,12 @@ mod tests {
                     "expected the evidence a {:?} check leaves behind, received {:?} for {}",
                     evidence.method, evidence.source, profile.id
                 );
-                let path = repository_root().join(evidence.source);
+                let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                    evidence
+                        .source
+                        .strip_prefix("crates/mango-agent-acp/")
+                        .unwrap_or(evidence.source),
+                );
                 assert!(
                     path.exists(),
                     "expected the evidence at {}, received no such path for {}",
@@ -940,14 +945,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// The repository root, from this crate's own manifest. Joined a segment at a time and never
-    /// canonicalised, for the reason `mango-agent-codex`'s fixture loader gives.
-    fn repository_root() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
     }
 
     fn is_iso_date(text: &str) -> bool {
