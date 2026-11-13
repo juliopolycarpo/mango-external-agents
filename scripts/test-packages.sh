@@ -3,6 +3,20 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 repo=$PWD
+package_options=()
+for arg in "$@"; do
+  case "$arg" in
+    --allow-dirty) package_options+=(--allow-dirty) ;;
+    *) echo "expected --allow-dirty, received $arg" >&2; exit 2 ;;
+  esac
+done
+if [ "${#package_options[@]}" -eq 0 ]; then
+  working_tree=$(git status --porcelain)
+  if [ -n "$working_tree" ]; then
+    echo 'expected a clean working tree, received dirty; pass --allow-dirty for local testing' >&2
+    exit 1
+  fi
+fi
 read -r -a crates <<< "$(sed -n 's/^  CRATES: //p' .github/workflows/release.yml)"
 if [ "${#crates[@]}" -eq 0 ]; then
   echo 'expected a CRATES list in the release workflow, received none' >&2
@@ -15,7 +29,7 @@ trap 'rm -rf -- "$scratch" "$target"' EXIT
 mkdir "$scratch/extracted"
 export CARGO_TARGET_DIR="$target"
 export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-$(rustup show active-toolchain | awk '{print $1}')}"
-cargo package --workspace --no-verify --locked --allow-dirty
+cargo package --workspace --no-verify --locked "${package_options[@]}"
 for crate in "${crates[@]}"; do
   archives=("$target/package/$crate"-*.crate)
   if [ "${#archives[@]}" -ne 1 ] || [ ! -f "${archives[0]}" ]; then
