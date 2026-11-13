@@ -1,5 +1,3732 @@
 {
   "codexVersion": "0.166.0",
+  "consumed": {
+    "$referenced": {
+      "v2#/definitions/TextElement": {
+        "type": "object"
+      }
+    },
+    "AbsolutePathBuf": {
+      "schema": {
+        "type": "string"
+      },
+      "source": "v2#/definitions/AbsolutePathBuf"
+    },
+    "Account": {
+      "schema": {
+        "variants": {
+          "amazonBedrock": {
+            "properties": {
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "amazonBedrock"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "apiKey": {
+            "properties": {
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "apiKey"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "chatgpt": {
+            "properties": {
+              "email": {
+                "required": true,
+                "schema": {
+                  "type": [
+                    "null",
+                    "string"
+                  ]
+                }
+              },
+              "planType": {
+                "required": true,
+                "schema": {
+                  "$ref": "v2#/definitions/PlanType"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "chatgpt"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "gcp": {
+            "properties": {
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "gcp"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          }
+        }
+      },
+      "source": "v2#/definitions/Account"
+    },
+    "AccountRateLimitsUpdatedNotification": {
+      "schema": {
+        "properties": {
+          "rateLimits": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/RateLimitSnapshot"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/AccountRateLimitsUpdatedNotification"
+    },
+    "AgentMessageDeltaNotification": {
+      "schema": {
+        "properties": {
+          "delta": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "itemId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "turnId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/AgentMessageDeltaNotification"
+    },
+    "ApprovalsReviewer": {
+      "schema": {
+        "enum": [
+          "auto_review",
+          "guardian_subagent",
+          "user"
+        ],
+        "type": "string"
+      },
+      "source": "v2#/definitions/ApprovalsReviewer"
+    },
+    "AskForApproval": {
+      "schema": {
+        "oneOf": [
+          {
+            "enum": [
+              "never",
+              "on-request",
+              "untrusted"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "source": "v2#/definitions/AskForApproval"
+    },
+    "ClientInfo": {
+      "schema": {
+        "properties": {
+          "name": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "title": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          },
+          "version": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ClientInfo"
+    },
+    "CodexErrorInfo": {
+      "schema": {
+        "anyOf": [
+          {
+            "additionalProperties": false,
+            "type": "object"
+          },
+          {
+            "literalTypes": [
+              "string"
+            ],
+            "type": "string"
+          },
+          {
+            "type": [
+              "object",
+              "string"
+            ]
+          }
+        ]
+      },
+      "source": "v2#/definitions/CodexErrorInfo"
+    },
+    "CollabAgentToolCallStatus": {
+      "schema": {
+        "enum": [
+          "completed",
+          "failed",
+          "inProgress"
+        ],
+        "type": "string",
+        "undeclared": [
+          "declined"
+        ]
+      },
+      "source": "v2#/definitions/CollabAgentToolCallStatus"
+    },
+    "CommandExecutionApprovalDecision": {
+      "schema": {
+        "objects": {
+          "acceptWithExecpolicyAmendment": {
+            "additionalProperties": false,
+            "properties": {
+              "acceptWithExecpolicyAmendment": {
+                "required": true,
+                "schema": {
+                  "properties": {
+                    "execpolicy_amendment": {
+                      "required": true,
+                      "schema": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      }
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "applyNetworkPolicyAmendment": {
+            "additionalProperties": false,
+            "properties": {
+              "applyNetworkPolicyAmendment": {
+                "required": true,
+                "schema": {
+                  "properties": {
+                    "network_policy_amendment": {
+                      "required": true,
+                      "schema": {
+                        "$ref": "v1#/definitions/NetworkPolicyAmendment"
+                      }
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "type": "object"
+          }
+        },
+        "oneOf": [
+          {
+            "enum": [
+              "accept"
+            ],
+            "type": "string"
+          },
+          {
+            "enum": [
+              "acceptForSession"
+            ],
+            "type": "string"
+          },
+          {
+            "enum": [
+              "cancel"
+            ],
+            "type": "string"
+          },
+          {
+            "enum": [
+              "decline"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "source": "v1#/definitions/CommandExecutionApprovalDecision"
+    },
+    "CommandExecutionOutputDeltaNotification": {
+      "schema": {
+        "properties": {
+          "delta": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "itemId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "turnId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/CommandExecutionOutputDeltaNotification"
+    },
+    "CommandExecutionRequestApprovalParams": {
+      "schema": {
+        "properties": {
+          "approvalId": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          },
+          "command": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          },
+          "cwd": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/LegacyAppPathString"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "itemId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "networkApprovalContext": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v1#/definitions/NetworkApprovalContext"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "proposedExecpolicyAmendment": {
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            }
+          },
+          "proposedNetworkPolicyAmendments": {
+            "required": false,
+            "schema": {
+              "items": {
+                "$ref": "v1#/definitions/NetworkPolicyAmendment"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            }
+          },
+          "reason": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          },
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "turnId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v1#/definitions/CommandExecutionRequestApprovalParams"
+    },
+    "CommandExecutionRequestApprovalResponse": {
+      "schema": {
+        "properties": {
+          "decision": {
+            "required": true,
+            "schema": {
+              "$ref": "v1#/definitions/CommandExecutionApprovalDecision"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v1#/definitions/CommandExecutionRequestApprovalResponse"
+    },
+    "CommandExecutionStatus": {
+      "schema": {
+        "enum": [
+          "completed",
+          "declined",
+          "failed",
+          "inProgress"
+        ],
+        "type": "string"
+      },
+      "source": "v2#/definitions/CommandExecutionStatus"
+    },
+    "CreditsSnapshot": {
+      "schema": {
+        "properties": {
+          "balance": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          },
+          "hasCredits": {
+            "required": true,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          "unlimited": {
+            "required": true,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/CreditsSnapshot"
+    },
+    "DynamicToolCallStatus": {
+      "schema": {
+        "enum": [
+          "completed",
+          "failed",
+          "inProgress"
+        ],
+        "type": "string",
+        "undeclared": [
+          "declined"
+        ]
+      },
+      "source": "v2#/definitions/DynamicToolCallStatus"
+    },
+    "ErrorNotification": {
+      "schema": {
+        "properties": {
+          "error": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/TurnError"
+            }
+          },
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "turnId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "willRetry": {
+            "required": true,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ErrorNotification"
+    },
+    "FileChangeApprovalDecision": {
+      "schema": {
+        "oneOf": [
+          {
+            "enum": [
+              "accept"
+            ],
+            "type": "string"
+          },
+          {
+            "enum": [
+              "acceptForSession"
+            ],
+            "type": "string"
+          },
+          {
+            "enum": [
+              "cancel"
+            ],
+            "type": "string"
+          },
+          {
+            "enum": [
+              "decline"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "source": "v1#/definitions/FileChangeApprovalDecision"
+    },
+    "FileChangePatchUpdatedNotification": {
+      "schema": {
+        "properties": {
+          "changes": {
+            "required": true,
+            "schema": {
+              "items": {
+                "$ref": "v2#/definitions/FileUpdateChange"
+              },
+              "type": "array"
+            }
+          },
+          "itemId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "turnId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/FileChangePatchUpdatedNotification"
+    },
+    "FileChangeRequestApprovalParams": {
+      "schema": {
+        "properties": {
+          "grantRoot": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          },
+          "itemId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "reason": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          },
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "turnId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v1#/definitions/FileChangeRequestApprovalParams"
+    },
+    "FileChangeRequestApprovalResponse": {
+      "schema": {
+        "properties": {
+          "decision": {
+            "required": true,
+            "schema": {
+              "$ref": "v1#/definitions/FileChangeApprovalDecision"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v1#/definitions/FileChangeRequestApprovalResponse"
+    },
+    "FileUpdateChange": {
+      "schema": {
+        "properties": {
+          "diff": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "path": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/FileUpdateChange"
+    },
+    "GatewayOAuthReadResponse": {
+      "schema": {
+        "properties": {
+          "required": {
+            "required": true,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          "status": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/GatewayOAuthStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/GatewayOAuthReadResponse"
+    },
+    "GatewayOAuthStatus": {
+      "schema": {
+        "enum": [
+          "failed",
+          "notReady",
+          "started",
+          "succeeded"
+        ],
+        "type": "string"
+      },
+      "source": "v2#/definitions/GatewayOAuthStatus"
+    },
+    "GetAccountParams": {
+      "schema": {
+        "type": "object"
+      },
+      "source": "v2#/definitions/GetAccountParams"
+    },
+    "GetAccountRateLimitsResponse": {
+      "schema": {
+        "properties": {
+          "rateLimitResetCredits": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/RateLimitResetCreditsSummary"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "rateLimits": {
+            "required": true,
+            "schema": {
+              "allOf": [
+                {
+                  "$ref": "v2#/definitions/RateLimitSnapshot"
+                }
+              ]
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/GetAccountRateLimitsResponse"
+    },
+    "GetAccountResponse": {
+      "schema": {
+        "properties": {
+          "account": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/Account"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "requiresOpenaiAuth": {
+            "required": true,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/GetAccountResponse"
+    },
+    "GrantedPermissionProfile": {
+      "schema": {
+        "type": "object"
+      },
+      "source": "v1#/definitions/GrantedPermissionProfile"
+    },
+    "InitializeCapabilities": {
+      "schema": {
+        "properties": {
+          "explicitGatewayOauth": {
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          "optOutNotificationMethods": {
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/InitializeCapabilities"
+    },
+    "InitializeParams": {
+      "schema": {
+        "properties": {
+          "capabilities": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/InitializeCapabilities"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "clientInfo": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/ClientInfo"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/InitializeParams"
+    },
+    "InitializeResponse": {
+      "schema": {
+        "properties": {
+          "platformOs": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "userAgent": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v1#/definitions/InitializeResponse"
+    },
+    "ItemCompletedNotification": {
+      "schema": {
+        "properties": {
+          "item": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/ThreadItem"
+            }
+          },
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "turnId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ItemCompletedNotification"
+    },
+    "ItemStartedNotification": {
+      "schema": {
+        "properties": {
+          "item": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/ThreadItem"
+            }
+          },
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "turnId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ItemStartedNotification"
+    },
+    "LegacyAppPathString": {
+      "schema": {
+        "type": "string"
+      },
+      "source": "v2#/definitions/LegacyAppPathString"
+    },
+    "McpServerElicitationAction": {
+      "schema": {
+        "enum": [
+          "decline"
+        ],
+        "type": "string"
+      },
+      "source": "v1#/definitions/McpServerElicitationAction"
+    },
+    "McpServerElicitationRequestParams": {
+      "schema": {
+        "properties": {
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "turnId": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          }
+        },
+        "type": "object",
+        "variants": {
+          "form": {
+            "properties": {
+              "mode": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "form"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "openai/form": {
+            "properties": {
+              "mode": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "openai/form"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "openaiForm": {
+            "properties": {
+              "mode": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "openaiForm"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "url": {
+            "properties": {
+              "elicitationId": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "mode": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "url"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          }
+        }
+      },
+      "source": "v1#/definitions/McpServerElicitationRequestParams"
+    },
+    "McpServerElicitationRequestResponse": {
+      "schema": {
+        "properties": {
+          "action": {
+            "required": true,
+            "schema": {
+              "$ref": "v1#/definitions/McpServerElicitationAction"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v1#/definitions/McpServerElicitationRequestResponse"
+    },
+    "McpToolCallProgressNotification": {
+      "schema": {
+        "properties": {
+          "itemId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "message": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "turnId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/McpToolCallProgressNotification"
+    },
+    "McpToolCallStatus": {
+      "schema": {
+        "enum": [
+          "completed",
+          "failed",
+          "inProgress"
+        ],
+        "type": "string",
+        "undeclared": [
+          "declined"
+        ]
+      },
+      "source": "v2#/definitions/McpToolCallStatus"
+    },
+    "Model": {
+      "schema": {
+        "properties": {
+          "defaultReasoningEffort": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/ReasoningEffort"
+            }
+          },
+          "description": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "displayName": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "hidden": {
+            "required": true,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          "id": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "isDefault": {
+            "required": true,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          "supportedReasoningEfforts": {
+            "required": true,
+            "schema": {
+              "items": {
+                "$ref": "v2#/definitions/ReasoningEffortOption"
+              },
+              "type": "array"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/Model"
+    },
+    "ModelListParams": {
+      "schema": {
+        "properties": {
+          "cursor": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          },
+          "limit": {
+            "required": false,
+            "schema": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ModelListParams"
+    },
+    "ModelListResponse": {
+      "schema": {
+        "properties": {
+          "data": {
+            "required": true,
+            "schema": {
+              "items": {
+                "$ref": "v2#/definitions/Model"
+              },
+              "type": "array"
+            }
+          },
+          "nextCursor": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ModelListResponse"
+    },
+    "NetworkApprovalContext": {
+      "schema": {
+        "properties": {
+          "host": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "protocol": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/NetworkApprovalProtocol"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v1#/definitions/NetworkApprovalContext"
+    },
+    "NetworkApprovalProtocol": {
+      "schema": {
+        "enum": [
+          "http",
+          "https",
+          "socks5Tcp",
+          "socks5Udp"
+        ],
+        "type": "string"
+      },
+      "source": "v2#/definitions/NetworkApprovalProtocol"
+    },
+    "NetworkPolicyAmendment": {
+      "schema": {
+        "properties": {
+          "action": {
+            "required": true,
+            "schema": {
+              "$ref": "v1#/definitions/NetworkPolicyRuleAction"
+            }
+          },
+          "host": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v1#/definitions/NetworkPolicyAmendment"
+    },
+    "NetworkPolicyRuleAction": {
+      "schema": {
+        "enum": [
+          "allow",
+          "deny"
+        ],
+        "type": "string"
+      },
+      "source": "v1#/definitions/NetworkPolicyRuleAction"
+    },
+    "PatchApplyStatus": {
+      "schema": {
+        "enum": [
+          "completed",
+          "declined",
+          "failed",
+          "inProgress"
+        ],
+        "type": "string"
+      },
+      "source": "v2#/definitions/PatchApplyStatus"
+    },
+    "PermissionGrantScope": {
+      "schema": {
+        "enum": [
+          "session",
+          "turn"
+        ],
+        "type": "string"
+      },
+      "source": "v1#/definitions/PermissionGrantScope"
+    },
+    "PermissionProfileListParams": {
+      "schema": {
+        "properties": {
+          "cursor": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          },
+          "cwd": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/PermissionProfileListParams"
+    },
+    "PermissionProfileListResponse": {
+      "schema": {
+        "properties": {
+          "data": {
+            "required": true,
+            "schema": {
+              "items": {
+                "$ref": "v2#/definitions/PermissionProfileSummary"
+              },
+              "type": "array"
+            }
+          },
+          "nextCursor": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/PermissionProfileListResponse"
+    },
+    "PermissionProfileSummary": {
+      "schema": {
+        "properties": {
+          "allowed": {
+            "required": true,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          "id": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/PermissionProfileSummary"
+    },
+    "PermissionsRequestApprovalParams": {
+      "schema": {
+        "properties": {
+          "cwd": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/LegacyAppPathString"
+            }
+          },
+          "itemId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "permissions": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/RequestPermissionProfile"
+            }
+          },
+          "reason": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          },
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "turnId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v1#/definitions/PermissionsRequestApprovalParams"
+    },
+    "PermissionsRequestApprovalResponse": {
+      "schema": {
+        "properties": {
+          "permissions": {
+            "required": true,
+            "schema": {
+              "$ref": "v1#/definitions/GrantedPermissionProfile"
+            }
+          },
+          "scope": {
+            "required": false,
+            "schema": {
+              "allOf": [
+                {
+                  "$ref": "v1#/definitions/PermissionGrantScope"
+                }
+              ]
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v1#/definitions/PermissionsRequestApprovalResponse"
+    },
+    "PlanType": {
+      "schema": {
+        "literalTypes": [
+          "string"
+        ],
+        "type": "string"
+      },
+      "source": "v2#/definitions/PlanType"
+    },
+    "RateLimitResetCredit": {
+      "schema": {
+        "properties": {
+          "description": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          },
+          "expiresAt": {
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "grantedAt": {
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "id": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "resetType": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/RateLimitResetType"
+            }
+          },
+          "status": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/RateLimitResetCreditStatus"
+            }
+          },
+          "title": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/RateLimitResetCredit"
+    },
+    "RateLimitResetCreditStatus": {
+      "schema": {
+        "literalTypes": [
+          "string"
+        ],
+        "type": "string"
+      },
+      "source": "v2#/definitions/RateLimitResetCreditStatus"
+    },
+    "RateLimitResetCreditsSummary": {
+      "schema": {
+        "properties": {
+          "availableCount": {
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "credits": {
+            "required": false,
+            "schema": {
+              "items": {
+                "$ref": "v2#/definitions/RateLimitResetCredit"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/RateLimitResetCreditsSummary"
+    },
+    "RateLimitResetType": {
+      "schema": {
+        "literalTypes": [
+          "string"
+        ],
+        "type": "string"
+      },
+      "source": "v2#/definitions/RateLimitResetType"
+    },
+    "RateLimitSnapshot": {
+      "schema": {
+        "properties": {
+          "credits": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/CreditsSnapshot"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "individualLimit": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/SpendControlLimitSnapshot"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "planType": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/PlanType"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "primary": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/RateLimitWindow"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "secondary": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/RateLimitWindow"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "spendControlReached": {
+            "required": false,
+            "schema": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/RateLimitSnapshot"
+    },
+    "RateLimitWindow": {
+      "schema": {
+        "properties": {
+          "resetsAt": {
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "usedPercent": {
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          "windowDurationMins": {
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/RateLimitWindow"
+    },
+    "ReasoningEffort": {
+      "schema": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "source": "v2#/definitions/ReasoningEffort"
+    },
+    "ReasoningEffortOption": {
+      "schema": {
+        "properties": {
+          "description": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "reasoningEffort": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/ReasoningEffort"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ReasoningEffortOption"
+    },
+    "ReasoningSummaryTextDeltaNotification": {
+      "schema": {
+        "properties": {
+          "delta": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "itemId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "turnId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ReasoningSummaryTextDeltaNotification"
+    },
+    "ReasoningTextDeltaNotification": {
+      "schema": {
+        "properties": {
+          "delta": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "itemId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "turnId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ReasoningTextDeltaNotification"
+    },
+    "RequestId": {
+      "schema": {
+        "anyOf": [
+          {
+            "format": "int64",
+            "type": "integer"
+          },
+          {
+            "type": "string"
+          }
+        ]
+      },
+      "source": "v2#/definitions/RequestId"
+    },
+    "RequestPermissionProfile": {
+      "schema": {
+        "additionalProperties": false,
+        "type": "object"
+      },
+      "source": "v2#/definitions/RequestPermissionProfile"
+    },
+    "ReviewStartParams": {
+      "schema": {
+        "properties": {
+          "target": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/ReviewTarget"
+            }
+          },
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ReviewStartParams"
+    },
+    "ReviewStartResponse": {
+      "schema": {
+        "properties": {
+          "reviewThreadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "turn": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/Turn"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ReviewStartResponse"
+    },
+    "ReviewTarget": {
+      "schema": {
+        "variants": {
+          "baseBranch": {
+            "properties": {
+              "branch": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "baseBranch"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "commit": {
+            "properties": {
+              "sha": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "title": {
+                "required": false,
+                "schema": {
+                  "type": [
+                    "null",
+                    "string"
+                  ]
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "commit"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "custom": {
+            "properties": {
+              "instructions": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "custom"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "uncommittedChanges": {
+            "properties": {
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "uncommittedChanges"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          }
+        }
+      },
+      "source": "v2#/definitions/ReviewTarget"
+    },
+    "SandboxMode": {
+      "schema": {
+        "enum": [
+          "danger-full-access",
+          "read-only",
+          "workspace-write"
+        ],
+        "type": "string"
+      },
+      "source": "v2#/definitions/SandboxMode"
+    },
+    "SandboxPolicy": {
+      "schema": {
+        "variants": {
+          "dangerFullAccess": {
+            "properties": {
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "dangerFullAccess"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "readOnly": {
+            "properties": {
+              "networkAccess": {
+                "required": false,
+                "schema": {
+                  "type": "boolean"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "readOnly"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "workspaceWrite": {
+            "properties": {
+              "excludeSlashTmp": {
+                "required": false,
+                "schema": {
+                  "type": "boolean"
+                }
+              },
+              "excludeTmpdirEnvVar": {
+                "required": false,
+                "schema": {
+                  "type": "boolean"
+                }
+              },
+              "networkAccess": {
+                "required": false,
+                "schema": {
+                  "type": "boolean"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "workspaceWrite"
+                  ],
+                  "type": "string"
+                }
+              },
+              "writableRoots": {
+                "required": false,
+                "schema": {
+                  "items": {
+                    "$ref": "v2#/definitions/AbsolutePathBuf"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "type": "object"
+          }
+        }
+      },
+      "source": "v2#/definitions/SandboxPolicy"
+    },
+    "ServerRequestResolvedNotification": {
+      "schema": {
+        "properties": {
+          "requestId": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/RequestId"
+            }
+          },
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ServerRequestResolvedNotification"
+    },
+    "SortDirection": {
+      "schema": {
+        "enum": [
+          "asc",
+          "desc"
+        ],
+        "type": "string"
+      },
+      "source": "v2#/definitions/SortDirection"
+    },
+    "SpendControlLimitSnapshot": {
+      "schema": {
+        "properties": {
+          "limit": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "remainingPercent": {
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          "resetsAt": {
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "used": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/SpendControlLimitSnapshot"
+    },
+    "SubAgentActivityKind": {
+      "schema": {
+        "literalTypes": [
+          "string"
+        ],
+        "type": "string"
+      },
+      "source": "v2#/definitions/SubAgentActivityKind"
+    },
+    "Thread": {
+      "schema": {
+        "properties": {
+          "cwd": {
+            "required": true,
+            "schema": {
+              "allOf": [
+                {
+                  "$ref": "v2#/definitions/AbsolutePathBuf"
+                }
+              ]
+            }
+          },
+          "id": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "name": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          },
+          "preview": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "recencyAt": {
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "updatedAt": {
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/Thread"
+    },
+    "ThreadItem": {
+      "schema": {
+        "type": "object",
+        "variants": {
+          "agentMessage": {
+            "properties": {
+              "id": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "agentMessage"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "collabAgentToolCall": {
+            "properties": {
+              "id": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "status": {
+                "required": true,
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "v2#/definitions/CollabAgentToolCallStatus"
+                    }
+                  ]
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "collabAgentToolCall"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "commandExecution": {
+            "properties": {
+              "aggregatedOutput": {
+                "required": false,
+                "schema": {
+                  "type": [
+                    "null",
+                    "string"
+                  ]
+                }
+              },
+              "command": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "cwd": {
+                "required": true,
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "v2#/definitions/LegacyAppPathString"
+                    }
+                  ]
+                }
+              },
+              "exitCode": {
+                "required": false,
+                "schema": {
+                  "format": "int32",
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "id": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "status": {
+                "required": true,
+                "schema": {
+                  "$ref": "v2#/definitions/CommandExecutionStatus"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "commandExecution"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "contextCompaction": {
+            "properties": {
+              "id": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "contextCompaction"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "dynamicToolCall": {
+            "properties": {
+              "id": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "status": {
+                "required": true,
+                "schema": {
+                  "$ref": "v2#/definitions/DynamicToolCallStatus"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "dynamicToolCall"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "enteredReviewMode": {
+            "properties": {
+              "id": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "review": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "enteredReviewMode"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "exitedReviewMode": {
+            "properties": {
+              "id": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "review": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "exitedReviewMode"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "fileChange": {
+            "properties": {
+              "changes": {
+                "required": true,
+                "schema": {
+                  "items": {
+                    "$ref": "v2#/definitions/FileUpdateChange"
+                  },
+                  "type": "array"
+                }
+              },
+              "id": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "status": {
+                "required": true,
+                "schema": {
+                  "$ref": "v2#/definitions/PatchApplyStatus"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "fileChange"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "functionCallOutput": {
+            "properties": {
+              "id": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "functionCallOutput"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object",
+            "undeclared": [
+              "status"
+            ]
+          },
+          "hookPrompt": {
+            "properties": {
+              "id": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "hookPrompt"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object",
+            "undeclared": [
+              "status"
+            ]
+          },
+          "imageGeneration": {
+            "properties": {
+              "id": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "status": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "imageGeneration"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "imageView": {
+            "properties": {
+              "id": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "imageView"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object",
+            "undeclared": [
+              "status"
+            ]
+          },
+          "mcpToolCall": {
+            "properties": {
+              "id": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "server": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "status": {
+                "required": true,
+                "schema": {
+                  "$ref": "v2#/definitions/McpToolCallStatus"
+                }
+              },
+              "tool": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "mcpToolCall"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "plan": {
+            "properties": {
+              "id": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "plan"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "reasoning": {
+            "properties": {
+              "content": {
+                "required": false,
+                "schema": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "id": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "summary": {
+                "required": false,
+                "schema": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "reasoning"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "sleep": {
+            "properties": {
+              "id": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "sleep"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object",
+            "undeclared": [
+              "status"
+            ]
+          },
+          "subAgentActivity": {
+            "properties": {
+              "agentThreadId": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "id": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "kind": {
+                "required": true,
+                "schema": {
+                  "$ref": "v2#/definitions/SubAgentActivityKind"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "subAgentActivity"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "userMessage": {
+            "properties": {
+              "id": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "userMessage"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object",
+            "undeclared": [
+              "status"
+            ]
+          },
+          "webSearch": {
+            "properties": {
+              "id": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "query": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "webSearch"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          }
+        }
+      },
+      "source": "v2#/definitions/ThreadItem"
+    },
+    "ThreadListCwdFilter": {
+      "schema": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "string"
+          }
+        ]
+      },
+      "source": "v2#/definitions/ThreadListCwdFilter"
+    },
+    "ThreadListParams": {
+      "schema": {
+        "properties": {
+          "archived": {
+            "required": false,
+            "schema": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          },
+          "cursor": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          },
+          "cwd": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/ThreadListCwdFilter"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "limit": {
+            "required": false,
+            "schema": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "sortDirection": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/SortDirection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "sortKey": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/ThreadSortKey"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "sourceKinds": {
+            "required": false,
+            "schema": {
+              "items": {
+                "$ref": "v2#/definitions/ThreadSourceKind"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ThreadListParams"
+    },
+    "ThreadListResponse": {
+      "schema": {
+        "properties": {
+          "data": {
+            "required": true,
+            "schema": {
+              "items": {
+                "$ref": "v2#/definitions/Thread"
+              },
+              "type": "array"
+            }
+          },
+          "nextCursor": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ThreadListResponse"
+    },
+    "ThreadReadParams": {
+      "schema": {
+        "properties": {
+          "includeTurns": {
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ThreadReadParams"
+    },
+    "ThreadReadResponse": {
+      "schema": {
+        "properties": {
+          "thread": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/Thread"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ThreadReadResponse"
+    },
+    "ThreadResumeParams": {
+      "schema": {
+        "properties": {
+          "approvalPolicy": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/AskForApproval"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "approvalsReviewer": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/ApprovalsReviewer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "config": {
+            "required": false,
+            "schema": {
+              "additionalProperties": true,
+              "type": [
+                "null",
+                "object"
+              ]
+            }
+          },
+          "cwd": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          },
+          "excludeTurns": {
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          "model": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          },
+          "sandbox": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/SandboxMode"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ThreadResumeParams"
+    },
+    "ThreadResumeResponse": {
+      "schema": {
+        "properties": {
+          "approvalPolicy": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/AskForApproval"
+            }
+          },
+          "approvalsReviewer": {
+            "required": true,
+            "schema": {
+              "allOf": [
+                {
+                  "$ref": "v2#/definitions/ApprovalsReviewer"
+                }
+              ]
+            }
+          },
+          "model": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "reasoningEffort": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/ReasoningEffort"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "thread": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/Thread"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ThreadResumeResponse"
+    },
+    "ThreadSortKey": {
+      "schema": {
+        "enum": [
+          "created_at",
+          "recency_at",
+          "updated_at"
+        ],
+        "type": "string"
+      },
+      "source": "v2#/definitions/ThreadSortKey"
+    },
+    "ThreadSourceKind": {
+      "schema": {
+        "enum": [
+          "appServer",
+          "cli",
+          "exec",
+          "vscode"
+        ],
+        "type": "string"
+      },
+      "source": "v2#/definitions/ThreadSourceKind"
+    },
+    "ThreadStartParams": {
+      "schema": {
+        "properties": {
+          "approvalPolicy": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/AskForApproval"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "approvalsReviewer": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/ApprovalsReviewer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "config": {
+            "required": false,
+            "schema": {
+              "additionalProperties": true,
+              "type": [
+                "null",
+                "object"
+              ]
+            }
+          },
+          "cwd": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          },
+          "model": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          },
+          "sandbox": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/SandboxMode"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ThreadStartParams"
+    },
+    "ThreadStartResponse": {
+      "schema": {
+        "properties": {
+          "approvalPolicy": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/AskForApproval"
+            }
+          },
+          "approvalsReviewer": {
+            "required": true,
+            "schema": {
+              "allOf": [
+                {
+                  "$ref": "v2#/definitions/ApprovalsReviewer"
+                }
+              ]
+            }
+          },
+          "model": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "reasoningEffort": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/ReasoningEffort"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "thread": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/Thread"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ThreadStartResponse"
+    },
+    "ThreadStartedNotification": {
+      "schema": {
+        "properties": {
+          "thread": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/Thread"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ThreadStartedNotification"
+    },
+    "ThreadTokenUsage": {
+      "schema": {
+        "properties": {
+          "last": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/TokenUsageBreakdown"
+            }
+          },
+          "modelContextWindow": {
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "total": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/TokenUsageBreakdown"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ThreadTokenUsage"
+    },
+    "ThreadTokenUsageUpdatedNotification": {
+      "schema": {
+        "properties": {
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "tokenUsage": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/ThreadTokenUsage"
+            }
+          },
+          "turnId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/ThreadTokenUsageUpdatedNotification"
+    },
+    "TokenUsageBreakdown": {
+      "schema": {
+        "properties": {
+          "cacheWriteInputTokens": {
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "cachedInputTokens": {
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "inputTokens": {
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "outputTokens": {
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "reasoningOutputTokens": {
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "totalTokens": {
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/TokenUsageBreakdown"
+    },
+    "ToolRequestUserInputAnswer": {
+      "schema": {
+        "properties": {
+          "answers": {
+            "required": true,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v1#/definitions/ToolRequestUserInputAnswer"
+    },
+    "ToolRequestUserInputOption": {
+      "schema": {
+        "properties": {
+          "description": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "label": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v1#/definitions/ToolRequestUserInputOption"
+    },
+    "ToolRequestUserInputParams": {
+      "schema": {
+        "properties": {
+          "isBlocking": {
+            "required": true,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          "itemId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "questions": {
+            "required": true,
+            "schema": {
+              "items": {
+                "$ref": "v1#/definitions/ToolRequestUserInputQuestion"
+              },
+              "type": "array"
+            }
+          },
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "turnId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v1#/definitions/ToolRequestUserInputParams"
+    },
+    "ToolRequestUserInputQuestion": {
+      "schema": {
+        "properties": {
+          "header": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "id": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "isOther": {
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          "isSecret": {
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          "options": {
+            "required": false,
+            "schema": {
+              "items": {
+                "$ref": "v1#/definitions/ToolRequestUserInputOption"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            }
+          },
+          "question": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v1#/definitions/ToolRequestUserInputQuestion"
+    },
+    "ToolRequestUserInputResponse": {
+      "schema": {
+        "properties": {
+          "answers": {
+            "required": true,
+            "schema": {
+              "additionalProperties": {
+                "$ref": "v1#/definitions/ToolRequestUserInputAnswer"
+              },
+              "type": "object"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v1#/definitions/ToolRequestUserInputResponse"
+    },
+    "Turn": {
+      "schema": {
+        "properties": {
+          "error": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/TurnError"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "id": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "status": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/TurnStatus"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/Turn"
+    },
+    "TurnCompletedNotification": {
+      "schema": {
+        "properties": {
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "turn": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/Turn"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/TurnCompletedNotification"
+    },
+    "TurnError": {
+      "schema": {
+        "properties": {
+          "additionalDetails": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          },
+          "codexErrorInfo": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/CodexErrorInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "message": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/TurnError"
+    },
+    "TurnInterruptParams": {
+      "schema": {
+        "properties": {
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "turnId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/TurnInterruptParams"
+    },
+    "TurnStartParams": {
+      "schema": {
+        "properties": {
+          "approvalPolicy": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/AskForApproval"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "approvalsReviewer": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/ApprovalsReviewer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "effort": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/ReasoningEffort"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "input": {
+            "required": true,
+            "schema": {
+              "items": {
+                "$ref": "v2#/definitions/UserInput"
+              },
+              "type": "array"
+            }
+          },
+          "model": {
+            "required": false,
+            "schema": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          },
+          "sandboxPolicy": {
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "v2#/definitions/SandboxPolicy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/TurnStartParams"
+    },
+    "TurnStartResponse": {
+      "schema": {
+        "properties": {
+          "turn": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/Turn"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/TurnStartResponse"
+    },
+    "TurnStartedNotification": {
+      "schema": {
+        "properties": {
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "turn": {
+            "required": true,
+            "schema": {
+              "$ref": "v2#/definitions/Turn"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/TurnStartedNotification"
+    },
+    "TurnStatus": {
+      "schema": {
+        "enum": [
+          "completed",
+          "failed",
+          "inProgress",
+          "interrupted"
+        ],
+        "type": "string"
+      },
+      "source": "v2#/definitions/TurnStatus"
+    },
+    "TurnSteerParams": {
+      "schema": {
+        "properties": {
+          "expectedTurnId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          "input": {
+            "required": true,
+            "schema": {
+              "items": {
+                "$ref": "v2#/definitions/UserInput"
+              },
+              "type": "array"
+            }
+          },
+          "threadId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/TurnSteerParams"
+    },
+    "TurnSteerResponse": {
+      "schema": {
+        "properties": {
+          "turnId": {
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "source": "v2#/definitions/TurnSteerResponse"
+    },
+    "UserInput": {
+      "schema": {
+        "variants": {
+          "image": {
+            "anyOf": [
+              {
+                "properties": {
+                  "url": {
+                    "required": true,
+                    "schema": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "type": "object"
+              }
+            ],
+            "properties": {
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "image"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          },
+          "text": {
+            "properties": {
+              "text": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text_elements": {
+                "required": false,
+                "schema": {
+                  "items": {
+                    "$ref": "v2#/definitions/TextElement"
+                  },
+                  "type": "array"
+                }
+              },
+              "type": {
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "text"
+                  ],
+                  "type": "string"
+                }
+              }
+            },
+            "type": "object"
+          }
+        }
+      },
+      "source": "v2#/definitions/UserInput"
+    }
+  },
   "definitions": {
     "Account": {
       "properties": [
