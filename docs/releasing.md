@@ -97,8 +97,9 @@ README and licence without build, scratch or environment files. Run it on a clea
 `cargo package --list` refuses sources with uncommitted changes. Inspect the packaged files before
 publishing; a registry artifact is immutable.
 
-Each crate ships the fixture bytes its tests and benchmarks read. Captures produced by
-`mea capture` remain canonical under the repository's `fixtures/` directory, with their existing
+The three harness crates ship local copies for their fixture-based tests and Codex's pipeline
+benchmark. Captures produced by `mea capture` remain canonical under the repository's `fixtures/`
+directory, with their existing
 manifest digests. Run `scripts/package-fixtures.py` after a capture changes and commit the derived
 crate-local copies with that change. `scripts/package-fixtures.py --check` rejects missing, stale
 or extra copies; `scripts/check.sh` and CI run that check.
@@ -107,6 +108,12 @@ The publication gate runs `scripts/test-packages.sh`: it extracts all four archi
 repository and runs their tests without a root-fixture fallback. Before the new core version is
 published, the helper patches each extracted archive's core dependency only to the extracted core
 archive. The selected Rust toolchain follows the tests outside the checkout.
+
+Core's captured-transcript framing cases still use the checkout's fixture corpus and skip when
+it is absent. Its generated-input framing cases remain usable from an archive. This
+[benchmark scope decision](https://github.com/juliopolycarpo/mango-external-agents/issues/340)
+keeps the non-gating cross-vendor corpus out of the core package; all four archives' shipped tests
+are covered by the standalone test gate.
 
 For pre-commit archive testing, `scripts/test-packages.sh --allow-dirty` explicitly tests working-tree
 bytes. Release qualification uses the clean-tree publication gate above. The earlier missing-fixture
