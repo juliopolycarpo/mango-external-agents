@@ -73,15 +73,15 @@ deny = [
   { crate = "async-process", reason = "the host owns the process; the library never spawns" },
   { crate = "blocking", reason = "the host owns the pipes; no blocking thread pool" },
 ]
-# The older of each pair, by major line, so a patch release of the same line does not need an edit
+# The reviewed older version of each pair. A different patch release requires review and an update
 # here. Remove an entry when the crate that brings it moves on; the gates deny skips that match
 # nothing or a crate with only one version.
 skip = [
-  { crate = "getrandom@0.2", reason = "ring 0.17 requires getrandom 0.2; other consumers, including rand and tempfile, require 0.4" },
-  { crate = "windows-sys@0.52", reason = "ring 0.17 is on windows-sys 0.52; tokio, mio and rustix are on 0.61" },
-  { crate = "thiserror@1", reason = "win32job 2 is on thiserror 1; tungstenite is on 2" },
-  { crate = "thiserror-impl@1", reason = "the derive half of thiserror 1, for win32job 2" },
-  { crate = "syn@2", reason = "derive_more and strum (the ACP schema crate), thiserror 1 and the windows macros are on syn 2; the rest are on 3" },
+  { crate = "getrandom@0.2.17", reason = "ring 0.17 requires getrandom 0.2; other consumers, including rand and tempfile, require 0.4" },
+  { crate = "windows-sys@0.52.0", reason = "ring 0.17 is on windows-sys 0.52; tokio, mio and rustix are on 0.61" },
+  { crate = "thiserror@1.0.69", reason = "win32job 2 is on thiserror 1; tungstenite is on 2" },
+  { crate = "thiserror-impl@1.0.69", reason = "the derive half of thiserror 1, for win32job 2" },
+  { crate = "syn@2.0.119", reason = "derive_more and strum (the ACP schema crate), thiserror 1 and the windows macros are on syn 2; the rest are on 3" },
 ]
 skip-tree = []
 
