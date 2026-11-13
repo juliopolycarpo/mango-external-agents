@@ -114,9 +114,8 @@ pub struct InitializeResponse {
 
 /// How much the agent has to ask before acting, as the app-server spells it.
 ///
-/// The `granular` variant upstream carries a struct of flags. It is never sent by this harness —
-/// three levels map onto the three plain values — so it is modelled as the opaque variant that
-/// keeps whatever arrived rather than as a shape that would have to track upstream's flags.
+/// The harness sends only these three choices. Incoming policies are observed separately because
+/// the server can also return a granular policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AskForApproval {
@@ -126,6 +125,29 @@ pub enum AskForApproval {
     OnRequest,
     /// Never ask.
     Never,
+}
+
+/// An approval policy observed in a thread response.
+///
+/// Other policies are discarded because the harness cannot infer host authority from them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObservedApprovalPolicy {
+    /// One of the three policy choices supported for outgoing requests.
+    Supported(AskForApproval),
+    /// A granular or unknown policy, without retaining its contents.
+    Other,
+}
+
+impl<'de> Deserialize<'de> for ObservedApprovalPolicy {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            Some("untrusted") => Self::Supported(AskForApproval::Untrusted),
+            Some("on-request") => Self::Supported(AskForApproval::OnRequest),
+            Some("never") => Self::Supported(AskForApproval::Never),
+            _ => Self::Other,
+        })
+    }
 }
 
 /// What the agent may touch, as the app-server spells it.
@@ -361,9 +383,9 @@ pub struct ThreadStartResponse {
     /// The reasoning effort it actually chose.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
-    /// The approval policy it actually applied.
+    /// The approval policy it actually applied, without retaining unknown values.
     #[serde(default)]
-    pub approval_policy: Option<AskForApproval>,
+    pub approval_policy: Option<ObservedApprovalPolicy>,
     /// The reviewer it actually routed to.
     #[serde(default)]
     pub approvals_reviewer: Option<ApprovalsReviewer>,
@@ -1006,6 +1028,65 @@ mod tests {
         ThreadResumeParams, ThreadStartParams, ThreadStartResponse, ThreadSummary, TurnStartParams,
         TurnStatus, UserInput,
     };
+
+    #[test]
+    fn granular_thread_approval_policy_decodes_without_exposing_unknown_fields() {
+        // This synthetic response validates against both pinned 0.166.0 response schemas.
+        let mut response: serde_json::Value =
+            serde_json::from_str(include_str!("../../testdata/granular-thread-response.json"))
+                .expect("expected a complete schema-shaped thread response");
+        response["approvalPolicy"]["granular"]["future_field"] =
+            serde_json::json!("api_key=policy-secret");
+        let decoded: ThreadStartResponse = serde_json::from_value(response)
+            .expect("expected a granular approval policy in a thread response");
+        assert_eq!(decoded.thread.id, "01900000-0000-7000-8000-000000000001");
+        assert_eq!(decoded.model.as_deref(), Some("gpt-observed"));
+        assert_eq!(decoded.reasoning_effort.as_deref(), Some("medium"));
+        // `approval_policy` defaults when absent, so a renamed or skipped field would still decode;
+        // pin that the documented granular object reached the field as the opaque variant.
+        assert_eq!(
+            decoded.approval_policy,
+            Some(super::ObservedApprovalPolicy::Other),
+            "expected the granular policy to decode as Other, received {:?}",
+            decoded.approval_policy
+        );
+        assert!(!format!("{decoded:?}").contains("policy-secret"));
+    }
+
+    #[test]
+    fn observed_approval_policy_keeps_supported_choices_and_discards_unknown_values() {
+        for (value, expected) in [
+            (
+                serde_json::json!("untrusted"),
+                super::ObservedApprovalPolicy::Supported(AskForApproval::Untrusted),
+            ),
+            (
+                serde_json::json!("on-request"),
+                super::ObservedApprovalPolicy::Supported(AskForApproval::OnRequest),
+            ),
+            (
+                serde_json::json!("never"),
+                super::ObservedApprovalPolicy::Supported(AskForApproval::Never),
+            ),
+            (
+                serde_json::json!("future-secret"),
+                super::ObservedApprovalPolicy::Other,
+            ),
+            (
+                serde_json::json!({"future": "future-secret"}),
+                super::ObservedApprovalPolicy::Other,
+            ),
+            (
+                serde_json::json!({"granular": {"future_field": "future-secret"}}),
+                super::ObservedApprovalPolicy::Other,
+            ),
+        ] {
+            let policy: super::ObservedApprovalPolicy =
+                serde_json::from_value(value).expect("expected an observed policy");
+            assert_eq!(policy, expected);
+            assert!(!format!("{policy:?}").contains("future-secret"));
+        }
+    }
 
     #[test]
     fn gateway_readiness_requires_a_boolean_and_local_success_when_required() {
