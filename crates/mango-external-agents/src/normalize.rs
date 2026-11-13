@@ -150,11 +150,25 @@ pub fn sanitize_field(raw: &str) -> BoundedText {
     sanitize_owned(raw.to_owned())
 }
 
-/// [`sanitize_field`] for text the caller already owns: nothing is copied.
+/// A stripped buffer is reclaimed once its capacity exceeds this multiple of the surviving bytes.
+///
+/// Four means survivors under a quarter of the buffer. A smaller factor would reallocate strings
+/// that merely lost a few control characters, which is the reuse the owned path keeps; a larger
+/// one would let a delta pin ten or more times its text.
+const RECLAIM_RATIO: usize = 4;
+
+/// Buffers up to this many bytes are never reclaimed: releasing one saves at most this much, which
+/// does not repay a reallocation.
+const RECLAIM_FLOOR: usize = 256;
+
+/// [`sanitize_field`] for text the caller already owns.
 ///
 /// Clean text comes back as it arrived. Dirty text is stripped in place, so the buffer that held
-/// it is the buffer that keeps the survivors. The result is byte-identical to
-/// `sanitize_field(&raw)`.
+/// it is the buffer that keeps the survivors, unless stripping leaves less than a quarter of it
+/// (and the buffer is over [`RECLAIM_FLOOR`] bytes): then the survivors move to a buffer that fits
+/// them, because a mostly stripped delta would otherwise pin its whole input for as long as the
+/// event is held. The result is byte-identical to `sanitize_field(&raw)`; only the spare capacity
+/// differs.
 pub(crate) fn sanitize_owned(mut raw: String) -> BoundedText {
     if !may_need_stripping(&raw) {
         return BoundedText {
@@ -165,8 +179,15 @@ pub(crate) fn sanitize_owned(mut raw: String) -> BoundedText {
     // One pass: a removal always shortens the text, so the length says whether anything went.
     let before = raw.len();
     raw.retain(|character| !is_strippable(character));
+    let truncated = raw.len() != before;
+    // `shrink_to_fit` moves at most the survivors, under a quarter of the buffer, so the cost is bounded
+    // by what is kept rather than by what was stripped. Text that lost only a little keeps its
+    // buffer, which is the reuse the owned path exists for.
+    if truncated && raw.capacity() > raw.len().saturating_mul(RECLAIM_RATIO).max(RECLAIM_FLOOR) {
+        raw.shrink_to_fit();
+    }
     BoundedText {
-        truncated: raw.len() != before,
+        truncated,
         text: raw,
     }
 }
@@ -596,6 +617,111 @@ mod tests {
                 "expected {input:?} sanitised in the buffer it arrived in | received a new buffer"
             );
         }
+    }
+
+    #[test]
+    fn owned_sanitising_reclaims_severely_stripped_buffers() {
+        // Survivors on every UTF-8 width, alone and interleaved with the stripped run, so a
+        // shrink that cut inside a character or reordered survivors would change the bytes.
+        let interleaved = format!(
+            "{}é{}日{}🍋",
+            "\u{202e}".repeat(9_000),
+            "\u{1b}".repeat(9_000),
+            "\u{85}".repeat(9_000)
+        );
+        let cases = [
+            ("short", format!("{}short", "\u{202e}".repeat(30_000))),
+            ("empty", "\u{202e}".repeat(30_000)),
+            ("multibyte", format!("{}🍋é", "\u{202e}".repeat(30_000))),
+            ("interleaved", interleaved),
+        ];
+        for (label, input) in cases {
+            let (expected_text, expected_truncated) = reference_sanitize(&input);
+            let cleaned = sanitize_owned(input);
+            assert_eq!(
+                (cleaned.text.as_bytes(), cleaned.truncated),
+                (expected_text.as_bytes(), expected_truncated),
+                "expected reference text and truncation for case {label}"
+            );
+            assert!(
+                cleaned.text.capacity() <= 64,
+                "expected capacity <= 64 bytes after stripping case {label} | received {}",
+                cleaned.text.capacity()
+            );
+        }
+    }
+
+    /// A buffer of `capacity` bytes holding ten stripped bytes and then `survivors` plain ones.
+    fn dirty_buffer(capacity: usize, survivors: usize) -> String {
+        let mut raw = String::with_capacity(capacity);
+        assert_eq!(
+            raw.capacity(),
+            capacity,
+            "expected the allocator to hand back the requested capacity"
+        );
+        raw.push_str(&"\u{1b}".repeat(10));
+        raw.push_str(&"a".repeat(survivors));
+        raw
+    }
+
+    #[test]
+    fn owned_sanitising_reclaims_only_when_survivors_fall_below_a_quarter_of_the_buffer() {
+        // (buffer capacity, surviving bytes, whether the buffer is released). A survivor share
+        // of exactly one quarter, and any buffer within the 256-byte floor, is ordinary reuse.
+        let cases = [
+            (4_096, 1_024, false),
+            (4_096, 1_023, true),
+            (4_096, 2_048, false),
+            (4_096, 4_000, false),
+            (256, 0, false),
+            (257, 0, true),
+            (1_024, 255, true),
+        ];
+        for (capacity, survivors, reclaimed) in cases {
+            let raw = dirty_buffer(capacity, survivors);
+            let pointer = raw.as_ptr();
+            let cleaned = sanitize_owned(raw);
+            assert_eq!(
+                (cleaned.text.len(), cleaned.truncated),
+                (survivors, true),
+                "expected {survivors} survivors of a {capacity} byte buffer, truncated"
+            );
+            if reclaimed {
+                assert!(
+                    cleaned.text.capacity() < capacity,
+                    "expected a {capacity} byte buffer holding {survivors} bytes to be released | \
+                     received capacity {}",
+                    cleaned.text.capacity()
+                );
+            } else {
+                assert_eq!(
+                    (cleaned.text.as_ptr(), cleaned.text.capacity()),
+                    (pointer, capacity),
+                    "expected a {capacity} byte buffer holding {survivors} bytes to be reused | \
+                     received capacity {}",
+                    cleaned.text.capacity()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn owned_sanitising_leaves_clean_oversized_buffers_alone() {
+        // Clean text takes the early return: this is a stripping policy, not a trim of every
+        // buffer that arrives with spare room.
+        let mut raw = String::with_capacity(90_000);
+        raw.push_str("short");
+        let pointer = raw.as_ptr();
+        let cleaned = sanitize_owned(raw);
+        assert_eq!(
+            (
+                cleaned.text.as_ptr(),
+                cleaned.text.capacity(),
+                cleaned.truncated
+            ),
+            (pointer, 90_000, false),
+            "expected clean text kept in its 90000 byte buffer"
+        );
     }
 
     #[test]

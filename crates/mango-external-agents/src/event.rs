@@ -1975,6 +1975,29 @@ mod tests {
     }
 
     #[test]
+    fn streaming_text_that_is_mostly_stripped_does_not_keep_its_input_buffer() {
+        for reasoning in [false, true] {
+            let raw = format!("{}short", "\u{202e}".repeat(30_000));
+            let kind = if reasoning {
+                EventKind::ReasoningDelta { text: raw }
+            } else {
+                EventKind::TextDelta { text: raw }
+            };
+            let cleaned = streamed_text(kind.normalized().expect("expected a delta"));
+            assert_eq!(
+                cleaned, "short",
+                "expected the overrides stripped (reasoning: {reasoning})"
+            );
+            assert!(
+                cleaned.capacity() <= 64,
+                "expected a buffer of at most 64 bytes for 5 surviving bytes (reasoning: \
+                 {reasoning}) | received {}",
+                cleaned.capacity()
+            );
+        }
+    }
+
+    #[test]
     fn refuses_an_activity_whose_call_id_cannot_survive_bounding() {
         let kind = EventKind::ActivityStarted {
             call_id: "c".repeat(129),
