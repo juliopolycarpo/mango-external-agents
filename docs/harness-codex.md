@@ -722,9 +722,9 @@ never read as the narrow one.
 ### Standing rules an amendment writes
 
 An amendment option writes a rule Codex applies on its own from then on, so the option's label
-carries the rule itself and never a generic description of it. The pinned digest in
-`vendor/schema.json` lists property names only, with no field types. The types come from
-`codex app-server generate-json-schema` originally checked at 0.154.0:
+carries the rule itself and never a generic description of it. The consumed projection in
+`vendor/schema.json` records the field types from `codex app-server generate-json-schema`,
+originally checked at 0.154.0:
 `CommandExecutionRequestApprovalParams.proposedExecpolicyAmendment` is `string[]` (a command
 prefix), `proposedNetworkPolicyAmendments` is `NetworkPolicyAmendment[]` where
 `NetworkPolicyAmendment` is `{host: string, action: "allow" | "deny"}`, and
@@ -1126,19 +1126,27 @@ workspace refuses and a dependency surface no MSRV lane could hold.
 
 What is vendored instead is OpenAI's own description of the wire.
 `codex app-server generate-json-schema` is a documented subcommand; `scripts/vendor-codex.sh` runs
-it against the pinned build and reduces the bundle to field names, enum values and JSON-RPC
-method discriminators in `vendor/schema.json`. The tests in
-`src/protocol/schema.rs` assert every name this crate writes or reads against it, so a field
-renamed upstream fails a test here rather than a turn on a user's machine.
+it against the pinned build. The broad inventory in `vendor/schema.json` lists field names, enum
+values and JSON-RPC method discriminators for the existing `src/protocol/schema.rs` name tests.
+It may also change when the vendor adds a field the harness ignores.
+
+A separate `consumed` projection uses an explicit allowlist of the fields and alternatives this
+harness reads or sends. It records each definition's source bundle, selected property types and
+references, requiredness, nullability and variant ownership. A referenced scalar's type is also
+recorded, and a non-equivalent referenced definition retains its own source path and selected
+shape. A selected field or value the pinned bundle does not declare is listed as `undeclared`
+on its definition or variant instead of being dropped, so an allowlist typo shows in the diff and a
+vendor release that adds it shows as drift. Opaque JSON is not expanded into a vendor API. Description changes and unselected
+additions do not change this projection. The recorded requiredness is the vendor schema's, not a
+new rule for the Rust decoder. This is an offline drift signal, not a runtime validator: unknown
+fields and variants retain their existing fallbacks, and the observed approval and reviewer
+fallbacks discard unknown payloads without changing outgoing choices.
 
 Re-pinning is `scripts/vendor-codex.sh <version>`, which requires the vendor's CLI at exactly
 the requested version. Maintainers run it to update the inventory; the pinned CI lane runs the
 same generator to reproduce that contract without modifying the checkout.
 The schema test checks that `vendor/PIN` matches the inventory version stamp and that the pin
 is accepted by the qualified minimum-version gate. It does not require pin and minimum equality.
-
-What the inventory deliberately does **not** catch is a field *added* upstream. This harness reads
-a subset on purpose, and every addition would otherwise be a red build.
 
 ## Fixtures
 
