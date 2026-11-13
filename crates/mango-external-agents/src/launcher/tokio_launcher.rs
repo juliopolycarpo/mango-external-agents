@@ -860,9 +860,9 @@ impl Drop for TokioChild {
                 // The same escalation `kill` runs, rather than a sleep and a signal: it asks first,
                 // stops the moment nothing is left, and never signals a tree that is already gone.
                 Ok(runtime) => {
-                    runtime.spawn(async move {
-                        let _ = end_process_tree(pid, grace, exit).await;
-                    });
+                    // Called here, not inside the task: a runtime shutting down drops the task
+                    // unpolled, and only a future that already exists can still send the signal.
+                    runtime.spawn(end_process_tree(pid, grace, exit));
                 }
                 // Nothing left to wait a grace on, so there is nowhere to wait between asking and
                 // insisting. Still checked first: a tree that is already gone must not be signalled,
@@ -942,8 +942,58 @@ async fn tree_ends_within(
 /// Takes the reaper's view of the leader rather than the child itself, so the drop path — which no
 /// longer holds a handle — runs the same escalation as [`ProcessControl::kill`] instead of a sleep
 /// and a signal of its own.
+///
+/// A runtime that shuts down drops this future wherever it stands, and a runtime already shutting
+/// down drops a task spawned to run it before its first poll. Either way no grace is left to wait
+/// on, so the drop sends the final signal itself, as [`TokioChild`]'s drop does with no runtime.
+/// The signal is armed when this function is called, not at the first poll, so the unpolled case
+/// is covered too.
 #[cfg(unix)]
-async fn end_process_tree(
+fn end_process_tree(
+    pid: u32,
+    grace: Duration,
+    exit: watch::Receiver<Option<ExitStatus>>,
+) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
+    let mut abandoned = FinalSignalIfDropped {
+        pid,
+        exit: exit.clone(),
+        armed: true,
+    };
+    async move {
+        let ended = escalate_process_tree(pid, grace, exit).await;
+        // A method call, so the block captures the whole guard rather than only its flag.
+        abandoned.disarm();
+        ended
+    }
+}
+
+/// Sends the signal that cannot be declined when an escalation is dropped before it finished.
+#[cfg(unix)]
+struct FinalSignalIfDropped {
+    pid: u32,
+    exit: watch::Receiver<Option<ExitStatus>>,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl FinalSignalIfDropped {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FinalSignalIfDropped {
+    fn drop(&mut self) {
+        // An empty group is never signalled: its number may already name somebody else.
+        if self.armed && !tree_is_gone(self.pid, &self.exit) {
+            insist_tree_stops(self.pid);
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn escalate_process_tree(
     pid: u32,
     grace: Duration,
     exit: watch::Receiver<Option<ExitStatus>>,

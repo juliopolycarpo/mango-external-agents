@@ -249,6 +249,11 @@ impl Drop for BlockedStopSignals {
 
 /// Launches the leader, then reads until both it and its helper have reported their pids.
 async fn launch(situation: &'static str) -> Launched {
+    launch_with_grace(situation, GRACE).await
+}
+
+/// The same launch under a chosen launcher grace.
+async fn launch_with_grace(situation: &'static str, grace: Duration) -> Launched {
     let spec = fixture("native-cleanup-leader");
     eprintln!(
         "native-cleanup[{situation}] command: {:?} MEA_LAUNCHER_FIXTURE=native-cleanup-leader",
@@ -257,7 +262,7 @@ async fn launch(situation: &'static str) -> Launched {
     // The launcher's spawn does not yield on Unix, so the whole call runs under the mask.
     let blocked = BlockedStopSignals::on_this_thread();
     let spawned = TokioLauncher::new()
-        .with_kill_grace(GRACE)
+        .with_kill_grace(grace)
         .spawn(spec)
         .await;
     drop(blocked);
@@ -560,4 +565,86 @@ fn handles_released_after_runtime_shutdown_end_the_group_through_the_controls_dr
     drop(control);
     pids.await_not_running_blocking("the last handle dropped outside a runtime");
     pids.observe("last handle dropped");
+}
+
+/// Whether SIGTERM is pending, undelivered, for the process. The helper blocks it, so a pending
+/// SIGTERM in `/proc/<pid>/status` is the kernel's record that the launcher's first group signal
+/// reached it.
+fn sigterm_pending(pid: i32) -> bool {
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("ShdPnd:"))
+        .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        .is_some_and(|mask| mask & (1 << (Signal::SIGTERM as i32 - 1)) != 0)
+}
+
+/// Early runtime shutdown that is itself the last owner. The runtime drops a task that holds the
+/// only handles, so the control's `Drop` runs inside the shutdown, where `Handle::try_current`
+/// still succeeds but nothing will run a spawned task. `docs/harness-claude.md` documents that
+/// `Drop` as the group's end on Unix.
+#[test]
+fn runtime_shutdown_dropping_the_last_handles_ends_the_group() {
+    let runtime = capture_runtime();
+    let native = runtime.block_on(launch("shutdown-drops-owner"));
+    let guard = runtime.block_on(async { native.guard() });
+    let Launched {
+        control,
+        stdin,
+        lines,
+        pids,
+        _guardian,
+    } = native;
+    runtime.spawn(async move {
+        let _held = (control, stdin, lines, guard);
+        std::future::pending::<()>().await;
+    });
+
+    drop(runtime);
+    pids.observe("runtime shut down, owner task dropped");
+
+    pids.await_not_running_blocking("the runtime dropped the only owner");
+}
+
+/// Early runtime shutdown in the middle of a started cleanup. The worker has sent SIGTERM and is
+/// inside its grace when the runtime goes away, with the host still holding the control. The
+/// helper ignores SIGTERM, so only a final signal ends it. The control's `Drop` cannot send one:
+/// the stop already claimed the escalation.
+#[test]
+fn runtime_shutdown_during_the_grace_still_ends_the_group() {
+    // Long enough that the grace cannot elapse before the runtime is dropped.
+    let long_grace = Duration::from_secs(30);
+    let runtime = capture_runtime();
+    let native = runtime.block_on(launch_with_grace("shutdown-mid-grace", long_grace));
+    let helper_pid = native.pids.helper.pid;
+    let limits = Limits {
+        kill_grace: long_grace,
+        shutdown_timeout: Duration::from_secs(90),
+        ..Limits::default()
+    };
+    let control = Arc::clone(&native.control);
+    runtime.block_on(async {
+        let guard = ProcessCleanupGuard::new(control, limits, CancelReason::Shutdown);
+        tokio::spawn(guard.finish());
+        let started = Instant::now();
+        while !sigterm_pending(helper_pid) {
+            assert!(
+                started.elapsed() < OBSERVE,
+                "(native cleanup: shutdown-mid-grace): expected SIGTERM pending on helper pid {helper_pid} within {OBSERVE:?} | received: none"
+            );
+            tokio::time::sleep(LOOK_AGAIN).await;
+        }
+    });
+    native
+        .pids
+        .observe("SIGTERM sent, runtime about to shut down");
+
+    drop(runtime);
+    native.pids.observe("runtime shut down, control still held");
+
+    native
+        .pids
+        .await_not_running_blocking("the runtime dropped a cleanup inside its grace");
 }
