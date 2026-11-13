@@ -453,7 +453,9 @@ impl StderrTail {
     ///
     /// - Memory. Up to `max_bytes` stay resident for as long as the tail lives, and
     ///   [`push`](Self::push) appends a chunk before it trims, so the buffer briefly holds
-    ///   `max_bytes` plus that chunk. Each [`read`](Self::read) then copies the tail, and the text
+    ///   `max_bytes` plus that chunk. A push that leaves the buffer with more than twice
+    ///   `max_bytes` of capacity gives the excess back, so one large chunk does not stay allocated
+    ///   after its text is dropped. Each [`read`](Self::read) then copies the tail, and the text
     ///   it returns is not bounded by `max_bytes`: a byte that is not valid UTF-8 becomes a 3-byte
     ///   replacement character and a credential's value becomes `[REDACTED]`. A cut that is still
     ///   open also keeps a window of the stderr it dropped, so the next bytes can be judged
@@ -518,11 +520,25 @@ impl StderrTail {
     /// ```
     pub fn push(&self, chunk: &[u8]) {
         let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        self.append(&mut guard, chunk);
+        // `append` extends the buffer by the whole chunk before it cuts, so a chunk far larger than
+        // the cap grows the allocation and the cut leaves it behind. Give back what is out of
+        // proportion to the cap. Up to twice the cap stays: the usual chunk lands inside it, and
+        // trimming at the cap itself would reallocate on nearly every push.
+        let buffer = &mut guard.buffer;
+        if buffer.capacity() > self.max_bytes.saturating_mul(2) {
+            buffer.shrink_to(self.max_bytes);
+        }
+    }
+
+    /// The append and cut half of [`push`](Self::push), which leaves the buffer's allocation to
+    /// the caller.
+    fn append(&self, state: &mut TailState, chunk: &[u8]) {
         let TailState {
             buffer,
             discard,
             key,
-        } = &mut *guard;
+        } = state;
         let chunk = match discard.as_mut().map(|open| open.consume(chunk)) {
             Some(None) => {
                 key.feed(chunk);
@@ -1626,6 +1642,125 @@ mod tests {
                 "expected the {name} clone to drop the overflowed remainder only | received {read:?}"
             );
         }
+    }
+
+    /// The capacity of the buffer behind a tail, which `read` never shows.
+    fn retained_capacity(tail: &StderrTail) -> usize {
+        tail.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .buffer
+            .capacity()
+    }
+
+    #[test]
+    fn an_oversized_chunk_does_not_leave_its_allocation_in_the_buffer() {
+        let tail = StderrTail::with_capacity(16);
+        let mut chunk = vec![b'x'; 1024 * 1024];
+        chunk.extend_from_slice(b"\nok\n");
+        tail.push(&chunk);
+        assert_eq!(tail.read(), "ok\n");
+        let capacity = retained_capacity(&tail);
+        assert!(
+            capacity <= 32,
+            "expected retained buffer capacity <= 32 (twice the cap) | received {capacity}"
+        );
+    }
+
+    #[test]
+    fn a_zero_cap_tail_holds_no_allocation_after_an_oversized_push() {
+        let tail = StderrTail::with_capacity(0);
+        tail.push(&vec![b'x'; 1024 * 1024]);
+        assert_eq!(tail.read(), "");
+        let capacity = retained_capacity(&tail);
+        assert_eq!(
+            capacity, 0,
+            "expected retained buffer capacity 0 | received {capacity}"
+        );
+    }
+
+    /// Chunks that fit inside twice the cap are the usual case, and giving their room back would
+    /// reallocate on the next push: the capacity has to settle.
+    #[test]
+    fn chunks_inside_twice_the_cap_keep_one_allocation() {
+        let cap = 16 * 1024;
+        let tail = StderrTail::with_capacity(cap);
+        let line = format!("{}\n", "d".repeat(127));
+        let chunk = line.repeat(32); // 4 KiB
+        for _ in 0..8 {
+            tail.push(chunk.as_bytes());
+        }
+        let settled = retained_capacity(&tail);
+        for pushes in 0..64 {
+            tail.push(chunk.as_bytes());
+            let capacity = retained_capacity(&tail);
+            assert_eq!(
+                capacity, settled,
+                "expected the buffer capacity to stay at {settled} | received {capacity} after {pushes} more pushes"
+            );
+        }
+        assert!(
+            settled <= 2 * cap,
+            "expected settled capacity <= {} | received {settled}",
+            2 * cap
+        );
+    }
+
+    /// Releasing the allocation must not release the cut: what follows an oversized line, an
+    /// awaited credential value or a private key's body is still dropped or hidden.
+    #[test]
+    fn an_oversized_chunk_keeps_the_open_cut_and_the_key_context() {
+        // One line longer than the cap, then its rest in a later push.
+        let tail = StderrTail::with_capacity(16);
+        tail.push(&vec![b'x'; 1024 * 1024]);
+        let capacity = retained_capacity(&tail);
+        assert!(
+            capacity <= 32,
+            "expected retained buffer capacity <= 32 after an unterminated oversized line | received {capacity}"
+        );
+        tail.push(b"continued-line\nok\n");
+        let shown = tail.read();
+        assert_eq!(
+            shown, "ok\n",
+            "expected the rest of the oversized line dropped | received {shown:?}"
+        );
+
+        // A name whose value is still awaited when the oversized chunk ends.
+        let tail = StderrTail::with_capacity(16);
+        let mut chunk = vec![b'x'; 1024 * 1024];
+        chunk.extend_from_slice(b"\nAPI_KEY=\n");
+        tail.push(&chunk);
+        let capacity = retained_capacity(&tail);
+        assert!(
+            capacity <= 32,
+            "expected retained buffer capacity <= 32 after an awaited value | received {capacity}"
+        );
+        tail.push(b"secret-value\nok\n");
+        let shown = tail.read();
+        assert_eq!(
+            shown, "ok\n",
+            "expected the awaited value dropped | received {shown:?}"
+        );
+
+        // A key whose begin line the cut drops, in one chunk far larger than the cap.
+        let line = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj";
+        let (begin, end) = (
+            ["-----BEGIN PRIV", "ATE KEY-----"].concat(),
+            ["-----END PRIV", "ATE KEY-----"].concat(),
+        );
+        let tail = StderrTail::with_capacity(230);
+        let body = format!("{line}\n").repeat(2048);
+        tail.push(format!("prefix line\n{begin}\n{body}{end}\nafter\n").as_bytes());
+        let capacity = retained_capacity(&tail);
+        assert!(
+            capacity <= 460,
+            "expected retained buffer capacity <= 460 after an oversized key | received {capacity}"
+        );
+        let shown = tail.read();
+        assert_eq!(
+            shown, "[REDACTED]\nafter\n",
+            "expected the key's kept lines hidden with its end marker | received {shown:?}"
+        );
     }
 
     #[test]

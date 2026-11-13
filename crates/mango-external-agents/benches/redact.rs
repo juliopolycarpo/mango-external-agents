@@ -23,6 +23,7 @@
 
 mod support;
 
+use mango_external_agents::StderrTail;
 use mango_external_agents::normalize::TextLimit;
 use mango_external_agents::redact::{bounded, stderr_tail, stderr_text};
 use support::{Bench, Unit};
@@ -276,6 +277,7 @@ fn main() {
     messages(&bench);
     token_shapes(&bench);
     tails(&bench);
+    push_tails(&bench);
 }
 
 /// `redact::stderr_tail` over 16 KiB tails, 320 KiB per sample, and `stderr_text` over the same
@@ -371,6 +373,63 @@ fn tails(bench: &Bench) {
             || (),
             |()| stderr_tail(std::hint::black_box(&raw)).len(),
         );
+    }
+}
+
+/// Times `StderrTail::push` over 4 MiB per sample, with input construction and the final redacted
+/// read outside the clock. `common` chunks fit inside twice the cap. `launcher` cases are the
+/// shape `TokioLauncher` produces: it pushes up to 16 KiB per read, into the default cap and into a
+/// host-chosen 1 KiB one. `oversize` and `stress` chunks are far larger than the cap, down to a
+/// tail that keeps 16 bytes or none. Each case prints the SHA-256 of the tail it ends on, so a
+/// Base and a Variant run can show they kept the same text.
+fn push_tails(bench: &Bench) {
+    const INPUT_BYTES: usize = 4 * 1024 * KIB;
+    for (label, lines) in [("plain", PLAIN_LINES), ("secrets", SECRET_LINES)] {
+        let input = tail(lines, INPUT_BYTES);
+        for (case, capacity, chunk_size) in [
+            ("common-64B", 16 * KIB, 64),
+            ("common-4KiB", 16 * KIB, 4 * KIB),
+            ("launcher-16KiB", 16 * KIB, 16 * KIB),
+            ("launcher-cap1KiB", KIB, 16 * KIB),
+            ("oversize-64KiB", 16 * KIB, 64 * KIB),
+            ("stress-16B", 16, 1024 * KIB),
+            ("stress-zero", 0, 1024 * KIB),
+        ] {
+            let name = format!("redact/push-{case}/{label}");
+            if !bench.selected(&name) {
+                continue;
+            }
+            let reference = StderrTail::with_capacity(capacity);
+            for chunk in input.as_bytes().chunks(chunk_size) {
+                reference.push(chunk);
+            }
+            let expected = reference.read();
+            let digest = ring::digest::digest(&ring::digest::SHA256, expected.as_bytes());
+            let digest_hex: String = digest
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            println!(
+                "{name} output_bytes: {} output_sha256: {digest_hex}",
+                expected.len()
+            );
+            bench.run_measured(
+                &name,
+                Unit::new(INPUT_BYTES as u64, "byte"),
+                || StderrTail::with_capacity(capacity),
+                |tail| {
+                    let start = std::time::Instant::now();
+                    for chunk in input.as_bytes().chunks(chunk_size) {
+                        tail.push(std::hint::black_box(chunk));
+                    }
+                    let elapsed = start.elapsed();
+                    let actual = tail.read();
+                    assert_eq!(actual, expected, "expected stable {case}/{label} output");
+                    (elapsed, actual)
+                },
+            );
+        }
     }
 }
 
