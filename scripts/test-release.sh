@@ -313,6 +313,49 @@ for rejected in dropped dotted target; do
     exit 1
   }
 done
+# A dev-dependency that repeats its [dependencies] entry adds nothing and is a second version
+# requirement to keep in step. One that turns on a feature of its own is a different entry.
+printf '[dependencies]\nplain = "1.0"\ntabled = { version = "1.0", default-features = false }\n\n[dev-dependencies]\nplain = { version = "1.0", features = ["extra"] }\ntabled = { version = "1.0", features = ["extra"] }\n' > "$dev_fixture/widened.toml"
+printf '[dependencies]\nsibling = "1.0"\n\n[dev-dependencies]\nsibling = { version = "1.0" }\n' > "$dev_fixture/repeated.toml"
+scripts/check-dev-dependencies.sh "$dev_fixture/widened.toml" >/dev/null
+if scripts/check-dev-dependencies.sh "$dev_fixture/repeated.toml" >/dev/null 2>"$dev_fixture/repeated.err"; then
+  echo "expected rejection of the dev-dependency that repeats [dependencies] in repeated.toml, received success" >&2
+  exit 1
+fi
+grep -q "differ from the \[dependencies\] entry" "$dev_fixture/repeated.err" &&
+  grep -q "repeated.toml: \[dev-dependencies\] sibling = " "$dev_fixture/repeated.err" || {
+  echo "expected the rejection to name repeated.toml, the dependency and the redundancy, received: $(cat "$dev_fixture/repeated.err")" >&2
+  exit 1
+}
+# A target's normal dependencies apply only to that exact target table. Root normal
+# dependencies also apply there, even when the target declares the same name differently.
+for target in 'cfg(unix)' x86_64-unknown-linux-gnu; do
+  printf '[target."%s".dependencies]\nsibling = "1.0"\n\n[target."%s".dev-dependencies]\nsibling = { version = "1.0" }\n' "$target" "$target" > "$dev_fixture/target-repeated.toml"
+  if scripts/check-dev-dependencies.sh "$dev_fixture/target-repeated.toml" >/dev/null 2>"$dev_fixture/target-repeated.err"; then
+    echo "expected rejection of repeated sibling in target '$target', received success" >&2
+    exit 1
+  fi
+  grep -Fq "[target.$target.dev-dependencies] sibling = " "$dev_fixture/target-repeated.err" &&
+    grep -q "differ from the \[dependencies\] entry" "$dev_fixture/target-repeated.err" || {
+    echo "expected rejection to name target '$target', sibling and redundancy, received: $(cat "$dev_fixture/target-repeated.err")" >&2
+    exit 1
+  }
+done
+printf '[dependencies]\nsibling = "1.0"\n\n[target."cfg(unix)".dependencies]\nsibling = "2.0"\n\n[target."cfg(unix)".dev-dependencies]\nsibling = { version = "1.0" }\n' > "$dev_fixture/target-root-repeated.toml"
+if scripts/check-dev-dependencies.sh "$dev_fixture/target-root-repeated.toml" >/dev/null 2>"$dev_fixture/target-root-repeated.err"; then
+  echo 'expected rejection of target sibling repeating the root dependency despite its local override, received success' >&2
+  exit 1
+fi
+grep -Fq '[target.cfg(unix).dev-dependencies] sibling = ' "$dev_fixture/target-root-repeated.err" || {
+  echo "expected rejection to name target.cfg(unix) and sibling, received: $(cat "$dev_fixture/target-root-repeated.err")" >&2
+  exit 1
+}
+printf '[target."cfg(unix)".dependencies]\nsibling = "1.0"\n\n[target."cfg(unix)".dev-dependencies]\nsibling = { version = "1.0", features = ["extra"] }\n' > "$dev_fixture/target-widened.toml"
+printf '[target."cfg(unix)".dependencies]\nsibling = "1.0"\n\n[target."cfg(windows)".dev-dependencies]\nsibling = "1.0"\n' > "$dev_fixture/different-targets.toml"
+printf '[dev-dependencies]\nsibling = "1.0"\n\n[target."cfg(unix)".dependencies]\nsibling = "1.0"\n' > "$dev_fixture/root-dev-target-normal.toml"
+for accepted in target-widened different-targets root-dev-target-normal; do
+  scripts/check-dev-dependencies.sh "$dev_fixture/$accepted.toml" >/dev/null
+done
 rm -rf "$dev_fixture"
 trap - EXIT
 scripts/check-dev-dependencies.sh >/dev/null
