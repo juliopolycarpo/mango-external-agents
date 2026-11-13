@@ -240,11 +240,11 @@ a newer submission only after proof of non-submission. The host owns ID uniquene
 storage. `TurnStream::terminal_status()` exposes completion without draining the transcript.
 See [turn ownership and recovery](lifecycle.md) for admission, abandonment and memory budgets.
 
-`RequestFingerprint` uses ring for SHA-256, including in the bare core. The proposed pure Rust
-replacement failed its runtime regression gate in the exploratory measurements recorded in
-[issue #294](https://github.com/juliopolycarpo/mango-external-agents/issues/294). Those measurements
-cover one machine and lack a complete frozen receipt, so they do not establish performance on other
-systems. The TLS provider policy is a separate decision.
+`RequestFingerprint` uses ring for SHA-256, including in the bare core.
+[Issue #294](https://github.com/juliopolycarpo/mango-external-agents/issues/294) reports an exploratory
+comparison on a CPU without SHA-NI: the pure Rust replacement exceeded the proposal's 10% runtime
+regression limit, so ring is retained. Processors with SHA extensions were not measured. No complete
+frozen receipt is available to reconstruct those figures. The TLS provider policy is independent.
 
 ## Discovery receipts are a seam, not a cache
 
