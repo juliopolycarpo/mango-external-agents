@@ -8,7 +8,8 @@ the `path`, keeps it.
 A dev-dependency whose specification equals the `[dependencies]` entry of the same name adds
 nothing: tests already see every normal dependency. It is refused so a second copy of a version
 requirement cannot drift from the first. An entry that turns on a feature the normal one does not
-is a different specification and stays.
+is a different specification and stays. Target dev entries compare with root normal dependencies
+and the same target's normal table, never another target's table.
 
 The manifest is parsed as TOML, so dotted keys, inline tables and comments are all read the way
 Cargo reads them.
@@ -20,10 +21,15 @@ import tomllib
 
 
 def dev_dependency_tables(manifest):
-    """Yields (label, table) for `[dev-dependencies]` and every `[target.*.dev-dependencies]`."""
-    yield "dev-dependencies", manifest.get("dev-dependencies", {})
+    """Yields each dev table with the normal tables applicable to that exact target."""
+    dependencies = manifest.get("dependencies", {})
+    yield "dev-dependencies", manifest.get("dev-dependencies", {}), (dependencies,)
     for target, body in manifest.get("target", {}).items():
-        yield f"target.{target}.dev-dependencies", body.get("dev-dependencies", {})
+        yield (
+            f"target.{target}.dev-dependencies",
+            body.get("dev-dependencies", {}),
+            (dependencies, body.get("dependencies", {})),
+        )
 
 
 def specification(spec):
@@ -35,11 +41,14 @@ def offenders(path):
     """Yields (kind, line) for each dev-dependency of the manifest at `path` that is refused."""
     with open(path, "rb") as handle:
         manifest = tomllib.load(handle)
-    dependencies = manifest.get("dependencies", {})
-    for label, table in dev_dependency_tables(manifest):
+    for label, table, normal_tables in dev_dependency_tables(manifest):
         for name, spec in table.items():
             line = f'{path}: [{label}] {name} = {spec}'
-            if name in dependencies and specification(spec) == specification(dependencies[name]):
+            # Compare both candidates: a different target entry must not hide a root match.
+            if any(
+                name in dependencies and specification(spec) == specification(dependencies[name])
+                for dependencies in normal_tables
+            ):
                 yield "redundant", line
             if not isinstance(spec, dict):
                 continue
