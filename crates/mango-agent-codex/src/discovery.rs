@@ -21,6 +21,7 @@ pub const PROGRAM: &str = "codex";
 /// `codex-cli 0.153.4` today. Only the last whitespace-separated token is read, so a build that
 /// grows a prefix still parses; a line with nothing version-shaped in it is `None`, which the
 /// caller turns into [`GateVerdict::Unknown`] rather than a refusal.
+/// A single leading `v` is accepted and retained in the observed token.
 ///
 /// # Example
 ///
@@ -33,10 +34,9 @@ pub const PROGRAM: &str = "codex";
 #[must_use]
 pub fn parse_version(output: &str) -> Option<String> {
     let token = output.split_whitespace().next_back()?;
-    let looks_like_a_version = token
-        .split('-')
-        .next()
-        .is_some_and(|core| core.contains('.') && core.starts_with(|c: char| c.is_ascii_digit()));
+    let unprefixed = token.strip_prefix('v').unwrap_or(token);
+    let looks_like_a_version = unprefixed.starts_with(|c: char| c.is_ascii_digit())
+        && version::components(unprefixed).is_some_and(|numbers| numbers.len() > 1);
     looks_like_a_version.then(|| token.to_owned())
 }
 
@@ -160,6 +160,28 @@ mod tests {
             parse_version("codex-cli 0.155.0-alpha.3\n").as_deref(),
             Some("0.155.0-alpha.3")
         );
+    }
+
+    #[test]
+    fn a_leading_v_is_retained_in_the_cli_version_token() {
+        for token in ["v0.147.0", "v0.166.0-alpha.1+build.7"] {
+            assert_eq!(
+                parse_version(&format!("codex-cli {token}")).as_deref(),
+                Some(token),
+                "expected the observed prefixed version token {token:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_leading_v_is_retained_in_the_handshake_version_token() {
+        for token in ["v0.147.0", "v0.166.0-alpha.1+build.7"] {
+            assert_eq!(
+                super::parse_user_agent_version(&format!("codex/{token} (Linux)")).as_deref(),
+                Some(token),
+                "expected the observed prefixed handshake version token {token:?}"
+            );
+        }
     }
 
     /// The text as a discovery shows it: `Discovery::normalized` reads it with `redact::bounded`.
