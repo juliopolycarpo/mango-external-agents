@@ -162,6 +162,17 @@ check_release_workflow() {
     echo "expected the minimum toolchain to be installed before the isolated feature check in $file, received the install at verify line ${install_line%%:*} and the check at line ${check_line%%:*}" >&2
     return 1
   fi
+  # Missing cargo-hack makes check.sh skip its powerset instead of failing the release.
+  install_line=$(grep -nE '^[[:space:]]+tool:[[:space:]]*([^,]+,)*cargo-hack(,|[[:space:]]*$)' <<<"$verify" | head -n 1 || true)
+  if [ -z "$install_line" ]; then
+    echo "expected the release verify job in $file to install cargo-hack for the stable feature powerset, received no cargo-hack tool entry" >&2
+    return 1
+  fi
+  check_line=$(grep -nE '^[[:space:]]+- run: scripts/check[.]sh[[:space:]]*$' <<<"$verify" | head -n 1 || true)
+  if [ -z "$check_line" ] || [ "${install_line%%:*}" -ge "${check_line%%:*}" ]; then
+    echo "expected cargo-hack installation before scripts/check.sh in $file, received install at verify line ${install_line%%:*} and check at line ${check_line%%:*}" >&2
+    return 1
+  fi
   found=$(workflow_job "$file" crates | grep -E '^[[:space:]]+needs:[[:space:]]*verify[[:space:]]*$' || true)
   if [ -z "$found" ]; then
     echo "expected the publish job (crates) in $file to need the verify job, received no 'needs: verify'" >&2
@@ -204,6 +215,13 @@ sed 's/needs: verify$/needs: []/' "$release_workflow" > "$workflow_dir/release.y
 expect_workflow_refusal 'to need the verify job'
 { cat "$release_workflow"; printf '      - run: echo "RUSTUP_TOOLCHAIN=1.97.0" >> "$GITHUB_ENV"\n'; } > "$workflow_dir/release.yml"
 expect_workflow_refusal 'to leave the pinned toolchain selected for every other step'
+sed 's/cargo-hack,//' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'to install cargo-hack for the stable feature powerset'
+sed 's/cargo-hack/cargo-hacker/' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'to install cargo-hack for the stable feature powerset'
+awk '/^[[:space:]]+tool:/ { held = $0; next } { print } /- run: scripts\/check[.]sh$/ { print held }' \
+  "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'cargo-hack installation before scripts/check.sh'
 rm -rf "$workflow_dir"
 trap - EXIT
 echo 'release workflow checks passed'
