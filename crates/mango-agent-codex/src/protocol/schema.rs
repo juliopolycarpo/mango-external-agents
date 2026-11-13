@@ -250,6 +250,34 @@ mod tests {
         assert_declares("InitializeResponse", &["userAgent", "platformOs"]);
     }
 
+    /// The 0.167.1 pin declares `requiredHumanApproval` (experimental, needs `experimentalApi`).
+    /// The harness never brokers a person's one-time decision on its own, so every capability it
+    /// can serialize is declared by the pin and neither opt-in is among them.
+    #[test]
+    fn the_handshake_never_opts_into_the_experimental_human_approval_capability() {
+        assert_declares("InitializeCapabilities", &["requiredHumanApproval"]);
+        let sent = serde_json::to_value(crate::protocol::requests::InitializeCapabilities {
+            explicit_gateway_oauth: Some(true),
+            opt_out_notification_methods: vec![String::from("thread/started")],
+        })
+        .expect("capabilities serialize");
+        let declared = properties("InitializeCapabilities");
+        let sent_names: Vec<&String> = sent.as_object().expect("an object").keys().collect();
+        for name in &sent_names {
+            assert!(
+                declared.contains(name),
+                "expected every sent capability to be declared by the pin, received {name} \
+                 beside {declared:?}"
+            );
+        }
+        for opt_in in ["requiredHumanApproval", "experimentalApi"] {
+            assert!(
+                !sent_names.iter().any(|name| name.as_str() == opt_in),
+                "expected the handshake not to carry {opt_in}, received {sent_names:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_thread_fields_are_the_ones_the_pinned_build_declares() {
         assert_declares(

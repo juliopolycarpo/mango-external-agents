@@ -42,3 +42,12 @@ opencode 1.19.5 opencode-linux-arm64.tar.gz fae5be262d693b7c5e562856cc473e59e741
 opencode 1.19.5 opencode-linux-x64.tar.gz 588310a336fa3b9df36b3f0225b26f679d453efaad0cf3d66c3651ef3ec1647a
 opencode 1.19.5 opencode-windows-arm64.zip 5d49139bd917511ff35a3c06065c9f47918346668f05ea020e778286f302fbb7
 opencode 1.19.5 opencode-windows-x64.zip 09a6e693157f0887e504f2cf4357a8cbddc5ead5d0dffb9a269dcc47c48640f5
+
+# Official GitHub Releases API asset digests retrieved 2026-11-13.
+# openai/codex rust-v0.167.1.
+codex 0.167.1 codex-aarch64-apple-darwin.tar.gz 4c97fbdafba21e172254107939489691195f34712cf0cb31293e5e21be8f5bfa
+codex 0.167.1 codex-aarch64-pc-windows-msvc.exe.zip af401c1c83a8d4005b0330eb180f42f6acf1954919da402ec73ada6f153c8192
+codex 0.167.1 codex-aarch64-unknown-linux-musl.tar.gz 3eefec1b400ea67d01a1a091ef98f8749304fdef89577beeeb97b8aee7c75e32
+codex 0.167.1 codex-x86_64-apple-darwin.tar.gz 1639c947f200d0ca8094534c910688512b2effc3c4a4ff32b8c8522605cfe064
+codex 0.167.1 codex-x86_64-pc-windows-msvc.exe.zip 191bd0dcd77a6aa17d4f8a4ab166fc9d05d24ca4b7015789e2aa9a53dcafb658
+codex 0.167.1 codex-x86_64-unknown-linux-musl.tar.gz 64bcc99c32e434b4bcb0508a97df9b7aeecdb97e956d976fb13661096ec4e3e2

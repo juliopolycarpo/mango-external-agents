@@ -475,9 +475,9 @@ and byte sizes, never a value, a call id or a denial's message.
 **Surface used:** `codex app-server`, the interface OpenAI documents for rich clients and ships its
 own VS Code extension on. JSON-RPC over newline-delimited JSON. `clientInfo.name` is always the
 host's name, passed through `HostContext`. The current public-contract reproduction pin is
-`codex-cli 0.166.0` (`rust-v0.166.0` in `vendor/PIN`), also the supported minimum.
-The 2026-11-07 refresh regenerates public contracts and qualifies changed consumed fields;
-it is not an authenticated live-turn check. The documented explicit gateway capability and a
+`codex-cli 0.167.1` (`rust-v0.167.1` in `vendor/PIN`); the supported minimum stays 0.166.0.
+The 2026-11-13 pin refresh regenerates public contracts and the schema inventory; it is not an
+authenticated live-turn check. The documented explicit gateway capability and a
 successful read-only readiness check precede authenticated requests on every connection.
 Failures block requests, and required gateways must report locally usable credentials.
 The SDK never calls gateway login. See the [official release-tag guide](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/app-server/README.md#gateway-oauth-sign-in). Interface-document quotations were re-read on
@@ -527,8 +527,8 @@ page draws no conclusion.
 **Interface quotes**, re-read on 2026-10-22 from
 [`codex-rs/app-server/README.md`](https://github.com/openai/codex/blob/41e22fee981a63b3698df7ed36bad393cda24715/codex-rs/app-server/README.md)
 at commit `41e22fee981a63b3698df7ed36bad393cda24715` (`rust-v0.153.0`). This is the
-document revision for these quotations, not the historical 0.154.0 baseline or current 0.166.0
-minimum and reproduction pin. The 0.154.0 tag does not contain that README:
+document revision for these quotations, not the historical 0.154.0 baseline, the 0.166.0 minimum or
+the 0.167.1 reproduction pin. The 0.154.0 tag does not contain that README:
 
 - "`codex app-server` is the interface Codex uses to power rich interfaces such as the Codex VS
   Code extension."
