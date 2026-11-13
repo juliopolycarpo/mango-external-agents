@@ -6,11 +6,15 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import tomllib
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 CHECK = ROOT / 'scripts/check-resolved-acp-schema.py'
 SOURCE = 'registry+https://github.com/rust-lang/crates.io-index'
+# The manifest's exact pin, so a schema bump does not need an edit here.
+with (ROOT / 'crates/mango-agent-acp/Cargo.toml').open('rb') as manifest:
+    PINNED_VERSION = tomllib.load(manifest)['dependencies']['agent-client-protocol-schema']['version'].removeprefix('=')
 
 
 class FakeCargo:
@@ -34,7 +38,7 @@ class FakeCargo:
 def valid_metadata():
     return {'packages': [{'id': 'acp', 'name': 'mango-agent-acp'},
                          {'id': 'schema', 'name': 'agent-client-protocol-schema',
-                          'version': '1.11.0', 'source': SOURCE}],
+                          'version': PINNED_VERSION, 'source': SOURCE}],
             'workspace_members': ['acp'],
             'resolve': {'nodes': [{'id': 'acp', 'deps': [{'name': 'agent_client_protocol_schema', 'pkg': 'schema'}]},
                                   {'id': 'schema', 'features': []}]}}
@@ -93,6 +97,25 @@ class ResolvedSchemaTests(unittest.TestCase):
             with self.subTest(case=case):
                 self.metadata = case
                 self.assert_refused('received')
+
+    def test_malformed_shapes_name_the_expected_shape(self):
+        # Each shape error states what was expected and the received type, never the raw value.
+        cases = [
+            ({'packages': 'x', 'workspace_members': None, 'resolve': {'nodes': {}}},
+             'expected metadata packages, workspace_members and resolve nodes as lists, received str, NoneType, dict'),
+        ]
+        deps = copy.deepcopy(self.metadata); deps['resolve']['nodes'][0]['deps'] = 'secret'
+        cases.append((deps, 'expected ACP dependency edges as a list, received str'))
+        version = copy.deepcopy(self.metadata); version['packages'][1]['version'] = 'secret token'
+        cases.append((version, 'expected a schema version of letters, digits, dots, plus signs and hyphens, received a str outside that set'))
+        features = copy.deepcopy(self.metadata); features['resolve']['nodes'][1]['features'] = ['secret token']
+        cases.append((features, 'expected resolved schema features as a list of safe feature names, received another shape'))
+        for metadata, expected in cases:
+            with self.subTest(expected=expected):
+                result = self.cargo.run(metadata)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(expected, result.stderr)
+                self.assertNotIn('secret', result.stderr)
 
     def test_malformed_and_cargo_failure(self):
         for data in ('{', '{}', json.dumps({'packages': None}), json.dumps(valid_metadata()).replace('"features": []', '"features": null')):
