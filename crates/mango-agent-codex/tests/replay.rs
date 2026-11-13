@@ -4676,6 +4676,183 @@ async fn the_approval_deadline_reuses_one_clock_read_despite_a_backward_jump() {
     );
 }
 
+/// Checks the host events against the request in the archival approval recording.
+fn assert_recorded_approval_events(
+    events: &[EventKind],
+    source: DecisionSource,
+) -> &PermissionRequest {
+    let transcript = Transcript::load("approval");
+    let native_requests: Vec<_> = transcript
+        .every_received()
+        .into_iter()
+        .filter(|frame| frame["method"] == "item/commandExecution/requestApproval")
+        .collect();
+    assert_eq!(
+        native_requests.len(),
+        1,
+        "expected one recorded native approval request, received {native_requests:?}"
+    );
+    let native_request = native_requests[0];
+    assert_eq!(
+        native_request["id"], 0,
+        "expected native approval request id 0, received {native_request}"
+    );
+    let item_id = native_request["params"]["itemId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a native approval item id, received {native_request}"));
+
+    let requests: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            EventKind::ApprovalRequested { request } => Some(request),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        requests.len(),
+        1,
+        "expected one host approval request, received {events:?}"
+    );
+    let request = requests[0];
+    assert_eq!(
+        request.interaction.id.as_str(),
+        item_id,
+        "expected the recorded item's interaction id"
+    );
+
+    let resolutions: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            EventKind::ApprovalResolved {
+                interaction_id,
+                decision,
+            } => Some((interaction_id, decision)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        resolutions.len(),
+        1,
+        "expected one host approval resolution, received {events:?}"
+    );
+    let (interaction_id, decision) = resolutions[0];
+    assert_eq!(
+        interaction_id.as_str(),
+        request.interaction.id.as_str(),
+        "expected the resolution to name the requested interaction"
+    );
+    assert_eq!(decision.option_id, "decline");
+    assert_eq!(decision.effect, PermissionEffect::Reject);
+    assert_eq!(decision.source, source);
+    request
+}
+
+/// Checks the single native response to the approval recording's only server request.
+fn check_recorded_approval_response(written: &[String]) -> Result<(), String> {
+    let frames: Vec<serde_json::Value> = written
+        .iter()
+        .map(|line| {
+            let expected = format!("expected a JSON wire frame, received {line:?}");
+            serde_json::from_str(line).expect(&expected)
+        })
+        .collect();
+    // Count every response and any decision-bearing frame, even when it has a different id.
+    let responses: Vec<_> = frames
+        .iter()
+        .filter(|frame| {
+            frame.get("method").is_none() || frame.pointer("/result/decision").is_some()
+        })
+        .collect();
+    let expected = serde_json::json!({"id": 0, "result": {"decision": "decline"}});
+    if responses.as_slice() == [&expected] {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected exactly one native approval response for id 0 with decision decline, received {frames:?}"
+        ))
+    }
+}
+
+fn assert_approval_response_rejected(frames: &[serde_json::Value]) {
+    let written: Vec<_> = frames.iter().map(serde_json::Value::to_string).collect();
+    let result = check_recorded_approval_response(&written);
+    assert!(
+        result.is_err(),
+        "expected exactly one native approval response for id 0 with decision decline, received {frames:?} and {result:?}"
+    );
+    let error = result.expect_err("expected the invalid native approval response to be rejected");
+    assert!(
+        error.contains("exactly one")
+            && error.contains("id 0")
+            && error.contains("decision decline")
+            && error.contains(&format!("{frames:?}")),
+        "expected the error to name the approval response shape and received frames, received {error:?}"
+    );
+}
+
+#[test]
+fn approval_response_evidence_accepts_one_recorded_decline() {
+    let written = [
+        serde_json::json!({"id": 0, "method": "initialize", "params": {}}).to_string(),
+        serde_json::json!({"id": 0, "result": {"decision": "decline"}}).to_string(),
+    ];
+    check_recorded_approval_response(&written)
+        .expect("expected the recorded approval response to pass");
+}
+
+#[test]
+fn approval_response_evidence_rejects_wrong_native_id() {
+    assert_approval_response_rejected(&[serde_json::json!({
+        "id": 1, "result": {"decision": "decline"}
+    })]);
+}
+
+#[test]
+fn approval_response_evidence_rejects_duplicate_declines() {
+    assert_approval_response_rejected(&[
+        serde_json::json!({"id": 0, "result": {"decision": "decline"}}),
+        serde_json::json!({"id": 0, "result": {"decision": "decline"}}),
+    ]);
+}
+
+#[test]
+fn approval_response_evidence_rejects_extra_allow_decision() {
+    assert_approval_response_rejected(&[
+        serde_json::json!({"id": 0, "result": {"decision": "decline"}}),
+        serde_json::json!({"id": 1, "result": {"decision": "accept"}}),
+    ]);
+}
+
+#[test]
+fn approval_response_evidence_rejects_an_additional_error_response() {
+    assert_approval_response_rejected(&[
+        serde_json::json!({"id": 0, "result": {"decision": "decline"}}),
+        serde_json::json!({"id": 0, "error": {"code": -1, "message": "unexpected"}}),
+    ]);
+}
+
+#[test]
+fn approval_response_evidence_rejects_a_wrong_decision() {
+    assert_approval_response_rejected(&[serde_json::json!({
+        "id": 0, "result": {"decision": "accept"}
+    })]);
+}
+
+#[test]
+fn approval_response_evidence_rejects_empty_output() {
+    assert_approval_response_rejected(&[]);
+}
+
+#[test]
+#[should_panic(expected = "expected a JSON wire frame, received \"not-json\"")]
+fn approval_response_evidence_rejects_a_malformed_written_frame() {
+    let written = [
+        serde_json::json!({"id": 0, "result": {"decision": "decline"}}).to_string(),
+        String::from("not-json"),
+    ];
+    let _ = check_recorded_approval_response(&written);
+}
+
 /// The recorded approval: the agent asks to leave its sandbox, the host refuses, the turn goes on.
 #[tokio::test]
 async fn a_recorded_approval_reaches_the_host_and_its_refusal_reaches_the_vendor() {
@@ -4718,22 +4895,14 @@ async fn a_recorded_approval_reaches_the_host_and_its_refusal_reaches_the_vendor
         "expected the vendor's own decisions as options, received {:?}",
         asked.options
     );
-    assert!(
-        events.iter().any(|kind| matches!(
-            kind,
-            EventKind::ApprovalResolved { decision, .. }
-                if decision.option_id == "decline" && decision.source == DecisionSource::User
-        )),
-        "expected the refusal to be recorded, received {events:#?}"
+    let requested = assert_recorded_approval_events(&events, DecisionSource::User);
+    assert_eq!(
+        requested.interaction.id.as_str(),
+        asked.interaction.id.as_str(),
+        "expected the user to answer the requested interaction"
     );
-
-    let answer = launcher
-        .written()
-        .into_iter()
-        .find(|line| line.contains("\"decision\""))
-        .expect("expected the refusal to reach the vendor");
-    let frame: serde_json::Value = serde_json::from_str(&answer).expect("expected a JSON frame");
-    assert_eq!(frame["result"]["decision"], "decline");
+    check_recorded_approval_response(&launcher.written())
+        .expect("expected the user's refusal to reach the vendor");
 }
 
 /// With a policy, the question still reaches the host as an event — the library brokers approvals,
@@ -4754,32 +4923,20 @@ async fn a_broker_that_refuses_answers_the_vendor_and_the_host_still_sees_the_qu
         .expect("expected a turn");
     let events = drain(&mut turn).await;
 
+    let broker_requests = broker.seen();
     assert_eq!(
-        broker.seen().len(),
+        broker_requests.len(),
         1,
-        "expected the policy to be asked exactly once"
+        "expected the policy to be asked exactly once, received {broker_requests:?}"
     );
-    assert!(
-        events
-            .iter()
-            .any(|kind| matches!(kind, EventKind::ApprovalRequested { .. })),
-        "expected the host to see the question anyway, received {events:#?}"
+    let requested = assert_recorded_approval_events(&events, DecisionSource::AutoReview);
+    assert_eq!(
+        broker_requests[0].interaction.id.as_str(),
+        requested.interaction.id.as_str(),
+        "expected the broker to answer the requested interaction"
     );
-    assert!(
-        events.iter().any(|kind| matches!(
-            kind,
-            EventKind::ApprovalResolved { decision, .. }
-                if decision.source == DecisionSource::AutoReview
-        )),
-        "expected the answer to be attributed to the policy, received {events:#?}"
-    );
-    assert!(
-        launcher
-            .written()
-            .iter()
-            .any(|line| line.contains("\"decline\"")),
-        "expected the policy's refusal to reach the vendor"
-    );
+    check_recorded_approval_response(&launcher.written())
+        .expect("expected the policy's refusal to reach the vendor");
 }
 
 /// The recorded interrupt: a running turn is stopped, and the stream still ends.
