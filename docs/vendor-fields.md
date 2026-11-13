@@ -50,9 +50,11 @@ present. This is not a new authenticated turn.
 | `uuid`                                                         | runtime | —                               | omit        | Numbers a stream record nothing addresses; the session and the turn are both already identified                                                                                   | none — recorded as a decision                                                                      |
 | `--permission-prompt-tool stdio`                               | runtime | —                               | refuse      | Real and undocumented. Driving it would make this library the answering host for every prompt                                                                                     | `docs/harness-claude.md` "Approvals: none, and why"                                                |
 
-## Codex — reproduction pin `codex` 0.166.0 (`vendor/PIN`)
+## Codex — reproduction pin `codex` 0.167.1 (`vendor/PIN`)
 
-The supported minimum is 0.166.0 for the documented explicit gateway readiness handshake.
+The supported minimum is 0.166.0 for the documented explicit gateway readiness handshake; the pin
+is 0.167.1. See [the 2026-11-13 refresh](harness-codex.md#pin-refresh--2026-11-13) for the one
+additive member of that bump.
 Historical field observations and transcripts retain their original versions. The 2026-11-07
 refresh covers GCP account kinds, optional subagent model/reasoning fields and generic
 image-generation handling. `explicitGatewayOauth` is sent as true; `required` and `status` from
@@ -90,6 +92,7 @@ omitted. See [the harness guide](harness-codex.md#explicit-gateway-readiness) fo
 | `PermissionGrantScope`                                           | runtime      | `PermissionScope::Turn`/`Session`                      | preserve    | A session-wide grant is not a permanent one; it does not outlive the session                                                                                                         | `protocol::approvals::tests::a_permissions_grant_echoes_its_scope_and_a_denial_echoes_nothing`          |
 | `item/tool/call`                                                 | runtime      | —                                                      | refuse      | Vendor tools never enter the host's tool registry — the library's central invariant                                                                                                  | `protocol::approvals::tests::a_request_to_run_a_tool_is_refused_by_the_invariant_that_names_it`         |
 | `account/chatgptAuthTokens/refresh`                              | runtime      | —                                                      | refuse      | No login handling, in either direction                                                                                                                                               | `protocol::approvals::tests::a_request_for_a_refreshed_token_is_refused_without_looking_at_it`          |
+| `InitializeCapabilities.requiredHumanApproval`                   | experimental | —                                                      | omit        | Needs `experimentalApi`, which this library does not request; approvals stay brokered to the host                                                                                    | `protocol::schema::tests::the_handshake_never_opts_into_the_experimental_human_approval_capability`     |
 
 ## ACP — `agent-client-protocol-schema` 1.17.0, v1 schema
 

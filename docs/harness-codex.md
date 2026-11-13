@@ -3,9 +3,27 @@
 Drives the `codex` CLI a user already installed, through `codex app-server` — the interface OpenAI
 documents for rich clients and uses for its own VS Code extension.
 
-The current public-contract pin and supported minimum are `codex-cli 0.166.0`;
-`vendor/PIN` records `rust-v0.166.0`. Older behavioral observations below retain their
+The current public-contract pin is `codex-cli 0.167.1` (`vendor/PIN` records `rust-v0.167.1`);
+the supported minimum stays `0.166.0`. Older behavioral observations below retain their
 dated source versions and do not qualify current startup behavior.
+
+## Pin refresh — 2026-11-13
+
+The reproduction pin moves from 0.166.0 to 0.167.1, published 2026-11-10 and past the three-day
+release-age window. 0.167.2, 0.168.0 and 0.169.0 were still inside it. The Linux x64 archive passed
+the installer's SHA-256 check before it ran, and the checksum registry now lists all six 0.167.1
+assets. `mea capture --harness codex` regenerated `fixtures/codex/contract/` and
+`scripts/vendor-codex.sh 0.167.1` regenerated `vendor/schema.json`. The followed document is the
+[0.167.1 app-server guide](https://github.com/openai/codex/blob/rust-v0.167.1/codex-rs/app-server/README.md),
+which lists `requiredHumanApproval`.
+
+The initialize response is unchanged. The only new inventory member is
+`InitializeCapabilities.requiredHumanApproval`. It is experimental, needs `experimentalApi` and
+asks the client to present `humanCommand` approvals to a person. The handshake sends neither, and
+`protocol::schema::tests::the_handshake_never_opts_into_the_experimental_human_approval_capability`
+checks that the pin declares the member and that the handshake serializes neither name. Approvals
+stay brokered to the host and are never auto-answered. The capture is unauthenticated and covers
+no vendor turn.
 
 ## Public-contract refresh — 2026-11-07
 
@@ -53,10 +71,10 @@ adapter explicitly supplies synthetic current-protocol readiness, which is not c
 | Executable        | `codex`, resolved by the host (`OpenSession::with_executable`) or by name                                                            |
 | Arguments         | `app-server`, and nothing else                                                                                                       |
 | Version read from | `codex --version` before any app-server starts (discovery, session open, picker); the handshake's own `userAgent` as the second line |
-| Minimum version   | `0.166.0` (`MINIMUM_CODEX_VERSION`); current schema pin: `rust-v0.166.0`                                                             |
+| Minimum version   | `0.166.0` (`MINIMUM_CODEX_VERSION`); current schema pin: `rust-v0.167.1`                                                             |
 
-The supported floor and current reproduction pin are 0.166.0 because startup now requires
-explicit gateway readiness. A `codex` below 0.166.0 on `PATH` reports
+The supported floor is 0.166.0 because startup requires explicit gateway readiness; the current
+reproduction pin is 0.167.1. A `codex` below 0.166.0 on `PATH` reports
 `GateVerdict::VersionTooOld` with both numbers and claims no capabilities; it never crashes, and no
 app-server is spawned for it. That holds for a session open and the short-lived picker connection
 too: they apply the same floor before they spawn `codex app-server`, because an older app-server
@@ -114,7 +132,7 @@ second line, for what `--version` could not say.
 Every method below follows the [official app-server documentation][app-server] and the
 [`codex-rs/app-server/README.md`][readme] at document revision
 `41e22fee981a63b3698df7ed36bad393cda24715` (`rust-v0.153.0`), re-read on 2026-10-22.
-The current public-contract CLI and schema pin are `rust-v0.166.0`. JSON-RPC
+The current public-contract CLI and schema pin are `rust-v0.167.1`. JSON-RPC
 2.0 over newline-delimited JSON, **without** the `"jsonrpc"` member — the README's own words:
 "bidirectional communication using JSON-RPC 2.0 messages (with the `"jsonrpc":"2.0"` header omitted
 on the wire)".

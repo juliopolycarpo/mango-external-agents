@@ -11,7 +11,7 @@ them with the committed files:
 | Vendor       | Pin       | Reproduced public artifact                                   |
 | ------------ | --------- | ------------------------------------------------------------ |
 | Claude Code  | `2.1.318` | `fixtures/claude/contract/`                                  |
-| OpenAI Codex | `0.166.0` | `fixtures/codex/contract/` and the vendored schema inventory |
+| OpenAI Codex | `0.167.1` | `fixtures/codex/contract/` and the vendored schema inventory |
 | OpenCode ACP | `1.19.5`  | `fixtures/acp/opencode/contract/`                            |
 
 The reproduction pins select the builds whose public artifacts CI regenerates. Codex's supported
@@ -51,7 +51,7 @@ turn loads.
 To inspect a Codex schema without touching the checkout, use:
 
 ```bash
-scripts/vendor-codex.sh 0.166.0 --out /tmp/codex-contract
+scripts/vendor-codex.sh 0.167.1 --out /tmp/codex-contract
 scripts/check-vendor-contract.sh codex \
   crates/mango-agent-codex/vendor/schema.json /tmp/codex-contract/schema.json
 ```
