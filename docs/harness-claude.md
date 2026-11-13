@@ -637,7 +637,8 @@ What each path does, and what a host sees when a bound runs out:
   opened the session and its result, `Error::CleanupRequired` if the stop failed, goes nowhere a
   host can ask: the session is gone. If that runtime has shut down, no stop is sent.
   The session still releases the host's `ProcessControl`, and the child's fate is that control's
-  own `Drop`. The core `TokioLauncher`'s control sends SIGKILL to the process group there on Unix.
+  own `Drop`. The core `TokioLauncher`'s control sends SIGKILL to the process group there on Unix,
+  also when the runtime's shutdown is what drops it or interrupts a stop inside its grace.
   On Windows the launcher's reaper task owns the Job, and the Job closes, ending its members, when
   that task goes with its runtime. A host control with no such `Drop` leaves the child running.
 
