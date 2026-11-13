@@ -981,6 +981,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
+    #[cfg(target_os = "linux")]
+    mod native_cleanup;
     mod stop_bound;
 
     /// Diagnostic failures do not send signals: the repeated-stop case only observes our group.
@@ -1179,6 +1181,47 @@ mod tests {
                 std::io::stdout().flush().expect("flush ready marker");
                 loop {
                     std::thread::sleep(Duration::from_secs(60));
+                }
+            }
+            // Synthetic native cleanup qualification: a leader that starts one helper in its own
+            // process group, reports itself, and exits only when the test releases its stdin. The
+            // helper inherits this stdout, so the pipe closes only once both members are gone.
+            // These are test-owned stand-ins, not vendor frames.
+            #[cfg(target_os = "linux")]
+            "native-cleanup-leader" => {
+                use std::io::Write as _;
+                let executable =
+                    std::env::current_exe().expect("expected the test binary's own path");
+                let helper = std::process::Command::new(executable)
+                    .args(["launcher_fixture_child", "--nocapture", "--test-threads=1"])
+                    .env(FIXTURE_MODE, "native-cleanup-helper")
+                    .stdin(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("expected the native cleanup helper to start");
+                // Never waited on: the launcher's cleanup or the test's own guard ends it.
+                std::mem::forget(helper);
+                // The helper above inherited the test's blocked stop signals. The leader takes
+                // SIGINT again, like a vendor that honours it while a helper does not.
+                let mut interrupt = nix::sys::signal::SigSet::empty();
+                interrupt.add(nix::sys::signal::Signal::SIGINT);
+                interrupt.thread_unblock().expect("unblock leader SIGINT");
+                println!("MEA-NATIVE-LEADER {}", std::process::id());
+                std::io::stdout().flush().expect("flush leader marker");
+                // Stdin end of file releases it too, so a host that drops every handle frees it.
+                let mut release = String::new();
+                let _ = std::io::stdin().read_line(&mut release);
+            }
+            // Runs until a signal ends it. The test blocks SIGINT and SIGTERM before it launches
+            // the leader, and the mask is inherited, so only the final signal reaches this process.
+            #[cfg(target_os = "linux")]
+            "native-cleanup-helper" => {
+                use std::io::Write as _;
+                println!("MEA-NATIVE-HELPER {}", std::process::id());
+                std::io::stdout().flush().expect("flush helper marker");
+                // Finite, so a test process that is killed outright cannot leave it running.
+                for _ in 0..12 {
+                    std::thread::sleep(Duration::from_secs(10));
                 }
             }
             #[cfg(windows)]
