@@ -122,12 +122,13 @@ impl ClaudeHarness {
     /// Everything the three probes established, in one pass.
     async fn survey(&self, host: &HostContext, executable: &ExecutablePath) -> Result<Survey> {
         // An incomplete banner still proves the binary ran, so its complete lines are used and an
-        // empty one leaves an installed CLI whose version is unreadable; only a probe that
-        // established nothing reads as "not installed". A cut-off read may have lost the Claude
+        // empty one leaves an installed CLI whose version is unreadable; only a failed launch
+        // reads as "not installed". A cut-off read may have lost the Claude
         // Code line behind a wrapper's own, so it is read strictly: only a line that names Claude
         // Code counts, never the single bare-version form.
         let (banner, version) = match probe::read(host, executable, &["--version"]).await? {
-            Probed::Nothing => return Ok(Survey::default()),
+            Probed::NotStarted => return Ok(Survey::default()),
+            Probed::StartedEmpty => (String::new(), None),
             Probed::Whole(banner) => {
                 let version = version::parse(&banner);
                 (banner, version)
