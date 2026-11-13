@@ -19,7 +19,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use mango_external_agents::{Error, McpServer, McpTransport, Result};
+use mango_external_agents::{Error, McpServer, McpTransport, Result, http_endpoint};
 use serde_json::{Map, Value, json};
 
 trait FileWriter {
@@ -412,6 +412,18 @@ pub(crate) async fn release_off_worker<T: Send + 'static>(value: Option<T>) {
 fn document_for(servers: &[McpServer]) -> Result<Value> {
     let mut configured = Map::new();
     for (index, server) in servers.iter().enumerate() {
+        if let McpTransport::Http { url, headers } = &server.transport
+            && (!http_endpoint::is_http_url(url)
+                || headers.iter().any(|(name, value)| {
+                    !http_endpoint::is_http_field_name(name)
+                        || !http_endpoint::is_http_field_value(value)
+                }))
+        {
+            return Err(Error::HostConfiguration {
+                expected: "an HTTP MCP URL and valid header names and values",
+                received: format!("invalid HTTP MCP server at index {index}"),
+            });
+        }
         let entry = entry_for(&server.transport).ok_or_else(|| Error::HostConfiguration {
             expected: "an MCP transport this harness maps onto --mcp-config",
             // Neither the transport nor the name: `Stdio` carries `env` and `Http` carries

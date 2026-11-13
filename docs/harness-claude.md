@@ -860,6 +860,13 @@ before a Claude probe starts — including a root whose finished leaf path could
 and the CLI's own parser does not. That check runs before the leaf is created, so a session never
 opens over a path whose every turn would fail.
 
+HTTP MCP servers must have an absolute ASCII `http` or `https` URL without user information or a
+fragment, and valid HTTP header names and values. The core `http_endpoint` module supplies the
+same validation used by ACP and Codex. The harness refuses malformed entries before it
+creates a scratch leaf or starts a Claude probe; diagnostics identify the server by index without
+printing its URL or headers. Claude documents [HTTP servers](https://code.claude.com/docs/en/mcp#option-1-add-a-remote-http-server)
+and the [`--mcp-config` flag](https://code.claude.com/docs/en/cli-reference).
+
 A build that does not declare `--mcp-config` returns
 `Error::NotSupported { capability: Capability::McpPassthrough }`; a transport kind this harness
 does not map is refused as host configuration. Accepting either would run every turn without the
