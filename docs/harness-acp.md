@@ -1229,9 +1229,11 @@ it does not change the vendor wire, prompt capability checks, or per-attachment 
 - **System prompt.** ACP v1 documents a `systemPrompt` on `session/new`, `session/load` and
   `session/resume`, offered by an agent that advertises `sessionCapabilities.systemPrompt`
   ([session setup](https://agentclientprotocol.com/protocol/v1/session-setup), read on 2026-11-12;
-  stable in the schema crate from [1.16](https://github.com/agentclientprotocol/agent-client-protocol/releases/tag/v1.16.0)). The harness sends none: `OpenSession` has no system
-  prompt, and the agent's own instructions are left as the agent ships them. The capability is
-  read off the wire and not surfaced.
+  stable in the schema crate from [1.16](https://github.com/agentclientprotocol/agent-client-protocol/releases/tag/v1.16.0)). The harness deliberately omits all system-prompt settings.
+  `OpenSession` stays neutral across harnesses and provides no host-supplied system prompt; the
+  agent retains its own system instructions. The handshake may carry
+  `sessionCapabilities.systemPrompt` (`{}` means append-only); the harness does not consult it, so
+  nothing is surfaced. This harness resumes with `session/load` and does not emit `session/resume`.
 - **Model selection.** ACP v1's documented session configuration surface carries model and
   reasoning selectors when an agent offers them. The harness never invents a static model catalog;
   it exposes the live negotiated catalog and refuses a model or effort mapping that is missing or
