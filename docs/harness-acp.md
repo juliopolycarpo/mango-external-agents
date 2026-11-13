@@ -1248,3 +1248,17 @@ MEA_ACP_PROFILE=cursor cargo test -p mango-agent-acp --all-features \
 ```
 
 Compliance posture: see [compliance.md](compliance.md).
+
+## Resolved schema policy
+
+The policy lane and `scripts/check.sh` run `python3 scripts/check-resolved-acp-schema.py` from
+the workspace root. It runs `cargo metadata --format-version 1 --locked --all-features` in the
+current Cargo environment and checks the ACP dependency edge for the manifest's exact schema
+version, the crates.io source identity, and no resolved features. The manifest policy remains a
+separate check. Developer overrides can be used outside this gate. When a build passes Cargo
+`--config` options, pass the same options to the check.
+
+[Cargo metadata](https://doc.rust-lang.org/cargo/commands/cargo-metadata.html) reports logical
+source identities and resolved features. It does not attest the downloaded archive or physical
+origin. Cargo [source replacement](https://doc.rust-lang.org/cargo/reference/source-replacement.html)
+permits equivalent mirrors, which can retain the original source identity.
