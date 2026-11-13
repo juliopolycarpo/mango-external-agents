@@ -35,8 +35,8 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup show active-toolchain
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-hack,cargo-nextest
       - run: cargo fmt --all -- --check
@@ -64,7 +64,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-deny,dprint,git-cliff
       - run: cargo deny check
@@ -96,7 +96,7 @@ jobs:
           toolchain=$(scripts/check-msrv-features.sh --print-toolchain)
           echo "MSRV_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
           rustup toolchain install "$toolchain" 1.96.0 --profile minimal
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: msrv
       # Every workspace member at once, so Cargo unifies features across them: this proves the
@@ -129,7 +129,7 @@ jobs:
           toolchain=$(scripts/check-msrv-features.sh --print-toolchain)
           echo "MSRV_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
           rustup toolchain install "$toolchain" --profile minimal
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: msrv-windows
       - run: cargo +"$MSRV_TOOLCHAIN" check --workspace --all-features --locked
