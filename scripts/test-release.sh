@@ -2,7 +2,8 @@
 # Regression coverage for tag-only dispatch and mismatched release versions.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-for version in 0.1.0 0.2.0-rc.1 1.2.3-0.alpha-01 18446744073709551615.0.0; do
+for version in 0.1.0 0.2.0-rc.1 1.2.3-0.alpha-01 18446744073709551615.0.0 \
+  1.0.0-18446744073709551616; do
   actual=$(scripts/release-version.sh "refs/tags/v$version" "$version")
   if [ "$actual" != "$version" ]; then
     echo "expected version '$version', received '$actual'" >&2
