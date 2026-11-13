@@ -51,7 +51,8 @@ fi
 run cargo nextest run --workspace --all-features --locked
 run cargo test --doc --workspace --all-features --locked
 RUSTDOCFLAGS="-D warnings" run cargo doc --no-deps --workspace --all-features --locked
-run cargo deny check
+run cargo deny check -D unmatched-skip -D unnecessary-skip
+run scripts/test-check-deny.sh
 run scripts/check-versions.sh
 run scripts/check-tls.sh
 echo "✓ check passed"

@@ -1,5 +1,5 @@
 # cargo-deny policy — https://embarkstudios.github.io/cargo-deny/
-# Checked by `cargo deny check` in CI and in scripts/check.sh.
+# Checked by `cargo deny check -D unmatched-skip -D unnecessary-skip` in CI and scripts/check.sh.
 
 [graph]
 # Every target the release plans build; bans are checked against all of them so a
@@ -32,7 +32,6 @@ allow = [
   "MIT",
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
-  "BSD-2-Clause",
   "BSD-3-Clause",
   "ISC",
   "Unicode-3.0",
@@ -40,12 +39,18 @@ allow = [
 ]
 confidence-threshold = 0.8
 exceptions = []
+# An allowance nothing in the graph needs is an allowance nobody reviewed: it would let the first
+# crate under that licence in without a diff to this file.
+unused-allowed-license = "deny"
 
 [licenses.private]
 ignore = true
 
 [bans]
-multiple-versions = "warn"
+# A second version of a crate is a second copy to build, audit and ship. Each one that cannot be
+# removed from here is named in `skip` below with who brings it, so a new one fails the check
+# instead of joining a list of warnings nobody reads.
+multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
 workspace-default-features = "allow"
@@ -68,7 +73,16 @@ deny = [
   { crate = "async-process", reason = "the host owns the process; the library never spawns" },
   { crate = "blocking", reason = "the host owns the pipes; no blocking thread pool" },
 ]
-skip = []
+# The reviewed older version of each pair. A different patch release requires review and an update
+# here. Remove an entry when the crate that brings it moves on; the gates deny skips that match
+# nothing or a crate with only one version.
+skip = [
+  { crate = "getrandom@0.2.17", reason = "ring 0.17 requires getrandom 0.2; other consumers, including rand and tempfile, require 0.4" },
+  { crate = "windows-sys@0.52.0", reason = "ring 0.17 is on windows-sys 0.52; tokio, mio and rustix are on 0.61" },
+  { crate = "thiserror@1.0.69", reason = "win32job 2 is on thiserror 1; tungstenite is on 2" },
+  { crate = "thiserror-impl@1.0.69", reason = "the derive half of thiserror 1, for win32job 2" },
+  { crate = "syn@2.0.119", reason = "derive_more and strum (the ACP schema crate), thiserror 1 and the windows macros are on syn 2; the rest are on 3" },
+]
 skip-tree = []
 
 [sources]

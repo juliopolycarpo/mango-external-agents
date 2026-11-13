@@ -106,7 +106,7 @@ jobs:
       - id: gate_deny
         name: cargo deny (bans, licenses, sources)
         if: ${{ !cancelled() && steps.resolve.outcome == 'success' }}
-        run: cargo deny --locked check bans licenses sources
+        run: cargo deny --locked check -D unmatched-skip -D unnecessary-skip bans licenses sources
       - id: gate_clippy_all_features
         name: Clippy (all features)
         if: ${{ !cancelled() && steps.resolve.outcome == 'success' }}
