@@ -173,9 +173,12 @@ What the handler does with the agent's traffic:
   out the approval deadline; a broker must tolerate that, as it already must at the deadline.
 - Permission registration, announcement and native reply serialize with the turn's terminal drain.
   Prompt completion and a refused update both seal permission settlement before draining pending
-  requests. Later requests and broker, host or deadline decisions receive ACP's `cancelled`
-  outcome. A request already announced to the host resolves once as withdrawn before the terminal;
-  an unannounced request produces no audit row. This follows ACP's
+  requests. A stream overflow can commit a terminal before that drain; registration, announcement
+  and decisions also check the stream terminal and withdraw when it is already committed. A
+  decision checked before a concurrent terminal may still take effect. Later requests and broker,
+  host or deadline decisions receive ACP's `cancelled` outcome. During a terminal drain, an
+  announced request resolves once as withdrawn before the terminal; an unannounced request produces
+  no audit row. A stream overflow may already have committed its terminal. This follows ACP's
   [permission cancellation](https://agentclientprotocol.com/protocol/v1/tool-calls#requesting-permission)
   outcome and also covers a prompt that finishes before its permission request does. Withdrawal
   keeps its audit ownership until cancellation and terminal draining can observe that resolution;
