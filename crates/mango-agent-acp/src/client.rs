@@ -145,11 +145,7 @@ struct NativeBinding {
     bound: Option<agent_client_protocol_schema::v1::SessionId>,
     abandoned: Option<agent_client_protocol_schema::v1::SessionId>,
     generation: u64,
-    pending: Vec<(
-        agent_client_protocol_schema::v1::SessionId,
-        SessionFact,
-        usize,
-    )>,
+    pending: Vec<(agent_client_protocol_schema::v1::SessionId, SessionFact)>,
     pending_bytes: usize,
     overflow: Option<(&'static str, usize, usize)>,
 }
@@ -570,7 +566,7 @@ impl SessionState {
     pub(crate) fn bind_native_session(&self, id: agent_client_protocol_schema::v1::SessionId) {
         let mut binding = self.lock_native_session();
         binding.bound = Some(id.clone());
-        for (session_id, fact, _) in std::mem::take(&mut binding.pending) {
+        for (session_id, fact) in std::mem::take(&mut binding.pending) {
             if session_id == id {
                 self.apply_fact(fact);
             }
@@ -1480,12 +1476,12 @@ async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotif
             // message and byte budgets to bound retained opening facts as well.
             let bytes = serde_json::to_vec(&notification).map_or(usize::MAX, |frame| frame.len());
             let facts = Reducer::session_facts(notification.update);
-            for fact in facts {
+            if !facts.is_empty() {
                 let count_limit = state
                     .limits
                     .turn_channel_capacity
                     .max(state.limits.max_pending_requests);
-                let received_count = binding.pending.len().saturating_add(1);
+                let received_count = binding.pending.len().saturating_add(facts.len());
                 let received_bytes = binding.pending_bytes.saturating_add(bytes);
                 if received_count > count_limit {
                     binding.overflow.get_or_insert((
@@ -1501,9 +1497,11 @@ async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotif
                     ));
                 } else {
                     binding.pending_bytes = received_bytes;
-                    binding
-                        .pending
-                        .push((notification.session_id.clone(), fact, bytes));
+                    binding.pending.extend(
+                        facts
+                            .into_iter()
+                            .map(|fact| (notification.session_id.clone(), fact)),
+                    );
                 }
             }
             return;
