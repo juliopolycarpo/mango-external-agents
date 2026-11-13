@@ -200,6 +200,28 @@ pub enum ApprovalsReviewer {
     AutoReview,
 }
 
+/// A reviewer observed in a thread response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObservedApprovalsReviewer {
+    /// A reviewer supported for outgoing requests, including its legacy incoming alias.
+    Supported(ApprovalsReviewer),
+    /// An unknown reviewer, without retaining its contents.
+    Other,
+}
+
+impl<'de> Deserialize<'de> for ObservedApprovalsReviewer {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            Some("user") => Self::Supported(ApprovalsReviewer::User),
+            Some("auto_review" | "guardian_subagent") => {
+                Self::Supported(ApprovalsReviewer::AutoReview)
+            }
+            _ => Self::Other,
+        })
+    }
+}
+
 /// Opening a conversation.
 #[derive(Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -386,9 +408,9 @@ pub struct ThreadStartResponse {
     /// The approval policy it actually applied, without retaining unknown values.
     #[serde(default)]
     pub approval_policy: Option<ObservedApprovalPolicy>,
-    /// The reviewer it actually routed to.
+    /// The reviewer it actually routed to, without retaining unknown values.
     #[serde(default)]
-    pub approvals_reviewer: Option<ApprovalsReviewer>,
+    pub approvals_reviewer: Option<ObservedApprovalsReviewer>,
 }
 
 impl fmt::Debug for ThreadStartResponse {
@@ -1023,10 +1045,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        Account, AccountReadResponse, AskForApproval, ClientInfo, InitializeParams, SandboxMode,
-        ThreadListParams, ThreadListResponse, ThreadReadParams, ThreadReadResponse,
-        ThreadResumeParams, ThreadStartParams, ThreadStartResponse, ThreadSummary, TurnStartParams,
-        TurnStatus, UserInput,
+        Account, AccountReadResponse, ApprovalsReviewer, AskForApproval, ClientInfo,
+        InitializeParams, ObservedApprovalsReviewer, SandboxMode, ThreadListParams,
+        ThreadListResponse, ThreadReadParams, ThreadReadResponse, ThreadResumeParams,
+        ThreadStartParams, ThreadStartResponse, ThreadSummary, TurnStartParams, TurnStatus,
+        UserInput,
     };
 
     #[test]
@@ -1085,6 +1108,86 @@ mod tests {
                 serde_json::from_value(value).expect("expected an observed policy");
             assert_eq!(policy, expected);
             assert!(!format!("{policy:?}").contains("future-secret"));
+        }
+    }
+
+    #[test]
+    fn legacy_reviewer_decodes_in_a_complete_thread_response() {
+        let decoded: ThreadStartResponse = serde_json::from_str(include_str!(
+            "../../testdata/legacy-reviewer-thread-response.json"
+        ))
+        .expect("expected the legacy reviewer in a complete thread response");
+        assert_eq!(decoded.thread.id, "01900000-0000-7000-8000-000000000001");
+        assert_eq!(decoded.model.as_deref(), Some("gpt-observed"));
+        assert_eq!(
+            decoded.approvals_reviewer,
+            Some(ObservedApprovalsReviewer::Supported(
+                ApprovalsReviewer::AutoReview
+            ))
+        );
+    }
+
+    #[test]
+    fn unknown_observed_reviewer_values_do_not_reach_diagnostics() {
+        for reviewer in [
+            serde_json::json!("future-reviewer-secret"),
+            serde_json::json!({"future": "future-reviewer-secret"}),
+            serde_json::json!(["future-reviewer-secret"]),
+        ] {
+            let mut response: serde_json::Value = serde_json::from_str(include_str!(
+                "../../testdata/legacy-reviewer-thread-response.json"
+            ))
+            .expect("expected a complete schema-shaped thread response");
+            response["approvalsReviewer"] = reviewer;
+            let decoded: ThreadStartResponse = serde_json::from_value(response)
+                .expect("expected an unknown reviewer to leave the thread response usable");
+            assert_eq!(decoded.thread.id, "01900000-0000-7000-8000-000000000001");
+            assert_eq!(decoded.model.as_deref(), Some("gpt-observed"));
+            assert_eq!(
+                decoded.approvals_reviewer,
+                Some(ObservedApprovalsReviewer::Other)
+            );
+            let diagnostic = format!("{decoded:?}");
+            assert!(
+                !diagnostic.contains("future-reviewer-secret"),
+                "expected unknown reviewer payload to stay out of diagnostics, received {diagnostic}"
+            );
+        }
+    }
+
+    #[test]
+    fn outgoing_reviewers_use_canonical_wire_values_for_start_resume_and_turn() {
+        for (reviewer, expected) in [
+            (ApprovalsReviewer::User, "user"),
+            (ApprovalsReviewer::AutoReview, "auto_review"),
+        ] {
+            let start = ThreadStartParams {
+                approvals_reviewer: Some(reviewer),
+                ..ThreadStartParams::default()
+            };
+            let resume = ThreadResumeParams {
+                approvals_reviewer: Some(reviewer),
+                ..ThreadResumeParams::default()
+            };
+            let turn = TurnStartParams {
+                thread_id: String::from("thread-1"),
+                input: Vec::new(),
+                model: None,
+                effort: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                approvals_reviewer: Some(reviewer),
+            };
+            for frame in [
+                serde_json::to_value(start).expect("expected thread/start parameters"),
+                serde_json::to_value(resume).expect("expected thread/resume parameters"),
+                serde_json::to_value(turn).expect("expected turn/start parameters"),
+            ] {
+                assert_eq!(
+                    frame["approvalsReviewer"], expected,
+                    "expected canonical outgoing reviewer {expected}, received {frame}"
+                );
+            }
         }
     }
 

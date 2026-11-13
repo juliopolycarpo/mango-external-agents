@@ -1111,17 +1111,14 @@ impl ResumeSuccessServer {
 }
 
 /// A synthetic 0.166.0 schema-shaped response, used for both opening methods.
-struct GranularApprovalServer;
+struct ThreadResponseServer;
 
-impl GranularApprovalServer {
-    fn process() -> FakeProcess {
+impl ThreadResponseServer {
+    fn process(mut response: serde_json::Value, transcript: &str) -> FakeProcess {
         let workspace = workspace_path().to_string_lossy().into_owned();
-        let mut response: serde_json::Value =
-            serde_json::from_str(include_str!("../testdata/granular-thread-response.json"))
-                .expect("expected a complete schema-shaped thread response");
         response["cwd"] = workspace.clone().into();
         response["thread"]["cwd"] = workspace.clone().into();
-        Transcript::load("handshake").as_process_intercepting(move |frame| {
+        Transcript::load(transcript).as_process_intercepting(move |frame| {
             if frame["method"] == "thread/read" {
                 return Some(vec![
                     serde_json::json!({
@@ -1144,7 +1141,10 @@ async fn open_with_granular_approval_policy(resumed: bool) {
     let native_id = "01900000-0000-7000-8000-000000000001";
     {
         let launcher = Arc::new(FakeLauncher::new());
-        launcher.push(GranularApprovalServer::process());
+        let response =
+            serde_json::from_str(include_str!("../testdata/granular-thread-response.json"))
+                .expect("expected a complete schema-shaped thread response");
+        launcher.push(ThreadResponseServer::process(response, "handshake"));
         let (host, launcher) = with_launcher(launcher, None);
         let mut request = OpenSession::new("chat-1");
         request.configuration = ConfigurationPatch::new()
@@ -1218,6 +1218,335 @@ async fn granular_approval_policy_opens_without_changing_host_authority() {
 #[tokio::test]
 async fn granular_approval_policy_resumes_without_changing_host_authority() {
     open_with_granular_approval_policy(true).await;
+}
+
+async fn open_with_observed_reviewer(
+    resumed: bool,
+    reviewer_override: Option<serde_json::Value>,
+    expected_routing: Option<ApprovalRouting>,
+) {
+    let native_id = "01900000-0000-7000-8000-000000000001";
+    // The unmodified response validates against both 0.166.0 opening response schemas.
+    let mut response: serde_json::Value = serde_json::from_str(include_str!(
+        "../testdata/legacy-reviewer-thread-response.json"
+    ))
+    .expect("expected a complete schema-shaped thread response");
+    if let Some(reviewer) = reviewer_override {
+        response["approvalsReviewer"] = reviewer;
+    }
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(ThreadResponseServer::process(response, "handshake"));
+    let (host, launcher) = with_launcher(launcher, None);
+    let mut request = OpenSession::new("chat-1").with_configuration(
+        ConfigurationPatch::new()
+            .model(ConfigurationChange::Set(String::from("gpt-requested")))
+            .effort(ConfigurationChange::Set(String::from("high"))),
+    );
+    if resumed {
+        request = request.resuming(native_id, mango_external_agents::ResumeMode::Strict);
+    }
+    let session = CodexHarness::new()
+        .open_session(&host, request)
+        .await
+        .expect("expected a thread with an observed reviewer to open");
+    assert_eq!(session.ids().session_id.as_str(), "chat-1");
+    assert_eq!(session.ids().native_session_id, native_id);
+    let snapshot = session.snapshot();
+    assert_eq!(snapshot.resumed, resumed);
+    assert_eq!(
+        snapshot.configuration.requested.model.as_deref(),
+        Some("gpt-requested")
+    );
+    assert_eq!(
+        snapshot.configuration.requested.effort.as_deref(),
+        Some("high")
+    );
+    assert_eq!(snapshot.configuration.requested.level, None);
+    assert_eq!(snapshot.configuration.requested.routing, None);
+    assert_eq!(
+        snapshot.configuration.accepted.model.as_deref(),
+        Some("gpt-requested")
+    );
+    assert_eq!(
+        snapshot.configuration.accepted.effort.as_deref(),
+        Some("high")
+    );
+    assert_eq!(snapshot.configuration.accepted.level, None);
+    assert_eq!(snapshot.configuration.accepted.routing, None);
+    assert_eq!(
+        snapshot.configuration.observed.model.as_deref(),
+        Some("gpt-observed")
+    );
+    assert_eq!(
+        snapshot.configuration.observed.effort.as_deref(),
+        Some("medium")
+    );
+    assert_eq!(snapshot.configuration.observed.level, None);
+    assert_eq!(snapshot.configuration.observed.routing, expected_routing);
+    assert_eq!(
+        snapshot.configuration.effective_routing(),
+        expected_routing.map(|routing| (
+            routing,
+            mango_external_agents::configuration::ConfigurationSource::Observed
+        ))
+    );
+
+    let method = if resumed {
+        "thread/resume"
+    } else {
+        "thread/start"
+    };
+    let frames: Vec<serde_json::Value> = launcher
+        .written()
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("expected a JSON wire frame"))
+        .collect();
+    let frame = frames
+        .iter()
+        .find(|frame| frame["method"] == method)
+        .expect("expected the opening request");
+    for field in ["approvalPolicy", "approvalsReviewer", "sandbox"] {
+        assert!(
+            frame["params"].get(field).is_none(),
+            "expected no implicit {field} in {method}, received {frame}"
+        );
+    }
+    session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected session cleanup");
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected the child to be reaped"
+    );
+}
+
+#[tokio::test]
+async fn legacy_reviewer_opens_with_auto_review_routing() {
+    open_with_observed_reviewer(false, None, Some(ApprovalRouting::AutoReview)).await;
+}
+
+#[tokio::test]
+async fn legacy_reviewer_resumes_with_auto_review_routing() {
+    open_with_observed_reviewer(true, None, Some(ApprovalRouting::AutoReview)).await;
+}
+
+#[tokio::test]
+async fn canonical_reviewers_keep_their_observed_routing() {
+    for (reviewer, routing) in [
+        ("user", ApprovalRouting::User),
+        ("auto_review", ApprovalRouting::AutoReview),
+    ] {
+        open_with_observed_reviewer(false, Some(serde_json::json!(reviewer)), Some(routing)).await;
+    }
+}
+
+#[tokio::test]
+async fn unknown_reviewer_opens_with_unknown_routing() {
+    open_with_observed_reviewer(false, Some(serde_json::json!("future_reviewer")), None).await;
+}
+
+#[tokio::test]
+async fn unknown_reviewer_resumes_with_unknown_routing() {
+    open_with_observed_reviewer(true, Some(serde_json::json!("future_reviewer")), None).await;
+}
+
+async fn unknown_reviewer_keeps_selected_routing_provenance(resumed: bool) {
+    let native_id = "01900000-0000-7000-8000-000000000001";
+    for (routing, outgoing_reviewer) in [
+        (ApprovalRouting::User, "user"),
+        (ApprovalRouting::AutoReview, "auto_review"),
+    ] {
+        let mut response: serde_json::Value = serde_json::from_str(include_str!(
+            "../testdata/legacy-reviewer-thread-response.json"
+        ))
+        .expect("expected a complete schema-shaped thread response");
+        response["approvalsReviewer"] = serde_json::json!("future_reviewer");
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(ThreadResponseServer::process(response, "handshake"));
+        let (host, launcher) = with_launcher(launcher, None);
+        let mut request = OpenSession::new("chat-1").with_configuration(
+            ConfigurationPatch::new().routing(ConfigurationChange::Set(routing)),
+        );
+        if resumed {
+            request = request.resuming(native_id, mango_external_agents::ResumeMode::Strict);
+        }
+        let session = CodexHarness::new()
+            .open_session(&host, request)
+            .await
+            .expect("expected a thread with an unknown reviewer to open");
+        let snapshot = session.snapshot();
+        assert_eq!(snapshot.resumed, resumed);
+        assert_eq!(snapshot.configuration.requested.routing, Some(routing));
+        assert_eq!(snapshot.configuration.accepted.routing, Some(routing));
+        assert_eq!(snapshot.configuration.observed.routing, None);
+        assert_eq!(
+            snapshot.configuration.effective_routing(),
+            Some((
+                routing,
+                mango_external_agents::configuration::ConfigurationSource::Accepted
+            )),
+            "expected the encoded choice's accepted provenance with an unknown reviewer"
+        );
+
+        let method = if resumed {
+            "thread/resume"
+        } else {
+            "thread/start"
+        };
+        let frames: Vec<serde_json::Value> = launcher
+            .written()
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("expected a JSON wire frame"))
+            .collect();
+        let frame = frames
+            .iter()
+            .find(|frame| frame["method"] == method)
+            .expect("expected the opening request");
+        assert_eq!(
+            frame["params"]["approvalsReviewer"], outgoing_reviewer,
+            "expected the canonical reviewer in {method}, received {frame}"
+        );
+        for field in ["approvalPolicy", "sandbox"] {
+            assert!(
+                frame["params"].get(field).is_none(),
+                "expected no implicit {field} in {method}, received {frame}"
+            );
+        }
+        session
+            .close(CloseReason::Shutdown)
+            .await
+            .expect("expected session cleanup");
+        assert_eq!(
+            launcher.live_children(),
+            0,
+            "expected the child to be reaped"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unknown_reviewer_open_keeps_explicit_routing_as_accepted() {
+    unknown_reviewer_keeps_selected_routing_provenance(false).await;
+}
+
+#[tokio::test]
+async fn unknown_reviewer_resume_keeps_explicit_routing_as_accepted() {
+    unknown_reviewer_keeps_selected_routing_provenance(true).await;
+}
+
+#[tokio::test]
+async fn legacy_reviewer_does_not_bypass_the_host_broker() {
+    let mut response: serde_json::Value = serde_json::from_str(include_str!(
+        "../testdata/legacy-reviewer-thread-response.json"
+    ))
+    .expect("expected a complete schema-shaped thread response");
+    response["thread"]["id"] = Transcript::load("approval")
+        .thread_id()
+        .expect("expected the approval recording to name its thread")
+        .into();
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(ThreadResponseServer::process(response, "approval"));
+    let broker = FixedBroker::new(BrokerDecision::Deny {
+        reason: String::from("no writes outside the workspace"),
+    });
+    let (host, launcher) = with_launcher(launcher, Some(broker.clone()));
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a thread with the legacy reviewer to open");
+    assert_eq!(
+        session.snapshot().configuration.observed.routing,
+        Some(ApprovalRouting::AutoReview)
+    );
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "create mango.txt"))
+        .await
+        .expect("expected a turn");
+    let events = drain(&mut turn).await;
+    let broker_requests = broker.seen();
+    assert_eq!(broker_requests.len(), 1, "expected one broker decision");
+    let requested = events
+        .iter()
+        .filter_map(|event| match event {
+            EventKind::ApprovalRequested { request } => Some(request),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        requested.len(),
+        1,
+        "expected one approval at the host, received {events:?}"
+    );
+    assert_eq!(
+        requested[0].interaction.id,
+        broker_requests[0].interaction.id
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EventKind::ApprovalResolved { interaction_id, decision }
+                if interaction_id == &requested[0].interaction.id
+                    && decision.option_id == "decline"
+                    && decision.source == DecisionSource::AutoReview
+        )),
+        "expected that approval to resolve with the broker's refusal, received {events:?}"
+    );
+    let frames: Vec<serde_json::Value> = launcher
+        .written()
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("expected a JSON wire frame"))
+        .collect();
+    let responses: Vec<_> = frames
+        .iter()
+        .filter(|frame| frame.get("method").is_none() && frame["id"] == 0)
+        .cloned()
+        .collect();
+    assert_eq!(
+        responses,
+        vec![serde_json::json!({"id": 0, "result": {"decision": "decline"}})],
+        "expected one refusal for approval id 0"
+    );
+    let decisions: Vec<_> = frames
+        .iter()
+        .filter_map(|frame| frame.pointer("/result/decision"))
+        .collect();
+    assert_eq!(
+        decisions.len(),
+        1,
+        "expected one decision response, received {decisions:?}"
+    );
+    assert!(
+        decisions.iter().all(|decision| **decision == "decline"),
+        "expected no allow response, received {decisions:?}"
+    );
+    for method in ["thread/start", "turn/start"] {
+        let frame = frames
+            .iter()
+            .find(|frame| frame["method"] == method)
+            .expect("expected the request on the wire");
+        for field in [
+            "approvalPolicy",
+            "approvalsReviewer",
+            "sandbox",
+            "sandboxPolicy",
+        ] {
+            assert!(
+                frame["params"].get(field).is_none(),
+                "expected no implicit {field} in {method}, received {frame}"
+            );
+        }
+    }
+    session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected session cleanup");
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected the child to be reaped"
+    );
 }
 
 #[tokio::test]

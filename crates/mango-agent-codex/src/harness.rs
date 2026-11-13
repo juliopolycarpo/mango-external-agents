@@ -33,9 +33,9 @@ use crate::permissions::PermissionOverrides;
 use crate::protocol::requests::{
     AccountReadResponse, ApprovalsReviewer, ClientInfo, GatewayOAuthReadResponse,
     InitializeCapabilities, InitializeParams, InitializeResponse, ModelListParams,
-    ModelListResponse, PermissionProfileListParams, PermissionProfileListResponse,
-    PermissionProfileSummary, ThreadReadParams, ThreadReadResponse, ThreadResumeParams,
-    ThreadStartParams, ThreadStartResponse, ThreadSummary, empty_params,
+    ModelListResponse, ObservedApprovalsReviewer, PermissionProfileListParams,
+    PermissionProfileListResponse, PermissionProfileSummary, ThreadReadParams, ThreadReadResponse,
+    ThreadResumeParams, ThreadStartParams, ThreadStartResponse, ThreadSummary, empty_params,
 };
 use crate::protocol::schema::MINIMUM_CODEX_VERSION;
 use crate::protocol::{CODE_PREFIX, PEER_NAME, method};
@@ -499,7 +499,7 @@ async fn open_thread(
     if let Some(effort) = &response.reasoning_effort {
         observed = observed.with_effort(effort.clone());
     }
-    if let Some(reviewer) = response.approvals_reviewer {
+    if let Some(ObservedApprovalsReviewer::Supported(reviewer)) = response.approvals_reviewer {
         observed = observed.with_routing(match reviewer {
             ApprovalsReviewer::User => mango_external_agents::ApprovalRouting::User,
             ApprovalsReviewer::AutoReview => mango_external_agents::ApprovalRouting::AutoReview,

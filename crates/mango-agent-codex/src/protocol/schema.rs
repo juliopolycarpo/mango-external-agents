@@ -342,7 +342,10 @@ mod tests {
             "SandboxMode",
             &["read-only", "workspace-write", "danger-full-access"],
         );
-        assert_accepts("ApprovalsReviewer", &["user", "auto_review"]);
+        assert_accepts(
+            "ApprovalsReviewer",
+            &["user", "auto_review", "guardian_subagent"],
+        );
     }
 
     #[test]
