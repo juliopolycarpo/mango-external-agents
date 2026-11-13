@@ -408,7 +408,7 @@ message on x86_64 (release build, `serde_json` 1.0.151), a single string parsed 
 while a 1 MB array of `0`, `[]` or `{}` elements held about 17 MB (32-byte values) or 38 MB
 (72-byte values), and a 1 MB array of `{"a":1}` objects held about 83 MB or 55 MB. Those are
 worst-case shapes, not typical ones, and ordinary text stays close to its wire size. Treat the
-figures as an illustration, not a multiplier. A host that needs a hard memory cap must enforce it
+figures as an illustration, not a multiplier. Normalizing a streamed text delta reallocates its buffer when stripping leaves under a quarter of it and the buffer is over 256 bytes, so a mostly stripped delta no longer pins its input. Text that arrives clean, or loses little, keeps the buffer it came in, so encoded bytes remain no bound on resident heap. A host that needs a hard memory cap must enforce it
 itself, for example with an operating-system memory limit on the process that embeds the library.
 
 ## Safe host retries

@@ -549,18 +549,21 @@ mod tests {
         );
     }
 
-    /// Sanitizing a delta leaves a short string in a buffer sized for the raw one, and it is the
-    /// buffer that a stalled watcher keeps alive.
+    /// A clean delta can arrive in a buffer larger than its text, and a stalled watcher keeps it.
     #[tokio::test]
     async fn a_delta_costs_the_buffer_it_pins_not_only_its_length() {
-        // Bidirectional overrides are stripped, so 90 KB of them leave five bytes of text.
-        let raw = format!("{}short", "\u{202e}".repeat(30_000));
+        let mut raw = String::with_capacity(90_000);
+        raw.push_str("short");
         let stamped = event(EventKind::TextDelta { text: raw }).await;
         let EventKind::TextDelta { text } = &stamped.kind else {
             panic!("expected a text delta back, received {stamped:?}");
         };
-        assert_eq!(text, "short", "expected the overrides to be stripped");
+        assert_eq!(text, "short", "expected the clean text to survive");
         let held = text.capacity();
+        assert!(
+            held >= 90_000,
+            "expected a buffer of at least 90000 bytes | received {held}"
+        );
         let cost = event_bytes(&stamped);
         assert!(
             cost >= size_of::<AgentEvent>() + held,

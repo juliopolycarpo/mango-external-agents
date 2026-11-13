@@ -60,7 +60,11 @@ fn sink() -> (EventSink, EventReceiver) {
 
 /// `EVENTS` text deltas of about 1 KiB, each `unit` repeated to fill.
 fn text_deltas(unit: &str) -> Vec<EventKind> {
-    let text = unit.repeat(1024 / unit.len().max(1) + 1);
+    deltas_of(unit.repeat(1024 / unit.len().max(1) + 1))
+}
+
+/// `EVENTS` text deltas, each a fresh copy of `text` whose buffer is exactly its length.
+fn deltas_of(text: String) -> Vec<EventKind> {
     (0..EVENTS)
         .map(|_| EventKind::TextDelta { text: text.clone() })
         .collect()
@@ -248,8 +252,10 @@ fn main() {
     let rt = support::runtime();
     let per_event = Unit::new(EVENTS as u64, "event");
 
-    // A dirty delta carries characters `sanitize_field` strips, so its output is a new string.
-    let shapes: [(&str, Shape); 10] = [
+    // A dirty delta carries characters the owned sanitiser strips from the buffer it arrived in.
+    // The three stripped-share cases bracket the reclaim rule: half the bytes survive and the
+    // buffer is kept, 1 in 16 survive and a 1 KiB buffer is released, 5 bytes of 90 KB survive.
+    let shapes: [(&str, Shape); 13] = [
         ("delta-16B-ascii", || small_deltas("hello, world....")),
         ("delta-64B-escapes", || small_deltas(&"a\"b\\".repeat(16))),
         ("approval-requested", approval_requests),
@@ -260,6 +266,15 @@ fn main() {
         ("delta-1KiB-unicode", || text_deltas("héllo wörld 日本語 ")),
         ("delta-1KiB-dirty", || {
             text_deltas("clean\u{1b}[0m\u{0}text ")
+        }),
+        ("delta-1KiB-half-stripped", || {
+            deltas_of("\u{1b}x".repeat(512))
+        }),
+        ("delta-1KiB-control-heavy", || {
+            deltas_of(format!("{}x", "\u{1b}".repeat(15)).repeat(64))
+        }),
+        ("delta-90KB-severely-stripped", || {
+            deltas_of(format!("{}short", "\u{202e}".repeat(30_000)))
         }),
         ("activity-rich", rich_activities),
     ];
@@ -346,10 +361,12 @@ fn main() {
     let clean = "the quick brown fox ".repeat(52);
     let unicode = "héllo wörld 日本語 ".repeat(40);
     let dirty = "clean\u{1b}[0m\u{0}text ".repeat(64);
+    let control_heavy = format!("{}x", "\u{1b}".repeat(15)).repeat(64);
     for (label, input) in [
         ("ascii-clean", &clean),
         ("unicode-clean", &unicode),
         ("dirty", &dirty),
+        ("control-heavy", &control_heavy),
     ] {
         bench.run(
             &format!("normalize/sanitize_field-1KiB/{label}"),
