@@ -377,6 +377,100 @@ async fn fallback_starts_new_when_the_agent_does_not_advertise_load_session() {
         .expect("expected close");
 }
 
+/// Schema 1.16 made `systemPrompt` a stable v1 field of `session/new` and `session/load`. This
+/// library has no host-supplied system prompt to send, and inventing one would put words in the
+/// agent's instructions that no host wrote, so neither lifecycle request carries the field.
+#[tokio::test]
+async fn no_session_lifecycle_request_carries_a_system_prompt() {
+    for (label, request) in [
+        (
+            "session/new",
+            mango_external_agents::OpenSession::new("new"),
+        ),
+        (
+            "session/load",
+            mango_external_agents::OpenSession::new("resume").resuming(
+                "remote-agent-session",
+                mango_external_agents::ResumeMode::Strict,
+            ),
+        ),
+    ] {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(FakeAcpAgent::new().process());
+        let session = AcpHarness::builtin("cursor")
+            .expect("expected Cursor profile")
+            .open_session(&host(launcher.clone()), request)
+            .await
+            .expect("expected the ACP session to open");
+        let lifecycle = launcher
+            .written()
+            .into_iter()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(&line).expect("expected JSON-RPC")
+            })
+            .find(|message| message.get("method") == Some(&serde_json::json!(label)))
+            .unwrap_or_else(|| panic!("expected a {label} request | received none"));
+        assert_eq!(
+            lifecycle["params"].get("systemPrompt"),
+            None,
+            "expected {label} without a systemPrompt field | received {}",
+            lifecycle["params"]
+        );
+        session
+            .close(CloseReason::Requested)
+            .await
+            .expect("expected close");
+    }
+}
+
+/// An agent's stable `sessionCapabilities.systemPrompt` field is ignored because the host has no
+/// operation that can supply that prompt.
+#[tokio::test]
+async fn system_prompt_session_capability_is_not_surfaced() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(
+        FakeAcpAgent::new()
+            .with_agent_capabilities(Some(serde_json::json!({
+                "loadSession": true,
+                "promptCapabilities": { "image": true, "embeddedContext": true },
+                "sessionCapabilities": { "systemPrompt": {} },
+            })))
+            .process(),
+    );
+    let session = AcpHarness::builtin("cursor")
+        .expect("expected Cursor profile")
+        .open_session(
+            &host(launcher),
+            mango_external_agents::OpenSession::new("system-prompt-capability"),
+        )
+        .await
+        .expect("expected the ACP session to open");
+
+    let expected = SessionCapabilities::new(Capabilities {
+        structured_streaming: true,
+        reasoning_stream: true,
+        interactive_approvals: true,
+        resume: true,
+        images: true,
+        usage_reporting: true,
+        cancellation: true,
+        configuration_catalog: true,
+        session_configuration: true,
+        mcp_passthrough: true,
+        configuration: true,
+        ..Capabilities::none()
+    });
+    assert_eq!(
+        session.snapshot().capabilities,
+        expected,
+        "expected unsupported systemPrompt capability to leave host capabilities unchanged"
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected close");
+}
+
 /// A resumed remote session runs under the directory the current host authorized.
 ///
 /// Its saved ACP id is opaque history, not authority to reuse the directory from a prior hub.
