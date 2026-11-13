@@ -565,11 +565,17 @@ impl Harness for AcpHarness {
                 return Err(error);
             }
         };
-        let connection = connection.release();
         let (handshake, opened) = opened;
+        connection_state.bind_native_session(opened.session_id.clone());
+        if let Some(error) = connection_state.opening_overflow() {
+            connection
+                .shutdown(mango_external_agents::CancelReason::Requested)
+                .await?;
+            return Err(error);
+        }
+        let connection = connection.release();
 
         session_state.set_native_session_id(opened.session_id.to_string());
-        connection_state.bind_native_session(opened.session_id.clone());
         let session_capabilities = mango_external_agents::SessionCapabilities::new(
             Self::capabilities_from(&handshake.capabilities),
         );

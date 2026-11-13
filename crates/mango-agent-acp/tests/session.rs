@@ -247,6 +247,7 @@ impl ReclassifyingCatalogAgent {
 
 /// A named ACP peer that announces a newer catalog while an opening response is in flight.
 struct OpeningCatalogInterleavingAgent {
+    foreign: bool,
     method: &'static str,
 }
 
@@ -254,6 +255,7 @@ impl OpeningCatalogInterleavingAgent {
     fn for_new() -> FakeProcess {
         Self {
             method: "session/new",
+            foreign: false,
         }
         .process()
     }
@@ -261,6 +263,7 @@ impl OpeningCatalogInterleavingAgent {
     fn for_load() -> FakeProcess {
         Self {
             method: "session/load",
+            foreign: false,
         }
         .process()
     }
@@ -299,7 +302,7 @@ impl OpeningCatalogInterleavingAgent {
                 if method == "session/new" {
                     response["sessionId"] = serde_json::Value::String(session_id.clone());
                 }
-                vec![
+                let mut replies = vec![
                     serde_json::json!({
                         "jsonrpc": "2.0",
                         "method": "session/update",
@@ -312,9 +315,99 @@ impl OpeningCatalogInterleavingAgent {
                         },
                     })
                     .to_string(),
-                    InterleavingConfigAgent::result(id, response),
-                ]
+                ];
+                if self.foreign {
+                    for (id, name) in [("new-session", "matching"), ("foreign-session", "foreign")]
+                    {
+                        replies.push(serde_json::json!({"jsonrpc":"2.0", "method":"session/update", "params": {
+                            "sessionId": id, "update": {"sessionUpdate":"available_commands_update",
+                            "availableCommands":[{"name":name, "description":"command"}]}
+                        }}).to_string());
+                    }
+                    replies.push(
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "method": "session/update",
+                            "params": {"sessionId": "foreign-session", "update": {
+                                "sessionUpdate": "config_option_update",
+                                "configOptions": [InterleavingConfigAgent::model_option("foreign")],
+                            }},
+                        })
+                        .to_string(),
+                    );
+                }
+                replies.push(InterleavingConfigAgent::result(id, response));
+                replies
             }
+            _ => vec![InterleavingConfigAgent::result(id, serde_json::json!({}))],
+        }
+    }
+}
+
+/// A peer that replays stale facts, rejects loading, then opens a fresh session.
+struct FailedLoadCatalogAgent {
+    opened_id: &'static str,
+    early: bool,
+}
+
+impl FailedLoadCatalogAgent {
+    fn process(opened_id: &'static str) -> FakeProcess {
+        let agent = Self {
+            opened_id,
+            early: false,
+        };
+        FakeProcess::responding(move |line| agent.answer(line))
+    }
+
+    fn process_early(opened_id: &'static str) -> FakeProcess {
+        let agent = Self {
+            opened_id,
+            early: true,
+        };
+        FakeProcess::responding(move |line| agent.answer(line))
+    }
+
+    fn answer(&self, line: &str) -> Vec<String> {
+        let message: serde_json::Value =
+            serde_json::from_str(line).expect("expected harness request");
+        let id = message["id"].clone();
+        match message["method"].as_str() {
+            Some("initialize") => vec![InterleavingConfigAgent::result(id, serde_json::json!({
+                "protocolVersion": 1, "agentCapabilities": {"loadSession": true}, "authMethods": []
+            }))],
+            Some("session/load") => vec![
+                serde_json::json!({"jsonrpc":"2.0", "method":"session/update", "params": {
+                    "sessionId":"resumed-session", "update": {"sessionUpdate":"available_commands_update",
+                    "availableCommands":[{"name":"stale", "description":"stale"}]}
+                }}).to_string(),
+                serde_json::json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32002, "message":"not found"}}).to_string(),
+            ],
+            Some("session/new") => {
+                let mut replies = Vec::new();
+                if self.early {
+                    replies.push(serde_json::json!({"jsonrpc":"2.0", "method":"session/update", "params": {
+                        "sessionId":self.opened_id, "update": {"sessionUpdate":"available_commands_update",
+                        "availableCommands":[{"name":"early-command", "description":"fresh"}]}
+                    }}).to_string());
+                    replies.push(serde_json::json!({"jsonrpc":"2.0", "method":"session/update", "params": {
+                        "sessionId":self.opened_id, "update": {"sessionUpdate":"config_option_update",
+                        "configOptions":[InterleavingConfigAgent::model_option("early")]}
+                    }}).to_string());
+                }
+                replies.push(InterleavingConfigAgent::result(id, serde_json::json!({
+                    "sessionId":self.opened_id, "configOptions":[InterleavingConfigAgent::model_option("fresh")]
+                })));
+                replies
+            },
+            Some("session/prompt") => vec![
+                serde_json::json!({"jsonrpc":"2.0", "method":"session/update", "params": {
+                    "sessionId":self.opened_id, "update": {"sessionUpdate":"available_commands_update",
+                    "availableCommands":[{"name":"fresh-command", "description":"fresh"}]}
+                }}).to_string(),
+                serde_json::json!({"jsonrpc":"2.0", "method":"session/update", "params": {
+                    "sessionId":self.opened_id, "update": {"sessionUpdate":"agent_message_chunk", "content":{"type":"text", "text":"fresh-text"}}
+                }}).to_string(),
+                InterleavingConfigAgent::result(id, serde_json::json!({"stopReason":"end_turn"})),
+            ],
             _ => vec![InterleavingConfigAgent::result(id, serde_json::json!({}))],
         }
     }
@@ -3824,6 +3917,189 @@ async fn opening_a_new_session_keeps_a_newer_catalog_notification() {
         .close(CloseReason::Requested)
         .await
         .expect("expected cleanup");
+}
+
+/// A foreign notification cannot replace the opening session's configuration.
+#[tokio::test]
+async fn opening_ignores_foreign_configuration_notification() {
+    let launcher = FakeLauncher::new();
+    launcher.push(
+        OpeningCatalogInterleavingAgent {
+            method: "session/new",
+            foreign: true,
+        }
+        .process(),
+    );
+    let session = AcpHarness::new(profile())
+        .open_session(&host(&launcher), OpenSession::new("foreign-catalog"))
+        .await
+        .expect("expected session to open");
+    let snapshot = session.snapshot();
+    let names: Vec<_> = snapshot
+        .commands
+        .iter()
+        .map(|command| command.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["matching"],
+        "expected opening commands: [matching] | received: {names:?}"
+    );
+    let observed = snapshot.configuration.observed.model.clone();
+    assert_eq!(
+        observed.as_deref(),
+        Some("newer"),
+        "expected opening session model: newer | received: {observed:?}"
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected cleanup");
+}
+
+/// A failed load's replay does not leak into the fresh session.
+#[tokio::test]
+async fn fallback_clears_failed_load_catalog() {
+    let launcher = FakeLauncher::new();
+    launcher.push(FailedLoadCatalogAgent::process("fresh-session"));
+    let session = AcpHarness::new(profile())
+        .open_session(
+            &host(&launcher),
+            OpenSession::new("fallback-catalog").resuming("resumed-session", ResumeMode::Fallback),
+        )
+        .await
+        .expect("expected fallback session");
+    let snapshot = session.snapshot();
+    let commands: Vec<_> = snapshot
+        .commands
+        .iter()
+        .map(|command| command.name.as_str())
+        .collect();
+    assert!(
+        commands.is_empty(),
+        "expected fresh commands: [] | received: {commands:?}"
+    );
+    assert_eq!(
+        snapshot.configuration.observed.model.as_deref(),
+        Some("fresh"),
+        "expected fresh model: fresh | received: {:?}",
+        snapshot.configuration.observed.model
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected cleanup");
+}
+
+/// A new session can reuse the failed ID and announce facts before its response.
+#[tokio::test]
+async fn fallback_same_id_keeps_early_session_facts() {
+    for opened_id in ["fresh-session", "resumed-session"] {
+        let launcher = FakeLauncher::new();
+        launcher.push(FailedLoadCatalogAgent::process_early(opened_id));
+        let session = AcpHarness::new(profile())
+            .open_session(
+                &host(&launcher),
+                OpenSession::new("fallback-early")
+                    .resuming("resumed-session", ResumeMode::Fallback),
+            )
+            .await
+            .expect("expected fallback session");
+        let snapshot = session.snapshot();
+        let commands: Vec<_> = snapshot
+            .commands
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect();
+        assert_eq!(
+            commands,
+            ["early-command"],
+            "expected {opened_id} early commands: [early-command] | received: {commands:?}"
+        );
+        assert_eq!(
+            snapshot.configuration.observed.model.as_deref(),
+            Some("early"),
+            "expected {opened_id} early model: early | received: {:?}",
+            snapshot.configuration.observed.model
+        );
+        session
+            .close(CloseReason::Requested)
+            .await
+            .expect("expected cleanup");
+    }
+}
+
+/// Both a fresh ID and the failed ID can be assigned to the new session.
+#[tokio::test]
+async fn fallback_same_id_keeps_command_updates() {
+    for opened_id in ["fresh-session", "resumed-session"] {
+        let launcher = FakeLauncher::new();
+        launcher.push(FailedLoadCatalogAgent::process(opened_id));
+        let session = AcpHarness::new(profile())
+            .open_session(
+                &host(&launcher),
+                OpenSession::new("fallback-command")
+                    .resuming("resumed-session", ResumeMode::Fallback),
+            )
+            .await
+            .expect("expected fallback session");
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn", "hello"))
+            .await
+            .expect("expected turn");
+        let _ = drain(&mut turn).await;
+        let snapshot = session.snapshot();
+        let commands: Vec<_> = snapshot
+            .commands
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect();
+        assert_eq!(
+            commands,
+            ["fresh-command"],
+            "expected {opened_id} commands: [fresh-command] | received: {commands:?}"
+        );
+        session
+            .close(CloseReason::Requested)
+            .await
+            .expect("expected cleanup");
+    }
+}
+
+#[tokio::test]
+async fn fallback_same_id_keeps_active_turn_text() {
+    for opened_id in ["fresh-session", "resumed-session"] {
+        let launcher = FakeLauncher::new();
+        launcher.push(FailedLoadCatalogAgent::process(opened_id));
+        let session = AcpHarness::new(profile())
+            .open_session(
+                &host(&launcher),
+                OpenSession::new("fallback-turn").resuming("resumed-session", ResumeMode::Fallback),
+            )
+            .await
+            .expect("expected fallback session");
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn", "hello"))
+            .await
+            .expect("expected turn");
+        let events = drain(&mut turn).await;
+        let texts: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                EventKind::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            ["fresh-text"],
+            "expected {opened_id} turn text: [fresh-text] | received: {texts:?}"
+        );
+        session
+            .close(CloseReason::Requested)
+            .await
+            .expect("expected cleanup");
+    }
 }
 
 /// A notification received while `session/load` is pending remains the authoritative catalog.
