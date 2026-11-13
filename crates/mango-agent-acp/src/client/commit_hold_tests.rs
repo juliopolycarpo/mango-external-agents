@@ -484,9 +484,13 @@ async fn a_permission_crossing_turn_release_cannot_reach_the_replacement_prompt(
         release: release_rx,
     });
 
-    // Order the wire response ahead of the permission handoff. The prompt owner can then
-    // finish on its own task while the notification worker is parked in permission routing.
+    // Let the prompt owner consume its response before parking the handoff worker. The held
+    // publication gate still prevents terminal preparation from remembering the closed call.
     agent.announce(prompt_end(&first_prompt));
+    until("the prompt owner to claim its terminal", || {
+        first_turn.is_finished()
+    })
+    .await;
     agent.announce(ask_line_for(97, call_id));
     tokio::time::timeout(Duration::from_secs(5), entered_rx)
         .await
@@ -621,6 +625,15 @@ async fn a_permission_crossing_native_binding_cannot_reach_the_first_prompt() {
         })
         .to_string(),
     );
+    // Consume the response before parking its handoff worker, but leave the native ID unbound
+    // until the permission has crossed the unbound-session check below.
+    let opened = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::await_sent(&connection, &profile, opening),
+    )
+    .await
+    .expect("expected the ordered session/new reply within 5s")
+    .expect("expected session/new to succeed");
     agent.announce(ask_line_for(99, "foreign-call"));
     tokio::time::timeout(Duration::from_secs(5), entered_rx)
         .await
@@ -631,15 +644,6 @@ async fn a_permission_crossing_native_binding_cannot_reach_the_first_prompt() {
         "expected permission 99 to arrive before native binding and first-prompt admission"
     );
 
-    // The reply preceded the permission on the wire. Its owner can finish opening while
-    // the notification worker is paused in permission routing.
-    let opened = tokio::time::timeout(
-        Duration::from_secs(5),
-        super::await_sent(&connection, &profile, opening),
-    )
-    .await
-    .expect("expected the ordered session/new reply within 5s")
-    .expect("expected session/new to succeed");
     state.bind_native_session(opened.session_id.clone());
     state
         .core_state
