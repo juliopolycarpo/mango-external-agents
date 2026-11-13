@@ -1,0 +1,8 @@
+{
+  "command": [
+    "grok",
+    "--no-auto-update",
+    "--version"
+  ],
+  "output": "grok 1.0.30 (04b7ffed98c6) [stable]"
+}

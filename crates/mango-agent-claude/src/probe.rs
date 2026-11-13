@@ -320,7 +320,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_captured_help_fits_the_cap_with_room_to_spare() {
-        let help = include_str!("../../../fixtures/claude/help/2.1.270.txt");
+        let help = include_str!("../fixtures/claude/help/2.1.270.txt");
         let launcher = Arc::new(FakeLauncher::new());
         launcher.push(FakeProcess::transcript(help.lines()));
         let host = host(Arc::clone(&launcher));

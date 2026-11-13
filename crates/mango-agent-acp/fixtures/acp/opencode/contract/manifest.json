@@ -1,0 +1,11 @@
+{
+  "format": 1,
+  "profile": "opencode",
+  "probe": "initialize",
+  "reproducible": true,
+  "sessionOpened": false,
+  "files": {
+    "initialize.json": "sha256:75a0bc2af9d787fdade78342a0b04ad52dae8b6bc4c9eb25f2eb7136f6ad9dbe",
+    "version.json": "sha256:327533a1057c0413dac1a363353c3634a190bf4cf8b3ca0b8e66d7eb7f315b67"
+  }
+}

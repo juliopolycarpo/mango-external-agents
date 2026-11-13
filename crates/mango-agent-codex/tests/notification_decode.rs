@@ -38,7 +38,7 @@ fn collect_transcripts(directory: &Path, found: &mut Vec<PathBuf>) {
 
 /// The params of every server notification in every captured Codex transcript.
 fn captured() -> Vec<(String, String, Value)> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/codex");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/codex");
     let mut paths = Vec::new();
     collect_transcripts(&root, &mut paths);
     paths.sort();

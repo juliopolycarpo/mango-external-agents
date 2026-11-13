@@ -27,6 +27,9 @@ if [ "$skip_format" = false ]; then
 fi
 run scripts/test-release.sh
 run scripts/test-vendor-drift.sh
+run scripts/test-package-admission.sh
+run python3 scripts/test-package-fixtures.py
+run scripts/package-fixtures.py --check
 run scripts/check-dev-dependencies.sh
 run scripts/check-bench-runner.sh
 run scripts/test-bench-runner.sh

@@ -98,3 +98,17 @@ The historical Claude manifest additionally carries an aggregate `checksum` from
 recorded it in 2026-09. Nothing in this repository can recompute it: it is not the digest of the
 committed files in any order, of their digests, or of the manifest itself. It is left as written
 and held only to its shape; the per-file digests are what the integrity check reads.
+
+## Packaged test fixtures
+
+The three harness crates carry derived copies of the captures their tests read. Claude and ACP
+copy whole manifest-owned contract directories; Codex copies every archival JSONL transcript.
+After capturing or changing a canonical fixture, regenerate the copies and verify them:
+
+```sh
+scripts/package-fixtures.py
+scripts/package-fixtures.py --check
+```
+
+The check rejects missing, stale and extra copied files. `scripts/fix.sh` regenerates the copies,
+and `scripts/check.sh` verifies them. Edit or capture only the canonical files under `fixtures/`.

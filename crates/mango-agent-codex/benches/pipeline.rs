@@ -411,7 +411,7 @@ fn collect_transcripts(directory: &Path, found: &mut Vec<PathBuf>) {
 
 /// Every Codex transcript's server notifications (`<<` lines with a method and no id).
 fn transcripts() -> Vec<Transcript> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/codex");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/codex");
     let mut paths = Vec::new();
     collect_transcripts(&root, &mut paths);
     paths.sort();

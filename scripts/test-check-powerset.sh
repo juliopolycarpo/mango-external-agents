@@ -24,8 +24,8 @@ ci_args=${ci_steps#cargo }
 mkdir -p "$work/scripts" "$work/bin"
 cp scripts/check.sh "$work/scripts/check.sh"
 
-# FakeGate: stands in for every scripts/*.sh that check.sh runs, whatever the list is today.
-gates=$(grep -oE 'run scripts/[A-Za-z0-9._-]+\.sh' scripts/check.sh | sed 's/^run //' | sort -u)
+# FakeGate: stands in for every directly executed script that check.sh runs.
+gates=$(grep -oE 'run scripts/[A-Za-z0-9._-]+\.(sh|py)' scripts/check.sh | sed 's/^run //' | sort -u)
 for gate in $gates; do
   printf '#!/usr/bin/env bash\nexit 0\n' > "$work/$gate"
   chmod +x "$work/$gate"
@@ -52,9 +52,11 @@ case "$*" in
 esac
 exit 0
 FAKE_CARGO
+# FakePython: Python-based gates are outside the powerset test.
+printf '#!/usr/bin/env bash\nexit 0\n' > "$work/bin/python3"
 # FakeDprint: the formatter check is not under test.
 printf '#!/usr/bin/env bash\nexit 0\n' > "$work/bin/dprint"
-chmod +x "$work/bin/cargo" "$work/bin/dprint"
+chmod +x "$work/bin/cargo" "$work/bin/dprint" "$work/bin/python3"
 
 # run_check <installed|absent> [argument fragment FakeCargo fails on]
 # Sets status, stdout_text, stderr_text and cargo_log for the assertions below.

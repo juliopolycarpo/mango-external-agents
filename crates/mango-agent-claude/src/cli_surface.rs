@@ -170,10 +170,10 @@ fn option_block<'a>(options: &'a [Option_], flag: &str) -> Option<&'a str> {
 mod tests {
     use super::CliSurface;
 
-    const HELP_2_1_227: &str = include_str!("../../../fixtures/claude/help/2.1.227.txt");
+    const HELP_2_1_227: &str = include_str!("../fixtures/claude/help/2.1.227.txt");
     /// `claude --help` in full, from the build installed when this harness was written.
-    const HELP_2_1_270: &str = include_str!("../../../fixtures/claude/help/2.1.270.txt");
-    const HELP_2_1_260: &str = include_str!("../../../fixtures/claude/help/2.1.260.txt");
+    const HELP_2_1_270: &str = include_str!("../fixtures/claude/help/2.1.270.txt");
+    const HELP_2_1_260: &str = include_str!("../fixtures/claude/help/2.1.260.txt");
 
     #[test]
     fn every_flag_every_turn_passes_is_present_on_both_captured_builds() {
@@ -299,7 +299,7 @@ mod tests {
     fn the_captured_contract_still_names_everything_this_harness_passes() {
         use crate::permissions::CliMode;
 
-        const CONTRACT: &str = include_str!("../../../fixtures/claude/contract/cli-surface.json");
+        const CONTRACT: &str = include_str!("../fixtures/claude/contract/cli-surface.json");
 
         let contract: serde_json::Value =
             serde_json::from_str(CONTRACT).expect("expected the captured contract to be JSON");

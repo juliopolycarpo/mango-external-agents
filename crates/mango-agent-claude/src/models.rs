@@ -178,8 +178,8 @@ mod tests {
     use crate::cli_surface::CliSurface;
     use mango_external_agents::{Configuration, Error};
 
-    const HELP_2_1_227: &str = include_str!("../../../fixtures/claude/help/2.1.227.txt");
-    const HELP_2_1_260: &str = include_str!("../../../fixtures/claude/help/2.1.260.txt");
+    const HELP_2_1_227: &str = include_str!("../fixtures/claude/help/2.1.227.txt");
+    const HELP_2_1_260: &str = include_str!("../fixtures/claude/help/2.1.260.txt");
 
     #[test]
     fn offers_the_aliases_a_build_advertises_each_with_its_effort_levels() {
