@@ -44,9 +44,14 @@ static expected shape and no raw help text. A `--help` that yielded neither the 
 nor any required flag is unreadable, never "a binary with no options": a parsed old version then
 reports `GateVerdict::VersionTooOld`, while a current or unreadable version reports
 `GateVerdict::Unknown` and opening returns a distinct safe `Error::Protocol` refusal. A multi-line
-wrapper banner can include its own semver, so discovery reads the semver from the line that
-identifies Claude Code rather than accepting the first semver in all stdout. A single bare version
-remains accepted for the documented compact form.
+wrapper banner can include its own version, so discovery reads the version from the line that
+identifies Claude Code rather than accepting the first version in all stdout. A single bare version
+remains accepted for the documented compact form. A version is a token of exactly three dotted
+numbers, with an optional leading `v` and an optional pre-release or build suffix; it is compared
+with the pin by the core `version` module, the same dotted-number comparison the Codex and ACP
+harnesses use, which drops the suffix.
+The public `version::is_supported` predicate applies that same Claude token grammar, including
+three numeric components without leading zeros and valid SemVer suffix identifiers.
 
 Probe output that may be incomplete is never read as a verdict. A read error before the CLI closed
 stdout, a line over the host's line cap, more than 1 MiB of stdout (the largest captured help is

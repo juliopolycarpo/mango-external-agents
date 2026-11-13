@@ -996,7 +996,7 @@ async fn the_thread_start_echo_is_what_is_observed_rather_than_the_request() {
 #[tokio::test]
 async fn opening_a_session_refuses_an_app_server_below_the_pinned_handshake_version() {
     let launcher = Arc::new(FakeLauncher::new());
-    launcher.push(OldProbeHandshakeServer.process());
+    launcher.push(VersionReportingHandshakeServer { version: "0.147.0" }.process());
     let (host, _) = with_launcher(Arc::clone(&launcher), None);
 
     let result = CodexHarness::new()
@@ -5213,18 +5213,20 @@ async fn listing_without_a_user_conversation_uses_only_the_authorized_workspace(
     assert_eq!(frame["params"]["limit"], 50);
 }
 
-/// A server that identifies an app-server older than the pinned protocol at initialization.
-struct OldProbeHandshakeServer;
+/// A server that reports a selected version at initialization and replays the remaining requests.
+struct VersionReportingHandshakeServer {
+    version: &'static str,
+}
 
-impl OldProbeHandshakeServer {
+impl VersionReportingHandshakeServer {
     fn process(self) -> FakeProcess {
-        Transcript::load("handshake").as_process_intercepting(|frame| {
+        Transcript::load("handshake").as_process_intercepting(move |frame| {
             (frame["method"] == "initialize").then(|| {
                 vec![
                     serde_json::json!({
                         "id": frame["id"],
                         "result": {
-                            "userAgent": "codex/0.147.0 (Linux)",
+                            "userAgent": format!("codex/{} (Linux)", self.version),
                             "platformOs": "linux",
                         },
                     })
@@ -5235,10 +5237,144 @@ impl OldProbeHandshakeServer {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum VersionGateEntryPoint {
+    OpenSession,
+    ListSessions,
+}
+
+async fn assert_prefixed_version_gate(
+    entry_point: VersionGateEntryPoint,
+    cli_banner: &'static str,
+    handshake_version: &'static str,
+    expected_app_servers: usize,
+) {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(
+        VersionReportingHandshakeServer {
+            version: handshake_version,
+        }
+        .process(),
+    );
+    let host = HostContext::builder()
+        .launcher(Arc::new(
+            support::VersionAnsweringLauncher::new(launcher.clone()).with_version_line(cli_banner),
+        ))
+        .cwd(workspace_path())
+        .client_info("version-floor-test", "0.0.0")
+        .limits(replay_limits())
+        .build()
+        .expect("expected a host for the version gate regression");
+    let result = match entry_point {
+        VersionGateEntryPoint::OpenSession => {
+            match CodexHarness::new()
+                .open_session(&host, OpenSession::new("version-floor-test"))
+                .await
+            {
+                Ok(session) => {
+                    // Reap the baseline's incorrectly opened session before asserting its gate.
+                    session
+                        .close(CloseReason::Shutdown)
+                        .await
+                        .expect("expected cleanup of the incorrectly admitted fake session");
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        }
+        VersionGateEntryPoint::ListSessions => CodexHarness::new()
+            .list_sessions(&host, SessionQuery::default())
+            .await
+            .map(|_| ()),
+    };
+    let thread_requests: Vec<_> = launcher
+        .written()
+        .iter()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).expect("expected a JSON request")
+        })
+        .filter_map(|frame| {
+            let method = frame["method"].as_str()?;
+            matches!(method, "thread/start" | "thread/resume" | "thread/list")
+                .then(|| method.to_owned())
+        })
+        .collect();
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected the fake child reaped for {entry_point:?} | received a live child"
+    );
+    assert_eq!(
+        launcher.launches().len(),
+        expected_app_servers,
+        "expected {expected_app_servers} app-server launches for {entry_point:?}, probe {cli_banner:?}, handshake {handshake_version:?} | received {:?}",
+        launcher.launches()
+    );
+    assert!(
+        thread_requests.is_empty(),
+        "expected no thread requests before the version refusal for {entry_point:?}, probe {cli_banner:?}, handshake {handshake_version:?} | received {thread_requests:?}"
+    );
+    assert!(
+        matches!(
+            &result,
+            Err(error) if matches!(
+                error.cause(),
+                mango_external_agents::Error::VersionGate { found, minimum }
+                    if found == "v0.147.0" && minimum == mango_agent_codex::MINIMUM_CODEX_VERSION
+            )
+        ),
+        "expected VersionGate retaining v0.147.0 for {entry_point:?} | received {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_leading_v_cli_version_is_refused_before_opening_an_app_server() {
+    assert_prefixed_version_gate(
+        VersionGateEntryPoint::OpenSession,
+        "codex-cli v0.147.0",
+        mango_agent_codex::MINIMUM_CODEX_VERSION,
+        0,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_leading_v_cli_version_is_refused_before_the_picker_launches_an_app_server() {
+    assert_prefixed_version_gate(
+        VersionGateEntryPoint::ListSessions,
+        "codex-cli v0.147.0",
+        mango_agent_codex::MINIMUM_CODEX_VERSION,
+        0,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_leading_v_handshake_version_is_refused_before_opening_a_thread() {
+    assert_prefixed_version_gate(
+        VersionGateEntryPoint::OpenSession,
+        "codex-cli unknown",
+        "v0.147.0",
+        1,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_leading_v_handshake_version_is_refused_before_listing_threads() {
+    assert_prefixed_version_gate(
+        VersionGateEntryPoint::ListSessions,
+        "codex-cli unknown",
+        "v0.147.0",
+        1,
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn picker_refuses_an_app_server_below_the_pinned_handshake_version() {
     let launcher = Arc::new(FakeLauncher::new());
-    launcher.push(OldProbeHandshakeServer.process());
+    launcher.push(VersionReportingHandshakeServer { version: "0.147.0" }.process());
     let (host, _) = with_launcher(Arc::clone(&launcher), None);
 
     let result = CodexHarness::new()

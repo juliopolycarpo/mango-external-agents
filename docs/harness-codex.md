@@ -63,6 +63,12 @@ too: they apply the same floor before they spawn `codex app-server`, because an 
 creates sqlite state, an installation id and system skills under `CODEX_HOME` merely by starting.
 They refuse with `Error::VersionGate { found, minimum }` and launch nothing but the version command.
 
+Both the CLI reader and the [initialization user-agent reader](https://github.com/openai/codex/blob/41e22fee981a63b3698df7ed36bad393cda24715/codex-rs/app-server/README.md#initialization)
+accept one leading `v` before the numeric version and retain it in `found`. For example,
+`codex-cli v0.147.0` is refused before app-server launch. If the CLI probe is unknown but the
+handshake reports `codex/v0.147.0`, opening and listing refuse before any thread request and reap
+the child. Plain numeric tokens keep the same floor checks.
+
 An executable that started but printed no readable version is `GateVerdict::Unknown`.
 Discovery reports `NotInstalled` for the launcher's typed `Error::Launch` unavailability;
 host policy, resource and cancellation refusals remain typed errors, including their dispatch

@@ -971,7 +971,7 @@ mod opening_a_session {
         );
         let shown = discovery.version.clone().unwrap_or_default();
         assert_eq!(
-            mango_agent_claude::version::parse(&shown).map(|version| version.to_string()),
+            mango_agent_claude::version::parse(&shown),
             Some(String::from("2.1.270")),
             "expected the reported version to parse again to 2.1.270 | received {shown:?}"
         );

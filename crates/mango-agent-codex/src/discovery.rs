@@ -6,6 +6,7 @@
 //! never asks for a token refresh, and has no login method anywhere.
 
 use mango_external_agents::discovery::{AuthMode, AuthState, GateVerdict};
+use mango_external_agents::version::{self, Comparison};
 
 use crate::protocol::requests::Account;
 
@@ -20,6 +21,7 @@ pub const PROGRAM: &str = "codex";
 /// `codex-cli 0.153.4` today. Only the last whitespace-separated token is read, so a build that
 /// grows a prefix still parses; a line with nothing version-shaped in it is `None`, which the
 /// caller turns into [`GateVerdict::Unknown`] rather than a refusal.
+/// A single leading `v` is accepted and retained in the observed token.
 ///
 /// # Example
 ///
@@ -32,10 +34,9 @@ pub const PROGRAM: &str = "codex";
 #[must_use]
 pub fn parse_version(output: &str) -> Option<String> {
     let token = output.split_whitespace().next_back()?;
-    let looks_like_a_version = token
-        .split('-')
-        .next()
-        .is_some_and(|core| core.contains('.') && core.starts_with(|c: char| c.is_ascii_digit()));
+    let unprefixed = token.strip_prefix('v').unwrap_or(token);
+    let looks_like_a_version = unprefixed.starts_with(|c: char| c.is_ascii_digit())
+        && version::components(unprefixed).is_some_and(|numbers| numbers.len() > 1);
     looks_like_a_version.then(|| token.to_owned())
 }
 
@@ -65,31 +66,29 @@ pub fn parse_user_agent_version(user_agent: &str) -> Option<String> {
 
 /// Whether `found` is at least `minimum`.
 ///
-/// Compared as dotted numbers, with any pre-release suffix dropped: `0.155.0-alpha.3` is treated
-/// as `0.155.0`, which is the reading that matters here — an alpha of a newer minor carries the
-/// newer protocol. A component that is not a number makes the whole comparison unanswerable, which
-/// the caller reports as [`GateVerdict::Unknown`].
+/// The core's [`version::compare`] as the `Option` this
+/// crate's callers match on: dotted numbers with any pre-release suffix dropped, so
+/// `0.155.0-alpha.3` is treated as `0.155.0`, which is the reading that matters here: an alpha
+/// of a newer minor carries the newer protocol. A component that is not a number makes the whole
+/// comparison unanswerable, which the caller reports as [`GateVerdict::Unknown`].
+///
+/// # Example
+///
+/// ```
+/// use mango_agent_codex::discovery::meets_minimum;
+///
+/// assert_eq!(meets_minimum("0.153.4", "0.153.0"), Some(true));
+/// assert_eq!(meets_minimum("0.152.9", "0.153.0"), Some(false));
+/// assert_eq!(meets_minimum("0.155.0-alpha.3", "0.155.0"), Some(true));
+/// assert_eq!(meets_minimum("nightly", "0.153.0"), None);
+/// ```
 #[must_use]
 pub fn meets_minimum(found: &str, minimum: &str) -> Option<bool> {
-    let parts = |version: &str| -> Option<Vec<u64>> {
-        version
-            .split('-')
-            .next()?
-            .split('.')
-            .map(|part| part.parse::<u64>().ok())
-            .collect()
-    };
-    let (found, minimum) = (parts(found)?, parts(minimum)?);
-    let width = found.len().max(minimum.len());
-    let at = |parts: &[u64], index: usize| parts.get(index).copied().unwrap_or(0);
-    for index in 0..width {
-        match at(&found, index).cmp(&at(&minimum, index)) {
-            std::cmp::Ordering::Less => return Some(false),
-            std::cmp::Ordering::Greater => return Some(true),
-            std::cmp::Ordering::Equal => {}
-        }
+    match version::compare(found, minimum) {
+        Comparison::AtLeast => Some(true),
+        Comparison::Below => Some(false),
+        Comparison::Unknown => None,
     }
-    Some(true)
 }
 
 /// The verdict for a build that reported `version`.
@@ -161,6 +160,28 @@ mod tests {
             parse_version("codex-cli 0.155.0-alpha.3\n").as_deref(),
             Some("0.155.0-alpha.3")
         );
+    }
+
+    #[test]
+    fn a_leading_v_is_retained_in_the_cli_version_token() {
+        for token in ["v0.147.0", "v0.166.0-alpha.1+build.7"] {
+            assert_eq!(
+                parse_version(&format!("codex-cli {token}")).as_deref(),
+                Some(token),
+                "expected the observed prefixed version token {token:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_leading_v_is_retained_in_the_handshake_version_token() {
+        for token in ["v0.147.0", "v0.166.0-alpha.1+build.7"] {
+            assert_eq!(
+                super::parse_user_agent_version(&format!("codex/{token} (Linux)")).as_deref(),
+                Some(token),
+                "expected the observed prefixed handshake version token {token:?}"
+            );
+        }
     }
 
     /// The text as a discovery shows it: `Discovery::normalized` reads it with `redact::bounded`.
