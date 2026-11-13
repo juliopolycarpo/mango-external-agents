@@ -377,7 +377,7 @@ async fn fallback_starts_new_when_the_agent_does_not_advertise_load_session() {
         .expect("expected close");
 }
 
-/// Schema 1.17 made `systemPrompt` a stable v1 field of `session/new` and `session/load`. This
+/// Schema 1.16 made `systemPrompt` a stable v1 field of `session/new` and `session/load`. This
 /// library has no host-supplied system prompt to send, and inventing one would put words in the
 /// agent's instructions that no host wrote, so neither lifecycle request carries the field.
 #[tokio::test]
