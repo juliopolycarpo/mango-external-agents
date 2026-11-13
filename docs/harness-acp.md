@@ -189,7 +189,9 @@ What the handler does with the agent's traffic:
 - Any other notification is dropped without an answer.
 - A `session/update` this build cannot read is dropped too, and the turn is told once: the first
   one in a turn becomes a warning `EventKind::Notice` ("The agent sent an update this client
-  could not read") in this library's own words, with nothing of the frame in it. It is not
+  could not read") in this library's own words, with nothing of the frame in it. A readable
+  foreign `sessionId` is dropped without consuming this warning; an unidentifiable envelope still
+  warns the turn that owned it at admission. It is not
   progress, so it does not restart the idle deadline, and it does not fail the turn. A tool
   call whose first frame was lost this way is opened by its next `tool_call_update`.
 
