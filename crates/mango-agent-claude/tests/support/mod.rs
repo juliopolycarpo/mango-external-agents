@@ -871,7 +871,15 @@ fn try_private_directory(path: &std::path::Path) -> std::io::Result<()> {
     let builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder.create(path)
+    builder.create(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // mkdir applies the umask even to 0700. Restore owner access only after
+        // creating a fresh directory, so a collision never changes an existing path.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 /// A host whose launcher is this fake, with a frozen clock and the ordinary caps.

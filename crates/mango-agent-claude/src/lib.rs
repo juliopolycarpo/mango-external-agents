@@ -115,7 +115,52 @@ mod tests {
             );
         }
         for root in [first, second] {
+            let child = root.join("named-private-directory");
+            crate::test_support::private_directory(&child);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&child)
+                    .expect("expected the named private directory")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(
+                    mode,
+                    0o700,
+                    "expected named private directory {} mode 0o700 | received {mode:#o}",
+                    child.display()
+                );
+            }
+            let artifact = child.join("artifact");
+            std::fs::write(&artifact, b"writable")
+                .expect("expected the private directory to allow owner writes");
+            std::fs::remove_file(artifact).expect("expected to remove the test artifact");
+            std::fs::remove_dir(child).expect("expected to remove the named private directory");
             std::fs::remove_dir(root).expect("expected to remove the empty scratch root");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scratch_helpers_restore_owner_permissions_under_a_restrictive_umask() {
+        // Change only the child process's umask; tests in this process run concurrently.
+        let output = std::process::Command::new("sh")
+            .args(["-c", "umask 0277; exec \"$@\"", "scratch-umask-test"])
+            .arg(std::env::current_exe().expect("expected this test executable"))
+            .args([
+                "--exact",
+                "tests::a_test_scratch_root_is_private_whatever_the_umask_and_never_shared",
+                "--nocapture",
+            ])
+            .output()
+            .expect("expected to run the scratch helper test under umask 0277");
+        assert!(
+            output.status.success(),
+            "expected writable owner-only scratch roots under umask 0277 | received {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
