@@ -344,8 +344,7 @@ impl Drop for StalledSession {
 }
 
 async fn stalled_session(launcher: FakeClaudeCli, limits: Limits) -> StalledSession {
-    let scratch = std::env::temp_dir().join(format!("mea-deadlines-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir(&scratch).expect("expected a scratch root");
+    let scratch = support::private_scratch("deadlines");
     let arrived = Arc::new(tokio::sync::Notify::new());
     let (release, released) = std::sync::mpsc::channel::<()>();
     let servers = vec![mango_external_agents::McpServer {

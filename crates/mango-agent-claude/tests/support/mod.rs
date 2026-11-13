@@ -815,6 +815,73 @@ impl ByteSink for FakeStdin {
     }
 }
 
+/// A scratch root of this test's own under the system temporary directory.
+///
+/// Owner-only whatever the process umask is. `std::fs::create_dir` under `umask 002`, the default
+/// for a user on Debian and Ubuntu, makes a group-writable directory, and the harness refuses a
+/// scratch root another user could replace: the tests that wanted a usable root then failed on the
+/// refusal instead of on what they assert. The name carries the process id and a per-process
+/// counter, so two tests, and two test binaries, never share one.
+///
+/// The caller removes it; a test that leaves one behind leaves an empty private directory.
+pub fn private_scratch(label: &str) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    private_scratch_with_counter(&std::env::temp_dir(), label, &NEXT)
+}
+
+/// Allocates a scratch root with a caller-owned counter so collisions can be reproduced.
+pub(crate) fn private_scratch_with_counter(
+    parent: &std::path::Path,
+    label: &str,
+    next: &std::sync::atomic::AtomicU64,
+) -> PathBuf {
+    loop {
+        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = parent.join(format!("mea-{label}-{}-{index}", std::process::id()));
+        match try_private_directory(&path) {
+            Ok(()) => return path,
+            // A failed earlier run can leave this name behind before its PID is reused.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!(
+                "expected to create a fresh private scratch directory {} | received: {error}",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// Creates `path` as an owner-only directory whatever the process umask is.
+///
+/// For a test that needs a directory with a name of its own choosing inside a
+/// [`private_scratch`] root, and needs the harness to accept it as a scratch root.
+pub fn private_directory(path: &std::path::Path) {
+    if let Err(error) = try_private_directory(path) {
+        panic!(
+            "expected to create the private directory {} | received: {error}",
+            path.display()
+        );
+    }
+}
+
+/// Atomically creates an owner-only directory, leaving collision handling to its caller.
+fn try_private_directory(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // mkdir applies the umask even to 0700. Restore owner access only after
+        // creating a fresh directory, so a collision never changes an existing path.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 /// A host whose launcher is this fake, with a frozen clock and the ordinary caps.
 pub fn host(launcher: Arc<FakeClaudeCli>) -> HostContext {
     host_under(launcher, Limits::default())

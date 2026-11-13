@@ -3211,8 +3211,7 @@ mod mcp_passthrough {
                     .with_turn(Run::replaying(READ_TURN)),
             );
             let scratch =
-                std::env::temp_dir().join(format!("mea-config-scratch-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+                support::private_scratch("config-scratch");
             let host = HostContext::builder()
                 .launcher(launcher.clone())
                 .cwd(std::env::temp_dir())
@@ -3294,9 +3293,7 @@ mod mcp_passthrough {
 
         runtime.block_on(async {
             let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
-            let scratch =
-                std::env::temp_dir().join(format!("mea-close-scratch-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+            let scratch = support::private_scratch("close-scratch");
             let host = HostContext::builder()
                 .launcher(launcher)
                 .cwd(std::env::temp_dir())
@@ -3373,9 +3370,7 @@ mod mcp_passthrough {
                     .with_help(HELP_2_1_270)
                     .with_turn(Run::stalling::<[String; 0], String>([])),
             );
-            let scratch =
-                std::env::temp_dir().join(format!("mea-twice-scratch-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+            let scratch = support::private_scratch("twice-scratch");
             let host = HostContext::builder()
                 .launcher(launcher.clone())
                 .cwd(std::env::temp_dir())
@@ -3447,9 +3442,7 @@ mod mcp_passthrough {
                     .with_turn(Run::replaying(READ_TURN)),
             );
             let stop = launcher.gate_turn_stops();
-            let scratch =
-                std::env::temp_dir().join(format!("mea-settle-scratch-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+            let scratch = support::private_scratch("settle-scratch");
             let host = HostContext::builder()
                 .launcher(launcher.clone())
                 .cwd(std::env::temp_dir())
@@ -3552,9 +3545,7 @@ mod mcp_passthrough {
                     .with_help(HELP_2_1_270)
                     .with_turn(Run::stalling::<[String; 0], String>([])),
             );
-            let scratch =
-                std::env::temp_dir().join(format!("mea-reap-scratch-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+            let scratch = support::private_scratch("reap-scratch");
             let host = HostContext::builder()
                 .launcher(launcher.clone())
                 .cwd(std::env::temp_dir())
@@ -3615,9 +3606,7 @@ mod mcp_passthrough {
 
         runtime.block_on(async {
             let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
-            let scratch =
-                std::env::temp_dir().join(format!("mea-stop-scratch-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+            let scratch = support::private_scratch("stop-scratch");
             let host = HostContext::builder()
                 .launcher(launcher.clone())
                 .cwd(std::env::temp_dir())
@@ -3695,9 +3684,7 @@ mod mcp_passthrough {
 
         runtime.block_on(async {
             let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
-            let scratch =
-                std::env::temp_dir().join(format!("mea-drop-scratch-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+            let scratch = support::private_scratch("drop-scratch");
             let host = HostContext::builder()
                 .launcher(launcher.clone())
                 .cwd(std::env::temp_dir())
@@ -3744,9 +3731,7 @@ mod mcp_passthrough {
     #[tokio::test]
     async fn passes_the_host_authorised_scratch_path_to_the_child_unchanged() {
         let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
-        let scratch =
-            std::env::temp_dir().join(format!("mea-host-scratch-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+        let scratch = support::private_scratch("host-scratch");
         let host = HostContext::builder()
             .launcher(launcher.clone())
             .cwd(std::env::temp_dir())
@@ -3820,8 +3805,7 @@ mod mcp_passthrough {
     #[tokio::test]
     async fn refuses_an_unusable_host_scratch_before_running_a_vendor_probe() {
         let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
-        let root = std::env::temp_dir().join(format!("mea-host-scratch-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&root).expect("expected a dedicated test root");
+        let root = support::private_scratch("host-scratch");
         let scratch_file = root.join("not-a-directory");
         std::fs::write(&scratch_file, "host-owned file")
             .expect("expected an unusable scratch path");
@@ -3858,9 +3842,7 @@ mod mcp_passthrough {
         // This build does not advertise `--mcp-config`, so opening fails after the local artifact
         // was prepared and the survey established the unsupported capability.
         let launcher = Arc::new(FakeClaudeCli::new());
-        let scratch =
-            std::env::temp_dir().join(format!("mea-host-scratch-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+        let scratch = support::private_scratch("host-scratch");
         let host = HostContext::builder()
             .launcher(launcher.clone())
             .cwd(std::env::temp_dir())

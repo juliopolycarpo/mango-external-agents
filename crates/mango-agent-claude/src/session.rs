@@ -3028,8 +3028,7 @@ mod tests {
             .build()
             .expect("expected a runtime whose blocking pool this test owns");
 
-        let scratch = std::env::temp_dir().join(format!("mea-drop-state-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&scratch).expect("expected a scratch root");
+        let scratch = crate::test_support::private_scratch("drop-state");
 
         runtime.block_on(async {
             let file = crate::mcp::ConfigFile::write(&servers(), &scratch)
@@ -3147,9 +3146,7 @@ mod tests {
     async fn a_close_stops_waiting_for_a_stalled_artifact_removal_at_the_shutdown_timeout() {
         use mango_external_agents::{CloseReason, Error, Limits, Session, SessionStatus};
 
-        let scratch =
-            std::env::temp_dir().join(format!("mea-stalled-close-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&scratch).expect("expected a scratch root");
+        let scratch = crate::test_support::private_scratch("stalled-close");
         let arrived = Arc::new(tokio::sync::Notify::new());
         let (release, released) = std::sync::mpsc::channel::<()>();
         let file = crate::mcp::ConfigFile::write(&servers(), &scratch)
