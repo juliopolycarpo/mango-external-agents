@@ -180,15 +180,21 @@ claude --print
 session id on disk, not a pipe staying open — so a session owns **no process**. It owns a session
 id, and each turn spawns, streams and reaps its own child.
 
-- **Opening starts nothing.** The id is minted as a UUID (`--session-id` "must be a valid UUID") so
+- **Opening starts no turn.** After discovery checks, the id is minted as a UUID
+  ([`--session-id` requires a valid UUID](https://code.claude.com/docs/en/cli-reference)) so
   a host holds a resumable handle before any tokens are spent. The first turn passes
   `--session-id`; every later one passes `--resume`, using whatever handle the run's own
   `system/init` reported.
+  UUID generation uses ring's operating-system randomness and returns a typed
+  `Error::HostConfiguration` refusal on entropy failure. It also names the private MCP artifact
+  directory for both new sessions and strict resumes, before directory creation or discovery
+  probes. A new-session id failure after discovery uses the existing open-failure artifact
+  cleanup; a strict resume reuses its native id.
 - **`Session::ids()` and `Session::snapshot().ids` are the handle in force.** A run may report a
   `session_id` other than the one `--session-id` proposed, and from then on that is the only handle
   `--resume` accepts — so it is the one a host persists. The opening snapshot remains available to
   the host that retained it when the session was opened.
-- **Strict resume is lazy and confirmed.** Opening does not launch a process, so the requested UUID
+- **Strict resume is lazy and confirmed.** Opening does not launch a turn process, so the requested UUID
   remains an unverified candidate in `Session::ids()` while `SessionSnapshot::resumed` is false.
   The first turn passes it to `--resume`; only `system/init` echoing that exact UUID confirms the
   resumed snapshot. A missing, invalid or different id ends that turn with a failure instead

@@ -224,19 +224,25 @@ pub fn is_vendor_session_id(id: &str) -> bool {
 /// Mints the UUID a new session proposes with `--session-id`, and names its scratch directory.
 ///
 /// A version 4 UUID: 122 bits from the operating system's random source, through the `ring` the
-/// core already links for its own digest, so this is a call rather than a dependency. The shape is
-/// the one [`is_vendor_session_id`] accepts, because the CLI documents `--session-id` as taking a
-/// valid UUID and refuses anything else.
+/// core already links for its own digest. The shape is the one [`is_vendor_session_id`] accepts:
+/// the CLI documents `--session-id` as taking a valid UUID and refuses anything else.
 ///
-/// The random source failing is not something a turn can work around, so it is a typed refusal
-/// before anything is launched and never a weaker id.
+/// Entropy failure returns a typed refusal without a weaker id. Artifact naming calls this before
+/// directory creation and discovery probes; new-session id generation follows discovery checks
+/// and uses the existing open-failure artifact cleanup. A strict resume reuses its native id.
 pub(crate) fn mint_uuid() -> Result<String> {
+    let random = ring::rand::SystemRandom::new();
+    mint_uuid_with_entropy(|bytes| ring::rand::SecureRandom::fill(&random, bytes))
+}
+
+/// Keeps the random-source failure path deterministic in tests.
+fn mint_uuid_with_entropy(
+    fill: impl FnOnce(&mut [u8]) -> std::result::Result<(), ring::error::Unspecified>,
+) -> Result<String> {
     let mut bytes = [0_u8; 16];
-    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut bytes).map_err(|_| {
-        Error::HostConfiguration {
-            expected: "16 bytes from the operating system's random source for a new session id",
-            received: String::from("a random source that returned none"),
-        }
+    fill(&mut bytes).map_err(|_| Error::HostConfiguration {
+        expected: "16 bytes from the operating system's random source to generate a UUID",
+        received: String::from("a random source that failed"),
     })?;
     Ok(format_uuid_v4(bytes))
 }
@@ -263,7 +269,9 @@ fn format_uuid_v4(mut bytes: [u8; 16]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{TurnArgv, format_uuid_v4, is_vendor_session_id, mint_uuid};
+    use super::{
+        TurnArgv, format_uuid_v4, is_vendor_session_id, mint_uuid, mint_uuid_with_entropy,
+    };
     use crate::permissions::CliMode;
 
     const SESSION: &str = "11111111-2222-3333-4444-555555555555";
@@ -706,6 +714,33 @@ mod tests {
         assert_ne!(
             first, second,
             "expected two mints to differ | received the same UUID twice"
+        );
+    }
+
+    struct FailingUuidEntropy;
+
+    impl FailingUuidEntropy {
+        fn fill(bytes: &mut [u8]) -> std::result::Result<(), ring::error::Unspecified> {
+            // Even a partial write followed by failure must refuse UUID generation.
+            bytes.fill(0xab);
+            Err(ring::error::Unspecified)
+        }
+    }
+
+    #[test]
+    fn uuid_entropy_failure_describes_generation_for_both_callers() {
+        let error = mint_uuid_with_entropy(FailingUuidEntropy::fill)
+            .expect_err("expected failed entropy to refuse UUID generation");
+        let mango_external_agents::Error::HostConfiguration { expected, received } = error else {
+            panic!("expected a typed UUID entropy refusal | received {error:?}");
+        };
+        assert_eq!(
+            (expected, received.as_str()),
+            (
+                "16 bytes from the operating system's random source to generate a UUID",
+                "a random source that failed",
+            ),
+            "expected a UUID generation refusal for session IDs and MCP artifact names | received expected={expected:?}, received={received:?}"
         );
     }
 }
