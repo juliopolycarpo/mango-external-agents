@@ -20,6 +20,31 @@ mango-agent-claude = { path = "crates/mango-agent-claude", version = "0.8.0", de
 mango-agent-codex = { path = "crates/mango-agent-codex", version = "0.8.0", default-features = false }
 mango-external-agents = { path = "crates/mango-external-agents", version = "0.8.0", default-features = false }
 
+# Every third-party requirement is declared here once, so a floor is raised in one place and two
+# crates cannot ask for two versions of the same dependency. An entry carries the version and
+# whether the defaults are off, never a feature: each crate lists the features it uses beside its
+# own `workspace = true`, where the reason for them is written.
+#
+# `agent-client-protocol-schema` is absent on purpose. It stays inside mango-agent-acp, pinned
+# exactly, and no other member may take it.
+async-trait = "0.1.92"
+base64 = { version = "0.22", default-features = false }
+chrono = { version = "0.4.44", default-features = false }
+clap = "4.6.6"
+futures-util = { version = "0.3.34", default-features = false }
+http = "1.4.0"
+nix = { version = "0.31.3", default-features = false }
+process-wrap = { version = "10.0.0", default-features = false }
+ring = { version = "0.17.14", default-features = false }
+rustls = { version = "0.23.46", default-features = false }
+serde = { version = "1.0.229", default-features = false }
+serde_json = { version = "1.0.151", default-features = false }
+tempfile = "3.27.0"
+tokio = { version = "1.53.3", default-features = false }
+tokio-tungstenite = { version = "0.30.0", default-features = false }
+win32job = { version = "2.1.0", default-features = false }
+windows = { version = "0.62.2", default-features = false }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

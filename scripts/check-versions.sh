@@ -2,6 +2,8 @@
 # Lockstep: one version in [workspace.package], inherited by every crate, and repeated
 # verbatim in every in-workspace [workspace.dependencies] entry. Each crate README's install
 # requirement follows the release rule; see scripts/check-readme-requirements.sh.
+# Third-party requirements are written once as well, in [workspace.dependencies]; see
+# scripts/check-workspace-dependencies.py.
 # Usage: scripts/check-versions.sh [expected]   # expected = a tag without the leading v
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -33,6 +35,9 @@ while IFS= read -r line; do
     status=1
   fi
 done < <(sed -n '/^\[workspace\.dependencies\]/,/^\[/p' Cargo.toml | grep -E '^mango-' || true)
+
+# A member that writes its own version of a dependency is a second requirement that can drift.
+python3 scripts/check-workspace-dependencies.py Cargo.toml crates/*/Cargo.toml examples/*/Cargo.toml || status=1
 
 # One README path per crate manifest, not a glob over READMEs: a deleted README would vanish from a
 # glob and pass, where a named path is refused as missing.
