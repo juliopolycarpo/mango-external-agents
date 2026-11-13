@@ -3767,6 +3767,103 @@ mod mcp_passthrough {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
+    async fn assert_invalid_http_mcp_refused(url: &str, header_name: &str, header_value: &str) {
+        let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+        let scratch = support::private_scratch("invalid-http-mcp");
+        let host = HostContext::builder()
+            .launcher(launcher.clone())
+            .cwd(std::env::temp_dir())
+            .scratch(&scratch)
+            .client_info("mea-tests", "0.0.0")
+            .build()
+            .expect("expected a host with scratch storage");
+        let server = McpServer {
+            name: String::from("server-name-canary"),
+            transport: McpTransport::Http {
+                url: url.to_owned(),
+                headers: [(header_name.to_owned(), header_value.to_owned())]
+                    .into_iter()
+                    .collect(),
+            },
+        };
+        let result = ClaudeHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1").with_mcp_servers(vec![server]),
+            )
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(session) => {
+                drop(session);
+                let _ = std::fs::remove_dir_all(&scratch);
+                panic!(
+                    "expected HostConfiguration for invalid HTTP MCP server | received: accepted"
+                );
+            }
+        };
+        assert!(
+            matches!(error.cause(), Error::HostConfiguration { expected: "an HTTP MCP URL and valid header names and values", received } if received.contains("index 0")),
+            "expected indexed HTTP MCP HostConfiguration refusal | received: {error:?}"
+        );
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            for canary in [
+                "server-name-canary",
+                "url-canary",
+                "header-name-canary",
+                "header-value-canary",
+            ] {
+                assert!(
+                    !rendered.contains(canary),
+                    "expected diagnostic without {canary} | received: {rendered}"
+                );
+            }
+        }
+        assert!(
+            launcher.launches().is_empty(),
+            "expected no vendor probes | received: {:?}",
+            launcher.launches()
+        );
+        assert_eq!(
+            std::fs::read_dir(&scratch)
+                .expect("expected scratch root")
+                .count(),
+            0,
+            "expected no scratch leaf"
+        );
+        std::fs::remove_dir_all(scratch).expect("expected scratch cleanup");
+    }
+
+    #[tokio::test]
+    async fn refuses_http_mcp_url_with_userinfo_before_vendor_probe() {
+        assert_invalid_http_mcp_refused(
+            "https://url-canary:secret@example.com/mcp",
+            "header-name-canary",
+            "header-value-canary",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn refuses_http_mcp_invalid_header_name_before_vendor_probe() {
+        assert_invalid_http_mcp_refused(
+            "https://example.com/url-canary",
+            "header-name-canary invalid",
+            "header-value-canary",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn refuses_http_mcp_header_line_break_before_vendor_probe() {
+        assert_invalid_http_mcp_refused(
+            "https://example.com/url-canary",
+            "header-name-canary",
+            "header-value-canary\r\ninjected: value",
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn refuses_missing_host_scratch_before_running_a_vendor_probe() {
         let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));

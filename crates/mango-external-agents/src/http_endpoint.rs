@@ -6,7 +6,7 @@
 //! cannot encode, is refused here, before a vendor process can observe it.
 //!
 //! The grammar is deliberately narrower than RFC 3986: an ASCII `http` or `https` URL whose host
-//! is a registered name or a bracketed IPv6 literal. The ACP and Codex harnesses apply the same
+//! is a registered name or a bracketed IPv6 literal. Claude, Codex and ACP apply the same
 //! grammar. The tests hold it against the `http`
 //! crate, which the harnesses used before: nothing accepted here is something that crate refuses.
 
