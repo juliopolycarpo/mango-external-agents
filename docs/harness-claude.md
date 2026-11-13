@@ -10,16 +10,23 @@ under `fixtures/claude/contract/`.
 
 Compliance posture: see [compliance.md](compliance.md).
 
-## Public-contract refresh — 2026-11-07
+## Public-contract refresh — 2026-11-13
 
-The current public-contract pin is **2.1.318**. Its official release archive passed the
-three-day release-age policy and `scripts/install-vendor-cli.sh` verified its checksum before
-`mea capture` regenerated the contract. The CLI flag inventory adds `--desktop`; existing
-harness arguments remain present. Help descriptions and command listings also change, so help
-is not byte-identical to 2.1.270. Historical behavior observations retain their dates and versions;
-this capture is not an authenticated turn. The headless reference's current opt-in `--bare`
-wording is covered alongside the older wording; contradictory default claims and unknown text
-fail the reference watch. Source: https://code.claude.com/docs/en/headless.
+The current public-contract pin is **2.1.322**, the newest release that had passed the
+three-day release-age policy on this date (2.1.323 and later were younger). `scripts/install-vendor-cli.sh`
+verified its official release archive against the recorded checksum before `mea capture`
+regenerated the contract. Apart from the version, the capture is byte-identical to the 2.1.318
+one: the same flag inventory and the same help text. No harness argument or parser change
+follows, and this capture is not an authenticated turn.
+
+## Previous refresh — 2026-11-07
+
+The 2.1.318 contract added `--desktop` to the CLI flag inventory; existing harness arguments
+remained present. Help descriptions and command listings also changed, so help was not
+byte-identical to 2.1.270. Historical behavior observations retain their dates and versions.
+The headless reference's current opt-in `--bare` wording is covered alongside the older wording;
+contradictory default claims and unknown text fail the reference watch. Source:
+https://code.claude.com/docs/en/headless.
 
 ## The executable and the version gate
 

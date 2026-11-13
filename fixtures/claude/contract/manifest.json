@@ -8,6 +8,6 @@
   "files": {
     "cli-surface.json": "sha256:2e23ed29b3161a711d7229c826f19505c6a58d720048df67436f59a0febc5585",
     "help.txt": "sha256:5ca3a9dac2026e56c221fdd34380c7d7d45ebbb51c1d01b7c17c75cb076a0be8",
-    "version.json": "sha256:66f2d581f18b4e08bb90087f265c582eff35201ab3086754083f5c61689936c3"
+    "version.json": "sha256:68dde9c029adadb5de628fa9f12be0d0140497768945e5393e2a738ac3794249"
   }
 }

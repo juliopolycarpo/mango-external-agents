@@ -23,11 +23,12 @@ per-harness guides, which say why each surface is driven the way it is.
 `refuse` is distinct from `omit`: an omitted field is one this library read and did not carry, and a
 refused one is a request it answered "no" to. Only requests can be refused.
 
-## Claude Code — reproduction pin `claude` 2.1.318
+## Claude Code — reproduction pin `claude` 2.1.322
 
-The field observations below originated at 2.1.270. The 2026-11-07 public-contract refresh adds
-`--desktop` to the flag inventory and changes help descriptions; existing harness arguments remain
-present. This is not a new authenticated turn.
+The field observations below originated at 2.1.270. The 2026-11-07 public-contract refresh (2.1.318)
+added `--desktop` to the flag inventory and changed help descriptions. The 2026-11-13 refresh
+(2.1.322) changes only the version; flags and help match 2.1.318. Existing harness arguments remain
+present. Neither is a new authenticated turn.
 
 | Field                                                          | Enabled | Destination                     | Disposition | Reason                                                                                                                                                                            | Evidence                                                                                           |
 | -------------------------------------------------------------- | ------- | ------------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
