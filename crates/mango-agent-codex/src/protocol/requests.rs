@@ -1054,7 +1054,7 @@ mod tests {
 
     #[test]
     fn granular_thread_approval_policy_decodes_without_exposing_unknown_fields() {
-        // This synthetic response validates against both pinned 0.166.0 response schemas.
+        // This synthetic response was shaped from the 0.166.0 response schemas.
         let mut response: serde_json::Value =
             serde_json::from_str(include_str!("../../testdata/granular-thread-response.json"))
                 .expect("expected a complete schema-shaped thread response");

@@ -1110,7 +1110,7 @@ impl ResumeSuccessServer {
     }
 }
 
-/// A synthetic 0.166.0 schema-shaped response, used for both opening methods.
+/// A synthetic response shaped from the 0.166.0 schemas, used for both opening methods.
 struct ThreadResponseServer;
 
 impl ThreadResponseServer {
@@ -1226,7 +1226,7 @@ async fn open_with_observed_reviewer(
     expected_routing: Option<ApprovalRouting>,
 ) {
     let native_id = "01900000-0000-7000-8000-000000000001";
-    // The unmodified response validates against both 0.166.0 opening response schemas.
+    // The unmodified response was shaped from both 0.166.0 opening response schemas.
     let mut response: serde_json::Value = serde_json::from_str(include_str!(
         "../testdata/legacy-reviewer-thread-response.json"
     ))
