@@ -136,7 +136,7 @@ impl ConfigFile {
         let document = document_for(servers)?;
         validate_scratch(scratch)?;
 
-        let directory = scratch.join(uuid::Uuid::new_v4().to_string());
+        let directory = scratch.join(crate::argv::mint_uuid()?);
         let path = directory.join(FILE_NAME);
         // `--mcp-config` takes one argument, and an argument is a string. A path that is not UTF-8
         // would have to be rendered lossily, and a lossy path names a different file.

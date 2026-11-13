@@ -564,7 +564,7 @@ impl ClaudeHarness {
             Some(resume) => resume.native_session_id.clone(),
             // `--session-id` takes a UUID and nothing else, so the handle is minted here rather
             // than derived from the host's own session id, which has no shape requirement.
-            None => uuid::Uuid::new_v4().to_string(),
+            None => argv::mint_uuid()?,
         };
 
         let effective_transport = descriptor.resolve_transport(request.transport)?;

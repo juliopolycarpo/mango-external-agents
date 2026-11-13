@@ -25,12 +25,13 @@ bench = false
 mango-external-agents = { workspace = true, features = ["stdio"] }
 
 async-trait = "0.1.92"
+# `--session-id` takes a UUID and nothing else, so the harness mints one rather than reusing the
+# host's own session id, which has no shape requirement. The sixteen random bytes come from the
+# crypto the core already ships: TLS is `ring` everywhere in this workspace.
+ring = { version = "0.17.14", default-features = false, features = ["std"] }
 semver = { version = "1.0.28", default-features = false, features = ["std"] }
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
 tokio = { version = "1.53.3", default-features = false, features = ["fs", "macros", "rt", "sync", "time"] }
-# `--session-id` takes a UUID and nothing else, so the harness mints one rather
-# than reusing the host's own session id, which has no shape requirement.
-uuid = { version = "1.19.1", default-features = false, features = ["std", "v4"] }
 
 [target.'cfg(unix)'.dependencies]
 # Read the effective uid without an unsafe libc call when validating a host scratch root.
