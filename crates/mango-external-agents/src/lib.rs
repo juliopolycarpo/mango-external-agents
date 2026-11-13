@@ -10,6 +10,7 @@ pub mod event;
 pub mod extension;
 pub mod harness;
 pub mod host;
+pub mod http_endpoint;
 pub mod identity;
 pub mod interaction;
 pub mod jsonrpc;

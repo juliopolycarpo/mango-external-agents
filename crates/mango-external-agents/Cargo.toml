@@ -64,6 +64,8 @@ win32job = { workspace = true, optional = true }
 windows = { workspace = true, features = ["Win32_System_Threading"], optional = true }
 
 [dev-dependencies]
+# The oracle for `http_endpoint`: tests compare validation with the former harness parser.
+http.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }
 
 # Non-gating benchmarks: plain `harness = false` binaries with no extra dependencies. Run them with

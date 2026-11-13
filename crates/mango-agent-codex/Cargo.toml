@@ -26,7 +26,6 @@ testing = ["mango-external-agents/testing"]
 
 [dependencies]
 async-trait.workspace = true
-http.workspace = true
 mango-external-agents = { workspace = true, features = ["stdio"] }
 # HMAC-SHA256 for the host-keyed account fingerprint, from the crypto the core already ships: TLS
 # is `ring` everywhere in this workspace.

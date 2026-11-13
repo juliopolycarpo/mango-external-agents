@@ -230,6 +230,22 @@ async fn malformed_mcp_servers_are_not_submitted_or_spawned() {
                 headers: std::collections::BTreeMap::new(),
             },
         }],
+        // The shared `http_endpoint` grammar: a fragment never reaches a server, and a character
+        // outside ASCII has to arrive percent-encoded.
+        vec![mango_external_agents::McpServer {
+            name: String::from("docs"),
+            transport: mango_external_agents::McpTransport::Http {
+                url: String::from("https://mcp.example/path#fragment"),
+                headers: std::collections::BTreeMap::new(),
+            },
+        }],
+        vec![mango_external_agents::McpServer {
+            name: String::from("docs"),
+            transport: mango_external_agents::McpTransport::Http {
+                url: String::from("https://mcp.example/caf\u{e9}"),
+                headers: std::collections::BTreeMap::new(),
+            },
+        }],
     ];
     for servers in cases {
         let launcher = Arc::new(FakeLauncher::new());

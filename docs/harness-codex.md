@@ -1059,8 +1059,10 @@ anything is spawned.
 `Capabilities::mcp_passthrough` is `true`. Host entries travel in the `config.mcp_servers` map
 on `thread/start` or `thread/resume`, the app-server's documented per-thread override. Stdio
 entries preserve command, arguments and server-only environment. Streamable HTTP entries preserve
-URL and literal headers. The harness validates header names and values with the `http` crate before
-launching Codex. Invalid, duplicate or unsupported entries fail before launching Codex;
+URL and literal headers. The harness validates the URL, header names and header values with the
+core `http_endpoint` module before launching Codex, the same grammar the ACP harness applies: an
+ASCII `http` or `https` URL without user information or a fragment.
+Invalid, duplicate or unsupported entries fail before launching Codex;
 the harness never edits the user's `config.toml` or adds server credentials to the Codex child's
 environment. Servers the user configured with `codex mcp` remain available to the vendor.
 
