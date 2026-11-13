@@ -117,8 +117,9 @@ pub fn parse(output: &str) -> Option<String> {
         .map(|token| token.trim_matches(|character: char| !character.is_ascii_alphanumeric()))
         .find_map(|token| {
             let candidate = token.trim_start_matches('v');
-            // At least one dot, so a bare build number is not mistaken for a version.
-            (candidate.contains('.') && components(candidate).is_some())
+            // Require a dot between numeric components; suffix dots only describe a build label.
+            components(candidate)
+                .is_some_and(|numbers| numbers.len() > 1)
                 .then(|| candidate.to_owned())
         })
 }
@@ -211,6 +212,27 @@ mod tests {
         assert_eq!(parse("built from source"), None);
         assert_eq!(parse(""), None);
         assert_eq!(parse("build 4821"), None);
+    }
+
+    #[test]
+    fn a_dot_in_a_build_suffix_does_not_make_an_integer_a_version() {
+        for banner in [
+            "tool build 4821-beta.1 agent 0.14.2",
+            "tool build 4821+build.7 agent 0.14.2",
+        ] {
+            assert_eq!(
+                parse(banner).as_deref(),
+                Some("0.14.2"),
+                "expected numeric version components in {banner:?}, skipping the build label"
+            );
+        }
+        for banner in ["build 4821-beta.1", "build 4821+build.7"] {
+            assert_eq!(
+                parse(banner),
+                None,
+                "expected no dotted numeric version in {banner:?}"
+            );
+        }
     }
 
     #[test]

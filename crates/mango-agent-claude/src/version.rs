@@ -75,15 +75,19 @@ fn parse_claude_line(line: &str) -> Option<String> {
 fn parse_version_tokens(line: &str) -> Option<String> {
     line.split_whitespace().find_map(|token| {
         let token = token.strip_prefix('v').unwrap_or(token);
-        let core = token.split(['-', '+']).next().unwrap_or(token);
-        let is_claude_version = token.starts_with(|first: char| first.is_ascii_digit())
-            && components(core).is_some_and(|numbers| numbers.len() == 3)
-            && core
-                .split('.')
-                .all(|component| component == "0" || !component.starts_with('0'))
-            && valid_semver_suffix(&token[core.len()..]);
-        is_claude_version.then(|| token.to_owned())
+        is_claude_version(token).then(|| token.to_owned())
     })
+}
+
+/// The unprefixed Claude token accepted by both banner extraction and the public version gate.
+fn is_claude_version(token: &str) -> bool {
+    let core = token.split(['-', '+']).next().unwrap_or(token);
+    token.starts_with(|first: char| first.is_ascii_digit())
+        && components(core).is_some_and(|numbers| numbers.len() == 3)
+        && core
+            .split('.')
+            .all(|component| component == "0" || !component.starts_with('0'))
+        && valid_semver_suffix(&token[core.len()..])
 }
 
 /// Accepts only SemVer pre-release and build metadata after Claude's three numeric components.
@@ -132,6 +136,7 @@ fn valid_semver_identifiers(identifiers: &str, prerelease: bool) -> bool {
 ///
 /// A version that could not be read is refused too, but only by callers that have nothing else to
 /// go on: [`CliSurface`](crate::cli_surface::CliSurface) answers first when it could be read.
+/// Direct callers must supply the same three-component token and suffix grammar [`parse`] accepts.
 ///
 /// The comparison is the core's, over dotted numbers with any pre-release suffix dropped, so a
 /// pre-release of the floor itself counts as the floor.
@@ -147,7 +152,10 @@ fn valid_semver_identifiers(identifiers: &str, prerelease: bool) -> bool {
 /// assert!(!is_supported(None));
 /// ```
 pub fn is_supported(observed: Option<&str>) -> bool {
-    observed.is_some_and(|observed| compare(observed, MINIMUM_VERSION) == Comparison::AtLeast)
+    observed.is_some_and(|observed| {
+        let token = observed.strip_prefix('v').unwrap_or(observed);
+        is_claude_version(token) && compare(token, MINIMUM_VERSION) == Comparison::AtLeast
+    })
 }
 
 #[cfg(test)]
@@ -241,6 +249,39 @@ mod tests {
             Some("2.1.270"),
             "expected the two-component token to be skipped for the three-component one"
         );
+    }
+
+    #[test]
+    fn the_public_version_gate_applies_the_claude_token_grammar() {
+        let malformed = [
+            "3",
+            "2.1.999.0",
+            "2.1.999-",
+            "02.1.999",
+            "2.1.999+",
+            "2.1.999-api_key=fixture-secret",
+            "vv2.1.999",
+        ];
+        let accepted: Vec<_> = malformed
+            .into_iter()
+            .filter(|token| is_supported(Some(token)))
+            .collect();
+        assert!(
+            accepted.is_empty(),
+            "expected unsupported malformed Claude version tokens | received accepted {accepted:?}"
+        );
+        for token in [
+            "2.1.999",
+            "v2.1.999",
+            "2.1.999-beta.1",
+            "2.1.999+build.01",
+            "2.1.999-beta.1+build.7",
+        ] {
+            assert!(
+                is_supported(Some(token)),
+                "expected a supported three-component Claude token | received refused {token:?}"
+            );
+        }
     }
 
     #[test]

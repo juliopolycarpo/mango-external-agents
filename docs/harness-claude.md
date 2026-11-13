@@ -50,6 +50,8 @@ remains accepted for the documented compact form. A version is a token of exactl
 numbers, with an optional leading `v` and an optional pre-release or build suffix; it is compared
 with the pin by the core `version` module, the same dotted-number comparison the Codex and ACP
 harnesses use, which drops the suffix.
+The public `version::is_supported` predicate applies that same Claude token grammar, including
+three numeric components without leading zeros and valid SemVer suffix identifiers.
 
 Probe output that may be incomplete is never read as a verdict. A read error before the CLI closed
 stdout, a line over the host's line cap, more than 1 MiB of stdout (the largest captured help is
