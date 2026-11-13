@@ -658,6 +658,17 @@ change the machine, so an escalation prompt's only honest answer is no.
 `auto_review` was accepted by a real app-server on a consumer subscription, so refusing the cell
 here would be this harness narrowing what the vendor offers rather than reporting it.
 
+The [0.166.0 thread response schema](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/app-server-protocol/schema/json/v2/ThreadStartResponse.json)
+and [reviewer definition](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/protocol/src/config_types.rs)
+identify `guardian_subagent` as a legacy alias for `auto_review`. The harness observes either as
+`AutoReview`. An unknown reviewer leaves observed routing unknown and its value is discarded.
+Outgoing requests continue to use only `user` and `auto_review`; the host still handles every
+approval the vendor sends.
+
+In the unreleased 0.8 minor, `ThreadStartResponse::approvals_reviewer` changes from
+`Option<ApprovalsReviewer>` to `Option<ObservedApprovalsReviewer>`. Match `Supported(reviewer)`
+for a known reviewer and `Other` for an unknown value; `None` still means no reviewer was provided.
+
 Per-turn permission changes send `approvalPolicy` and the structured `sandboxPolicy` together.
 Read-only disables network access; workspace-write authorises only the host's workspace and
 excludes temporary directories. Full access is sent only from a host-selected configuration.
