@@ -147,6 +147,78 @@ async fn an_unknown_or_malformed_session_update_is_ignored() {
     session.close(CloseReason::Shutdown).await.expect("close");
 }
 
+/// A peer that sends foreign and local unreadable updates around a readable marker.
+struct UnreadableRoutingAgent;
+
+impl UnreadableRoutingAgent {
+    fn answer(line: &str) -> Vec<String> {
+        let frame: serde_json::Value =
+            serde_json::from_str(line).expect("expected JSON-RPC request");
+        let id = frame["id"].clone();
+        match frame["method"].as_str() {
+            Some("initialize") => vec![InterleavingConfigAgent::result(id, serde_json::json!({
+                "protocolVersion": 1, "agentCapabilities": {}, "authMethods": []
+            }))],
+            Some("session/new") => vec![InterleavingConfigAgent::result(id, serde_json::json!({"sessionId": "sess_fake"}))],
+            Some("session/prompt") => vec![
+                serde_json::json!({"jsonrpc":"2.0", "method":"session/update", "params": {
+                    "sessionId":"foreign", "update":{"sessionUpdate":"unknown_foreign", "sentinel":"secret_foreign"}
+                }}).to_string(),
+                update_frame(serde_json::json!({"sessionUpdate":"agent_message_chunk", "content":{"type":"text", "text":"marker"}})),
+                update_frame(serde_json::json!({"sessionUpdate":"unknown_local", "sentinel":"secret_local"})),
+                InterleavingConfigAgent::result(id, serde_json::json!({"stopReason":"end_turn"})),
+            ],
+            other => panic!("expected initialize, session/new or session/prompt | received: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn foreign_unreadable_update_does_not_consume_local_warning() {
+    let launcher = FakeLauncher::new();
+    launcher.push(FakeProcess::responding(UnreadableRoutingAgent::answer));
+    let session = AcpHarness::new(profile())
+        .open_session(
+            &host(&launcher),
+            OpenSession::new("unreadable-routing").with_configuration(permissive()),
+        )
+        .await
+        .expect("expected a session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "go"))
+        .await
+        .expect("expected a turn");
+    let events = drain(&mut turn).await;
+    let marker = events
+        .iter()
+        .position(|event| matches!(event, EventKind::TextDelta { text } if text == "marker"))
+        .expect("expected marker before local unreadable update");
+    let notices: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| matches!(event, EventKind::Notice { .. }))
+        .collect();
+    assert!(
+        notices.len() == 1 && notices[0].0 > marker,
+        "expected one unreadable warning after marker | received: {events:?}"
+    );
+    assert!(
+        matches!(notices[0].1, EventKind::Notice { severity: mango_external_agents::NoticeSeverity::Warning, title, description }
+            if title == "The agent sent an update this client could not read"
+            && description.as_deref() == Some("Updates in a shape this client does not know are skipped. The turn continues without them.")),
+        "expected fixed sanitized warning payload | received: {:?}",
+        notices[0].1
+    );
+    assert!(
+        matches!(events.last(), Some(EventKind::Completed)),
+        "expected normal terminal | received: {events:?}"
+    );
+    session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected close");
+}
+
 /// A `session/request_permission` with no params names no options, so there is nothing a host
 /// could answer. It is refused on the wire, never shown, and the turn carries on.
 #[tokio::test]

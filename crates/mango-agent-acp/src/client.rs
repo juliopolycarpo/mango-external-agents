@@ -1553,10 +1553,29 @@ async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotif
 /// an event the core cannot publish and too much for a frame that was only skipped.
 ///
 /// ```ignore
-/// on_unreadable_update(&state).await;
+/// on_unreadable_update(&state, generation, turn).await;
 /// ```
-async fn on_unreadable_update(state: &Arc<SessionState>) {
-    let Some(turn) = state.turn() else {
+async fn on_unreadable_update(
+    state: &Arc<SessionState>,
+    generation: u64,
+    turn: Option<TurnHandle>,
+) {
+    #[cfg(test)]
+    if let Some(hold) = state
+        .update_admission_hold
+        .lock()
+        .expect("expected update gate")
+        .take()
+    {
+        let _ = hold.entered.send(());
+        hold.release
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("expected update gate release within 5s");
+    }
+    if state.lock_native_session().generation != generation {
+        return;
+    }
+    let Some(turn) = turn else {
         return;
     };
     if turn.is_finished() || turn.unreadable_update_noticed.swap(true, Ordering::AcqRel) {
@@ -1832,8 +1851,19 @@ impl PeerHandler for AcpHandler {
         if method != CLIENT_METHOD_NAMES.session_update {
             return;
         }
+        // Capture the owner before decoding, including for envelopes whose update is unknown.
+        let (generation, turn, foreign) = {
+            let binding = self.state.lock_native_session();
+            let id = params.get("sessionId").and_then(serde_json::Value::as_str);
+            let foreign = id
+                .zip(binding.bound.as_ref())
+                .is_some_and(|(id, bound)| id != bound.0.as_ref());
+            (binding.generation, self.state.turn(), foreign)
+        };
         let Ok(notification) = serde_json::from_value::<SessionNotification>(params) else {
-            on_unreadable_update(&self.state).await;
+            if !foreign {
+                on_unreadable_update(&self.state, generation, turn).await;
+            }
             return;
         };
         on_session_update(&self.state, notification).await;
@@ -3167,6 +3197,93 @@ mod tests {
                 "status": "in_progress",
                 "content": [{ "type": "content", "content": { "type": "text", "text": "output" } }],
             }))
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn delayed_unreadable_update_keeps_its_admitted_turn() {
+            for replacing in [false, true] {
+                let (state, host) = state();
+                let state = Arc::new(state);
+                state.bind_native_session(agent_client_protocol_schema::v1::SessionId::new(
+                    "session-1",
+                ));
+                let old = replacing.then(|| {
+                    state
+                        .begin_turn(super::sink(&host, "old"), None)
+                        .expect("expected old turn")
+                });
+                let (entered, observed) = tokio::sync::oneshot::channel();
+                let (release, released) = std::sync::mpsc::channel();
+                *state.update_admission_hold.lock().expect("expected gate") =
+                    Some(super::super::UpdateAdmissionHold {
+                        entered,
+                        release: released,
+                    });
+                let task = tokio::spawn({
+                    let state = Arc::clone(&state);
+                    async move {
+                        let handler = super::super::AcpHandler {
+                            state,
+                            ended: mango_external_agents::CancelToken::new(),
+                        };
+                        mango_external_agents::jsonrpc::PeerHandler::on_notification(
+                            &handler,
+                            "session/update".to_owned(),
+                            serde_json::json!({"sessionId":"session-1", "update": 7}),
+                        )
+                        .await;
+                    }
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(3), observed)
+                    .await
+                    .expect("expected admission within 3s")
+                    .expect("expected observer");
+                if let Some(old) = &old {
+                    state.release_turn_matching(old);
+                }
+                let next = state
+                    .begin_turn(super::sink(&host, "next"), None)
+                    .expect("expected next turn");
+                release.send(()).expect("expected release");
+                task.await.expect("expected handler completion");
+                let noticed = next
+                    .unreadable_update_noticed
+                    .load(std::sync::atomic::Ordering::Acquire);
+                assert!(
+                    !noticed,
+                    "expected replacement warning available (replacing={replacing}): true | received: {}",
+                    !noticed
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn unidentifiable_unreadable_update_warns_its_turn() {
+            let (state, host) = state();
+            let state = Arc::new(state);
+            state.bind_native_session(agent_client_protocol_schema::v1::SessionId::new(
+                "session-1",
+            ));
+            let turn = state
+                .begin_turn(super::sink(&host, "turn"), None)
+                .expect("expected turn");
+            let handler = super::super::AcpHandler {
+                state,
+                ended: mango_external_agents::CancelToken::new(),
+            };
+            mango_external_agents::jsonrpc::PeerHandler::on_notification(
+                &handler,
+                "session/update".to_owned(),
+                serde_json::json!({"update": 7}),
+            )
+            .await;
+            let noticed = turn
+                .unreadable_update_noticed
+                .load(std::sync::atomic::Ordering::Acquire);
+            assert!(
+                noticed,
+                "expected missing-ID warning consumed: true | received: {noticed}"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
