@@ -23,7 +23,8 @@ pub const HTTP_FIELD_NAME_MAX_BYTES: usize = 65_535;
 /// that fits sixteen bits, then an optional path and query of printable ASCII.
 ///
 /// Refused: user information (`user@host`), a fragment, whitespace, control characters, any
-/// non-ASCII character (percent-encode it), and a port that is empty or out of range.
+/// non-ASCII character, and a port that is empty or out of range. Supply an ASCII host;
+/// percent-encode non-ASCII text in paths and queries.
 /// Paths also refuse `"`, `{` and `}`; bracketed hosts refuse IPv6 zone identifiers such as
 /// `[fe80::1%25eth0]`.
 ///
@@ -34,6 +35,8 @@ pub const HTTP_FIELD_NAME_MAX_BYTES: usize = 65_535;
 ///
 /// assert!(is_http_url("https://mcp.example.com/mcp?tenant=docs"));
 /// assert!(is_http_url("http://[::1]:8080/mcp"));
+/// assert!(is_http_url("https://docs.example/mcp/%C3%A4?q=%C3%A4"));
+/// assert!(!is_http_url("https://docs.ex%C3%A4mple/mcp"));
 /// assert!(!is_http_url("https://user:secret@mcp.example.com/mcp"));
 /// assert!(!is_http_url("https://mcp.example.com/mcp#section"));
 /// assert!(!is_http_url("ftp://mcp.example.com/mcp"));
