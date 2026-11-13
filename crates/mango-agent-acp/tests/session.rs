@@ -343,6 +343,68 @@ impl OpeningCatalogInterleavingAgent {
     }
 }
 
+/// An agent that sends two opening facts with a round trip between them.
+struct OpeningBudgetAgent {
+    opening_id: Mutex<Option<serde_json::Value>>,
+}
+
+impl OpeningBudgetAgent {
+    fn process() -> FakeProcess {
+        let agent = Self {
+            opening_id: Mutex::new(None),
+        };
+        FakeProcess::responding(move |line| agent.answer(line))
+    }
+
+    fn answer(&self, line: &str) -> Vec<String> {
+        let message: serde_json::Value =
+            serde_json::from_str(line).expect("expected JSON-RPC frame");
+        let id = message["id"].clone();
+        match message["method"].as_str() {
+            Some("initialize") => vec![InterleavingConfigAgent::result(
+                id,
+                serde_json::json!({
+                    "protocolVersion": 1, "agentCapabilities": {}, "authMethods": []
+                }),
+            )],
+            Some("session/new") => {
+                *self.opening_id.lock().expect("expected opening id lock") = Some(id);
+                vec![
+                    Self::fact(),
+                    serde_json::json!({"jsonrpc":"2.0", "id": 42, "method":"unsupported"})
+                        .to_string(),
+                ]
+            }
+            None if id == 42 => {
+                let opening_id = self
+                    .opening_id
+                    .lock()
+                    .expect("expected opening id lock")
+                    .take()
+                    .expect("expected session/new request");
+                vec![
+                    Self::fact(),
+                    InterleavingConfigAgent::result(
+                        opening_id,
+                        serde_json::json!({"sessionId":"new-session"}),
+                    ),
+                ]
+            }
+            method => {
+                panic!("expected initialize, session/new or response to 42 | received: {method:?}")
+            }
+        }
+    }
+
+    fn fact() -> String {
+        serde_json::json!({"jsonrpc":"2.0", "method":"session/update", "params": {
+            "sessionId":"new-session", "update": {"sessionUpdate":"available_commands_update",
+            "availableCommands":[{"name":"command", "description":"x".repeat(500)}]}
+        }})
+        .to_string()
+    }
+}
+
 /// A peer that replays stale facts, rejects loading, then opens a fresh session.
 struct FailedLoadCatalogAgent {
     opened_id: &'static str,
@@ -3917,6 +3979,52 @@ async fn opening_a_new_session_keeps_a_newer_catalog_notification() {
         .close(CloseReason::Requested)
         .await
         .expect("expected cleanup");
+}
+
+/// Opening-fact overflow returns its typed limit and reaps the agent.
+#[tokio::test]
+async fn opening_fact_overflow_refuses_session_and_reaps_child() {
+    let launcher = FakeLauncher::new();
+    launcher.push(OpeningBudgetAgent::process());
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("opening-budget-test", "1")
+        .limits(Limits {
+            turn_buffer_bytes: 1024,
+            ..Limits::default()
+        })
+        .build()
+        .expect("expected host");
+    let fact: serde_json::Value =
+        serde_json::from_str(&OpeningBudgetAgent::fact()).expect("expected fact");
+    let frame_bytes = serde_json::to_vec(&fact["params"])
+        .expect("expected encoded notification")
+        .len();
+    let result = AcpHarness::new(profile())
+        .open_session(&host, OpenSession::new("opening-budget"))
+        .await;
+    let error = match result {
+        Ok(session) => {
+            session
+                .close(CloseReason::Requested)
+                .await
+                .expect("expected cleanup of unexpectedly opened session");
+            panic!("expected opening fact limit error | received: open session");
+        }
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error.cause(), Error::LimitExceeded { subject: "bytes of opening session facts", limit: 1024, received } if *received == frame_bytes * 2),
+        "expected opening fact byte limit: 1024, received: {} | received: {error:?}",
+        frame_bytes * 2
+    );
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected live children: 0 | received: {}",
+        launcher.live_children()
+    );
 }
 
 /// A foreign notification cannot replace the opening session's configuration.
