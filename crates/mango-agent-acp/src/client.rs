@@ -1152,6 +1152,7 @@ impl SessionState {
         let settlement = pending.turn.permission_settlement.clone();
         let settlement = settlement.lock().unwrap_or_else(PoisonError::into_inner);
         if *settlement != PermissionSettlement::Open
+            || pending.turn.sink.is_terminal()
             || parked.len() >= self.limits.max_pending_requests
         {
             drop(parked);
@@ -1176,7 +1177,7 @@ impl SessionState {
         };
         let settlement = pending.turn.permission_settlement.clone();
         let settlement = settlement.lock().unwrap_or_else(PoisonError::into_inner);
-        if *settlement != PermissionSettlement::Open {
+        if *settlement != PermissionSettlement::Open || pending.turn.sink.is_terminal() {
             let pending = parked
                 .remove(id)
                 .expect("the registered permission remains locked");
@@ -1207,7 +1208,10 @@ impl SessionState {
         self.touch();
         let settlement = pending.turn.permission_settlement.clone();
         let settlement = settlement.lock().unwrap_or_else(PoisonError::into_inner);
-        if cancelling.is_some() || *settlement != PermissionSettlement::Open {
+        if cancelling.is_some()
+            || *settlement != PermissionSettlement::Open
+            || pending.turn.sink.is_terminal()
+        {
             pending.withdraw();
             return Ok(Answered::AlreadyResolved);
         }
@@ -1680,10 +1684,10 @@ async fn on_request_permission(
         // No turn: nobody is reading, and an unanswered request would hold the agent forever.
         return reply.respond(permission::cancelled());
     };
-    if turn.is_finished() {
-        // The turn's terminal has been claimed. A close handshake or prompt completion may still
-        // be draining requests. Withdrawn rather than parked or decided: nothing
-        // may grant a permission while the session is being torn down, and a reply parked now
+    if turn.is_finished() || turn.sink.is_terminal() {
+        // The turn's terminal has been claimed or committed by the stream. A close handshake or
+        // prompt completion may still be draining requests. Withdraw rather than park or decide:
+        // nothing may grant a permission while the session is being torn down, and a reply parked now
         // would be left waiting when the connection goes.
         return reply.respond(permission::cancelled());
     }

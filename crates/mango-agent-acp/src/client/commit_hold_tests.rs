@@ -1801,3 +1801,107 @@ async fn a_close_at_the_moment_of_an_exit_during_a_hold_ends_one_teardown_after_
         deadlines.close_worst_case()
     );
 }
+
+/// The prompt owner is held by this fixture after the core commits an ordinary payload overflow.
+/// Both a host choice and a later agent request must be withdrawn in that interval.
+#[tokio::test]
+async fn permissions_after_payload_overflow_are_cancelled_before_prompt_cleanup() {
+    let broker = Arc::new(RecordingBroker::new(BrokerDecision::Ask));
+    let limits = Limits {
+        turn_channel_capacity: 128,
+        ..Limits::default()
+    };
+    let Launch {
+        launcher,
+        host,
+        state,
+        agent,
+        framed,
+    } = launch_with(None, None, limits, Some(broker.clone())).await;
+    let connection = Arc::new(drive(framed, Arc::clone(&state)));
+    let (turn, mut events) = begin_turn(&host, &state);
+
+    agent.announce(ask_line(310));
+    let question = loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("expected permission event within 5s")
+            .expect("expected open stream");
+        if let EventKind::ApprovalRequested { request } = event.kind {
+            break request;
+        }
+    };
+    // The transport has room for every frame; the unread core queue has only 16 slots.
+    for index in 0..17 {
+        agent.announce(update_line(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": format!("chunk {index}") }
+        })));
+    }
+    until("core stream overflow", || turn.sink.is_terminal()).await;
+    assert_eq!(
+        events.terminal_status(),
+        Some(TerminalStatus::Failed {
+            code: mango_external_agents::ErrorCode::from_static("stream-overflow"),
+        })
+    );
+    assert!(
+        !turn.is_finished(),
+        "expected prompt cleanup held after overflow"
+    );
+    state
+        .answer(&question.allow().expect("expected allow option"))
+        .expect("expected late choice handled");
+    agent.announce(ask_line(311));
+    let replies = || {
+        launcher
+            .written()
+            .iter()
+            .filter_map(|line| {
+                let frame: serde_json::Value = serde_json::from_str(line).ok()?;
+                (frame["id"] == 310 || frame["id"] == 311).then_some(frame)
+            })
+            .collect::<Vec<_>>()
+    };
+    until("both permission replies", || {
+        replies().len() == 2 || state.pending_count() != 0
+    })
+    .await;
+    // A buggy late request may remain parked. Withdraw it to collect a diagnostic without waiting
+    // for its deadline; preserve the broker count and pending state before cleanup.
+    let pending = state.pending_count();
+    let brokered = broker.requests().len();
+    state.withdraw_pending();
+    until("both permission replies after withdrawal", || {
+        replies().len() == 2
+    })
+    .await;
+    let replies = replies();
+    let late_announcements = std::iter::from_fn(|| events.try_recv().ok())
+        .filter(|event| matches!(event.kind, EventKind::ApprovalRequested { .. }))
+        .count();
+    connection
+        .shutdown(CancelReason::Shutdown)
+        .await
+        .expect("expected shutdown");
+    let outcomes: Vec<_> = [310, 311]
+        .iter()
+        .map(|id| {
+            replies
+                .iter()
+                .find(|frame| frame["id"] == *id)
+                .expect("expected reply")["result"]["outcome"]
+                .clone()
+        })
+        .collect();
+    assert_eq!(
+        outcomes,
+        vec![serde_json::json!({"outcome":"cancelled"}); 2],
+        "expected both permission outcomes cancelled | received {outcomes:?}"
+    );
+    assert_eq!(
+        (pending, brokered, late_announcements),
+        (0, 1, 0),
+        "expected no late pending request or announcement and one preterminal broker call | received pending={pending}, broker calls={brokered}, announcements={late_announcements}"
+    );
+}
