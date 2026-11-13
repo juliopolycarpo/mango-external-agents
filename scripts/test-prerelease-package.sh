@@ -31,7 +31,7 @@ if count != 1:
     raise SystemExit(f'{path}: expected one package version, received {count}')
 path.write_text(manifest)
 PY
-(cd "${core[0]}" && cargo generate-lockfile --offline && cargo nextest run --lib --all-features --locked)
+(cd "${core[0]}" && cargo update --workspace --offline && cargo nextest run --lib --all-features --locked)
 size=$(du -sk "$target" | cut -f1)
 if [ "$size" -gt 20971520 ]; then
   echo "prerelease package target: expected at most 20 GiB, received $size KiB" >&2

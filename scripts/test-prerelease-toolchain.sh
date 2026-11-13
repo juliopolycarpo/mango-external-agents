@@ -7,6 +7,7 @@ scratch=$(mktemp -d "${TMPDIR:-/tmp}/mango-prerelease-fake.XXXXXX")
 trap 'rm -rf -- "$scratch"' EXIT
 mkdir -p "$scratch/bin" "$scratch/package/mango-external-agents-1.2.3"
 printf '[package]\nname = "mango-external-agents"\nversion = "1.2.3"\n' > "$scratch/package/mango-external-agents-1.2.3/Cargo.toml"
+printf 'core = "1.2.3"\ndependency = "1.0.151"\n' > "$scratch/package/mango-external-agents-1.2.3/Cargo.lock"
 cat > "$scratch/bin/rustup" <<'FAKE_RUSTUP'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -26,11 +27,19 @@ case "$1" in
     mkdir -p "$CARGO_TARGET_DIR/package"
     tar -czf "$CARGO_TARGET_DIR/package/mango-external-agents-1.2.3.crate" -C "$FAKE_SCRATCH/package" mango-external-agents-1.2.3
     ;;
-  generate-lockfile|nextest)
+  update|nextest)
     [ "$PWD" != "$FAKE_REPO" ] || { echo 'expected extracted package directory, received checkout' >&2; exit 1; }
     grep -qx 'version = "1.2.3-rc.1"' Cargo.toml || { echo 'expected prerelease 1.2.3-rc.1, received another manifest' >&2; exit 1; }
+    if [ "$1" = update ]; then
+      [ "$*" = 'update --workspace --offline' ] || { echo "expected cargo update --workspace --offline, received cargo $*" >&2; exit 1; }
+      sed -i 's/core = "1.2.3"/core = "1.2.3-rc.1"/' Cargo.lock
+    else
+      [ "$*" = 'nextest run --lib --all-features --locked' ] || { echo "expected cargo nextest run --lib --all-features --locked, received cargo $*" >&2; exit 1; }
+      grep -qx 'core = "1.2.3-rc.1"' Cargo.lock || { echo 'expected updated core version in Cargo.lock' >&2; exit 1; }
+      grep -qx 'dependency = "1.0.151"' Cargo.lock || { echo 'expected dependency 1.0.151 preserved in Cargo.lock' >&2; exit 1; }
+    fi
     ;;
-  *) echo "expected package, generate-lockfile or nextest, received $*" >&2; exit 1 ;;
+  *) echo "expected cargo update --workspace --offline or locked nextest, received cargo $*" >&2; exit 1 ;;
 esac
 FAKE_CARGO
 chmod +x "$scratch/bin/rustup" "$scratch/bin/cargo"
