@@ -25,10 +25,20 @@ import tomllib
 from pathlib import Path
 path = Path(sys.argv[1])
 manifest = path.read_text()
+# Cargo's normalized manifest uses one unquoted table header per line.
+headers = list(re.finditer(r'(?m)^\[.*\]$', manifest))
+package_headers = [i for i, header in enumerate(headers) if header.group() == '[package]']
+assignments = []
+if len(package_headers) == 1:
+    index = package_headers[0]
+    start = headers[index].end()
+    end = headers[index + 1].start() if index + 1 < len(headers) else len(manifest)
+    assignments = list(re.finditer(r'(?m)^version\s*=.*$', manifest[start:end]))
+if len(assignments) != 1:
+    raise SystemExit(f'{path}: expected one package version assignment, received {len(assignments)}')
 version = tomllib.loads(manifest)["package"]["version"].split("-", 1)[0].split("+", 1)[0]
-manifest, count = re.subn(r'(?m)^version = "[^"]+"$', f'version = "{version}-rc.1"', manifest, count=1)
-if count != 1:
-    raise SystemExit(f'{path}: expected one package version, received {count}')
+assignment = assignments[0]
+manifest = manifest[:start + assignment.start()] + f'version = "{version}-rc.1"' + manifest[start + assignment.end():]
 path.write_text(manifest)
 PY
 (cd "${core[0]}" && cargo update --workspace --offline && cargo nextest run --lib --all-features --locked)

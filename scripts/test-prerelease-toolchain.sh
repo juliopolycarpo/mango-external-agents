@@ -6,7 +6,7 @@ repo=$PWD
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/mango-prerelease-fake.XXXXXX")
 trap 'rm -rf -- "$scratch"' EXIT
 mkdir -p "$scratch/bin" "$scratch/package/mango-external-agents-1.2.3"
-printf '[package]\nname = "mango-external-agents"\nversion = "1.2.3"\n' > "$scratch/package/mango-external-agents-1.2.3/Cargo.toml"
+printf '[dependencies.example]\nversion = "4.5.6"\n\n[package]\nname = "mango-external-agents"\nversion = "1.2.3"\n' > "$scratch/package/mango-external-agents-1.2.3/Cargo.toml"
 printf 'core = "1.2.3"\ndependency = "1.0.151"\n' > "$scratch/package/mango-external-agents-1.2.3/Cargo.lock"
 cat > "$scratch/bin/rustup" <<'FAKE_RUSTUP'
 #!/usr/bin/env bash
@@ -29,7 +29,17 @@ case "$1" in
     ;;
   update|nextest)
     [ "$PWD" != "$FAKE_REPO" ] || { echo 'expected extracted package directory, received checkout' >&2; exit 1; }
-    grep -qx 'version = "1.2.3-rc.1"' Cargo.toml || { echo 'expected prerelease 1.2.3-rc.1, received another manifest' >&2; exit 1; }
+    python3 - <<'CHECK_MANIFEST'
+import tomllib
+from pathlib import Path
+manifest = tomllib.loads(Path('Cargo.toml').read_text())
+for label, actual, expected in (
+    ('package.version', manifest['package']['version'], '1.2.3-rc.1'),
+    ('dependencies.example.version', manifest['dependencies']['example']['version'], '4.5.6'),
+):
+    if actual != expected:
+        raise SystemExit(f'{label}: expected {expected}, received {actual}')
+CHECK_MANIFEST
     if [ "$1" = update ]; then
       [ "$*" = 'update --workspace --offline' ] || { echo "expected cargo update --workspace --offline, received cargo $*" >&2; exit 1; }
       sed -i 's/core = "1.2.3"/core = "1.2.3-rc.1"/' Cargo.lock
@@ -49,4 +59,22 @@ if [ "$(wc -l < "$FAKE_LOG")" -ne 3 ]; then
   echo "expected three cargo calls, received $(cat "$FAKE_LOG")" >&2
   exit 1
 fi
+for case_name in missing repeated; do
+  manifest="$scratch/package/mango-external-agents-1.2.3/Cargo.toml"
+  if [ "$case_name" = missing ]; then
+    sed -i '/^version = "1.2.3"$/d' "$manifest"
+    expected_count=0
+  else
+    printf 'version = "1.2.3"\nversion = "1.2.4"\n' >> "$manifest"
+    expected_count=2
+  fi
+  if PATH="$scratch/bin:$PATH" env -u RUSTUP_TOOLCHAIN scripts/test-prerelease-package.sh > "$scratch/$case_name.log" 2>&1; then
+    echo "$case_name package version: expected probe failure, received success" >&2
+    exit 1
+  fi
+  if ! grep -Fq "expected one package version assignment, received $expected_count" "$scratch/$case_name.log"; then
+    echo "$case_name package version: expected assignment count $expected_count, received $(cat "$scratch/$case_name.log")" >&2
+    exit 1
+  fi
+done
 echo 'prerelease toolchain selection passed'
