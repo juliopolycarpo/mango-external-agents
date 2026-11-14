@@ -61,7 +61,7 @@ turn loads.
 
 The Claude and Codex scheduled lanes also run `scripts/check-vendor-acp-docs.sh`. It reads two public
 Markdown pages per vendor, without a login, and fails when either names ACP (`acp` as a word, or
-"Agent Client Protocol"):
+"Agent Client Protocol") on a line the reviewed allowlist (below) does not accept:
 
 | Vendor | Pages                                                                                                                                               |
 | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -76,9 +76,20 @@ issue body for a mention is the generic failure text; the workflow log names the
 matching line. The step runs on the schedule only, so a vendor page cannot block a pull request.
 Its tests use the named fake fetcher `scripts/test-fixtures/fake-doc-curl.sh` and reach no network.
 
-An accepted mention (say, an index line about a third-party adapter) keeps the watch failing every
-Monday. Narrow `ACP_PATTERN` in the script in the same change that records the decision in
-[the ACP convergence assessment](acp-convergence.md).
+An accepted mention (say, an index line about a third-party adapter) goes in the reviewed
+allowlist, [`scripts/vendor-acp-docs-allowlist.txt`](../scripts/vendor-acp-docs-allowlist.txt), not
+in `ACP_PATTERN`. One entry per line, three fields separated by a TAB: the vendor (`claude` or
+`codex`), the exact text of the page line, and the reason the project keeps it. A Markdown table row
+carries `|` itself, which is why the separator is a TAB. The watch subtracts an entry only when it
+equals a whole line of one of that vendor's watched pages, so a reworded line, a longer line that
+contains it, or the same text under the other vendor fails again and gets a new review. Add the
+entry in the same change that records the decision in [the ACP convergence assessment](acp-convergence.md).
+
+An entry that no watched page carries any more is stale. The watch fails on it, exit 1, and names it
+in the workflow log, so the weekly issue asks for the entry to be deleted; a dead entry would
+otherwise excuse the line if it came back. The stale check is skipped when a page could not be read
+(exit 2), because that page may still carry the line. A malformed entry, an unknown vendor or an
+empty reason exits 2 before any page is read.
 
 The watch sees a documented ACP mode before a release ships it, which the help diff cannot. The help
 diff still catches a flag that ships undocumented.
