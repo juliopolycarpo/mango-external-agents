@@ -22,8 +22,8 @@ use mango_agent_codex::{CodexHarness, MINIMUM_CODEX_VERSION};
 use mango_external_agents::event::EventKind;
 use mango_external_agents::testing::FakeLauncher;
 use mango_external_agents::{
-    CancelReason, CloseReason, Dispatch, Error, Harness, HostContext, OpenSession, SessionStatus,
-    TransportKind, TurnRequest,
+    CancelReason, CancelToken, CloseReason, Dispatch, Error, Harness, HostContext, OpenSession,
+    SessionStatus, TransportKind, TurnRequest,
 };
 use serde_json::{Value, json};
 use support::{Transcript, workspace_path};
@@ -759,4 +759,110 @@ async fn closing_while_the_server_has_stopped_reading_still_detaches() {
         "expected the attachment to be ended, close returned {closed:?}"
     );
     server.until_disconnections(1).await;
+}
+
+/// A listener that accepts a connection and never answers the upgrade: the dial is stuck until its
+/// own deadline unless something else ends it.
+struct FakeSocketThatNeverUpgrades {
+    /// Held so the socket's directory outlives the test.
+    _directory: tempfile::TempDir,
+    path: PathBuf,
+    accepted: Arc<Notify>,
+}
+
+impl FakeSocketThatNeverUpgrades {
+    fn start() -> Self {
+        let directory = tempfile::Builder::new()
+            .prefix("mea-")
+            .tempdir()
+            .expect("expected a temporary directory");
+        let path = directory.path().join("app-server.sock");
+        let listener = UnixListener::bind(&path).expect("expected a listener");
+        let accepted = Arc::new(Notify::new());
+        let signal = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            signal.notify_one();
+            // Holds the connection open, without a byte, past every deadline in the test.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(stream);
+        });
+        Self {
+            _directory: directory,
+            path,
+            accepted,
+        }
+    }
+}
+
+/// The host's cancel ends a dial that is waiting on the server, as `Cancelled` and not as the
+/// `request_timeout` it would otherwise sit out, and nothing was submitted.
+#[tokio::test]
+async fn cancelling_the_host_during_the_dial_is_cancelled_not_a_timeout() {
+    let server = FakeSocketThatNeverUpgrades::start();
+    let cancel = CancelToken::new();
+    let host = HostContext::builder()
+        .launcher(Arc::new(FakeLauncher::new()))
+        .cwd(workspace_path())
+        .client_info("mango-test", "0.0.1")
+        .cancel(cancel.clone())
+        .limits(mango_external_agents::Limits {
+            request_timeout: Duration::from_secs(30),
+            ..mango_external_agents::Limits::default()
+        })
+        .build()
+        .expect("expected a host");
+    let harness = CodexHarness::new().with_unix_socket(&server.path);
+
+    let opening = tokio::spawn(async move {
+        harness
+            .open_session(&host, over_socket("chat-1"))
+            .await
+            .map(|_| ())
+    });
+    server.accepted.notified().await;
+    cancel.cancel();
+
+    let error = tokio::time::timeout(Duration::from_secs(2), opening)
+        .await
+        .expect(
+            "expected the open to end within 2s of the cancel, well before request_timeout (30s)",
+        )
+        .expect("expected the open task to finish")
+        .expect_err("expected a refusal, received a session");
+    assert!(
+        matches!(error.cause(), Error::Cancelled { .. }),
+        "expected Cancelled, received {error:?}"
+    );
+    assert_eq!(error.dispatch(), Dispatch::NotSubmitted);
+}
+
+/// A host that was cancelled before the open never dials the server.
+#[tokio::test]
+async fn a_host_cancelled_before_the_open_never_dials() {
+    let server = FakeAppServerSocket::replaying_turn();
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let host = HostContext::builder()
+        .launcher(Arc::new(FakeLauncher::new()))
+        .cwd(workspace_path())
+        .client_info("mango-test", "0.0.1")
+        .cancel(cancel)
+        .build()
+        .expect("expected a host");
+
+    let error = server
+        .harness()
+        .open_session(&host, over_socket("chat-1"))
+        .await
+        .err()
+        .expect("expected a refusal, received a session");
+    assert!(
+        matches!(error.cause(), Error::Cancelled { .. }),
+        "expected Cancelled, received {error:?}"
+    );
+    assert_eq!(error.dispatch(), Dispatch::NotSubmitted);
+    assert_eq!(server.connections.load(Ordering::SeqCst), 0);
 }

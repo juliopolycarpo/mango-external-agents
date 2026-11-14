@@ -1160,7 +1160,9 @@ surface has no Windows equivalent.
   host's server may keep running that turn. The turn's stream reports `Cancelled` with the reason
   either way; it records what this side did, not what the server did next.
 - **Limits.** Connect plus upgrade is bounded by `Limits::request_timeout`; a server that accepts
-  and never answers is `Error::Timeout`. Messages are capped at `Limits::line.max_line_bytes`
+  and never answers is `Error::Timeout`. The host's cancel token ends the dial sooner: it is
+  `Error::Cancelled` with `Dispatch::NotSubmitted`, and a token cancelled before the open never
+  connects. Messages are capped at `Limits::line.max_line_bytes`
   after decoding, so the reducer's three-times bound is never the one that binds on this transport.
 - **Refusal shapes.** A missing path, a path that is relative or too long, a server of another
   user, and a `401` or `403` are `Error::HostConfiguration`. A socket nobody listens on is `Error::Link` naming the

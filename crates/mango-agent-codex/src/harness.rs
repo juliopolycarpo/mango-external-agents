@@ -325,15 +325,21 @@ impl CodexHarness {
                     }
                     .with_dispatch(Dispatch::NotSubmitted)
                 })?;
-                if host.cancel().is_cancelled() {
-                    return Err(Error::Cancelled {
-                        reason: mango_external_agents::CancelReason::Shutdown,
+                // Raced against the host's cancel, not checked once before: a server that accepts
+                // and never answers the upgrade would otherwise hold the open for the whole
+                // `request_timeout`. Biased, so a cancel that already happened never dials. The
+                // open future is dropped on cancel, which closes the half-open connection.
+                let opened = tokio::select! {
+                    biased;
+                    () = host.cancel().cancelled() => {
+                        return Err(Error::Cancelled {
+                            reason: mango_external_agents::CancelReason::Shutdown,
+                        }
+                        .with_dispatch(Dispatch::NotSubmitted));
                     }
-                    .with_dispatch(Dispatch::NotSubmitted));
-                }
-                let opened = unix_socket::open(spec, host.limits())
-                    .await
-                    .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+                    opened = unix_socket::open(spec, host.limits()) => opened
+                        .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?,
+                };
                 Ok((opened.link, opened.control))
             }
             other => Err(Error::UnsupportedTransport {
