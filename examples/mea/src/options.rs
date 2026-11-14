@@ -657,6 +657,9 @@ pub(crate) struct CaptureOptions {
     pub workspace: Option<PathBuf>,
     #[arg(long)]
     pub transcripts: bool,
+    /// The Codex model id every transcript conversation opens its thread with.
+    #[arg(long)]
+    pub model: Option<String>,
     #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(crate::capture::scenario_names()))]
     pub scenario: Option<String>,
 }
@@ -688,6 +691,21 @@ impl CaptureOptions {
             return Err(format!(
                 "expected a Codex transcript capture for --scenario, received {selected} without transcript selection"
             ));
+        }
+        if let Some(model) = &self.model {
+            model_id("capture", model)?;
+            let transcript =
+                selected == HarnessChoice::Codex && (self.legacy.is_some() || self.transcripts);
+            if !transcript {
+                let received = if selected == HarnessChoice::Codex {
+                    format!("--model {model:?} with --harness codex without --transcripts")
+                } else {
+                    format!("--model {model:?} with --harness {selected}")
+                };
+                return Err(format!(
+                    "(mea capture): expected --model with a Codex transcript capture (--harness codex --transcripts or `codex`) | received {received}"
+                ));
+            }
         }
         Ok(selected)
     }
@@ -748,6 +766,76 @@ mod capture_tests {
                 assert_eq!(options.scenario.as_deref(), Some(name));
             }
         }
+    }
+
+    fn capture_arguments(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_model_is_accepted_for_both_spellings_of_a_codex_transcript_capture() {
+        for words in [
+            vec![
+                "--harness",
+                "codex",
+                "--transcripts",
+                "--model",
+                "gpt-5.2-codex",
+            ],
+            vec!["codex", "--model", "gpt-5.2-codex"],
+        ] {
+            let options = CaptureOptions::parse(&capture_arguments(&words))
+                .expect("expected the capture arguments to parse");
+            assert_eq!(options.kind(), Ok(HarnessChoice::Codex));
+            assert_eq!(options.model.as_deref(), Some("gpt-5.2-codex"));
+        }
+        let without = CaptureOptions::parse(&capture_arguments(&["codex"]))
+            .expect("expected a capture without --model");
+        assert_eq!(without.model, None);
+    }
+
+    #[test]
+    fn a_model_is_refused_where_no_codex_transcript_would_use_it() {
+        for (words, received) in [
+            (
+                vec!["--harness", "codex", "--model", "gpt-5.2-codex"],
+                "--model \"gpt-5.2-codex\" with --harness codex without --transcripts",
+            ),
+            (
+                vec!["--model", "gpt-5.2-codex"],
+                "--model \"gpt-5.2-codex\" with --harness codex without --transcripts",
+            ),
+            (
+                vec!["--harness", "claude", "--model", "gpt-5.2-codex"],
+                "--model \"gpt-5.2-codex\" with --harness claude",
+            ),
+            (
+                vec!["--harness", "acp:cursor", "--model", "gpt-5.2-codex"],
+                "--model \"gpt-5.2-codex\" with --harness acp:cursor",
+            ),
+        ] {
+            let refused = CaptureOptions::parse(&capture_arguments(&words))
+                .and_then(|options| options.kind());
+            assert_eq!(
+                refused.err(),
+                Some(format!(
+                    "(mea capture): expected --model with a Codex transcript capture (--harness codex --transcripts or `codex`) | received {received}"
+                )),
+                "expected {words:?} to be refused with the value it received"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_capture_model_is_refused_with_the_value_it_received() {
+        let refused = CaptureOptions::parse(&capture_arguments(&["codex", "--model", ""]))
+            .and_then(|options| options.kind());
+        assert_eq!(
+            refused.err(),
+            Some(String::from(
+                "(mea capture): expected --model as a nonempty, bounded model id without surrounding spaces or control characters | received \"\""
+            ))
+        );
     }
 }
 

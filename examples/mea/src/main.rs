@@ -146,10 +146,10 @@ fn print_banner() {
         "       mea turn [--harness claude|codex|acp:<profile>] [--profile ID] [--transport stdio|websocket|unix-socket|acp] [--socket PATH] [--model ID] [--cwd DIR] [--json] [--level read-only|default|full-access] [--cancel-after SECONDS] <prompt>"
     );
     println!(
-        "       mea capture --harness claude|codex|acp[:profile] [--profile ID] [--out DIR] [--workspace DIR] [--transcripts]"
+        "       mea capture --harness claude|codex|acp[:profile] [--profile ID] [--out DIR] [--workspace DIR] [--transcripts [--model ID]]"
     );
     println!(
-        "       mea capture codex [--scenario NAME] [--out DIR] [--workspace DIR] (archival transcripts)"
+        "       mea capture codex [--scenario NAME] [--model ID] [--out DIR] [--workspace DIR] (archival transcripts)"
     );
     println!(
         "       mea digests [--out DIR] [--check] (rewrite or verify capture manifest digests)"
@@ -422,7 +422,13 @@ async fn capture(arguments: &[String]) -> Result<(), String> {
     let workspace = workspace::CaptureWorkspace::new(options.workspace)?;
     let result = match &kind {
         HarnessChoice::Codex if options.legacy.is_some() || options.transcripts => {
-            capture::codex(&out, &workspace.path, options.scenario.as_deref()).await
+            capture::codex(
+                &out,
+                &workspace.path,
+                options.scenario.as_deref(),
+                options.model.as_deref(),
+            )
+            .await
         }
         HarnessChoice::Codex => capture::codex_contract(&out, &workspace.path).await,
         HarnessChoice::Claude => capture::claude(&out, &workspace.path).await,
