@@ -1741,6 +1741,143 @@ async fn a_turn_whose_child_cannot_be_stopped_leaves_only_an_incomplete_diagnost
     }
 }
 
+#[tokio::test]
+async fn a_schema_capture_hands_the_verbatim_answer_notice_to_the_operator_once() {
+    let facts = MachineFacts::new();
+    let out = tempfile::tempdir().expect("expected an output directory");
+    let notices = RecordedNotices::default();
+
+    capture_noticed(
+        scripted_cli(answered_turn_lines(&facts)),
+        out.path(),
+        &facts,
+        Some(SCHEMA),
+        None,
+        &notices,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("expected the capture to qualify, received {error}"));
+
+    let expected = verbatim_answer_notice(STRUCTURED_OUTPUT);
+    let received: Vec<String> = notices
+        .recorded()
+        .into_iter()
+        .filter(|notice| notice.contains("kept verbatim"))
+        .collect();
+    assert_eq!(
+        received,
+        vec![expected],
+        "expected the verbatim-answer notice exactly once for a schema turn"
+    );
+}
+
+#[tokio::test]
+async fn the_verbatim_answer_notice_reaches_the_operator_before_a_refusal_ends_the_capture() {
+    let facts = MachineFacts::new();
+    let out = tempfile::tempdir().expect("expected an output directory");
+    let cli = Arc::new(
+        FakeClaudeCli::new()
+            .with_help(HELP_WITH_JSON_SCHEMA)
+            .with_auth(SIGNED_OUT),
+    );
+    let notices = RecordedNotices::default();
+
+    capture_noticed(cli, out.path(), &facts, Some(SCHEMA), None, &notices)
+        .await
+        .expect_err("expected a signed-out CLI to be refused");
+
+    assert_eq!(
+        notices.recorded(),
+        vec![verbatim_answer_notice(STRUCTURED_OUTPUT)],
+        "expected the notice the operator reads before committing, even for a refused capture"
+    );
+}
+
+#[tokio::test]
+async fn a_capture_refused_for_want_of_a_schema_says_nothing_about_a_verbatim_answer() {
+    let facts = MachineFacts::new();
+    let out = tempfile::tempdir().expect("expected an output directory");
+    let notices = RecordedNotices::default();
+
+    capture_noticed(
+        Arc::new(FakeLauncher::new()),
+        out.path(),
+        &facts,
+        None,
+        None,
+        &notices,
+    )
+    .await
+    .expect_err("expected a missing schema to be refused");
+
+    assert_eq!(
+        notices.recorded(),
+        Vec::<String>::new(),
+        "expected no verbatim-answer notice for a capture that runs under no schema"
+    );
+}
+
+/// A CLI whose turn launch fails with a vendor refusal and leaves behind a child that cannot be
+/// stopped, so the capture's cleanup fails after its conversation did. Probes run as on the shared
+/// fake.
+struct RefusedTurnWithUnstoppableChildCli {
+    cli: Arc<FakeClaudeCli>,
+}
+
+#[async_trait::async_trait]
+impl ProcessLauncher for RefusedTurnWithUnstoppableChildCli {
+    async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
+        let turn = is_turn_launch(&spec.argv);
+        let process = self.cli.spawn(spec).await?;
+        if !turn {
+            return Ok(process);
+        }
+        Err(Error::CleanupRequired {
+            control: Arc::new(UnstoppableControl {
+                inner: process.control,
+            }),
+            source: Box::new(FakeVendorFailure::error()),
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_failed_turn_and_a_failed_cleanup_hand_the_vendor_message_to_the_operator() {
+    let facts = MachineFacts::new();
+    let out = tempfile::tempdir().expect("expected an output directory");
+    let cli = Arc::new(RefusedTurnWithUnstoppableChildCli {
+        cli: scripted_cli(vec![String::from(r#"{"type":"result","is_error":false}"#)]),
+    });
+    let notices = RecordedNotices::default();
+
+    let error = capture_noticed(cli, out.path(), &facts, Some(SCHEMA), None, &notices)
+        .await
+        .expect_err("expected a refused turn with an unstoppable child to fail the capture");
+
+    assert!(
+        error.cleanup_control().is_some(),
+        "expected the capture to fail with its process cleanup still owed | received: {error:?}"
+    );
+    let primary: Vec<String> = notices
+        .recorded()
+        .into_iter()
+        .filter(|notice| notice.contains("capture failed before cleanup"))
+        .collect();
+    assert_eq!(
+        primary.len(),
+        1,
+        "expected one primary-failure line | received: {:?}",
+        notices.recorded()
+    );
+    assert!(
+        primary[0].starts_with("claude/structured-output: capture failed before cleanup: ")
+            && primary[0].contains(FakeVendorFailure::CODE)
+            && primary[0].contains(FakeVendorFailure::MESSAGE),
+        "expected the scenario, then the vendor code and message of the failed turn | received: {:?}",
+        primary[0]
+    );
+}
+
 /// Which interaction a [`PromptingSession`] raises when its turn starts.
 #[derive(Clone, Copy)]
 enum Prompt {
