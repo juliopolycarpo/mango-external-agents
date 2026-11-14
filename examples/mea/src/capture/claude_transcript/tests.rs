@@ -2013,9 +2013,10 @@ fn the_pinned_stream_reports_no_member_this_build_has_not_reviewed() {
     let drift = drift_over(&answered_turn_lines(&facts));
 
     assert!(
-        drift.unseen.is_empty(),
-        "expected no unseen string member in the pinned stream | received: {:?}",
-        drift.unseen
+        drift.unseen.is_empty() && drift.retained.is_empty(),
+        "expected no unseen member in the pinned stream | received strings: {:?} retained: {:?}",
+        drift.unseen,
+        drift.retained
     );
 }
 
@@ -2062,14 +2063,16 @@ fn a_member_a_name_rule_hides_and_a_schema_property_are_not_drift() {
              "input": {"schemaProperty": "mango", "by_type": "mango"}}]}}),
         json!({"type": "system", "subtype": "init", "session_id": SESSION_ID,
                "cwd": facts.cwd, NOVEL_INIT_MEMBER: null}),
+        json!({"type": "result", NOVEL_NUMBER_MEMBER: null}),
     ]));
 
     assert!(
-        drift.denied.is_empty() && drift.unseen.is_empty(),
+        drift.denied.is_empty() && drift.unseen.is_empty() && drift.retained.is_empty(),
         "expected a name-rule member, an answer property and a null to add no name | received \
-         denied: {:?} unseen: {:?}",
+         denied: {:?} unseen: {:?} retained: {:?}",
         drift.denied,
-        drift.unseen
+        drift.unseen,
+        drift.retained
     );
 }
 
@@ -2106,12 +2109,13 @@ fn a_report_escapes_a_hostile_name_and_cuts_a_long_one() {
     let mut drift = DriftReport::default();
     drift.note_denied("bell\u{7}\nline\u{1b}[2J");
     drift.note_unseen(&"x".repeat(DRIFT_NAME_CHARS + 10));
+    drift.note_retained("count\u{1b}]0;title\u{7}");
 
     let lines = drift.lines(STRUCTURED_OUTPUT);
 
     assert_eq!(
         lines.len(),
-        2,
+        3,
         "expected one line per kind | received: {lines:?}"
     );
     assert!(
@@ -2124,6 +2128,11 @@ fn a_report_escapes_a_hostile_name_and_cuts_a_long_one() {
             && !lines[1].contains(&"x".repeat(DRIFT_NAME_CHARS + 1)),
         "expected a name cut at {DRIFT_NAME_CHARS} characters | received: {:?}",
         lines[1]
+    );
+    assert!(
+        lines[2].contains("count\\u001b]0;title\\u0007"),
+        "expected the retained name written as visible escapes | received: {:?}",
+        lines[2]
     );
     for line in &lines {
         assert!(
@@ -2152,12 +2161,14 @@ fn a_report_line_names_the_scenario_and_the_kind() {
     let mut drift = DriftReport::default();
     drift.note_denied("tools");
     drift.note_unseen("novel");
+    drift.note_retained("counts");
 
     assert_eq!(
         drift.lines(STRUCTURED_OUTPUT),
         vec![
             "claude/structured-output: members replaced by the deny-by-default rule (1): tools; review them against the lists in claude_transcript.rs".to_owned(),
             "claude/structured-output: members not seen before, their strings replaced (1): novel; review them against the lists in claude_transcript.rs".to_owned(),
+            "claude/structured-output: members not seen before, their numbers, booleans and objects kept (1): counts; review them against the lists in claude_transcript.rs".to_owned(),
         ]
     );
 }
@@ -2217,11 +2228,12 @@ fn the_committed_claude_transcripts_report_no_member_outside_the_reviewed_lists(
     let drift = drift_over(&committed_transcript_lines());
 
     assert!(
-        drift.denied.is_empty() && drift.unseen.is_empty(),
+        drift.denied.is_empty() && drift.unseen.is_empty() && drift.retained.is_empty(),
         "expected the committed transcripts to need no new reviewed member | received denied: {:?} \
-         unseen: {:?}",
+         unseen: {:?} retained: {:?}",
         drift.denied,
-        drift.unseen
+        drift.unseen,
+        drift.retained
     );
 }
 
@@ -2245,4 +2257,182 @@ fn a_report_holds_the_key_as_the_transcript_writes_it_not_the_raw_name() {
             .any(|notice| notice.contains(redact::PLACEHOLDER)),
         "expected the redacted model-id key to be what the report holds | received: {notices:?}"
     );
+}
+
+/// A number member no review has seen, with a value that must never reach a notice.
+const NOVEL_NUMBER_MEMBER: &str = "novelCounter";
+/// A map keyed by names a user chose, as `by_type` is, under a member no review has seen.
+const NOVEL_MAP_MEMBER: &str = "novelCountsByKind";
+/// A key of that map, which names something the user defined.
+const USER_CHOSEN_KEY: &str = "my-private-agent-6207";
+/// The count under [`USER_CHOSEN_KEY`] and the numbers beside it; none may reach a notice.
+const NOVEL_COUNT: u64 = 7_390_421;
+
+fn retained_names(lines: &[Value]) -> Vec<String> {
+    drift_over(&lines_of(lines)).retained.into_iter().collect()
+}
+
+#[test]
+fn a_new_number_boolean_or_object_member_is_reported_by_name_and_never_by_value() {
+    let names = retained_names(&[json!({"type": "result",
+        NOVEL_NUMBER_MEMBER: NOVEL_COUNT,
+        "novelFlag": true,
+        "novelGroup": {"reviewedLater": false}})]);
+
+    assert_eq!(
+        names,
+        vec![
+            NOVEL_NUMBER_MEMBER,
+            "novelFlag",
+            "novelGroup",
+            "reviewedLater"
+        ],
+        "expected the name of every retained non-string member outside REVIEWED_RETAINED_MEMBERS"
+    );
+    let drift = drift_over(&lines_of(&[
+        json!({"type": "result", NOVEL_NUMBER_MEMBER: NOVEL_COUNT}),
+    ]));
+    assert_no_value_in(&drift.lines(STRUCTURED_OUTPUT), &[&NOVEL_COUNT.to_string()]);
+}
+
+#[test]
+fn a_map_of_counts_keyed_by_user_chosen_names_reports_the_map_and_its_keys() {
+    let names = retained_names(&[json!({"type": "result",
+        NOVEL_MAP_MEMBER: {USER_CHOSEN_KEY: NOVEL_COUNT, "other-kind": {"count": 2}}})]);
+
+    for expected in [NOVEL_MAP_MEMBER, USER_CHOSEN_KEY, "other-kind"] {
+        assert!(
+            names.iter().any(|name| name == expected),
+            "expected the map name and its keys in the report | missing: {expected:?} | received: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn a_member_that_is_a_number_in_an_array_is_reported_once_under_the_array_member_name() {
+    let names = retained_names(&[json!({"type": "result",
+        "novelSeries": [1, 2, 3], "novelRecords": [{"count": 1}, {"count": 2}]})]);
+
+    assert_eq!(
+        names,
+        vec!["count", "novelRecords", "novelSeries"],
+        "expected each array member name once, whatever the item count"
+    );
+}
+
+#[test]
+fn a_retained_number_inside_the_models_answer_is_the_schemas_own_and_not_reported() {
+    let names = retained_names(&[
+        json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "StructuredOutput",
+             "input": {"schemaCounter": 1, "schemaFlag": true, "schemaGroup": {"nested": 2}}}]}}),
+        json!({"type": "result", "structured_output": {
+            "schemaCounter": 1, "schemaGroup": {"nested": 2, "deeper": {"leaf": 3}}},
+            "wire_tool_inputs": {"toolu_1": {"schemaCounter": 1}}}),
+    ]);
+
+    assert!(
+        names.is_empty(),
+        "expected no answer member in the report | received: {names:?}"
+    );
+}
+
+#[test]
+fn a_denied_number_or_object_is_replaced_and_not_reported_as_retained() {
+    let facts = MachineFacts::new();
+    let names = retained_names(&[
+        json!({"type": "result", "resetsAt": CANARY_RESET_AT,
+            "subagent_stats": {"by_type": {USER_CHOSEN_KEY: {"count": NOVEL_COUNT}}}}),
+        json!({"type": "system", "subtype": "init", "session_id": SESSION_ID, "cwd": facts.cwd,
+            NOVEL_INIT_MEMBER: {"nested": NOVEL_COUNT}}),
+    ]);
+
+    assert_eq!(
+        names,
+        vec!["subagent_stats"],
+        "expected only the retained parent of a denied map | received: {names:?} | the denied \
+         values are placeholders, so neither their names nor their keys can appear"
+    );
+}
+
+#[test]
+fn a_model_keyed_usage_entry_adds_no_name_and_its_counters_are_reviewed_ones() {
+    let arn = "arn:aws:bedrock:us-east-1:111122223333:inference-profile/novel";
+    let names = retained_names(&[json!({"type": "result", "modelUsage": {
+        "claude-sonnet-5": {"inputTokens": 1, "outputTokens": 2},
+        arn: {"inputTokens": 3}}})]);
+
+    assert!(
+        names.is_empty(),
+        "expected a model id key to be data and not a member name | received: {names:?}"
+    );
+}
+
+#[test]
+fn a_retained_member_name_is_reported_as_the_transcript_writes_it() {
+    let facts = MachineFacts::new();
+    let home_keyed = format!("{}/novel-counter", facts.home);
+    let drift = drift_over(&lines_of(&[
+        json!({"type": "result", home_keyed.clone(): 1}),
+    ]));
+
+    let notices = drift.lines(STRUCTURED_OUTPUT);
+    assert_no_value_in(&notices, &[facts.home.as_str()]);
+    assert!(
+        drift
+            .retained
+            .iter()
+            .all(|name| !name.contains(&facts.home))
+            && !drift.retained.is_empty(),
+        "expected the home directory rewritten in the retained name | received: {:?}",
+        drift.retained
+    );
+}
+
+#[test]
+fn the_reviewed_retained_members_are_sorted_and_unique() {
+    let mut sorted = REVIEWED_RETAINED_MEMBERS.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        REVIEWED_RETAINED_MEMBERS,
+        sorted.as_slice(),
+        "expected the reviewed list sorted without a repeat"
+    );
+}
+
+#[tokio::test]
+async fn a_capture_names_a_novel_retained_member_on_its_notices_and_never_its_value() {
+    let facts = MachineFacts::new();
+    let out = tempfile::tempdir().expect("expected an output directory");
+    let mut lines = answered_turn_lines(&facts);
+    lines.insert(
+        2,
+        json!({"type": "assistant", NOVEL_MAP_MEMBER: {USER_CHOSEN_KEY: NOVEL_COUNT},
+            "message": {"id": "msg_0", "role": "assistant", "content": []}})
+        .to_string(),
+    );
+    let notices = RecordedNotices::default();
+
+    capture_noticed(
+        scripted_cli(lines),
+        out.path(),
+        &facts,
+        Some(SCHEMA),
+        None,
+        &notices,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("expected the capture to qualify, received {error}"));
+
+    let recorded = notices.recorded();
+    assert!(
+        recorded
+            .iter()
+            .any(|notice| notice.contains(NOVEL_MAP_MEMBER)
+                && notice.contains(USER_CHOSEN_KEY)
+                && notice.contains("numbers, booleans and objects kept")),
+        "expected the retained map and its key in a drift notice | received: {recorded:?}"
+    );
+    assert_no_value_in(&recorded, &[&NOVEL_COUNT.to_string()]);
 }

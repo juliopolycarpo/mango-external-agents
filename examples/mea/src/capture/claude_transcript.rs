@@ -680,6 +680,7 @@ fn redact_value(
 ) -> Value {
     match value {
         Value::Object(members) => {
+            note_retained_member(member, context, paths, drift);
             let tool_call = matches!(
                 members.get("type").and_then(Value::as_str),
                 Some("tool_use" | "server_tool_use")
@@ -765,7 +766,34 @@ fn redact_value(
                 placeholder()
             }
         },
-        other => other,
+        // A number or a boolean is kept as is; a null carries nothing and has no name to review.
+        other => {
+            if !other.is_null() {
+                note_retained_member(member, context, paths, drift);
+            }
+            other
+        }
+    }
+}
+
+/// Notes the name of a retained number, boolean or object member that no review has seen.
+///
+/// Called for every non-string value the walk keeps. A member that is denied never gets here, and
+/// neither does anything inside the model's answer, whose members are the schema's own. A value
+/// under a model-keyed map sits at a model id, which is data and not a member name.
+fn note_retained_member(
+    member: Option<&str>,
+    context: ValueContext,
+    paths: Paths<'_>,
+    drift: &mut DriftReport,
+) {
+    if let Some(member) = member
+        && !context.answer
+        && !context.model_key
+        && !REVIEWED_RETAINED_MEMBERS.contains(&member)
+    {
+        // As the transcript writes the key, so the report holds nothing the file does not.
+        drift.note_retained(&redact::rewrite_paths(member, paths));
     }
 }
 
@@ -830,6 +858,65 @@ const REVIEWED_REDACTED_STRING_MEMBERS: &[&str] = &[
     "version",
 ];
 
+/// Number, boolean and object members the committed Claude transcripts under
+/// `fixtures/claude/transcripts/` already show and that the recorder keeps, so they are expected
+/// and not reported as new. A number or a boolean is written as the CLI gave it, and an object is
+/// walked into, so a name that is not here is one no review has seen: a map keyed by names a user
+/// chose would show up as its member name and the keys inside it. A name here records that it is
+/// understood, not that every value under it is safe. Sorted.
+const REVIEWED_RETAINED_MEMBERS: &[&str] = &[
+    "cacheCreationInputTokens",
+    "cacheReadInputTokens",
+    "cache_creation",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "caller",
+    "content",
+    "content_block",
+    "contextWindow",
+    "context_management",
+    "costUSD",
+    "delta",
+    "duration_api_ms",
+    "duration_ms",
+    "ephemeral_1h_input_tokens",
+    "ephemeral_5m_input_tokens",
+    "estimated_tokens",
+    "estimated_tokens_delta",
+    "event",
+    "file",
+    "index",
+    "inputTokens",
+    "input_tokens",
+    "is_error",
+    "iterations",
+    "maxOutputTokens",
+    "message",
+    "modelUsage",
+    "numLines",
+    "num_turns",
+    "outputTokens",
+    "output_tokens",
+    "output_tokens_details",
+    "permission_denials",
+    "plugins",
+    "server_tool_use",
+    "startLine",
+    "thinking_tokens",
+    "time_to_request_ms",
+    "tool_input",
+    "tool_result_meta",
+    "tool_use_result",
+    "totalLines",
+    "total_cost_usd",
+    "ttft_ms",
+    "ttft_stream_ms",
+    "usage",
+    "webSearchRequests",
+    "web_fetch_requests",
+    "web_search_requests",
+];
+
 /// How many names of each kind the drift report prints before it only counts the rest.
 const DRIFT_NAMES_SHOWN: usize = 12;
 
@@ -849,6 +936,9 @@ struct DriftReport {
     /// Members whose string the default rule replaced and that [`REVIEWED_REDACTED_STRING_MEMBERS`]
     /// does not list.
     unseen: BTreeSet<String>,
+    /// Members whose number, boolean or object the recorder kept and that
+    /// [`REVIEWED_RETAINED_MEMBERS`] does not list.
+    retained: BTreeSet<String>,
 }
 
 impl DriftReport {
@@ -860,6 +950,10 @@ impl DriftReport {
         self.unseen.insert(name.to_owned());
     }
 
+    fn note_retained(&mut self, name: &str) {
+        self.retained.insert(name.to_owned());
+    }
+
     /// One line per kind that is not empty. Each gives the count of distinct names and the first
     /// [`DRIFT_NAMES_SHOWN`] of them in sorted order, every name escaped for a terminal and cut at
     /// [`DRIFT_NAME_CHARS`] characters.
@@ -869,6 +963,10 @@ impl DriftReport {
             (
                 "members not seen before, their strings replaced",
                 &self.unseen,
+            ),
+            (
+                "members not seen before, their numbers, booleans and objects kept",
+                &self.retained,
             ),
         ]
         .into_iter()
