@@ -14,6 +14,35 @@ use mango_external_agents::{
 
 use super::*;
 
+/// [`super::redact_line`] for a test that does not read the drift report.
+fn redact_line(raw: &str, paths: Paths<'_>) -> Option<String> {
+    super::redact_line(raw, paths, &mut DriftReport::default())
+}
+
+/// Collects the notices a capture hands to the operator, in place of stderr.
+#[derive(Default)]
+struct RecordedNotices {
+    lines: Mutex<Vec<String>>,
+}
+
+impl CaptureNotices for RecordedNotices {
+    fn notice(&self, line: &str) {
+        self.lines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(line.to_owned());
+    }
+}
+
+impl RecordedNotices {
+    fn recorded(&self) -> Vec<String> {
+        self.lines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
 /// A signed-in `claude` whose help declares `--json-schema`, playing `turn_lines` for its one
 /// turn and refusing any turn past it, so a second launch fails naming its argv.
 fn scripted_cli(turn_lines: Vec<String>) -> Arc<FakeClaudeCli> {
@@ -166,11 +195,32 @@ async fn capture_on_model(
     schema: Option<&str>,
     model: Option<&str>,
 ) -> Result<()> {
+    capture_noticed(
+        launcher,
+        out_dir,
+        facts,
+        schema,
+        model,
+        &RecordedNotices::default(),
+    )
+    .await
+}
+
+/// Runs `structured-output` over a scripted CLI and hands its notices to `notices`.
+async fn capture_noticed(
+    launcher: Arc<dyn ProcessLauncher>,
+    out_dir: &Path,
+    facts: &MachineFacts,
+    schema: Option<&str>,
+    model: Option<&str>,
+    notices: &RecordedNotices,
+) -> Result<()> {
     let tap = TurnLineTap::over(launcher);
     let host = host_over(tap.clone());
     claude_with(
         &host,
         &tap,
+        notices,
         out_dir,
         STRUCTURED_OUTPUT,
         schema,
@@ -1595,6 +1645,7 @@ async fn an_unknown_scenario_is_refused_with_the_name_it_received() {
     let error = claude_with(
         &host,
         &tap,
+        &RecordedNotices::default(),
         out.path(),
         "handshake",
         Some(SCHEMA),
@@ -1832,4 +1883,366 @@ async fn a_question_fails_the_capture_unanswered() {
         other => panic!("expected Error::Protocol for a question | received: {other:?}"),
     }
     assert_eq!(replies, 0, "expected no answer sent by the recorder");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The drift report
+// ---------------------------------------------------------------------------------------------
+
+/// A member of an ordinary record that no review has seen. The vendor names it, so the name is
+/// what a maintainer needs; the value is what is private.
+const NOVEL_STRING_MEMBER: &str = "novelVendorNote";
+/// A value for [`NOVEL_STRING_MEMBER`]; it must never reach a notice.
+const NOVEL_STRING_VALUE: &str = "canary-novel-value-6204";
+/// A `system/init` member outside the allow-list, with a value that must never reach a notice.
+const NOVEL_INIT_MEMBER: &str = "novelInitSetting";
+const NOVEL_INIT_VALUE: &str = "canary-init-value-6205";
+
+/// The pinned stream with a novel string member, a novel init member and a novel rate-limit member
+/// added, each carrying a canary value.
+fn drifted_turn_lines(facts: &MachineFacts) -> Vec<String> {
+    let mut lines = answered_turn_lines(facts);
+    let mut init: Value = serde_json::from_str(&lines[0]).expect("expected the init line");
+    init[NOVEL_INIT_MEMBER] = json!(NOVEL_INIT_VALUE);
+    lines[0] = init.to_string();
+    lines.insert(
+        2,
+        json!({"type": "assistant", "session_id": SESSION_ID,
+            NOVEL_STRING_MEMBER: NOVEL_STRING_VALUE,
+            "message": {"id": "msg_0", "role": "assistant", "content": []}})
+        .to_string(),
+    );
+    lines
+}
+
+/// Runs the walk over `lines` as a capture does and returns the drift it collected.
+fn drift_over(lines: &[String]) -> DriftReport {
+    let facts = MachineFacts::new();
+    let mut drift = DriftReport::default();
+    for line in lines {
+        super::redact_line(line, facts.paths(), &mut drift);
+    }
+    drift
+}
+
+fn assert_no_value_in(notices: &[String], values: &[&str]) {
+    for value in values {
+        assert!(
+            notices.iter().all(|notice| !notice.contains(value)),
+            "expected no value in a drift notice | value: {value:?} | received: {notices:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_capture_names_the_novel_members_on_its_notices_and_never_their_values() {
+    let facts = MachineFacts::new();
+    let out = tempfile::tempdir().expect("expected an output directory");
+    let cli = scripted_cli(drifted_turn_lines(&facts));
+    let notices = RecordedNotices::default();
+
+    capture_noticed(cli, out.path(), &facts, Some(SCHEMA), None, &notices)
+        .await
+        .unwrap_or_else(|error| panic!("expected the capture to qualify, received {error}"));
+
+    let recorded = notices.recorded();
+    for name in [NOVEL_STRING_MEMBER, NOVEL_INIT_MEMBER, FUTURE_MEMBER] {
+        assert!(
+            recorded.iter().any(|notice| notice.contains(name)),
+            "expected the member name in a drift notice | name: {name:?} | received: {recorded:?}"
+        );
+    }
+    assert_no_value_in(
+        &recorded,
+        &[
+            NOVEL_STRING_VALUE,
+            NOVEL_INIT_VALUE,
+            CANARY_TEXT,
+            &CANARY_RESET_AT.to_string(),
+            &(CANARY_NUMBER + 1).to_string(),
+        ],
+    );
+    let written = read_transcript(out.path(), "structured-output.jsonl");
+    assert!(
+        !written.contains(NOVEL_STRING_VALUE) && !written.contains(NOVEL_INIT_VALUE),
+        "expected the transcript to hold no novel value | received: {written}"
+    );
+}
+
+#[tokio::test]
+async fn an_unqualified_capture_still_reports_its_drift_after_writing_the_file() {
+    let facts = MachineFacts::new();
+    let out = tempfile::tempdir().expect("expected an output directory");
+    let plain_answer = lines_of(&[
+        json!({"type": "system", "subtype": "init", "cwd": facts.cwd,
+               "session_id": SESSION_ID, NOVEL_INIT_MEMBER: NOVEL_INIT_VALUE}),
+        json!({"type": "result", "subtype": "success", "is_error": false, "result": "mango"}),
+    ]);
+    let notices = RecordedNotices::default();
+
+    capture_noticed(
+        scripted_cli(plain_answer),
+        out.path(),
+        &facts,
+        Some(SCHEMA),
+        None,
+        &notices,
+    )
+    .await
+    .expect_err("expected a turn without structured output to fail the capture");
+
+    let recorded = notices.recorded();
+    assert!(
+        recorded
+            .iter()
+            .any(|notice| notice.contains(NOVEL_INIT_MEMBER)),
+        "expected the init member name in a drift notice | received: {recorded:?}"
+    );
+    assert_no_value_in(&recorded, &[NOVEL_INIT_VALUE]);
+    assert!(
+        transcript_dir(out.path())
+            .join("structured-output.unqualified.jsonl")
+            .exists(),
+        "expected the unqualified file to be written before the notice"
+    );
+}
+
+#[test]
+fn the_pinned_stream_reports_no_member_this_build_has_not_reviewed() {
+    let facts = MachineFacts::new();
+    let drift = drift_over(&answered_turn_lines(&facts));
+
+    assert!(
+        drift.unseen.is_empty(),
+        "expected no unseen string member in the pinned stream | received: {:?}",
+        drift.unseen
+    );
+}
+
+#[test]
+fn a_denied_member_is_reported_unless_a_capture_already_showed_it() {
+    let facts = MachineFacts::new();
+    let mut lines = answered_turn_lines(&facts);
+    lines.push(
+        json!({"type": "result", "subagent_stats": {
+            "by_type": {CANARY_AGENT_TYPE: {"count": 2}}}})
+        .to_string(),
+    );
+
+    let drift = drift_over(&lines);
+
+    // The init configuration, `rate_limit_info` and `by_type` are denied on every run; only the
+    // member this build never had is news.
+    let denied: Vec<&str> = drift.denied.iter().map(String::as_str).collect();
+    assert_eq!(
+        denied,
+        vec![FUTURE_MEMBER],
+        "expected only the member outside REVIEWED_DENIED_MEMBERS {REVIEWED_DENIED_MEMBERS:?} | received: {denied:?}"
+    );
+}
+
+#[test]
+fn the_reviewed_denied_members_are_sorted() {
+    let mut sorted = REVIEWED_DENIED_MEMBERS.to_vec();
+    sorted.sort_unstable();
+    assert_eq!(
+        REVIEWED_DENIED_MEMBERS,
+        sorted.as_slice(),
+        "expected the reviewed list sorted"
+    );
+}
+
+#[test]
+fn a_member_a_name_rule_hides_and_a_schema_property_are_not_drift() {
+    let facts = MachineFacts::new();
+    let drift = drift_over(&lines_of(&[
+        json!({"type": "result", "credentialHint": CANARY_TEXT, "email": "someone@example.com"}),
+        json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "StructuredOutput",
+             "input": {"schemaProperty": "mango", "by_type": "mango"}}]}}),
+        json!({"type": "system", "subtype": "init", "session_id": SESSION_ID,
+               "cwd": facts.cwd, NOVEL_INIT_MEMBER: null}),
+    ]));
+
+    assert!(
+        drift.denied.is_empty() && drift.unseen.is_empty(),
+        "expected a name-rule member, an answer property and a null to add no name | received \
+         denied: {:?} unseen: {:?}",
+        drift.denied,
+        drift.unseen
+    );
+}
+
+#[test]
+fn a_report_counts_distinct_names_once_and_shows_the_first_few_sorted() {
+    let mut drift = DriftReport::default();
+    for _ in 0..3 {
+        for ordinal in (0..DRIFT_NAMES_SHOWN + 5).rev() {
+            drift.note_unseen(&format!("member{ordinal:02}"));
+        }
+    }
+
+    let lines = drift.lines(STRUCTURED_OUTPUT);
+
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected one line for one kind | received: {lines:?}"
+    );
+    let total = DRIFT_NAMES_SHOWN + 5;
+    let expected_shown: Vec<String> = (0..DRIFT_NAMES_SHOWN)
+        .map(|ordinal| format!("member{ordinal:02}"))
+        .collect();
+    assert!(
+        lines[0].contains(&format!("({total}): {}", expected_shown.join(", ")))
+            && lines[0].contains(", and 5 more;")
+            && !lines[0].contains(&format!("member{DRIFT_NAMES_SHOWN:02}")),
+        "expected {total} distinct names, the first {DRIFT_NAMES_SHOWN} sorted, and 5 more | received: {lines:?}"
+    );
+}
+
+#[test]
+fn a_report_escapes_a_hostile_name_and_cuts_a_long_one() {
+    let mut drift = DriftReport::default();
+    drift.note_denied("bell\u{7}\nline\u{1b}[2J");
+    drift.note_unseen(&"x".repeat(DRIFT_NAME_CHARS + 10));
+
+    let lines = drift.lines(STRUCTURED_OUTPUT);
+
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected one line per kind | received: {lines:?}"
+    );
+    assert!(
+        lines[0].contains("bell\\u0007\\nline\\u001b[2J"),
+        "expected the controls written as visible escapes | received: {:?}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains(&format!("{}...", "x".repeat(DRIFT_NAME_CHARS)))
+            && !lines[1].contains(&"x".repeat(DRIFT_NAME_CHARS + 1)),
+        "expected a name cut at {DRIFT_NAME_CHARS} characters | received: {:?}",
+        lines[1]
+    );
+    for line in &lines {
+        assert!(
+            !line.chars().any(char::is_control),
+            "expected a one-line notice with no raw control | received: {line:?}"
+        );
+    }
+}
+
+#[test]
+fn an_empty_report_says_nothing() {
+    let drift = DriftReport::default();
+    let notices = RecordedNotices::default();
+
+    drift.announce(&notices, STRUCTURED_OUTPUT);
+
+    assert!(
+        notices.recorded().is_empty(),
+        "expected no notice for a stream with no drift | received: {:?}",
+        notices.recorded()
+    );
+}
+
+#[test]
+fn a_report_line_names_the_scenario_and_the_kind() {
+    let mut drift = DriftReport::default();
+    drift.note_denied("tools");
+    drift.note_unseen("novel");
+
+    assert_eq!(
+        drift.lines(STRUCTURED_OUTPUT),
+        vec![
+            "claude/structured-output: members replaced by the deny-by-default rule (1): tools; review them against the lists in claude_transcript.rs".to_owned(),
+            "claude/structured-output: members not seen before, their strings replaced (1): novel; review them against the lists in claude_transcript.rs".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn the_reviewed_string_members_are_sorted_and_do_not_repeat_a_structural_one() {
+    let mut sorted = REVIEWED_REDACTED_STRING_MEMBERS.to_vec();
+    sorted.sort_unstable();
+    assert_eq!(
+        REVIEWED_REDACTED_STRING_MEMBERS,
+        sorted.as_slice(),
+        "expected the reviewed list sorted"
+    );
+    for member in REVIEWED_REDACTED_STRING_MEMBERS {
+        assert!(
+            !STRUCTURAL_STRING_MEMBERS.contains(member),
+            "expected {member:?} to be reviewed once: its string is kept by STRUCTURAL_STRING_MEMBERS, so it never reaches the default"
+        );
+    }
+}
+
+/// Every JSON line of the committed Claude transcripts: the real streams the reviewed lists were
+/// read from.
+fn committed_transcript_lines() -> Vec<String> {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/claude/transcripts");
+    let mut lines = Vec::new();
+    let entries = std::fs::read_dir(&directory).unwrap_or_else(|error| {
+        panic!("expected {directory:?} to be readable | received: {error}")
+    });
+    for entry in entries {
+        let path = entry.expect("expected a directory entry").path();
+        if path
+            .extension()
+            .is_none_or(|extension| extension != "jsonl")
+        {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("expected {path:?} to be readable | received: {error}"));
+        lines.extend(
+            text.lines()
+                .filter(|line| !line.starts_with('#'))
+                .map(str::to_owned),
+        );
+    }
+    assert!(
+        !lines.is_empty(),
+        "expected committed Claude transcripts under {directory:?} | received none"
+    );
+    lines
+}
+
+/// What makes "seen before" checkable: the committed streams are the ones the two reviewed lists
+/// were built from, so they report nothing, and a name they do show is one the lists must gain.
+#[test]
+fn the_committed_claude_transcripts_report_no_member_outside_the_reviewed_lists() {
+    let drift = drift_over(&committed_transcript_lines());
+
+    assert!(
+        drift.denied.is_empty() && drift.unseen.is_empty(),
+        "expected the committed transcripts to need no new reviewed member | received denied: {:?} \
+         unseen: {:?}",
+        drift.denied,
+        drift.unseen
+    );
+}
+
+#[test]
+fn a_report_holds_the_key_as_the_transcript_writes_it_not_the_raw_name() {
+    let facts = MachineFacts::new();
+    let home_keyed = format!("{}/novel-key", facts.home);
+    let model_keyed = String::from("arn:aws:bedrock:us-east-1:111122223333:profile/novel");
+    let drift = drift_over(&lines_of(&[
+        json!({"type": "system", "subtype": "init", "session_id": SESSION_ID,
+               home_keyed.clone(): CANARY_NUMBER}),
+        json!({"type": "assistant", home_keyed.clone(): "value"}),
+        json!({"type": "result", "modelUsage": {model_keyed.clone(): "value"}}),
+    ]));
+
+    let notices: Vec<String> = drift.lines(STRUCTURED_OUTPUT);
+    assert_no_value_in(&notices, &[facts.home.as_str(), "111122223333"]);
+    assert!(
+        notices
+            .iter()
+            .any(|notice| notice.contains(redact::PLACEHOLDER)),
+        "expected the redacted model-id key to be what the report holds | received: {notices:?}"
+    );
 }

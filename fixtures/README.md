@@ -100,6 +100,30 @@ Retained on purpose:
   capture's request and not the operator's default.
 - `session_id`, `uuid` and `claude_code_version`, as before, and a plain vendor `model` id.
 
+### The drift report
+
+The by-name rules only know the shapes seen at the pinned Claude Code, so a later release can add a
+member that is redacted without anyone noticing. After it writes the transcript (qualified,
+`.unqualified` or `.partial`), `mea capture` prints up to two lines to stderr:
+
+- `members replaced by the deny-by-default rule`: members of a `system/init` or `rate_limit_event`
+  record outside its allow-list, and `by_type`, that the committed transcripts do not already show.
+  The reviewed set is `REVIEWED_DENIED_MEMBERS` in `claude_transcript.rs`.
+- `members not seen before, their strings replaced`: members whose string the default rule replaced
+  and that `REVIEWED_REDACTED_STRING_MEMBERS` does not list. Only string members are checked;
+  numbers and booleans are kept as before and are not reported. A `mea` test replays the committed
+  `fixtures/claude/transcripts/` through the recorder and fails when either list is incomplete for
+  them, so both lists stay in step with what the fixtures show.
+
+Each line gives the count of distinct names and the first 12 in sorted order, then `and N more`.
+A name is escaped for a terminal and cut at 48 characters. The report holds names only, never a
+value, and nothing is printed when no member is new. A name inside the model's answer is the
+operator's schema and is left out. Reading a name is the prompt to review it: move it to the
+allow-list if the reducer reads it, add it to the reviewed set if it is understood and stays
+redacted, or add a rule if it carries something private. The report cannot tell a data-keyed map
+from a record: the keys of a map of strings appear as names, and a map of numbers or objects does
+not appear.
+
 ## Three classes of fixture
 
 **Reproducible public contracts.** CI can install the CLI that produced them at the pin and record
