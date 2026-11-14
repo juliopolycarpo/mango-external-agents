@@ -822,8 +822,8 @@ held back.
 | [`gemini`][p-gemini]           | `gemini --acp`                       | none; inside `gemini` | none                                |
 | [`copilot`][p-copilot]         | `copilot --acp`                      | `copilot login`       | none                                |
 | [`goose`][p-goose]             | `goose acp --with-builtin developer` | `goose configure`     | none                                |
-| [`codex-acp`][p-codex]         | `codex-acp`                          | `codex login`         | none                                |
-| [`claude-agent-acp`][p-claude] | `claude-agent-acp`                   | `claude auth login`   | none                                |
+| [`codex-acp`][p-codex]         | `codex-acp`                          | `codex login`         | captured handshake, 2026-11-14      |
+| [`claude-agent-acp`][p-claude] | `claude-agent-acp`                   | `claude auth login`   | captured handshake, 2026-11-14      |
 | `custom`                       | the host's own argv                  | the host's own        | whatever the host records           |
 
 [p-cursor]: https://cursor.com/docs/cli/acp
@@ -867,15 +867,21 @@ Two methods, and they are not degrees of the same thing:
 `cursor` and `grok` carry one of each: the live run that earned verification, and the handshake
 captured on 2026-09-19 under `fixtures/acp/cursor/contract` and
 `fixtures/acp/grok/contract` (see their manifests and `AcpProfile::evidence`), so the capability set they are driven under is a file rather than a memory.
-`opencode` 1.19.5 was recaptured on 2026-11-07. It carries the second kind alone and is deliberately **not** verified. Its committed capture
-is an `initialize` probe whose manifest records `sessionOpened: false`; calling that verified would
+`opencode` 1.19.5 was recaptured on 2026-11-07, and `codex-acp` 2.6.0 and `claude-agent-acp` 0.107.0
+were captured on 2026-11-14. Those three carry the second kind alone and are deliberately **not**
+verified. Each committed capture is an `initialize` probe whose manifest records `sessionOpened: false`; calling that verified would
 claim a session nobody opened. A profile with no evidence at all is a documented entry nobody has
 run; a host can say so in its own interface, and nothing here pretends otherwise.
 
 A capture is not automatically reproducible. `scripts/install-vendor-cli.sh` pins `claude`, `codex`
-and `opencode` and nothing else, so `fixtures/acp/cursor/` and `fixtures/acp/grok/` declare
-`reproducible: false` and record `capturedFrom` and `capturedAt` in place of a promise CI cannot
-keep. The digests hold them to the tree either way.
+and `opencode` and nothing else, so `fixtures/acp/cursor/`, `fixtures/acp/grok/`,
+`fixtures/acp/codex-acp/` and `fixtures/acp/claude-agent-acp/` declare `reproducible: false` and
+record `capturedFrom` and `capturedAt` in place of a promise CI cannot keep.
+
+The two adapter captures say what they measured in [the convergence assessment](acp-convergence.md#what-the-adapter-handshakes-measured): `loadSession`,
+`sessionCapabilities.list` and `promptCapabilities.image` are advertised by both. `version.json`
+holds the adapter's own version; the vendor CLI beneath it (`claude` 2.1.323 and `codex-cli` 0.166.0
+in the install trees captured against) is not in it. The digests hold them to the tree either way.
 
 ### Executable names and installation order
 
@@ -926,14 +932,14 @@ The profile argv launches the adapter. The adapter then starts a vendor binary o
 which the host never named, so the version probe (`<adapter> --version`) reads the adapter and not
 the CLI beneath it. Both READMEs were read on 2026-11-14.
 
-| Profile            | Install                      | Vendor binary the adapter runs           | Chosen by                                    |
-| ------------------ | ---------------------------- | ---------------------------------------- | -------------------------------------------- |
-| `claude-agent-acp` | standalone archive           | the `claude` shipped in the same archive | whoever installed the archive                |
-| `claude-agent-acp` | `CLAUDE_CODE_EXECUTABLE` set | the CLI that variable names              | whoever sets it in the adapter's environment |
-| `claude-agent-acp` | npm package                  | not stated                               | not stated                                   |
-| `codex-acp`        | npm package                  | the bundled `@openai/codex` dependency   | the adapter's package                        |
-| `codex-acp`        | `CODEX_PATH` set             | the executable that variable names       | whoever sets it in the adapter's environment |
-| `codex-acp`        | other than npm               | not stated                               | not stated                                   |
+| Profile            | Install                      | Vendor binary the adapter runs                                          | Chosen by                                    |
+| ------------------ | ---------------------------- | ----------------------------------------------------------------------- | -------------------------------------------- |
+| `claude-agent-acp` | standalone archive           | the `claude` shipped in the same archive                                | whoever installed the archive                |
+| `claude-agent-acp` | `CLAUDE_CODE_EXECUTABLE` set | the CLI that variable names                                             | whoever sets it in the adapter's environment |
+| `claude-agent-acp` | npm package                  | the SDK platform package's `claude`, per 0.107.0's `dist/claude-cli.js` | the adapter's package                        |
+| `codex-acp`        | npm package                  | the bundled `@openai/codex` dependency                                  | the adapter's package                        |
+| `codex-acp`        | `CODEX_PATH` set             | the executable that variable names                                      | whoever sets it in the adapter's environment |
+| `codex-acp`        | other than npm               | not stated                                                              | not stated                                   |
 
 What each README says:
 
@@ -942,6 +948,10 @@ What each README says:
   elsewhere works." The only override it documents, in the archive section, is "To use a Claude CLI
   you already have instead, set `CLAUDE_CODE_EXECUTABLE`." It does not say which CLI the npm package
   uses, nor whether the override applies there.
+  The package source does: in 0.107.0, `dist/claude-cli.js` picks `CLAUDE_CODE_EXECUTABLE` first, then a
+  CLI shipped beside a standalone executable, then the SDK's platform package
+  (`@anthropic-ai/claude-agent-sdk-linux-x64`, 0.3.323 in the capture, holding `claude` 2.1.323). That
+  is a reading of one release's code, not a documented contract.
 - [`codex-acp`][p-codex]: "The npm package includes a compatible `@openai/codex` dependency." and
   "Set `CODEX_PATH` only when you want the adapter to run a different Codex binary". Its option list
   repeats it: "`CODEX_PATH` - run a specific Codex executable instead of the bundled package

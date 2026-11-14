@@ -7,8 +7,8 @@ converging, and the signal that reopens the question.
 
 **Verdict at this revision: do not converge.** Neither vendor documents an ACP mode in its own CLI,
 and the ACP surface this library drives carries less than either dedicated harness. Both agents stay
-reachable as opt-in profiles (`claude-agent-acp`, `codex-acp`), which no capture or live run covers
-yet.
+reachable as opt-in profiles (`claude-agent-acp`, `codex-acp`). Each has a committed `initialize`
+capture, and neither has had a session opened against it.
 
 Evidence read on 2026-11-14. The pinned CLIs are Claude Code `2.1.322` and Codex `0.167.1`
 ([vendor-drift.md](vendor-drift.md)). Reading a vendor page later does not requalify a pin.
@@ -64,10 +64,11 @@ host did not name; see
 
 "Profile" means the generic harness as it stands: `ceiling()` in
 `crates/mango-agent-acp/src/harness.rs`, narrowed when a session opens by what the agent's
-`initialize` answer advertises. No adapter handshake is committed
-([#434](https://github.com/juliopolycarpo/mango-external-agents/issues/434)), so a cell that
-depends on it reads "unmeasured" instead of a guess. The `claude-agent-acp` and `codex-acp`
-columns are identical except where marked, because the generic harness is the same for both.
+`initialize` answer advertises. Both adapters' handshakes are committed under
+`fixtures/acp/claude-agent-acp/` and `fixtures/acp/codex-acp/`
+([#434](https://github.com/juliopolycarpo/mango-external-agents/issues/434)); a cell they cannot
+answer reads "unmeasured" instead of a guess. The two adapters advertise the same values for the
+cells below, so the column holds for either.
 
 | Capability                 | Claude dedicated                                                        | Codex dedicated                                    | ACP profile (either adapter)                                                      |
 | -------------------------- | ----------------------------------------------------------------------- | -------------------------------------------------- | --------------------------------------------------------------------------------- |
@@ -75,19 +76,19 @@ columns are identical except where marked, because the generic harness is the sa
 | Interactive approvals      | no: modes and allow-lists only                                          | yes, brokered                                      | yes, when the agent sends `session/request_permission`                            |
 | Typed questions            | no                                                                      | yes (experimental upstream)                        | no: `elicitation/create` is declined                                              |
 | Permission levels          | `ReadOnly`, `Default`, `FullAccess`, and `auto` for qualifying accounts | full matrix over `approvalPolicy` and sandbox      | `Default`, `ReadOnly`; `FullAccess` only if the profile knows a mode id (none do) |
-| Resume                     | `--resume`; nonresumable after a forced kill                            | `thread/resume`                                    | `session/load` when `loadSession` is advertised: unmeasured                       |
+| Resume                     | `--resume`; nonresumable after a forced kill                            | `thread/resume`                                    | `session/load`; both adapters advertise `loadSession`                             |
 | Cancellation               | SIGINT or kill, with a recorded resumability verdict                    | `turn/interrupt`                                   | `session/cancel`, then the kill grace                                             |
 | Steering                   | no                                                                      | yes                                                | no: ACP v1 has no surface; adapter extensions are not consumed                    |
 | Native review              | no                                                                      | yes                                                | no: `native_review` stays false                                                   |
 | Account quota, rate limits | no                                                                      | yes: `account/rateLimits/*` into `AccountLimits`   | no: `usage_update` reports the context window, not plan quota                     |
 | Usage reporting            | yes: the `result` record's counts                                       | yes                                                | context-window use only                                                           |
-| Model catalog flag         | yes, per build: aliases from `--model` help                             | yes: `model/list`                                  | `model_catalog` stays false; a `model` config option may serve a host: unmeasured |
+| Model catalog flag         | yes, per build: aliases from `--model` help                             | yes: `model/list`                                  | `model_catalog` stays false; a `model` config option: unmeasured (`session/new`)  |
 | Session configuration      | no: argv on a fresh child                                               | per turn                                           | yes: `session/set_config_option`                                                  |
-| Session listing            | no                                                                      | yes                                                | `session/list` when advertised: unmeasured                                        |
-| Images                     | no                                                                      | yes                                                | when `promptCapabilities.image`: unmeasured                                       |
+| Session listing            | no                                                                      | yes                                                | `session/list`; both adapters advertise `sessionCapabilities.list`                |
+| Images                     | no                                                                      | yes                                                | yes: both adapters advertise `promptCapabilities.image`                           |
 | MCP passthrough            | `--mcp-config`, per build                                               | per-thread `config.mcp_servers`                    | `mcpServers`; HTTP only when advertised                                           |
 | Login state                | `auth status` probe                                                     | `account/read`                                     | always `Unknown`                                                                  |
-| Public contract under CI   | `fixtures/claude/contract/`                                             | `fixtures/codex/contract/` and the vendored schema | none for either adapter                                                           |
+| Public contract under CI   | `fixtures/claude/contract/`                                             | `fixtures/codex/contract/` and the vendored schema | labelled maintainer captures, not pinned (see below)                              |
 
 Reading the table:
 
@@ -102,6 +103,50 @@ Reading the table:
   settle whether that route now counts as documented.
 - No rule of the library weakens. Cancelling an ACP turn withdraws every pending question, and no
   profile reaches `FullAccess` by answering on an agent's behalf.
+
+## What the adapter handshakes measured
+
+Captured on 2026-11-14 with `mea capture --harness acp --profile <id>`. Each sent `initialize` and
+nothing else: no `authenticate`, no `session/new`.
+
+| `initialize` member                     | `claude-agent-acp` 0.107.0                                                                    | `codex-acp` 2.6.0                     |
+| --------------------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------- |
+| `protocolVersion`                       | `1`                                                                                           | `1`                                   |
+| `loadSession`                           | `true`                                                                                        | `true`                                |
+| `promptCapabilities`                    | `image`, `embeddedContext`                                                                    | `image`, `embeddedContext`            |
+| `sessionCapabilities`, both             | `list`, `resume`, `close`, `fork`, `delete`, `title`, `additionalDirectories`, `systemPrompt` | same                                  |
+| `sessionCapabilities`, one adapter only | `options`, `status`                                                                           | `subagents`                           |
+| `mcpCapabilities`                       | `http`, `sse`                                                                                 | `http`; `sse` and `acp` are `false`   |
+| `authMethods`                           | none listed                                                                                   | `api-key`, `chat-gpt`                 |
+| Vendor CLI under the npm install tree   | `claude` 2.1.323 (SDK platform package 0.3.323)                                               | `codex-cli` 0.166.0 (`@openai/codex`) |
+
+The last row is not in the capture. `mea` records the adapter's own `--version` and nothing beneath
+it, so these two versions were read with each binary's own `--version` from the install tree the
+capture ran against. Neither equals the pin above (Claude Code `2.1.322`, Codex `0.167.1`).
+Codex `0.166.0` is the supported minimum.
+
+What it settles for the table above:
+
+- Both adapters advertise `loadSession`, `sessionCapabilities.list` and `promptCapabilities.image`,
+  so `capabilities_from` in `crates/mango-agent-acp/src/harness.rs` reports `resume`, `session_listing`
+  and `images` as true for either. The advertisement is not a driven session: no `session/load`,
+  `session/list` or image prompt has run against an adapter.
+- Against the dedicated harnesses, the cells that move are Claude's: its dedicated harness has no
+  session listing and no images, and `claude-agent-acp` advertises both. Codex's dedicated harness
+  already has them.
+- The rows that decide convergence do not move. The handshake carries no rate limits, steering,
+  native review or typed questions for Codex, and no structured output or interrupt verdict for
+  Claude. `codex-acp`'s `subagents` session capability is an adapter extension that this harness
+  does not consume.
+- `configOptions`, and with it the model catalog cell, stays unmeasured. An agent returns it from
+  `session/new`, and a capture never sends that: it opens no session.
+
+Criterion 2 is not met, and this is a decision rather than an oversight. `scripts/install-vendor-cli.sh`
+downloads an exact vendor release asset and checks its digest. Neither adapter is an asset it knows,
+and an exact `npm install` of the adapter pins only the top level: `codex-acp` declares
+`@openai/codex` as `^0.166.0`, so the binary beneath it is whatever the range resolves to on the
+day. Both manifests therefore say `reproducible: false` and carry `capturedFrom` and `capturedAt`.
+The install and capture recipe is in [fixtures/README.md](../fixtures/README.md).
 
 ## Decision criteria
 
@@ -159,4 +204,5 @@ The lane does not watch two things:
 - An ACP flag under another subcommand's help before any watched page names it. Subcommand help is
   kept out of the public contracts ([vendor-drift.md](vendor-drift.md)):
   [#451](https://github.com/juliopolycarpo/mango-external-agents/issues/451).
-- An adapter's own `initialize` answer: [#434](https://github.com/juliopolycarpo/mango-external-agents/issues/434).
+- An adapter's own `initialize` answer. It is captured once and no lane records it again, because
+  neither adapter is pinned (see above).

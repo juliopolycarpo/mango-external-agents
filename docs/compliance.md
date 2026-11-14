@@ -705,12 +705,12 @@ Some profiles need a note beyond the link:
 
 Only `cursor` and `grok` answer `AcpProfile::is_verified()`, and each carries two records: the live
 `tests/smoke.rs` run that earned it, and the `initialize` handshake captured beside it under
-`fixtures/acp/`. `opencode` carries the committed-capture record alone — its handshake was captured,
-no session was opened, and it is not verified. Every other entry is documented and nobody has driven
+`fixtures/acp/`. `opencode`, `codex-acp` and `claude-agent-acp` carry the committed-capture record
+alone — each handshake was captured, no session was opened, and none is verified. Every other entry is documented and nobody has driven
 the agent.
 
-Neither `cursor-agent` nor `grok` has a pinned installer in `scripts/install-vendor-cli.sh`, so their
-captures declare `reproducible: false` and name the build and the day instead. CI cannot reproduce
+None of `cursor-agent`, `grok`, `codex-acp` and `claude-agent-acp` has a pinned installer in
+`scripts/install-vendor-cli.sh`, so their captures declare `reproducible: false` and name the build and the day instead. CI cannot reproduce
 them; they are a maintainer's record of one machine, held to the tree by their digests like every
 other capture. A host can say all of this in its own interface; see `docs/harness-acp.md`.
 

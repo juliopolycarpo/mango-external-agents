@@ -157,13 +157,35 @@ printed, and `capturedAt`, the day. Routine drift checks leave them alone.
 
 `fixtures/acp/cursor/` and `fixtures/acp/grok/` are this class. They exist because those two
 profiles are the ones `mango-agent-acp` marks verified, and a claim a host is told to trust should
-rest on a file rather than on a source comment. Refreshing one means having the agent installed:
+rest on a file rather than on a source comment. `fixtures/acp/codex-acp/` and
+`fixtures/acp/claude-agent-acp/` are this class too: the adapters are npm packages, which the
+installer script does not handle, and an exact adapter version still leaves the vendor CLI beneath it
+to the adapter's own dependency range. Refreshing one means having the agent installed:
 
 ```sh
 cargo run -p mea -- capture --harness acp --profile cursor --out fixtures/acp/cursor
 cargo run -p mea -- capture --harness acp --profile grok --out fixtures/acp/grok
 ```
 
+The two adapters are installed from npm into a fresh, empty directory at an exact version, without
+running package scripts, and captured with their config homes pointed at empty directories so
+nothing is read from a real account. The capture sends `initialize` only. Run it from a directory
+that is not the install tree:
+
+```sh
+npm install --prefix "$ADAPTER_DIR" --ignore-scripts --no-audit --no-fund \
+  @agentclientprotocol/claude-agent-acp@0.107.0
+PATH="$ADAPTER_DIR/node_modules/.bin:$PATH" CLAUDE_CONFIG_DIR="$(mktemp -d)" \
+  cargo run -p mea -- capture --harness acp --profile claude-agent-acp --out fixtures/acp/claude-agent-acp
+
+npm install --prefix "$ADAPTER_DIR" --ignore-scripts --no-audit --no-fund \
+  @agentclientprotocol/codex-acp@2.6.0
+PATH="$ADAPTER_DIR/node_modules/.bin:$PATH" CODEX_HOME="$(mktemp -d)" \
+  cargo run -p mea -- capture --harness acp --profile codex-acp --out fixtures/acp/codex-acp
+```
+
+`$ADAPTER_DIR` is a different empty directory for each adapter. Run `scripts/package-fixtures.py`
+afterwards. `version.json` holds the adapter's own version; the vendor CLI beneath it is not recorded.
 Do that only when the agent is a version worth recording, and update the profile's
 `VerificationEvidence` in the same change — the record names a build and a day, and a capture that
 moved without it is a claim about the wrong one.
@@ -196,7 +218,7 @@ the digest its manifest declares and the digest the file has, and it refuses a f
 directory which the manifest does not declare. It runs under `scripts/check.sh` with the rest of
 the suite; nothing has to be enabled for it.
 
-What that covers is the six `contract/` directories. The archival transcripts
+What that covers is the eight `contract/` directories. The archival transcripts
 (`codex/*.jsonl`, `claude/transcripts/*.jsonl`) and the recorded help surfaces (`claude/help/`)
 carry no manifest and therefore no digest: they are read by the replaying fakes, and an edit to one
 shows up as a test that disagrees with the transcript rather than as an integrity failure. If such
