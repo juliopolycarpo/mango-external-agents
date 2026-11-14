@@ -882,8 +882,12 @@ rests on what a recapture would add.
 
 The two adapter captures say what they measured in [the convergence assessment](acp-convergence.md#what-the-adapter-handshakes-measured): `loadSession`,
 `sessionCapabilities.list` and `promptCapabilities.image` are advertised by both. `version.json`
-holds the adapter's own version; the vendor CLI beneath it (`claude` 2.1.323 and `codex-cli` 0.166.0
-in the install trees captured against) is not in it. The digests hold them to the tree either way.
+holds the adapter's own version and, under `vendorCli`, the `--version` of the binary the operator
+named with `mea capture --vendor-cli` (`claude` 2.1.323 and `codex-cli` 0.166.0 in the install trees
+captured against). `mea` does not find that binary, because the adapter's resolution is not a
+documented contract ([which binary an adapter runs](#which-vendor-binary-an-adapter-runs)), so the member says it was named by the operator and
+records the file name only. It shows which binary the operator pointed at, not that the adapter
+ran it. A capture made without the flag has no `vendorCli` member. The digests hold both to the tree.
 
 ### Executable names and installation order
 

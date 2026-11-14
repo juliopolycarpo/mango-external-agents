@@ -120,10 +120,11 @@ nothing else: no `authenticate`, no `session/new`.
 | `authMethods`                           | none listed                                                                                   | `api-key`, `chat-gpt`                 |
 | Vendor CLI under the npm install tree   | `claude` 2.1.323 (SDK platform package 0.3.323)                                               | `codex-cli` 0.166.0 (`@openai/codex`) |
 
-The last row is not in the capture. `mea` records the adapter's own `--version` and nothing beneath
-it, so these two versions were read with each binary's own `--version` from the install tree the
-capture ran against. Neither equals the pin above (Claude Code `2.1.322`, Codex `0.167.1`).
-Codex `0.166.0` is the supported minimum.
+The last row is in `version.json` under `vendorCli`, recorded with `mea capture --vendor-cli` on the
+binary each npm install tree ships. `mea` takes the name from the operator and never searches for
+it, so the member says the version was named, not observed beneath the running adapter. Neither
+equals the pin above (Claude Code `2.1.322`, Codex `0.167.1`). Codex `0.166.0` is the supported
+minimum.
 
 What it settles for the table above:
 
