@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use mango_external_agents::event::{AgentEvent, EventKind};
+use mango_external_agents::normalize::TextLimit;
 use mango_external_agents::{
     ActivityContent, BrokerDecision, CancelReason, CloseReason, Dispatch, Error, InteractionId,
     NoticeSeverity, PermissionBroker, PermissionRequest, PermissionResponse, QuestionRequest,
@@ -610,10 +611,13 @@ fn permission_response(
 /// Renders one event and returns an interaction that should wait for terminal input.
 fn print_event(event: &AgentEvent, json: bool) -> Result<Option<PromptRequest>> {
     if json {
-        println!("{}", serde_json::json!(event));
+        println!("{}", json_event_line(event));
     }
     match &event.kind {
         EventKind::TextDelta { text } if !json => print!("{text}"),
+        EventKind::StructuredOutput { value } if !json => {
+            println!("{}", structured_output_line(value));
+        }
         // A question is not a permission, and this is the branch that proves it: nothing here
         // consults the broker, and answering grants the agent nothing.
         EventKind::QuestionAsked { request } => {
@@ -655,6 +659,58 @@ fn print_event(event: &AgentEvent, json: bool) -> Result<Option<PromptRequest>> 
         _ => {}
     }
     Ok(None)
+}
+
+/// One event as the line `--json` prints: the event's own JSON, whatever its kind.
+///
+/// A structured answer takes this path like every other event, so `--json` carries it in full
+/// (the core already bounds it at `STRUCTURED_OUTPUT_MAX_BYTES`) and nothing here renders it.
+fn json_event_line(event: &AgentEvent) -> String {
+    serde_json::json!(event).to_string()
+}
+
+/// The label plain mode puts before a structured answer, on a line of its own.
+const STRUCTURED_OUTPUT_LABEL: &str = "structured output: ";
+
+/// A structured answer as one labelled line a person reads.
+///
+/// The value is vendor-derived and untrusted, and a smoke run prints it at a terminal. It is
+/// printed as compact JSON, so a newline inside a string is the two characters `\n` and the line
+/// stays one line. The serialiser already escapes the C0 controls; this also escapes what it
+/// leaves alone and a terminal may act on or that hides text: DEL, the C1 controls (one of which
+/// is a one-byte CSI), the line and paragraph separators and the bidirectional formatting
+/// characters. Each becomes a JSON `\uXXXX` escape, so the text stays valid JSON. The line is
+/// bounded like other vendor detail text ([`TextLimit::Detail`]) and says how much it left out;
+/// `--json` carries the whole answer.
+///
+/// For example, `{"verdict":"pass"}` prints as `structured output: {"verdict":"pass"}`.
+fn structured_output_line(value: &serde_json::Value) -> String {
+    let mut escaped = String::new();
+    for character in value.to_string().chars() {
+        if is_terminal_active(character) {
+            escaped.push_str(&format!("\\u{:04x}", u32::from(character)));
+        } else {
+            escaped.push(character);
+        }
+    }
+    let limit = TextLimit::Detail.max_code_points();
+    let total = escaped.chars().count();
+    if total <= limit {
+        return format!("{STRUCTURED_OUTPUT_LABEL}{escaped}");
+    }
+    let shown: String = escaped.chars().take(limit).collect();
+    format!(
+        "{STRUCTURED_OUTPUT_LABEL}{shown} ... [truncated: {limit} of {total} characters shown; use --json for the whole answer]"
+    )
+}
+
+/// Whether a terminal may act on this character, or it can hide or reorder the text around it.
+fn is_terminal_active(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            u32::from(character),
+            0x061c | 0x200e | 0x200f | 0x2028 | 0x2029 | 0x202a..=0x202e | 0x2066..=0x2069
+        )
 }
 
 /// One notice as a line a person reads: `[notice:warning] title: description`.
@@ -724,6 +780,8 @@ mod tests {
         QuestionRequest, QuestionResponse, Result, Session, SessionState, SessionStatus,
         SystemClock, TurnRequest, TurnStream, VendorError,
     };
+
+    use mango_external_agents::normalize::TextLimit;
 
     use super::run;
 
@@ -2408,5 +2466,125 @@ mod tests {
                 "expected notice line: {expected:?} | received: {received:?}"
             );
         }
+    }
+
+    /// The line a structured answer prints, without the label, parsed back as JSON.
+    fn answer_printed_as(value: &serde_json::Value) -> serde_json::Value {
+        let line = super::structured_output_line(value);
+        let json = line
+            .strip_prefix(super::STRUCTURED_OUTPUT_LABEL)
+            .unwrap_or_else(|| panic!("expected the label to open the line | received: {line:?}"));
+        serde_json::from_str(json)
+            .unwrap_or_else(|error| panic!("expected compact JSON | received: {json:?} ({error})"))
+    }
+
+    #[test]
+    fn a_structured_answer_prints_as_one_labelled_compact_line() {
+        let value = serde_json::json!({"verdict": {"checks": [1, true, null]}});
+        assert_eq!(
+            super::structured_output_line(&value),
+            r#"structured output: {"verdict":{"checks":[1,true,null]}}"#
+        );
+    }
+
+    #[test]
+    fn a_structured_answer_escapes_what_a_terminal_would_act_on() {
+        let hostile = "line\none\u{1b}[31m\u{9b}31m\u{7f}\u{202e}gnp\u{2028}end";
+        let value = serde_json::json!({ "note": hostile, "k\u{7}ey": 1 });
+        let line = super::structured_output_line(&value);
+        let offending: Vec<char> = line
+            .chars()
+            .filter(|character| super::is_terminal_active(*character))
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "expected one line free of control and bidirectional characters | received: {offending:?} in {line:?}"
+        );
+        for escape in [
+            "\\n", "\\u001b", "\\u009b", "\\u007f", "\\u202e", "\\u2028", "\\u0007",
+        ] {
+            assert!(
+                line.contains(escape),
+                "expected the escape {escape:?} | received: {line:?}"
+            );
+        }
+        assert_eq!(
+            answer_printed_as(&value),
+            value,
+            "expected the escaped line to stay JSON that reads back as the answer"
+        );
+    }
+
+    #[test]
+    fn a_structured_answer_past_the_detail_bound_is_cut_and_says_so() {
+        let limit = TextLimit::Detail.max_code_points();
+        let value = serde_json::json!({ "log": "x".repeat(limit * 3) });
+        let line = super::structured_output_line(&value);
+        let total = value.to_string().chars().count();
+        let shown = line
+            .strip_prefix(super::STRUCTURED_OUTPUT_LABEL)
+            .and_then(|rest| rest.split(" ... [truncated").next())
+            .unwrap_or_else(|| panic!("expected a truncation marker | received: {line:?}"));
+        assert_eq!(
+            shown.chars().count(),
+            limit,
+            "expected exactly the bound's code points of the answer"
+        );
+        assert!(
+            line.ends_with(&format!(
+                "[truncated: {limit} of {total} characters shown; use --json for the whole answer]"
+            )),
+            "expected the marker to name what was shown and what exists | received: {line:?}"
+        );
+
+        let fits = serde_json::json!({ "log": "x".repeat(limit - 10) });
+        assert_eq!(
+            fits.to_string().chars().count(),
+            limit,
+            "expected a value that is exactly the bound"
+        );
+        assert!(
+            !super::structured_output_line(&fits).contains("truncated"),
+            "expected a value at the bound to print whole"
+        );
+    }
+
+    /// `--json` prints every event through one expression; the answer is not special-cased and not
+    /// shortened.
+    #[tokio::test]
+    async fn json_mode_carries_the_whole_structured_answer_in_the_events_own_json() {
+        let value =
+            serde_json::json!({ "log": "y".repeat(TextLimit::Detail.max_code_points() * 2) });
+        let request = TurnRequest::new("mea-turn-1", "answer");
+        let (sink, events) = EventSink::new(
+            mango_external_agents::SessionId::new("structured-session"),
+            request.turn_id.clone(),
+            request.attempt,
+            Arc::new(SystemClock),
+            4,
+        );
+        sink.emit(EventKind::structured_output(value.clone()).expect("expected a value in bounds"))
+            .await
+            .expect("expected the answer to be accepted");
+        sink.emit(EventKind::Completed)
+            .await
+            .expect("expected the terminal to be accepted");
+        let mut stream = TurnStream::accepted(request.turn_id, request.attempt, "turn", events);
+        let event = stream
+            .recv()
+            .await
+            .expect("expected the answer event first");
+
+        let line: serde_json::Value =
+            serde_json::from_str(&super::json_event_line(&event)).expect("expected one JSON line");
+        assert_eq!(
+            line["kind"]["type"], "structured_output",
+            "expected the event's kind tag"
+        );
+        assert!(
+            line["kind"]["value"] == value,
+            "expected --json to carry the whole {}-byte answer | received a value of another shape",
+            value.to_string().len()
+        );
     }
 }

@@ -8,6 +8,8 @@ mod ask;
 mod capture;
 mod doctor;
 mod failure;
+#[cfg(test)]
+mod json_schema_tests;
 mod options;
 mod redact;
 mod terminal;
@@ -20,7 +22,7 @@ use std::sync::Arc;
 use failure::describe as command_failure;
 use mango_external_agents::launcher::TokioLauncher;
 use mango_external_agents::{
-    ApprovalRouting, AuthState, ConfigurationChange, EnvSource, ExecutablePath, HarnessId,
+    ApprovalRouting, AuthState, ConfigurationChange, EnvSource, ExecutablePath, Harness, HarnessId,
     HarnessRegistry, HostContext, OpenSession, TransportKind, TransportSelection, TurnRequest,
 };
 use options::HarnessChoice;
@@ -54,11 +56,17 @@ fn registry() -> HarnessRegistry {
 /// this user) answer for it. `mea` starts no server; running `codex app-server --listen
 /// unix://PATH` is the operator's job.
 fn registry_attaching_to(socket: Option<&std::path::Path>) -> HarnessRegistry {
+    registry_with(socket, mango_agent_claude::harness())
+}
+
+/// [`registry_attaching_to`], with the Claude harness the caller built, such as one that carries a
+/// `--json-schema`.
+fn registry_with(socket: Option<&std::path::Path>, claude: Arc<dyn Harness>) -> HarnessRegistry {
     let codex = match socket {
         Some(path) => mango_agent_codex::CodexHarness::new().with_unix_socket(path),
         None => mango_agent_codex::CodexHarness::new(),
     };
-    let mut harnesses = vec![mango_agent_claude::harness(), Arc::new(codex)];
+    let mut harnesses = vec![claude, Arc::new(codex)];
     harnesses.extend(mango_agent_acp::AcpHarness::builtins());
     HarnessRegistry::new(harnesses).expect("expected one harness per kind")
 }
@@ -143,7 +151,7 @@ fn print_banner() {
         "usage: mea discover|doctor [--harness claude|codex|acp:<profile>] [--json] [--cwd DIR]"
     );
     println!(
-        "       mea turn [--harness claude|codex|acp:<profile>] [--profile ID] [--transport stdio|websocket|unix-socket|acp] [--socket PATH] [--model ID] [--cwd DIR] [--json] [--level read-only|default|full-access] [--cancel-after SECONDS] <prompt>"
+        "       mea turn [--harness claude|codex|acp:<profile>] [--profile ID] [--transport stdio|websocket|unix-socket|acp] [--socket PATH] [--model ID] [--json-schema FILE] [--cwd DIR] [--json] [--level read-only|default|full-access] [--cancel-after SECONDS] <prompt>"
     );
     println!(
         "       mea capture --harness claude|codex|acp[:profile] [--profile ID] [--out DIR] [--workspace DIR] [--transcripts [--model ID]]"
@@ -329,11 +337,29 @@ async fn turn(options: &Options) -> Result<(), String> {
         return Err(String::from("expected a prompt, received none"));
     }
     turn_with(
-        &registry_attaching_to(options.socket.as_deref()),
+        &turn_registry(options)?,
         &host(options.cwd.as_deref())?,
         options,
     )
     .await
+}
+
+/// The registry one `mea turn` dispatches through.
+///
+/// `--json-schema` is read here, before anything is discovered or spawned, and handed to
+/// [`ClaudeHarness::with_json_schema`](mango_agent_claude::ClaudeHarness::with_json_schema), whose
+/// refusal (not JSON, not an object, too large for a command line) is returned as it is. The flag
+/// is only accepted with the Claude harness, which `Options::parse_for` has already checked.
+fn turn_registry(options: &Options) -> Result<HarnessRegistry, String> {
+    let claude: Arc<dyn Harness> = match &options.json_schema {
+        Some(path) => Arc::new(
+            mango_agent_claude::ClaudeHarness::new()
+                .with_json_schema(&options::read_json_schema_file(path)?)
+                .map_err(|error| error.to_string())?,
+        ),
+        None => mango_agent_claude::harness(),
+    };
+    Ok(registry_with(options.socket.as_deref(), claude))
 }
 
 /// One turn through the harness the options select, in the host and registry it is given.
