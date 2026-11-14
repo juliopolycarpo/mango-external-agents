@@ -320,7 +320,8 @@ fn header(
     });
     let mut lines = vec![format!("# claude/{}: {}", scenario.name, scenario.purpose)];
     if let Some(model) = model {
-        lines.push(format!("# model: {model}"));
+        // The operator typed it, and on Bedrock or Vertex that can be an ARN or a project path.
+        lines.push(format!("# model: {}", redact_model_id(model)));
     }
     lines.push(format!("# capture {metadata}"));
     lines
@@ -415,11 +416,11 @@ fn qualify(body: &[String], vendor_failure: Option<&str>) -> std::result::Result
 ///
 /// `cwd` is not here: it is always rewritten to [`redact::FIXTURE_CWD`]. `name` is not here either,
 /// because it is a tool name only beside `"type": "tool_use"` and a server or plugin name
-/// everywhere else; see [`redact_value`].
+/// everywhere else; see [`redact_value`]. Neither is `model`: its value is kept only when
+/// [`is_plain_vendor_model_id`] accepts it.
 const STRUCTURAL_STRING_MEMBERS: &[&str] = &[
     "claude_code_version",
     "id",
-    "model",
     "parent_tool_use_id",
     "permissionMode",
     "role",
@@ -494,6 +495,92 @@ fn is_credential_member(name: &str) -> bool {
             .any(|fragment| name.contains(fragment))
 }
 
+/// Members that hold a map keyed by model id, one entry of per-model usage each.
+const MODEL_KEYED_MEMBERS: &[&str] = &["modelUsage", "model_usage_since_last_result"];
+
+/// The aliases the CLI accepts for `--model`, which name a tier and nobody's account.
+const MODEL_ALIASES: &[&str] = &["best", "default", "haiku", "opus", "opusplan", "sonnet"];
+
+/// The cross-region prefixes of a Bedrock model id, such as `us.anthropic.claude-…`.
+const BEDROCK_REGION_PREFIXES: &[&str] = &["apac", "au", "eu", "global", "jp", "us", "us-gov"];
+
+/// The model family words of a vendor id. A word outside this list makes the id user-shaped, so a
+/// family a later Claude Code adds is redacted until it is reviewed here.
+const MODEL_FAMILIES: &[&str] = &["haiku", "instant", "opus", "sonnet"];
+
+/// Whether `id` is a model name the vendor assigns, one that says nothing about who runs it.
+///
+/// The shapes kept: an alias (`opus`, `sonnet[1m]`), a vendor id (`claude-sonnet-5`,
+/// `claude-haiku-4-5-20251001`, `claude-opus-4-1@20250805` on Vertex) and a Bedrock id, with or
+/// without its cross-region prefix (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`). Everything
+/// else is private: an ARN carries an AWS account id, a Vertex path carries a project, and an
+/// inference-profile name is whatever its owner typed. The check is an allow-list, so a shape this
+/// function has not seen is redacted.
+fn is_plain_vendor_model_id(id: &str) -> bool {
+    // The context-window suffix (`[1m]`) selects a variant of the same model.
+    let id = id.strip_suffix("[1m]").unwrap_or(id);
+    if MODEL_ALIASES.contains(&id) {
+        return true;
+    }
+    let id = id.strip_prefix("anthropic.").unwrap_or(id);
+    let id = BEDROCK_REGION_PREFIXES
+        .iter()
+        .find_map(|region| {
+            id.strip_prefix(region)
+                .and_then(|rest| rest.strip_prefix(".anthropic."))
+        })
+        .unwrap_or(id);
+    // Vertex puts the release date after `@`; it reads as one more segment.
+    let id = id.replacen('@', "-", 1);
+    let Some(rest) = id.strip_prefix("claude") else {
+        return false;
+    };
+    let mut segments = rest.split('-');
+    // `claude` ends its own segment: the text before the first `-` is empty.
+    segments.next() == Some("")
+        && segments.all(|segment| {
+            MODEL_FAMILIES.contains(&segment)
+                || segment == "latest"
+                || is_digits(segment, 1..=2)
+                || is_digits(segment, 8..=8)
+                || is_bedrock_revision(segment)
+        })
+}
+
+fn is_digits(text: &str, length: std::ops::RangeInclusive<usize>) -> bool {
+    length.contains(&text.len()) && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// A Bedrock revision suffix: `v1` or `v1:0`.
+fn is_bedrock_revision(segment: &str) -> bool {
+    segment.strip_prefix('v').is_some_and(|revision| {
+        let (version, minor) = revision.split_once(':').unwrap_or((revision, "0"));
+        is_digits(version, 1..=2) && is_digits(minor, 1..=2)
+    })
+}
+
+/// A model id as a transcript keeps it: a plain vendor id as is, any other id as
+/// [`redact::PLACEHOLDER`]. See [`is_plain_vendor_model_id`].
+fn redact_model_id(id: &str) -> String {
+    if is_plain_vendor_model_id(id) {
+        id.to_owned()
+    } else {
+        String::from(redact::PLACEHOLDER)
+    }
+}
+
+/// `key` if the map has no such entry, otherwise `key#2`, `key#3`, … so that two keys redacted to
+/// the same text keep both entries and their counters.
+fn unused_key(map: &Map<String, Value>, key: String) -> String {
+    if !map.contains_key(&key) {
+        return key;
+    }
+    (2..)
+        .map(|ordinal| format!("{key}#{ordinal}"))
+        .find(|candidate| !map.contains_key(candidate))
+        .unwrap_or(key)
+}
+
 /// One raw stdout line as the redacted line a transcript keeps, or `None` for a line that is not
 /// a JSON object.
 ///
@@ -529,28 +616,35 @@ fn redact_value(
             );
             let rate_limit_event =
                 members.get("type").and_then(Value::as_str) == Some("rate_limit_event");
-            Value::Object(
-                members
-                    .into_iter()
-                    .map(|(name, value)| {
-                        // Keys are rewritten too: a map keyed by a path would carry it.
-                        let key = redact::rewrite_paths(&name, paths);
-                        let denied = is_credential_member(&name)
-                            || USER_KEYED_MEMBERS.contains(&name.as_str())
-                            || (rate_limit_event
-                                && !RATE_LIMIT_EVENT_STRUCTURE.contains(&name.as_str()));
-                        // A null carries nothing, so it stays null.
-                        if denied && !value.is_null() {
-                            return (key, placeholder());
-                        }
-                        let inner = ValueContext {
-                            tool_call,
-                            answer: context.answer || ANSWER_MEMBERS.contains(&name.as_str()),
-                        };
-                        (key, redact_value(value, Some(&name), inner, paths))
-                    })
-                    .collect::<Map<String, Value>>(),
-            )
+            // The keys of a per-model usage map are model ids, which can name an account. Inside
+            // the model's answer the keys are the schema's own and stay.
+            let model_keyed = !context.answer
+                && member.is_some_and(|member| MODEL_KEYED_MEMBERS.contains(&member));
+            let mut redacted = Map::new();
+            for (name, value) in members {
+                // Keys are rewritten too: a map keyed by a path would carry it.
+                let key = if model_keyed {
+                    redact_model_id(&name)
+                } else {
+                    redact::rewrite_paths(&name, paths)
+                };
+                let key = unused_key(&redacted, key);
+                let denied = is_credential_member(&name)
+                    || USER_KEYED_MEMBERS.contains(&name.as_str())
+                    || (rate_limit_event && !RATE_LIMIT_EVENT_STRUCTURE.contains(&name.as_str()));
+                // A null carries nothing, so it stays null.
+                let kept = if denied && !value.is_null() {
+                    placeholder()
+                } else {
+                    let inner = ValueContext {
+                        tool_call,
+                        answer: context.answer || ANSWER_MEMBERS.contains(&name.as_str()),
+                    };
+                    redact_value(value, Some(&name), inner, paths)
+                };
+                redacted.insert(key, kept);
+            }
+            Value::Object(redacted)
         }
         // An array's strings are judged by the member that holds the array, so `tools` and
         // `mcp_servers` lose their entries while `content` keeps its block types.
@@ -567,6 +661,7 @@ fn redact_value(
             Some("name") if context.tool_call && !context.answer && !text.starts_with("mcp__") => {
                 Value::String(redact::rewrite_paths(&text, paths))
             }
+            Some("model") if !context.answer => Value::String(redact_model_id(&text)),
             Some(member) if !context.answer && STRUCTURAL_STRING_MEMBERS.contains(&member) => {
                 Value::String(redact::rewrite_paths(&text, paths))
             }
