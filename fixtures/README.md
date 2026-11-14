@@ -166,7 +166,9 @@ and held only to its shape; the per-file digests are what the integrity check re
 The three harness crates carry derived copies of the captures their tests read. Claude and ACP
 copy whole manifest-owned contract directories; Codex copies every archival JSONL transcript, and
 Claude copies every `transcripts/*.jsonl` the same way, so a new recording is packaged without
-editing the script. The Claude help surfaces stay named one by one.
+editing the script. The Claude help surfaces stay named one by one. A recorder's
+`*.partial.jsonl` (incomplete run) and `*.unqualified.jsonl` (completed run that failed
+qualification) diagnostics are never packaged and never reported by `--check`, in any selection.
 After capturing or changing a canonical fixture, regenerate the copies and verify them:
 
 ```sh

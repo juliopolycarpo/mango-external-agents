@@ -72,5 +72,48 @@ class PackageFixtureTests(unittest.TestCase):
                                  ["denied-write-turn.jsonl", "read-turn.jsonl", "structured-output.jsonl"])
 
 
+    def test_recorder_diagnostics_are_neither_packaged_nor_reported(self):
+        """`.partial.jsonl` and `.unqualified.jsonl` are recorder diagnostics, not replay fixtures."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "fixtures" / "codex"
+            (source / "nested").mkdir(parents=True)
+            for relative in ("turn.jsonl", "nested/subagent.jsonl", "turn.partial.jsonl",
+                             "nested/subagent.unqualified.jsonl", "nested/subagent.partial.jsonl"):
+                (source / relative).write_bytes(relative.encode())
+            with patch.object(package_fixtures, "SELECTIONS", {"codex": ["**/*.jsonl"]}):
+                self.assertEqual(package_fixtures.selected_files(source, ["**/*.jsonl"]),
+                                 {Path("turn.jsonl"), Path("nested/subagent.jsonl")})
+                package_fixtures.synchronize(root, False)
+                self.assertEqual(package_fixtures.synchronize(root, True), [])
+                packaged = root / "crates" / "mango-agent-codex" / "fixtures" / "codex"
+                self.assertEqual(sorted(str(path.relative_to(packaged)) for path in packaged.rglob("*.jsonl")),
+                                 ["nested/subagent.jsonl", "turn.jsonl"])
+
+    def test_claude_transcript_selection_skips_recorder_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            transcripts = Path(directory) / "transcripts"
+            transcripts.mkdir()
+            for name in ("read-turn.jsonl", "structured-output.partial.jsonl", "structured-output.unqualified.jsonl"):
+                (transcripts / name).write_bytes(name.encode())
+            self.assertEqual(package_fixtures.selected_files(Path(directory), ["transcripts/*.jsonl"]),
+                             {Path("transcripts/read-turn.jsonl")})
+
+    def test_directory_selection_skips_recorder_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            contract = Path(directory) / "contract"
+            contract.mkdir()
+            for name in ("manifest.json", "run.partial.jsonl", "run.unqualified.jsonl"):
+                (contract / name).write_bytes(name.encode())
+            self.assertEqual(package_fixtures.selected_files(Path(directory), ["contract"]),
+                             {Path("contract/manifest.json")})
+
+    def test_selection_holding_only_diagnostics_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "only.partial.jsonl").write_bytes(b"partial")
+            with self.assertRaisesRegex(ValueError, r"expected fixture selection, received no files"):
+                package_fixtures.selected_files(Path(directory), ["*.jsonl"])
+
+
 if __name__ == "__main__":
     unittest.main()
