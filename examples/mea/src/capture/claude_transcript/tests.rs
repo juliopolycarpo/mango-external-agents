@@ -549,6 +549,131 @@ fn a_tool_input_map_is_the_models_answer_whatever_the_schema_names_its_propertie
     );
 }
 
+/// Parameter and field names a tool author can pick that collide with a structural member, a
+/// model id member or a tool-call name, each paired with a value only that author would write.
+const TOOL_AUTHOR_COLLISIONS: &[(&str, &str)] = &[
+    ("type", "canary-type-4411"),
+    ("id", "canary-id-4412"),
+    ("role", "canary-role-4413"),
+    ("subtype", "canary-subtype-4414"),
+    ("model", "canary-model-4415"),
+];
+
+/// `TOOL_AUTHOR_COLLISIONS` as the object a tool author wrote.
+fn tool_author_object() -> Value {
+    Value::Object(
+        TOOL_AUTHOR_COLLISIONS
+            .iter()
+            .map(|(name, value)| (String::from(*name), json!(value)))
+            .collect(),
+    )
+}
+
+/// Fails naming each collision value that is still in `line`, with the shape it was expected in.
+fn assert_no_tool_author_value(line: &Value, where_: &str) {
+    let written = line.to_string();
+    let kept: Vec<&str> = TOOL_AUTHOR_COLLISIONS
+        .iter()
+        .map(|(_, value)| *value)
+        .filter(|value| written.contains(value))
+        .collect();
+    assert!(
+        kept.is_empty(),
+        "expected every string {where_} replaced, structural names included | received kept: {kept:?} in {line}"
+    );
+}
+
+#[test]
+fn a_denied_tool_calls_input_replaces_strings_under_structural_parameter_names() {
+    let line = redacted_record(&json!({"type": "result", "permission_denials": [
+        {"tool_name": "mcp__ledger__lookup", "tool_use_id": "toolu_1",
+         "tool_input": tool_author_object()}]}));
+
+    assert_no_tool_author_value(&line, "under permission_denials[].tool_input");
+    let input = &line["permission_denials"][0]["tool_input"];
+    assert!(
+        input["type"] == redact::PLACEHOLDER && input.as_object().is_some_and(|map| map.len() == 5),
+        "expected the five parameter names kept with [REDACTED] values | received: {input}"
+    );
+    assert_eq!(
+        line["permission_denials"][0]["tool_use_id"], "toolu_1",
+        "expected the call's own tool_use_id to stay beside its input | received: {line}"
+    );
+}
+
+#[test]
+fn a_tool_input_inside_a_denial_replaces_a_nested_tool_use_lookalike_name() {
+    let line = redacted_record(&json!({"type": "result", "permission_denials": [
+        {"tool_input": {"payload": {"type": "tool_use", "name": "canary-name-4416"}}}]}));
+
+    assert!(
+        !line.to_string().contains("canary-name-4416"),
+        "expected a parameter object that reads like a tool call to lose its name | received: {line}"
+    );
+}
+
+#[test]
+fn a_tool_result_replaces_strings_under_structural_field_names() {
+    let line = redacted_record(&json!({"type": "user", "tool_use_result": tool_author_object()}));
+
+    assert_no_tool_author_value(&line, "under tool_use_result");
+}
+
+#[test]
+fn a_tool_result_array_replaces_strings_under_structural_field_names() {
+    let line = redacted_record(&json!({"type": "user",
+        "tool_use_result": [tool_author_object(), {"nested": [tool_author_object()]}]}));
+
+    assert_no_tool_author_value(&line, "inside an array under tool_use_result");
+}
+
+#[test]
+fn a_structural_name_replaced_inside_tool_data_is_not_reported_as_a_new_member() {
+    let drift = drift_over(&lines_of(&[
+        json!({"type": "user", "tool_use_result": tool_author_object()}),
+        json!({"type": "result", "permission_denials": [
+            {"tool_input": {"payload": tool_author_object(), TOOL_PARAMETER_KEY: "x"}}]}),
+    ]));
+
+    assert!(
+        drift.unseen.is_empty(),
+        "expected no structural name reported as unseen | received: {:?}",
+        drift.unseen
+    );
+}
+
+#[test]
+fn a_string_named_outside_every_list_inside_tool_data_is_still_reported() {
+    let drift = drift_over(&lines_of(&[
+        json!({"type": "user", "tool_use_result": {"novelNote": "x", "type": "y"}}),
+    ]));
+
+    assert_eq!(
+        drift.unseen.iter().collect::<Vec<_>>(),
+        vec!["novelNote"],
+        "expected only the member no review lists to be reported"
+    );
+}
+
+#[test]
+fn the_structural_members_beside_a_tool_input_and_a_tool_result_keep_their_strings() {
+    let line = redacted_record(
+        &json!({"type": "user", "role": "user", "session_id": SESSION_ID,
+        "tool_use_result": {"type": "text"},
+        "permission_denials": [{"tool_use_id": "toolu_1", "tool_input": {"type": "x"}}]}),
+    );
+
+    assert_eq!(
+        (
+            line["type"].as_str(),
+            line["role"].as_str(),
+            line["session_id"].as_str()
+        ),
+        (Some("user"), Some("user"), Some(SESSION_ID)),
+        "expected the record's own structural strings kept | received: {line}"
+    );
+}
+
 #[test]
 fn subagent_type_names_are_redacted_and_the_counters_beside_them_survive() {
     let line = redacted_record(&json!({"type": "result", "subagent_stats": {
