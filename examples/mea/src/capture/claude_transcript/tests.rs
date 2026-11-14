@@ -152,6 +152,17 @@ async fn capture_over(
     facts: &MachineFacts,
     schema: Option<&str>,
 ) -> Result<()> {
+    capture_on_model(launcher, out_dir, facts, schema, None).await
+}
+
+/// Runs `structured-output` over a scripted CLI, on the model `--model` named.
+async fn capture_on_model(
+    launcher: Arc<dyn ProcessLauncher>,
+    out_dir: &Path,
+    facts: &MachineFacts,
+    schema: Option<&str>,
+    model: Option<&str>,
+) -> Result<()> {
     let tap = TurnLineTap::over(launcher);
     let host = host_over(tap.clone());
     claude_with(
@@ -160,6 +171,7 @@ async fn capture_over(
         out_dir,
         STRUCTURED_OUTPUT,
         schema,
+        model,
         facts.paths(),
     )
     .await
@@ -622,7 +634,7 @@ fn an_unqualified_report_names_the_vendor_failure_and_only_structural_words() {
 
 #[test]
 fn the_header_names_the_scenario_the_cli_version_and_the_capture_time() {
-    let lines = header(&SCENARIOS[0], Some("2.1.325"), Some(1_790_000_000));
+    let lines = header(&SCENARIOS[0], Some("2.1.325"), Some(1_790_000_000), None);
 
     assert!(
         lines[0].starts_with("# claude/structured-output: "),
@@ -637,10 +649,36 @@ fn the_header_names_the_scenario_the_cli_version_and_the_capture_time() {
     assert_eq!(metadata["capturedAtUnixSeconds"], 1_790_000_000);
     assert_eq!(metadata["captureVersion"], env!("CARGO_PKG_VERSION"));
 
-    let unknown = header(&SCENARIOS[0], None, None);
+    let unknown = header(&SCENARIOS[0], None, None, None);
     assert!(
         unknown[1].contains("\"claudeVersion\":null"),
         "received: {unknown:?}"
+    );
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected no model line without --model | received: {lines:?}"
+    );
+}
+
+#[test]
+fn a_header_names_the_model_between_the_label_and_the_capture_metadata_when_one_was_chosen() {
+    let plain = header(&SCENARIOS[0], Some("2.1.325"), Some(1_790_000_000), None);
+    let pinned = header(
+        &SCENARIOS[0],
+        Some("2.1.325"),
+        Some(1_790_000_000),
+        Some("claude-opus-5"),
+    );
+
+    assert_eq!(
+        pinned,
+        vec![
+            plain[0].clone(),
+            String::from("# model: claude-opus-5"),
+            plain[1].clone()
+        ],
+        "expected the Codex header shape: label, `# model: ID`, then the rest"
     );
 }
 
@@ -869,6 +907,98 @@ async fn a_qualified_capture_writes_the_redacted_transcript_and_nothing_private(
 }
 
 #[tokio::test]
+async fn a_chosen_model_reaches_the_turn_argv_and_the_transcript_header() {
+    let facts = MachineFacts::new();
+    let out = tempfile::tempdir().expect("expected an output directory");
+    let cli = scripted_cli(answered_turn_lines(&facts));
+
+    capture_on_model(
+        cli.clone(),
+        out.path(),
+        &facts,
+        Some(SCHEMA),
+        Some("claude-opus-5"),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("expected the capture to qualify, received {error}"));
+
+    let turns = cli.turn_argvs();
+    assert!(
+        turns[0]
+            .windows(2)
+            .any(|pair| pair[0] == "--model" && pair[1] == "claude-opus-5"),
+        "expected the harness's argv to carry --model claude-opus-5 | received: {:?}",
+        turns[0]
+    );
+    let written = read_transcript(out.path(), "structured-output.jsonl");
+    let header: Vec<&str> = written.lines().take(3).collect();
+    assert_eq!(
+        header[1], "# model: claude-opus-5",
+        "expected the model on the second header line | received: {header:?}"
+    );
+    assert!(
+        header[2].starts_with("# capture {"),
+        "expected the capture metadata after the model line | received: {header:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_capture_without_a_model_passes_no_model_flag_and_writes_no_model_line() {
+    let facts = MachineFacts::new();
+    let out = tempfile::tempdir().expect("expected an output directory");
+    let cli = scripted_cli(answered_turn_lines(&facts));
+
+    capture_over(cli.clone(), out.path(), &facts, Some(SCHEMA))
+        .await
+        .unwrap_or_else(|error| panic!("expected the capture to qualify, received {error}"));
+
+    let turns = cli.turn_argvs();
+    assert!(
+        !turns[0].iter().any(|word| word == "--model"),
+        "expected the user's configured model to stay in force | received: {:?}",
+        turns[0]
+    );
+    let written = read_transcript(out.path(), "structured-output.jsonl");
+    assert!(
+        !written.contains("# model:"),
+        "expected no model line without --model | received: {written}"
+    );
+}
+
+#[tokio::test]
+async fn a_model_the_harness_cannot_put_on_argv_stops_the_capture_before_any_process_starts() {
+    let facts = MachineFacts::new();
+    let out = tempfile::tempdir().expect("expected an output directory");
+    let launcher = Arc::new(FakeLauncher::new());
+
+    let error = capture_on_model(
+        launcher.clone(),
+        out.path(),
+        &facts,
+        Some(SCHEMA),
+        Some("--dangerously-skip-permissions"),
+    )
+    .await
+    .expect_err("expected a model that reads as a flag to be refused");
+
+    assert!(
+        matches!(&error, Error::HostConfiguration { expected, received }
+            if *expected == "a non-empty Claude model identifier that can occupy a --model value"
+                && received == "30 code points"),
+        "expected the harness's own refusal | received: {error:?}"
+    );
+    assert!(
+        launcher.launches().is_empty(),
+        "expected no launch | received: {:?}",
+        launcher.launches()
+    );
+    assert!(
+        !transcript_dir(out.path()).exists(),
+        "expected nothing written"
+    );
+}
+
+#[tokio::test]
 async fn a_qualified_capture_removes_the_diagnostics_an_earlier_attempt_left() {
     let facts = MachineFacts::new();
     let out = tempfile::tempdir().expect("expected an output directory");
@@ -1066,6 +1196,7 @@ async fn an_unknown_scenario_is_refused_with_the_name_it_received() {
         out.path(),
         "handshake",
         Some(SCHEMA),
+        None,
         facts.paths(),
     )
     .await

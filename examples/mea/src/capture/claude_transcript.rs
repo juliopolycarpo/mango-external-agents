@@ -68,7 +68,8 @@ pub fn scenario_needs_schema(name: &str) -> bool {
 /// Records one Claude scenario into `out_dir/transcripts/`.
 ///
 /// `schema` is the text of the `--json-schema` file. The CLI is the one on `PATH`, already signed
-/// in; the turn runs in `workspace`.
+/// in; the turn runs in `workspace`. A `model` runs the turn on that id instead of the account's
+/// configured one, and the transcript header records it on a `# model: ID` line.
 ///
 /// # Errors
 ///
@@ -80,6 +81,7 @@ pub async fn claude(
     workspace: &Path,
     scenario: &str,
     schema: Option<&str>,
+    model: Option<&str>,
 ) -> Result<()> {
     let workspace = workspace
         .canonicalize()
@@ -106,7 +108,7 @@ pub async fn claude(
         home: &home,
         user: &user,
     };
-    claude_with(&host, &tap, out_dir, scenario, schema, paths).await
+    claude_with(&host, &tap, out_dir, scenario, schema, model, paths).await
 }
 
 /// [`claude`] on a host and tap the caller built, so a test can inject its own launcher.
@@ -118,6 +120,7 @@ async fn claude_with(
     out_dir: &Path,
     selected: &str,
     schema: Option<&str>,
+    model: Option<&str>,
     paths: Paths<'_>,
 ) -> Result<()> {
     let scenario = SCENARIOS
@@ -142,6 +145,10 @@ async fn claude_with(
         Some(schema) => ClaudeHarness::new().with_json_schema(schema)?,
         None => ClaudeHarness::new(),
     };
+    // The harness refuses a model that reads as a flag too, but only once it has probed the CLI.
+    if let Some(model) = model {
+        mango_agent_claude::models::validate_model(model)?;
+    }
     let directory = out_dir.join("transcripts");
     std::fs::create_dir_all(&directory).map_err(|error| Error::HostConfiguration {
         expected: "a writable fixture directory",
@@ -162,6 +169,10 @@ async fn claude_with(
     // where nothing was ever gated. The harness has no approver, so a prompt is denied by the CLI.
     request.configuration.level = ConfigurationChange::Set(PermissionLevel::ReadOnly);
     request.configuration.routing = ConfigurationChange::Set(ApprovalRouting::User);
+    if let Some(model) = model {
+        // Becomes `--model` on the turn's argv; without it the account's own default applies.
+        request.configuration.model = ConfigurationChange::Set(model.to_owned());
+    }
     if let Some(executable) = &discovery.executable {
         request = request.with_executable(ExecutablePath::resolved(executable.clone()));
     }
@@ -172,6 +183,7 @@ async fn claude_with(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs())
             .ok(),
+        model,
     );
 
     let session = harness.open_session(host, request).await?;
@@ -286,18 +298,27 @@ fn unexpected_prompt(received: &str) -> Error {
 
 /// The header lines of a transcript: what it is, and which build recorded it and when.
 ///
-/// The second line is the same `# capture {json}` shape the Codex subagent transcript carries,
-/// with the CLI's own version where Codex has its own.
-fn header(scenario: &Scenario, version: Option<&str>, captured_at: Option<u64>) -> Vec<String> {
+/// The `# capture {json}` line is the same shape the Codex subagent transcript carries, with the
+/// CLI's own version where Codex has its own. A capture that chose a model adds `# model: ID`
+/// under the label, as a Codex capture does, so a reader and a re-run see what it ran on; one that
+/// chose none keeps the two lines the committed transcripts have.
+fn header(
+    scenario: &Scenario,
+    version: Option<&str>,
+    captured_at: Option<u64>,
+    model: Option<&str>,
+) -> Vec<String> {
     let metadata = json!({
         "claudeVersion": version,
         "captureVersion": env!("CARGO_PKG_VERSION"),
         "capturedAtUnixSeconds": captured_at,
     });
-    vec![
-        format!("# claude/{}: {}", scenario.name, scenario.purpose),
-        format!("# capture {metadata}"),
-    ]
+    let mut lines = vec![format!("# claude/{}: {}", scenario.name, scenario.purpose)];
+    if let Some(model) = model {
+        lines.push(format!("# model: {model}"));
+    }
+    lines.push(format!("# capture {metadata}"));
+    lines
 }
 
 /// A transcript file: header, an optional label for a diagnostic, then the redacted body.

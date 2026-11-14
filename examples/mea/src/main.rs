@@ -159,7 +159,7 @@ fn print_banner() {
         "       mea capture codex [--scenario NAME] [--model ID] [--out DIR] [--workspace DIR] (archival transcripts)"
     );
     println!(
-        "       mea capture --harness claude --transcripts --scenario structured-output --json-schema FILE [--out DIR] [--workspace DIR] (archival transcript)"
+        "       mea capture --harness claude --transcripts --scenario structured-output --json-schema FILE [--model ID] [--out DIR] [--workspace DIR] (archival transcript)"
     );
     println!(
         "       mea digests [--out DIR] [--check] (rewrite or verify capture manifest digests)"
@@ -477,6 +477,7 @@ async fn capture(arguments: &[String]) -> Result<(), String> {
                 &workspace.path,
                 options.scenario.as_deref().unwrap_or_default(),
                 schema.as_deref(),
+                options.model.as_deref(),
             )
             .await
         }

@@ -868,7 +868,8 @@ pub(crate) struct CaptureOptions {
     pub workspace: Option<PathBuf>,
     #[arg(long)]
     pub transcripts: bool,
-    /// The Codex model id every transcript conversation opens its thread with.
+    /// The model id a transcript capture runs on, instead of the user's configured one: the Codex
+    /// thread's `model`, or Claude's `--model`.
     #[arg(long)]
     pub model: Option<String>,
     /// The schema file a Claude transcript scenario asks the CLI to answer under; refused anywhere
@@ -905,16 +906,19 @@ impl CaptureOptions {
         self.check_json_schema(&selected)?;
         if let Some(model) = &self.model {
             model_id("capture", model)?;
-            let transcript =
-                selected == HarnessChoice::Codex && (self.legacy.is_some() || self.transcripts);
+            let transcript = match selected {
+                HarnessChoice::Codex => self.legacy.is_some() || self.transcripts,
+                HarnessChoice::Claude => self.transcripts,
+                _ => false,
+            };
             if !transcript {
-                let received = if selected == HarnessChoice::Codex {
-                    format!("--model {model:?} with --harness codex without --transcripts")
+                let received = if matches!(selected, HarnessChoice::Codex | HarnessChoice::Claude) {
+                    format!("--model {model:?} with --harness {selected} without --transcripts")
                 } else {
                     format!("--model {model:?} with --harness {selected}")
                 };
                 return Err(format!(
-                    "(mea capture): expected --model with a Codex transcript capture (--harness codex --transcripts or `codex`) | received {received}"
+                    "(mea capture): expected --model with a transcript capture (--harness codex|claude --transcripts, or `codex`) | received {received}"
                 ));
             }
         }
@@ -1161,7 +1165,25 @@ mod capture_tests {
     }
 
     #[test]
-    fn a_model_is_refused_where_no_codex_transcript_would_use_it() {
+    fn a_model_is_accepted_for_a_claude_transcript_capture() {
+        let options = CaptureOptions::parse(&capture_arguments(&[
+            "--harness",
+            "claude",
+            "--transcripts",
+            "--scenario",
+            "structured-output",
+            "--json-schema",
+            "answer.schema.json",
+            "--model",
+            "claude-opus-5",
+        ]))
+        .expect("expected the capture arguments to parse");
+        assert_eq!(options.kind(), Ok(HarnessChoice::Claude));
+        assert_eq!(options.model.as_deref(), Some("claude-opus-5"));
+    }
+
+    #[test]
+    fn a_model_is_refused_where_no_transcript_would_use_it() {
         for (words, received) in [
             (
                 vec!["--harness", "codex", "--model", "gpt-5.2-codex"],
@@ -1172,8 +1194,8 @@ mod capture_tests {
                 "--model \"gpt-5.2-codex\" with --harness codex without --transcripts",
             ),
             (
-                vec!["--harness", "claude", "--model", "gpt-5.2-codex"],
-                "--model \"gpt-5.2-codex\" with --harness claude",
+                vec!["--harness", "claude", "--model", "opus"],
+                "--model \"opus\" with --harness claude without --transcripts",
             ),
             (
                 vec!["--harness", "acp:cursor", "--model", "gpt-5.2-codex"],
@@ -1185,7 +1207,7 @@ mod capture_tests {
             assert_eq!(
                 refused.err(),
                 Some(format!(
-                    "(mea capture): expected --model with a Codex transcript capture (--harness codex --transcripts or `codex`) | received {received}"
+                    "(mea capture): expected --model with a transcript capture (--harness codex|claude --transcripts, or `codex`) | received {received}"
                 )),
                 "expected {words:?} to be refused with the value it received"
             );
@@ -1265,33 +1287,6 @@ mod capture_tests {
             refused.err().as_deref(),
             Some(
                 "(mea capture): expected --json-schema FILE with --scenario structured-output | received no --json-schema"
-            )
-        );
-    }
-
-    #[test]
-    fn a_model_is_still_refused_for_a_claude_transcript_capture() {
-        let typed = std::env::temp_dir()
-            .join("answer.schema.json")
-            .display()
-            .to_string();
-        let refused = CaptureOptions::parse(&capture_arguments(&[
-            "--harness",
-            "claude",
-            "--transcripts",
-            "--scenario",
-            "structured-output",
-            "--json-schema",
-            &typed,
-            "--model",
-            "claude-sonnet-5",
-        ]))
-        .and_then(|options| options.kind());
-
-        assert_eq!(
-            refused.err().as_deref(),
-            Some(
-                "(mea capture): expected --model with a Codex transcript capture (--harness codex --transcripts or `codex`) | received --model \"claude-sonnet-5\" with --harness claude"
             )
         );
     }
