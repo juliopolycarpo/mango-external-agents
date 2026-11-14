@@ -24,6 +24,7 @@ make_repo() {
     : > "$repo/scripts/$name"
   done
   printf 'python3 scripts/test-codex-schema-inventory.py\npython3 scripts/test-vendor-result.py\n' > "$repo/scripts/test-vendor-drift.sh"
+  # shellcheck disable=SC2016 # the fixture script must contain the literal $work
   printf 'cp scripts/test-packages.sh "$work/"\n' > "$repo/scripts/test-package-admission.sh"
   {
     echo '# test-ghost.sh is only mentioned in a comment'
@@ -82,6 +83,7 @@ workflow_fixture() {
   case "$variant" in
     matrix-os | matrix-os-unlisted)
       echo '  matrixed:'
+      # shellcheck disable=SC2016 # the workflow text must contain the literal ${{ matrix.os }}
       echo '    runs-on: ${{ matrix.os }}'
       echo '    strategy:'
       echo '      matrix:'
@@ -223,6 +225,7 @@ make_repo "$work/repo" "$base" "$without_beta" no-pull-request
 expect_fail 'a workflow that does not trigger on pull_request' '.github/workflows/ci.yml: the workflow does not trigger on pull_request'
 
 make_repo "$work/repo" "$base" "$without_beta" gate-less
+# shellcheck disable=SC2016 # the backticks are literal Markdown in the expected message, not command substitution
 expect_fail 'a workflow without a gate job' '.github/workflows/ci.yml: the workflow has no `gate` job'
 
 # An indirect parent is held to the same rule.

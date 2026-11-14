@@ -42,6 +42,7 @@ fi
 # The scopes are the backticked words of the `Scopes:` sentence in AGENTS.md's commit rule, and
 # nothing else in that bullet: matching the whole bullet would turn any backticked lower-case word
 # a later edit adds to its prose into an accepted scope.
+# shellcheck disable=SC2016 # the backticks are literal characters for grep and tr, not command substitution
 scopes=$(
   sed -n '/^- Conventional Commits with a body/,/per commit\./p' AGENTS.md | tr '\n' ' ' |
     { grep -oE 'Scopes:[^.]*\.' || true; } |
