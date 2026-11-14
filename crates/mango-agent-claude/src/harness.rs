@@ -120,8 +120,9 @@ impl ClaudeHarness {
     /// Opt-in: a harness built without this passes no `--json-schema`, so the default argv is
     /// unchanged. The flag is documented for headless runs
     /// (<https://code.claude.com/docs/en/headless.md>). The schema is checked here, before any
-    /// session opens or process starts: it must parse as a JSON object and fit
-    /// [`MAX_JSON_SCHEMA_BYTES`](crate::json_schema::MAX_JSON_SCHEMA_BYTES) once compacted. The
+    /// session opens or process starts: it must parse as a JSON object and, compacted and escaped
+    /// for a Windows command line, fit
+    /// [`MAX_JSON_SCHEMA_ARGUMENT_UNITS`](crate::json_schema::MAX_JSON_SCHEMA_ARGUMENT_UNITS). The
     /// argument is inline, so it is visible in a process listing; keep secrets out of a schema.
     ///
     /// Opening a session on a build whose `--help` does not declare `--json-schema` is refused

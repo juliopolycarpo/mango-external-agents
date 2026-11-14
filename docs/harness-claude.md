@@ -902,7 +902,11 @@ What the harness checks, all before anything is spawned:
 - The text parses as JSON and its top level is an object. A bare `-1` is valid JSON and starts
   with `-`, which the CLI's parser would read as another flag.
 - The argument is the compact re-serialisation, so pretty-printing never puts a newline on argv.
-  It is at most 16 KiB, which keeps the whole command line under Windows' 32,767-character cap.
+  Its length is bounded as a Windows command line writes it, not in bytes: Rust's `Command`
+  turns every `"` into `\"` and doubles the backslashes before it, so a quote-dense schema
+  grows. The escaped argument may take at most 16,384 UTF-16 code units, half of Windows'
+  32,767-unit cap on a whole command line, which leaves the other half for the program path,
+  the other flags, the session id and the MCP path.
 - The build's `--help` declares `--json-schema` (fail closed, like `--mcp-config`). Opening a
   session on a build that does not is refused instead of running without the schema.
 

@@ -15,27 +15,30 @@
 //!   CLI's parser as another flag (`-1` is valid JSON and begins with `-`);
 //! - the argument is the compact re-serialisation, so a newline or other control character the
 //!   host's pretty-printing carried never reaches argv;
-//! - the size stays under [`MAX_JSON_SCHEMA_BYTES`].
+//! - the argument fits [`MAX_JSON_SCHEMA_ARGUMENT_UNITS`] as a Windows command line writes it.
 
 use mango_external_agents::{Error, Result};
 
-/// The largest compact schema this harness puts on a command line.
+/// The most UTF-16 code units the schema argument may occupy on a Windows command line.
 ///
 /// The schema travels inline, because the flag takes a value rather than a path. Windows caps a
-/// whole command line at 32,767 characters, so 16 KiB leaves room for every other flag. A host
-/// with a larger schema needs a surface the vendor documents for it; none is documented for
-/// `--json-schema` today.
-pub const MAX_JSON_SCHEMA_BYTES: usize = 16 * 1024;
+/// whole command line at 32,767 UTF-16 code units, and Rust's `Command` writes an argument as
+/// [`windows_argument_units`] counts it: every `"` becomes `\"` and the backslashes before it are
+/// doubled. A compact schema dense in quotes therefore grows well past its byte length, so the
+/// bound is on the escaped length. Half the cap leaves the other half for the program path, the
+/// other flags, the session id and the MCP path. A host with a larger schema needs a surface the
+/// vendor documents for it; none is documented for `--json-schema` today.
+pub const MAX_JSON_SCHEMA_ARGUMENT_UNITS: usize = 16 * 1024;
 
 /// What a refusal names as the accepted shape.
-const EXPECTED_SHAPE: &str = "a JSON object, no larger than 16384 bytes once compacted, that is a JSON Schema for --json-schema";
+const EXPECTED_SHAPE: &str = "a JSON object, no larger than 16384 UTF-16 code units once compacted and escaped as a Windows command-line argument, that is a JSON Schema for --json-schema";
 
 /// Checks a host's schema text and returns the compact form that goes on argv.
 ///
 /// # Errors
 ///
 /// [`Error::HostConfiguration`] naming the size (never the content) of what was received, when the
-/// text is not JSON, is not an object, or does not fit [`MAX_JSON_SCHEMA_BYTES`].
+/// text is not JSON, is not an object, or does not fit [`MAX_JSON_SCHEMA_ARGUMENT_UNITS`].
 ///
 /// # Example
 ///
@@ -48,7 +51,7 @@ const EXPECTED_SHAPE: &str = "a JSON object, no larger than 16384 bytes once com
 /// ```
 pub fn compact(raw: &str) -> Result<String> {
     // Checked before parsing so a megabyte of nested brackets is never walked.
-    if raw.len() > MAX_JSON_SCHEMA_BYTES.saturating_mul(4) {
+    if raw.len() > MAX_JSON_SCHEMA_ARGUMENT_UNITS.saturating_mul(4) {
         return Err(refusal(format!("{} bytes of text", raw.len())));
     }
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|error| {
@@ -71,13 +74,58 @@ pub fn compact(raw: &str) -> Result<String> {
             crate::argv::value_summary(raw)
         ))
     })?;
-    if compact.len() > MAX_JSON_SCHEMA_BYTES {
+    let units = windows_argument_units(&compact);
+    if units > MAX_JSON_SCHEMA_ARGUMENT_UNITS {
         return Err(refusal(format!(
-            "a schema of {} compact bytes",
+            "a schema of {} bytes that takes {units} UTF-16 code units on a Windows command line",
             compact.len()
         )));
     }
     Ok(compact)
+}
+
+/// How many UTF-16 code units `argument` takes on a Windows command line, as Rust's `Command`
+/// writes it.
+///
+/// The argument is counted as quoted, which is conservative: `Command` quotes only an argument
+/// holding a space or tab. Inside the quotes each `"` is written as `\"`, and each backslash
+/// directly before a quote (or before the closing quote) is written twice. Every other
+/// character takes its UTF-16 length.
+///
+/// # Example
+///
+/// ```
+/// use mango_agent_claude::json_schema::windows_argument_units;
+///
+/// assert_eq!(windows_argument_units("{}"), 4);
+/// // The quote becomes `\"`: 2 units, plus the 2 surrounding quotes.
+/// assert_eq!(windows_argument_units("\""), 4);
+/// // A backslash before a quote is written twice: `\\\"`.
+/// assert_eq!(windows_argument_units("\\\""), 6);
+/// ```
+pub fn windows_argument_units(argument: &str) -> usize {
+    // The surrounding quotes.
+    let mut units = 2;
+    let mut backslashes = 0;
+    for character in argument.chars() {
+        match character {
+            '\\' => {
+                backslashes += 1;
+                units += 1;
+            }
+            // The quote becomes `\"`, and each backslash before it is written a second time.
+            '"' => {
+                units += backslashes + 2;
+                backslashes = 0;
+            }
+            other => {
+                backslashes = 0;
+                units += other.len_utf16();
+            }
+        }
+    }
+    // Backslashes before the closing quote are doubled too.
+    units + backslashes
 }
 
 fn refusal(received: String) -> Error {
@@ -100,7 +148,7 @@ fn json_kind(value: &serde_json::Value) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_JSON_SCHEMA_BYTES, compact, json_kind};
+    use super::{MAX_JSON_SCHEMA_ARGUMENT_UNITS, compact, json_kind, windows_argument_units};
     use mango_external_agents::Error;
 
     fn refusal_received(raw: &str) -> String {
@@ -112,9 +160,17 @@ mod tests {
                 );
                 received
             }
-            other => {
-                panic!("expected a host-configuration refusal for {raw:?} | received {other:?}")
-            }
+            // Sizes only: a schema fixture can be 20,000 characters long.
+            Ok(argument) => panic!(
+                "expected a host-configuration refusal for {} bytes of schema text | received an accepted argument of {} bytes taking {} Windows command-line units",
+                raw.len(),
+                argument.len(),
+                windows_argument_units(&argument)
+            ),
+            Err(other) => panic!(
+                "expected a host-configuration refusal for {} bytes of schema text | received {other:?}",
+                raw.len()
+            ),
         }
     }
 
@@ -174,23 +230,84 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_schema_over_the_compact_cap_and_accepts_one_at_it() {
+    fn refuses_a_schema_over_the_argument_cap_and_accepts_one_at_it() {
         let filler = |length: usize| format!("{{\"d\":\"{}\"}}", "x".repeat(length));
-        // `{"d":""}` is 8 bytes of structure.
-        let at_cap = filler(MAX_JSON_SCHEMA_BYTES - 8);
+        // `{"d":""}` takes 14 units quoted and escaped, and each `x` takes one.
+        let at_cap = filler(MAX_JSON_SCHEMA_ARGUMENT_UNITS - 14);
+        let argument = compact(&at_cap).expect("expected the cap itself to pass");
         assert_eq!(
-            compact(&at_cap)
-                .expect("expected the cap itself to pass")
-                .len(),
-            MAX_JSON_SCHEMA_BYTES
+            windows_argument_units(&argument),
+            MAX_JSON_SCHEMA_ARGUMENT_UNITS
         );
-        let received = refusal_received(&filler(MAX_JSON_SCHEMA_BYTES - 7));
-        assert!(received.contains("compact bytes"), "received {received:?}");
+        let received = refusal_received(&filler(MAX_JSON_SCHEMA_ARGUMENT_UNITS - 13));
+        assert!(
+            received.contains("16385 UTF-16 code units"),
+            "received {received:?}"
+        );
+    }
+
+    /// Each `"` in a schema string is `\"` in JSON and `\\\"` on a Windows command line, so a
+    /// schema well under the cap in bytes can overflow it once escaped.
+    #[test]
+    fn refuses_a_quote_dense_schema_that_fits_in_bytes_but_not_once_escaped() {
+        let quotes = 5_000;
+        let raw = format!("{{\"d\":\"{}\"}}", "\\\"".repeat(quotes));
+        let compact_bytes = 8 + 2 * quotes;
+        assert!(
+            compact_bytes < MAX_JSON_SCHEMA_ARGUMENT_UNITS,
+            "expected the fixture to fit the cap in bytes | received {compact_bytes} bytes"
+        );
+        let received = refusal_received(&raw);
+        assert_eq!(
+            received,
+            format!(
+                "a schema of {compact_bytes} bytes that takes {} UTF-16 code units on a Windows command line",
+                14 + 4 * quotes
+            ),
+            "expected the escaped length named | received {received:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_a_quote_dense_schema_exactly_at_the_escaped_cap() {
+        // 14 units of structure, 4 per escaped quote, then two filler characters.
+        let raw = format!("{{\"d\":\"{}xx\"}}", "\\\"".repeat(4_092));
+        let argument = compact(&raw).expect("expected the escaped cap itself to pass");
+        assert_eq!(
+            windows_argument_units(&argument),
+            MAX_JSON_SCHEMA_ARGUMENT_UNITS
+        );
+        let over = format!("{{\"d\":\"{}xxx\"}}", "\\\"".repeat(4_092));
+        refusal_received(&over);
+    }
+
+    #[test]
+    fn counts_a_windows_argument_as_rusts_command_writes_it() {
+        for (argument, units) in [
+            ("", 2),
+            ("{}", 4),
+            // The quote becomes `\"`.
+            ("\"", 4),
+            // The backslash before a quote is doubled: `\\\"`.
+            ("\\\"", 6),
+            // Backslashes elsewhere are written once.
+            ("a\\b", 5),
+            // A backslash run before the closing quote is doubled.
+            ("\\\\", 6),
+            // A character outside the BMP takes two UTF-16 units.
+            ("\u{1F600}", 4),
+        ] {
+            assert_eq!(
+                windows_argument_units(argument),
+                units,
+                "expected {units} units | received {argument:?}"
+            );
+        }
     }
 
     #[test]
     fn refuses_oversized_text_before_parsing_it() {
-        let received = refusal_received(&" ".repeat(MAX_JSON_SCHEMA_BYTES * 4 + 1));
+        let received = refusal_received(&" ".repeat(MAX_JSON_SCHEMA_ARGUMENT_UNITS * 4 + 1));
         assert!(received.contains("bytes of text"), "received {received:?}");
     }
 
