@@ -1135,8 +1135,9 @@ nothing; the server's own handshake supplies the version gate and the signed-in 
 
 `mea doctor` and `mea discover` take neither flag. They probe the local CLI and stay read-only;
 attaching would mean opening a session, and a session start leaves a thread on the server. Given
-`--socket` or `--transport unix-socket` they refuse with `expected no --socket and no unix-socket
-transport; doctor probes the local CLI and never opens a session`.
+`--socket` or `--transport unix-socket` they refuse with `(mea <command>): expected no --socket and
+no unix-socket transport; <command> probes the local CLI and never opens a session`, naming
+themselves as `<command>`.
 
 - **The host owns the server and the path.** The library never starts `codex app-server`, its
   `daemon` subcommand or its `proxy`, and takes no default control-socket path: the host passes the
