@@ -21,7 +21,9 @@ async-trait.workspace = true
 clap = { workspace = true, features = ["derive"] }
 mango-agent-acp.workspace = true
 mango-agent-claude.workspace = true
-mango-agent-codex.workspace = true
+# The Unix socket transport is a feature of the harness, declared on Unix only: a build elsewhere
+# still refuses `--transport unix-socket` through the descriptor.
+mango-agent-codex = { workspace = true, features = ["unix-socket"] }
 # `mea` is the host here, so it takes the default launcher rather than writing one: it has no
 # sandbox policy of its own to express.
 mango-external-agents = { workspace = true, features = ["launcher-tokio", "stdio"] }

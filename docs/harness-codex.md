@@ -1119,6 +1119,26 @@ of the same name and pulls the WebSocket handshake without a TLS stack. Elsewher
 holds `stdio` alone, so the request above is refused as `UnsupportedTransport`. The documented
 surface has no Windows equivalent.
 
+`mea turn` drives the same attach from a terminal. Start the server yourself in one terminal, then
+point `mea` at its socket from another:
+
+```sh
+codex app-server --listen unix:///tmp/codex-app-server.sock
+cargo run -p mea -- turn --harness codex --transport unix-socket --socket /tmp/codex-app-server.sock "summarise this repository"
+```
+
+`--socket` is required with `--transport unix-socket`, refused with any other transport, and must be
+an absolute path. `mea` passes it to the harness as typed and prints the harness's refusals as they
+are: a path too long for a socket address, a server owned by another user, a `401` or `403` on the
+upgrade. It never starts a server. `turn` skips the local `codex` probe, because an attach spawns
+nothing; the server's own handshake supplies the version gate and the signed-in check.
+
+`mea doctor` and `mea discover` take neither flag. They probe the local CLI and stay read-only;
+attaching would mean opening a session, and a session start leaves a thread on the server. Given
+`--socket` or `--transport unix-socket` they refuse with `(mea <command>): expected no --socket and
+no unix-socket transport; <command> probes the local CLI and never opens a session`, naming
+themselves as `<command>`.
+
 - **The host owns the server and the path.** The library never starts `codex app-server`, its
   `daemon` subcommand or its `proxy`, and takes no default control-socket path: the host passes the
   socket it started or discovered. The path must be absolute and fit `sockaddr_un` (107 bytes on
