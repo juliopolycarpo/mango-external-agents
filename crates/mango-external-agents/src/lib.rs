@@ -98,7 +98,9 @@ pub use state::{
     SessionSubscription, TransportSelection,
 };
 pub use stream::{EventReceiver, EventSink, ReviewStream, TerminalStatus, TurnStream};
-pub use transport::{AcpSpec, ExecutablePath, StdioSpec, TransportKind, TransportSpec, WsSpec};
+pub use transport::{
+    AcpSpec, ExecutablePath, StdioSpec, TransportKind, TransportSpec, UnixSocketSpec, WsSpec,
+};
 
 /// Semantic version of this crate, kept in lockstep with every workspace crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

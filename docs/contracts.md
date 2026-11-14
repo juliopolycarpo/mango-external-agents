@@ -12,7 +12,7 @@ rationale and the compatibility surface.
 | Registration name | `HarnessId`      | `claude`, `codex`, `acp:cursor`                            | the harness, persisted by the host |
 | Wire dialect      | `ProtocolFamily` | `claude-code`, `codex-app-server`, `agent-client-protocol` | the harness                        |
 | Execution profile | `ProfileId`      | `cursor`, `opencode`, `goose`, `custom`                    | the harness, per agent             |
-| Carrier           | `TransportKind`  | `stdio`, `websocket`, `acp`                                | the **host**, per session          |
+| Carrier           | `TransportKind`  | `stdio`, `websocket`, `unix-socket`, `acp`                 | the **host**, per session          |
 
 `HarnessIdentity` carries the first three. The carrier is the other axis and is chosen per session,
 because the same dialect rides more than one of them.

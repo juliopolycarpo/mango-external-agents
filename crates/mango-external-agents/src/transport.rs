@@ -20,6 +20,11 @@ pub enum TransportKind {
     Stdio,
     /// A dialled WebSocket URL; the library owns message framing.
     WebSocket,
+    /// A Unix socket the host names, upgraded to a WebSocket; the library owns message framing.
+    ///
+    /// Unix only: other platforms refuse it with
+    /// [`Error::UnsupportedTransport`](crate::Error::UnsupportedTransport).
+    UnixSocket,
     /// The official Agent Client Protocol connection, which owns its own framing.
     Acp,
 }
@@ -29,6 +34,7 @@ impl fmt::Display for TransportKind {
         formatter.write_str(match self {
             Self::Stdio => "stdio",
             Self::WebSocket => "websocket",
+            Self::UnixSocket => "unix-socket",
             Self::Acp => "acp",
         })
     }
@@ -42,6 +48,8 @@ pub enum TransportSpec {
     Stdio(StdioSpec),
     /// Dial this URL.
     WebSocket(WsSpec),
+    /// Dial this Unix socket path and upgrade the connection to a WebSocket.
+    UnixSocket(UnixSocketSpec),
     /// Hand the official ACP client one of its two carriers.
     Acp(AcpSpec),
 }
@@ -61,6 +69,7 @@ impl TransportSpec {
         match self {
             Self::Stdio(_) => TransportKind::Stdio,
             Self::WebSocket(_) => TransportKind::WebSocket,
+            Self::UnixSocket(_) => TransportKind::UnixSocket,
             Self::Acp(_) => TransportKind::Acp,
         }
     }
@@ -155,6 +164,45 @@ impl WsSpec {
     }
 }
 
+/// A Unix socket an already-running vendor server listens on.
+///
+/// The host owns the path and the server behind it: the library dials it and never starts, stops
+/// or signals whatever listens there. There is no credential field. A server that wants a bearer
+/// token on the upgrade is refused as host configuration rather than fed one, because the library
+/// does not handle tokens.
+#[derive(Clone, PartialEq, Eq)]
+pub struct UnixSocketSpec {
+    /// The absolute filesystem path of the socket, or of a symlink to it.
+    pub path: PathBuf,
+}
+
+impl UnixSocketSpec {
+    /// Dials the socket at this path.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::UnixSocketSpec;
+    ///
+    /// let spec = UnixSocketSpec::new("/run/user/1000/app-server.sock");
+    /// assert!(spec.path.is_absolute());
+    /// ```
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+impl fmt::Debug for UnixSocketSpec {
+    /// Hand-written so a `{spec:?}` never prints the host's filesystem layout, which can name a
+    /// user or a project.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UnixSocketSpec")
+            .field("path_configured", &true)
+            .finish()
+    }
+}
+
 /// Which carrier an Agent Client Protocol connection uses.
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -243,7 +291,9 @@ impl fmt::Debug for ExecutablePath {
 
 #[cfg(test)]
 mod tests {
-    use super::{AcpSpec, ExecutablePath, StdioSpec, TransportKind, TransportSpec, WsSpec};
+    use super::{
+        AcpSpec, ExecutablePath, StdioSpec, TransportKind, TransportSpec, UnixSocketSpec, WsSpec,
+    };
 
     #[test]
     fn every_spec_names_its_kind() {
@@ -255,6 +305,10 @@ mod tests {
             (
                 TransportSpec::WebSocket(WsSpec::new("wss://localhost:1455")),
                 TransportKind::WebSocket,
+            ),
+            (
+                TransportSpec::UnixSocket(UnixSocketSpec::new("/run/app-server.sock")),
+                TransportKind::UnixSocket,
             ),
             (
                 TransportSpec::Acp(AcpSpec::Http(String::from("https://localhost:8080"))),
@@ -317,6 +371,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_unix_socket_path_never_reaches_a_debug_line() {
+        let spec = UnixSocketSpec::new("/home/private-user/project-secret/app-server.sock");
+        for rendered in [
+            format!("{spec:?}"),
+            format!("{:?}", TransportSpec::UnixSocket(spec)),
+        ] {
+            assert!(
+                !rendered.contains("private-user") && !rendered.contains("project-secret"),
+                "expected no socket path in transport debug, received {rendered}"
+            );
+            assert!(
+                rendered.contains("path_configured: true"),
+                "expected endpoint metadata, received {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_unix_socket_kind_is_named_unix_socket_in_text_and_serde() {
+        assert_eq!(TransportKind::UnixSocket.to_string(), "unix-socket");
+        assert_eq!(
+            serde_json::to_string(&TransportKind::UnixSocket).expect("expected json"),
+            "\"unix-socket\""
+        );
     }
 
     /// The ACP HTTP arm is a URL like the WebSocket one, so it leaks the same password through the

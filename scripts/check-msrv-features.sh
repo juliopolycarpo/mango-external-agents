@@ -45,7 +45,7 @@ check() {
 # bare line is the one a host that supplies its own transport and launcher compiles.
 core=(-p mango-external-agents --no-default-features)
 check "${core[@]}"
-for feature in stdio websocket launcher-tokio testing; do
+for feature in stdio websocket unix-socket launcher-tokio testing; do
   check "${core[@]}" --features "$feature"
 done
 check -p mango-external-agents --all-features
