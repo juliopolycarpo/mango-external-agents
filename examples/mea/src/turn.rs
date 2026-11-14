@@ -4,10 +4,12 @@ use crate::failure::with_cleanup;
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::io::Write;
 use std::pin::Pin;
 use std::time::Duration;
 
 use mango_external_agents::event::{AgentEvent, EventKind};
+use mango_external_agents::normalize::TextLimit;
 use mango_external_agents::{
     ActivityContent, BrokerDecision, CancelReason, CloseReason, Dispatch, Error, InteractionId,
     NoticeSeverity, PermissionBroker, PermissionRequest, PermissionResponse, QuestionRequest,
@@ -607,42 +609,58 @@ fn permission_response(
     }
 }
 
-/// Renders one event and returns an interaction that should wait for terminal input.
+/// Renders one event to stdout and returns an interaction that should wait for terminal input.
 fn print_event(event: &AgentEvent, json: bool) -> Result<Option<PromptRequest>> {
+    write_event(&mut std::io::stdout().lock(), event, json)
+}
+
+/// [`print_event`] against any writer, so a test reads what a person would see.
+///
+/// A failed write panics, as `println!` on a closed stdout does.
+fn write_event(
+    out: &mut dyn Write,
+    event: &AgentEvent,
+    json: bool,
+) -> Result<Option<PromptRequest>> {
     if json {
-        println!("{}", serde_json::json!(event));
+        writeln!(out, "{}", json_event_line(event)).expect(WRITE_FAILED);
     }
     match &event.kind {
-        EventKind::TextDelta { text } if !json => print!("{text}"),
+        EventKind::TextDelta { text } if !json => write!(out, "{text}").expect(WRITE_FAILED),
+        EventKind::StructuredOutput { value } if !json => {
+            // A text delta ends without a newline, and a usage line may be absent, so the label
+            // opens its own line; a blank line after a usage line is the price.
+            writeln!(out, "\n{}", structured_output_line(value)).expect(WRITE_FAILED);
+        }
         // A question is not a permission, and this is the branch that proves it: nothing here
         // consults the broker, and answering grants the agent nothing.
         EventKind::QuestionAsked { request } => {
             if !json {
-                println!("{}", serde_json::json!(event.kind));
+                writeln!(out, "{}", serde_json::json!(event.kind)).expect(WRITE_FAILED);
             }
             return Ok(Some(PromptRequest::Question(request.clone())));
         }
         EventKind::ActivityStarted { activity, .. } if !json => {
-            println!("{}", serde_json::json!(event.kind));
-            print_content(activity.content.as_ref());
+            writeln!(out, "{}", serde_json::json!(event.kind)).expect(WRITE_FAILED);
+            write_content(out, activity.content.as_ref());
         }
         EventKind::ActivityUpdated { update, .. } if !json => {
-            println!("{}", serde_json::json!(event.kind));
-            print_content(update.content.as_ref());
+            writeln!(out, "{}", serde_json::json!(event.kind)).expect(WRITE_FAILED);
+            write_content(out, update.content.as_ref());
         }
         EventKind::ActivityCompleted { result, .. } if !json => {
-            println!("{}", serde_json::json!(event.kind));
-            print_content(result.content.as_ref());
+            writeln!(out, "{}", serde_json::json!(event.kind)).expect(WRITE_FAILED);
+            write_content(out, result.content.as_ref());
         }
         EventKind::ApprovalRequested { request } => {
             if !json {
-                println!("{}", serde_json::json!(event.kind));
+                writeln!(out, "{}", serde_json::json!(event.kind)).expect(WRITE_FAILED);
             }
             return Ok(Some(PromptRequest::Approval(request.clone())));
         }
         EventKind::Error { error } => {
             if !json {
-                println!("{}", serde_json::json!(event.kind));
+                writeln!(out, "{}", serde_json::json!(event.kind)).expect(WRITE_FAILED);
             }
             return Err(Error::Vendor(error.clone()));
         }
@@ -650,11 +668,73 @@ fn print_event(event: &AgentEvent, json: bool) -> Result<Option<PromptRequest>> 
             severity,
             title,
             description,
-        } if !json => println!("{}", notice_line(severity, title, description.as_deref())),
-        other if !json => println!("{}", serde_json::json!(other)),
+        } if !json => {
+            writeln!(
+                out,
+                "{}",
+                notice_line(severity, title, description.as_deref())
+            )
+            .expect(WRITE_FAILED);
+        }
+        other if !json => writeln!(out, "{}", serde_json::json!(other)).expect(WRITE_FAILED),
         _ => {}
     }
     Ok(None)
+}
+
+/// What a failed write to the event writer says; stdout closing under a running turn is fatal.
+const WRITE_FAILED: &str = "expected the event writer to accept the line";
+
+/// One event as the line `--json` prints: the event's own JSON, whatever its kind.
+///
+/// A structured answer takes this path like every other event, so `--json` carries it in full
+/// (the core already bounds it at `STRUCTURED_OUTPUT_MAX_BYTES`) and nothing here renders it.
+fn json_event_line(event: &AgentEvent) -> String {
+    serde_json::json!(event).to_string()
+}
+
+/// The label plain mode puts before a structured answer, on a line of its own.
+const STRUCTURED_OUTPUT_LABEL: &str = "structured output: ";
+
+/// A structured answer as one labelled line a person reads.
+///
+/// The value is vendor-derived and untrusted, and a smoke run prints it at a terminal. It is
+/// printed as compact JSON, so a newline inside a string is the two characters `\n` and the line
+/// stays one line. The serialiser already escapes the C0 controls; this also escapes what it
+/// leaves alone and a terminal may act on or that hides text: DEL, the C1 controls (one of which
+/// is a one-byte CSI), the line and paragraph separators and the bidirectional formatting
+/// characters. Each becomes a JSON `\uXXXX` escape, so the text stays valid JSON. The line is
+/// bounded like other vendor detail text ([`TextLimit::Detail`]) and says how much it left out;
+/// `--json` carries the whole answer.
+///
+/// For example, `{"verdict":"pass"}` prints as `structured output: {"verdict":"pass"}`.
+fn structured_output_line(value: &serde_json::Value) -> String {
+    let mut escaped = String::new();
+    for character in value.to_string().chars() {
+        if is_terminal_active(character) {
+            escaped.push_str(&format!("\\u{:04x}", u32::from(character)));
+        } else {
+            escaped.push(character);
+        }
+    }
+    let limit = TextLimit::Detail.max_code_points();
+    let total = escaped.chars().count();
+    if total <= limit {
+        return format!("{STRUCTURED_OUTPUT_LABEL}{escaped}");
+    }
+    let shown: String = escaped.chars().take(limit).collect();
+    format!(
+        "{STRUCTURED_OUTPUT_LABEL}{shown} ... [truncated: {limit} of {total} characters shown; use --json for the whole answer]"
+    )
+}
+
+/// Whether a terminal may act on this character, or it can hide or reorder the text around it.
+fn is_terminal_active(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            u32::from(character),
+            0x061c | 0x200e | 0x200f | 0x2028 | 0x2029 | 0x202a..=0x202e | 0x2066..=0x2069
+        )
 }
 
 /// One notice as a line a person reads: `[notice:warning] title: description`.
@@ -685,11 +765,11 @@ fn notice_line(severity: &NoticeSeverity, title: &str, description: Option<&str>
 /// The JSON already carries every field; this exists so a person running the smoke tool can see at
 /// a glance that a plan arrived as steps and a diff as files, which is the whole reason the
 /// harnesses stopped flattening them into a sentence.
-fn print_content(content: Option<&ActivityContent>) {
+fn write_content(out: &mut dyn Write, content: Option<&ActivityContent>) {
     match content {
         Some(ActivityContent::Plan { steps }) => {
             for step in steps {
-                println!("    [{}] {}", step.status, step.title);
+                writeln!(out, "    [{}] {}", step.status, step.title).expect(WRITE_FAILED);
             }
         }
         Some(ActivityContent::Diff { files }) => {
@@ -698,10 +778,10 @@ fn print_content(content: Option<&ActivityContent>) {
                     (Some(added), Some(removed)) => format!(" (+{added} -{removed})"),
                     _ => String::new(),
                 };
-                println!("    {}{counts}", file.path);
+                writeln!(out, "    {}{counts}", file.path).expect(WRITE_FAILED);
             }
         }
-        Some(ActivityContent::Output { text }) => println!("    {text}"),
+        Some(ActivityContent::Output { text }) => writeln!(out, "    {text}").expect(WRITE_FAILED),
         Some(ActivityContent::Empty) => {}
         _ => {}
     }
@@ -724,6 +804,9 @@ mod tests {
         QuestionRequest, QuestionResponse, Result, Session, SessionState, SessionStatus,
         SystemClock, TurnRequest, TurnStream, VendorError,
     };
+
+    use mango_external_agents::event::AgentEvent;
+    use mango_external_agents::normalize::TextLimit;
 
     use super::run;
 
@@ -2408,5 +2491,240 @@ mod tests {
                 "expected notice line: {expected:?} | received: {received:?}"
             );
         }
+    }
+
+    /// The line a structured answer prints, without the label, parsed back as JSON.
+    fn answer_printed_as(value: &serde_json::Value) -> serde_json::Value {
+        let line = super::structured_output_line(value);
+        let json = line
+            .strip_prefix(super::STRUCTURED_OUTPUT_LABEL)
+            .unwrap_or_else(|| panic!("expected the label to open the line | received: {line:?}"));
+        serde_json::from_str(json)
+            .unwrap_or_else(|error| panic!("expected compact JSON | received: {json:?} ({error})"))
+    }
+
+    #[test]
+    fn a_structured_answer_prints_as_one_labelled_compact_line() {
+        let value = serde_json::json!({"verdict": {"checks": [1, true, null]}});
+        assert_eq!(
+            super::structured_output_line(&value),
+            r#"structured output: {"verdict":{"checks":[1,true,null]}}"#
+        );
+    }
+
+    #[test]
+    fn a_structured_answer_escapes_what_a_terminal_would_act_on() {
+        let hostile = "line\none\u{1b}[31m\u{9b}31m\u{7f}\u{202e}gnp\u{2028}end";
+        let value = serde_json::json!({ "note": hostile, "k\u{7}ey": 1 });
+        let line = super::structured_output_line(&value);
+        let offending: Vec<char> = line
+            .chars()
+            .filter(|character| super::is_terminal_active(*character))
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "expected one line free of control and bidirectional characters | received: {offending:?} in {line:?}"
+        );
+        for escape in [
+            "\\n", "\\u001b", "\\u009b", "\\u007f", "\\u202e", "\\u2028", "\\u0007",
+        ] {
+            assert!(
+                line.contains(escape),
+                "expected the escape {escape:?} | received: {line:?}"
+            );
+        }
+        assert_eq!(
+            answer_printed_as(&value),
+            value,
+            "expected the escaped line to stay JSON that reads back as the answer"
+        );
+    }
+
+    #[test]
+    fn a_structured_answer_past_the_detail_bound_is_cut_and_says_so() {
+        let limit = TextLimit::Detail.max_code_points();
+        let value = serde_json::json!({ "log": "x".repeat(limit * 3) });
+        let line = super::structured_output_line(&value);
+        let total = value.to_string().chars().count();
+        let shown = line
+            .strip_prefix(super::STRUCTURED_OUTPUT_LABEL)
+            .and_then(|rest| rest.split(" ... [truncated").next())
+            .unwrap_or_else(|| panic!("expected a truncation marker | received: {line:?}"));
+        assert_eq!(
+            shown.chars().count(),
+            limit,
+            "expected exactly the bound's code points of the answer"
+        );
+        assert!(
+            line.ends_with(&format!(
+                "[truncated: {limit} of {total} characters shown; use --json for the whole answer]"
+            )),
+            "expected the marker to name what was shown and what exists | received: {line:?}"
+        );
+
+        let fits = serde_json::json!({ "log": "x".repeat(limit - 10) });
+        assert_eq!(
+            fits.to_string().chars().count(),
+            limit,
+            "expected a value that is exactly the bound"
+        );
+        assert!(
+            !super::structured_output_line(&fits).contains("truncated"),
+            "expected a value at the bound to print whole"
+        );
+    }
+
+    /// The events a sink hands the turn loop for these kinds, in order, as the stream stamps them.
+    async fn events_of(kinds: Vec<EventKind>) -> Vec<AgentEvent> {
+        let request = TurnRequest::new("mea-turn-1", "answer");
+        let (sink, events) = EventSink::new(
+            mango_external_agents::SessionId::new("structured-session"),
+            request.turn_id.clone(),
+            request.attempt,
+            Arc::new(SystemClock),
+            kinds.len() + 1,
+        );
+        let count = kinds.len();
+        for kind in kinds {
+            sink.emit(kind)
+                .await
+                .expect("expected the event to be accepted");
+        }
+        let mut stream = TurnStream::accepted(request.turn_id, request.attempt, "turn", events);
+        let mut received = Vec::new();
+        for _ in 0..count {
+            received.push(stream.recv().await.expect("expected a queued event"));
+        }
+        received
+    }
+
+    /// What a person (or, with `json`, a script) sees for these events, in one string.
+    fn written_for(events: &[AgentEvent], json: bool) -> String {
+        let mut out = Vec::new();
+        for event in events {
+            // An `Error` event is the turn's failure; its line is written before it is returned.
+            let _ = super::write_event(&mut out, event, json);
+        }
+        String::from_utf8(out).expect("expected the writer to hold UTF-8")
+    }
+
+    fn answer_event(value: &serde_json::Value) -> EventKind {
+        EventKind::structured_output(value.clone()).expect("expected a value in bounds")
+    }
+
+    /// The answer's label opens its own line whatever came before: assistant text, which ends
+    /// without a newline, or a usage line, which does.
+    #[tokio::test]
+    async fn the_structured_label_starts_a_line_after_assistant_text_and_after_a_usage_line() {
+        let value = serde_json::json!({ "word": "ok" });
+        let after_text = events_of(vec![
+            EventKind::TextDelta {
+                text: String::from("ok"),
+            },
+            answer_event(&value),
+        ])
+        .await;
+        assert_eq!(
+            written_for(&after_text, false),
+            "ok\nstructured output: {\"word\":\"ok\"}\n",
+            "expected the label on its own line after assistant text"
+        );
+
+        let after_usage = events_of(vec![
+            EventKind::Usage {
+                usage: mango_external_agents::Usage::default(),
+            },
+            answer_event(&value),
+        ])
+        .await;
+        let written = written_for(&after_usage, false);
+        let last = written.lines().last().unwrap_or_default();
+        assert_eq!(
+            last, "structured output: {\"word\":\"ok\"}",
+            "expected the label at the start of the last line | received: {written:?}"
+        );
+    }
+
+    /// The arm that renders the answer is what escapes it: without it the value would fall to the
+    /// generic JSON line, which leaves C1 controls, DEL, line separators and bidirectional
+    /// formatting raw.
+    #[tokio::test]
+    async fn write_event_escapes_a_hostile_answer_on_the_plain_path() {
+        let value = serde_json::json!({ "note": "a\u{9b}31m\u{7f}\u{202e}b\u{2028}c\u{1b}d" });
+        let events = events_of(vec![answer_event(&value)]).await;
+        let written = written_for(&events, false);
+
+        let offending: Vec<char> = written
+            .chars()
+            .filter(|character| super::is_terminal_active(*character) && *character != '\n')
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "expected no terminal-active character in the written line | received: {offending:?} in {written:?}"
+        );
+        for escape in ["\\u009b", "\\u007f", "\\u202e", "\\u2028", "\\u001b"] {
+            assert!(
+                written.contains(escape),
+                "expected the escape {escape:?} | received: {written:?}"
+            );
+        }
+    }
+
+    /// `--json` prints every event through one expression; the answer is not special-cased and not
+    /// shortened, and the plain label never appears.
+    #[tokio::test]
+    async fn json_mode_carries_the_whole_structured_answer_in_the_events_own_json() {
+        let value =
+            serde_json::json!({ "log": "y".repeat(TextLimit::Detail.max_code_points() * 2) });
+        let events = events_of(vec![answer_event(&value), EventKind::Completed]).await;
+        let written = written_for(&events, true);
+
+        assert!(
+            !written.contains(super::STRUCTURED_OUTPUT_LABEL),
+            "expected no plain-mode label in --json output"
+        );
+        let first = written
+            .lines()
+            .next()
+            .expect("expected one line for the answer");
+        let line: serde_json::Value =
+            serde_json::from_str(first).expect("expected one JSON line for the answer");
+        assert_eq!(
+            line["kind"]["type"], "structured_output",
+            "expected the event's kind tag"
+        );
+        assert!(
+            line["kind"]["value"] == value,
+            "expected --json to carry the whole {}-byte answer | received a value of another shape",
+            value.to_string().len()
+        );
+    }
+
+    /// A failed turn's event line carries the vendor's code and message, and the event is returned
+    /// as the turn's error.
+    #[tokio::test]
+    async fn an_error_event_is_written_with_its_code_and_message_and_returned() {
+        let error = VendorError::new(
+            ErrorCode::from_static("scripted-vendor-failure"),
+            "the scripted vendor failure",
+        );
+        let events = events_of(vec![EventKind::Error {
+            error: error.clone(),
+        }])
+        .await;
+        let mut out = Vec::new();
+        let returned = super::write_event(&mut out, &events[0], false);
+
+        assert!(
+            matches!(&returned, Err(Error::Vendor(received)) if received.code.as_str() == "scripted-vendor-failure"),
+            "expected the vendor error returned | received: {:?}",
+            returned.as_ref().err()
+        );
+        let written = String::from_utf8(out).expect("expected UTF-8");
+        assert!(
+            written.contains("scripted-vendor-failure")
+                && written.contains("the scripted vendor failure"),
+            "expected the code and message in the written line | received: {written:?}"
+        );
     }
 }

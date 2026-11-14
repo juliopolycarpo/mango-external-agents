@@ -1,7 +1,7 @@
 //! Shared discovery and turn arguments, checked before launching a vendor.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Parser;
@@ -22,6 +22,8 @@ struct Arguments {
     socket: Option<PathBuf>,
     #[arg(long)]
     model: Option<String>,
+    #[arg(long)]
+    json_schema: Option<PathBuf>,
     #[arg(long)]
     cwd: Option<PathBuf>,
     #[arg(long)]
@@ -71,6 +73,8 @@ pub(crate) struct Options {
     pub socket: Option<PathBuf>,
     /// The Codex model id `mea turn` opens its thread with, instead of the user's configured one.
     pub model: Option<String>,
+    /// The file holding the JSON Schema a Claude turn's answer must follow, as typed.
+    pub json_schema: Option<PathBuf>,
     pub cwd: Option<PathBuf>,
     pub json: bool,
     /// How long after a turn starts `mea turn` asks its session to cancel it, when asked to.
@@ -91,6 +95,7 @@ impl Options {
             transport: args.transport.as_deref().map(transport).transpose()?,
             socket: args.socket,
             model: args.model,
+            json_schema: args.json_schema,
             cwd: args.cwd,
             json: args.json,
             cancel_after: args.cancel_after.as_deref().map(cancel_after).transpose()?,
@@ -107,7 +112,34 @@ impl Options {
         let options = Self::parse(arguments)?;
         options.check_socket(command)?;
         options.check_model(command)?;
+        options.check_json_schema(command)?;
         Ok(options)
+    }
+
+    /// The `--json-schema` pairing: only `turn` opens a session, and only the Claude harness takes
+    /// the flag.
+    ///
+    /// The value is a file path so the schema is not typed into `mea`'s own command line; the file
+    /// is read later, by `turn`, and the schema still reaches the vendor's command line. Other
+    /// harnesses are refused here rather than quietly run without the
+    /// schema, which is the run the flag exists to avoid.
+    fn check_json_schema(&self, command: &str) -> Result<(), String> {
+        let Some(path) = &self.json_schema else {
+            return Ok(());
+        };
+        if command != "turn" {
+            return Err(format!(
+                "(mea {command}): expected no --json-schema; {command} probes the local CLI and never opens a session | received --json-schema {path:?}"
+            ));
+        }
+        let kind = self.kind.clone().unwrap_or(HarnessChoice::Claude);
+        if kind == HarnessChoice::Claude {
+            Ok(())
+        } else {
+            Err(format!(
+                "(mea {command}): expected --json-schema with --harness claude | received --json-schema {path:?} with --harness {kind}"
+            ))
+        }
     }
 
     /// The `--model` pairing: only `turn` opens a session, and only the Codex harness takes it.
@@ -196,6 +228,50 @@ pub(crate) fn model_id<'a>(command: &str, received: &'a str) -> Result<&'a str, 
         ));
     }
     Ok(received)
+}
+
+/// The most bytes `mea` reads from a `--json-schema` file before it refuses the file.
+///
+/// Far above what the Claude harness takes onto a command line (a few kilobytes once compacted),
+/// so the harness's own refusal, which names the size it received, still answers for every schema
+/// that is merely too large. This bound only stops a wrong path, such as a log or a device, from
+/// being read whole.
+pub(crate) const JSON_SCHEMA_FILE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// The text of the file `--json-schema` names, or the refusal that names the path.
+///
+/// The path is read as typed, relative to this process's directory rather than to `--cwd`, the way
+/// every shell command reads a path. Only the file's presence, readability, size and emptiness are
+/// judged: whether the text is a JSON object that fits a command line is
+/// `ClaudeHarness::with_json_schema`'s call, and its refusal is printed unchanged.
+/// Example: `--json-schema answer.schema.json`.
+pub(crate) fn read_json_schema_file(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+
+    let expected = "expected --json-schema as a readable UTF-8 file holding a JSON Schema object";
+    let refused =
+        |error: &dyn fmt::Display| format!("(mea turn): {expected} | received {path:?} ({error})");
+    // Bytes first: a cut at the bound can split a character, which must read as "too large"
+    // rather than as invalid UTF-8.
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| {
+            file.take(JSON_SCHEMA_FILE_MAX_BYTES + 1)
+                .read_to_end(&mut bytes)
+        })
+        .map_err(|error| refused(&error))?;
+    if bytes.len() as u64 > JSON_SCHEMA_FILE_MAX_BYTES {
+        return Err(format!(
+            "(mea turn): expected --json-schema as a file of at most {JSON_SCHEMA_FILE_MAX_BYTES} bytes | received {path:?} with more than that"
+        ));
+    }
+    let text = String::from_utf8(bytes).map_err(|error| refused(&error))?;
+    if text.trim().is_empty() {
+        return Err(format!(
+            "(mea turn): expected --json-schema as a nonempty file holding a JSON Schema object | received {path:?} with no text"
+        ));
+    }
+    Ok(text)
 }
 
 /// The permission level this name asks for. Example: `--level read-only`.
@@ -639,6 +715,134 @@ mod tests {
             ))
         );
     }
+
+    /// An absolute path on every platform, which is all these tests need to type.
+    fn schema_path() -> PathBuf {
+        std::env::temp_dir().join("answer.schema.json")
+    }
+
+    #[test]
+    fn a_claude_turn_carries_the_schema_path_as_typed() {
+        let path = schema_path();
+        let typed = path.display().to_string();
+        for harness in [vec!["--harness", "claude"], vec![]] {
+            let mut words = harness;
+            words.extend(["--json-schema", typed.as_str(), "hello"]);
+            let options = Options::parse_for("turn", &arguments(&words)).unwrap_or_else(|error| {
+                panic!("expected (mea turn) to accept it, received {error}")
+            });
+            assert_eq!(options.json_schema.as_deref(), Some(path.as_path()));
+            assert_eq!(options.prompt, "hello");
+        }
+        let without = Options::parse_for("turn", &arguments(&["hello"]))
+            .expect("expected a turn without --json-schema");
+        assert_eq!(without.json_schema, None);
+    }
+
+    #[test]
+    fn a_schema_for_another_harness_is_refused_with_the_harness_it_received() {
+        let path = schema_path();
+        let typed = path.display().to_string();
+        for harness in ["codex", "acp:cursor"] {
+            let refused = Options::parse_for(
+                "turn",
+                &arguments(&["--harness", harness, "--json-schema", &typed, "hello"]),
+            );
+            assert_eq!(
+                refused.err(),
+                Some(format!(
+                    "(mea turn): expected --json-schema with --harness claude | received --json-schema {path:?} with --harness {harness}"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn discover_and_doctor_refuse_a_schema_they_would_never_use() {
+        let path = schema_path();
+        let typed = path.display().to_string();
+        for command in ["discover", "doctor"] {
+            let refused = Options::parse_for(
+                command,
+                &arguments(&["--harness", "claude", "--json-schema", &typed]),
+            );
+            assert_eq!(
+                refused.err(),
+                Some(format!(
+                    "(mea {command}): expected no --json-schema; {command} probes the local CLI and never opens a session | received --json-schema {path:?}"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn a_schema_file_is_read_as_typed_and_its_text_is_returned_whole() {
+        let directory = tempfile::tempdir().expect("expected a scratch directory");
+        let path = directory.path().join("answer.schema.json");
+        let text = "{\n  \"type\": \"object\"\n}\n";
+        std::fs::write(&path, text).expect("expected the schema file to be written");
+        assert_eq!(read_json_schema_file(&path), Ok(String::from(text)));
+    }
+
+    #[test]
+    fn an_unreadable_schema_file_is_refused_with_its_path() {
+        let directory = tempfile::tempdir().expect("expected a scratch directory");
+        let missing = directory.path().join("missing.schema.json");
+        let invalid = directory.path().join("latin1.schema.json");
+        std::fs::write(&invalid, [0xff, 0xfe, b'{', b'}'])
+            .expect("expected the file to be written");
+        // A directory opens on Unix and fails on its first read; either way it is unreadable.
+        let directory_path = directory.path().to_path_buf();
+        for path in [missing, invalid, directory_path] {
+            let refused = read_json_schema_file(&path).expect_err("expected the file refused");
+            let expected = format!(
+                "(mea turn): expected --json-schema as a readable UTF-8 file holding a JSON Schema object | received {path:?} ("
+            );
+            assert!(
+                refused.starts_with(&expected) && refused.ends_with(')'),
+                "expected a refusal that opens {expected:?} and names the cause | received: {refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_schema_file_is_refused_with_its_path() {
+        let directory = tempfile::tempdir().expect("expected a scratch directory");
+        for (name, text) in [("empty.json", ""), ("blank.json", " \n\t\n")] {
+            let path = directory.path().join(name);
+            std::fs::write(&path, text).expect("expected the file to be written");
+            assert_eq!(
+                read_json_schema_file(&path),
+                Err(format!(
+                    "(mea turn): expected --json-schema as a nonempty file holding a JSON Schema object | received {path:?} with no text"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn a_schema_file_past_the_read_bound_is_refused_even_when_a_character_straddles_it() {
+        let directory = tempfile::tempdir().expect("expected a scratch directory");
+        let bound = usize::try_from(JSON_SCHEMA_FILE_MAX_BYTES).expect("expected a small bound");
+        // The three-byte character starts one byte before the bound and ends after it.
+        let mut text = "a".repeat(bound - 1);
+        text.push('\u{20ac}');
+        let path = directory.path().join("huge.schema.json");
+        std::fs::write(&path, &text).expect("expected the file to be written");
+        assert_eq!(
+            read_json_schema_file(&path),
+            Err(format!(
+                "(mea turn): expected --json-schema as a file of at most {JSON_SCHEMA_FILE_MAX_BYTES} bytes | received {path:?} with more than that"
+            ))
+        );
+
+        let exact = directory.path().join("exact.schema.json");
+        std::fs::write(&exact, "a".repeat(bound)).expect("expected the file to be written");
+        assert!(
+            read_json_schema_file(&exact).is_ok(),
+            "expected a file of exactly the bound to be read"
+        );
+    }
 }
 
 /// Contract capture arguments. `capture codex` preserves the historical transcript command.
@@ -660,6 +864,9 @@ pub(crate) struct CaptureOptions {
     /// The Codex model id every transcript conversation opens its thread with.
     #[arg(long)]
     pub model: Option<String>,
+    /// Parsed only to be refused: a capture records a vendor's contract and takes no host schema.
+    #[arg(long)]
+    pub json_schema: Option<PathBuf>,
     #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(crate::capture::scenario_names()))]
     pub scenario: Option<String>,
 }
@@ -675,6 +882,11 @@ impl CaptureOptions {
 
     /// Resolves the requested vendor. Example: `acp` uses the documented default capture profile.
     pub fn kind(&self) -> Result<HarnessChoice, String> {
+        if let Some(path) = &self.json_schema {
+            return Err(format!(
+                "(mea capture): expected no --json-schema; capture records a vendor's own output and never takes a host schema | received --json-schema {path:?}"
+            ));
+        }
         let name = self.harness.as_deref().unwrap_or("codex");
         let default_profile =
             (name == "acp").then_some(crate::capture::DEFAULT_ACP_CAPTURE_PROFILE);
@@ -836,6 +1048,33 @@ mod capture_tests {
                 "(mea capture): expected --model as a nonempty, bounded model id without surrounding spaces or control characters | received \"\""
             ))
         );
+    }
+
+    #[test]
+    fn capture_refuses_a_schema_it_would_never_use() {
+        let path = std::env::temp_dir().join("answer.schema.json");
+        let typed = path.display().to_string();
+        for words in [
+            vec!["--harness", "claude", "--json-schema", typed.as_str()],
+            vec![
+                "--harness",
+                "codex",
+                "--transcripts",
+                "--json-schema",
+                typed.as_str(),
+            ],
+            vec!["codex", "--json-schema", typed.as_str()],
+        ] {
+            let refused = CaptureOptions::parse(&capture_arguments(&words))
+                .and_then(|options| options.kind());
+            assert_eq!(
+                refused.err(),
+                Some(format!(
+                    "(mea capture): expected no --json-schema; capture records a vendor's own output and never takes a host schema | received --json-schema {path:?}"
+                )),
+                "expected {words:?} to be refused with the value it received"
+            );
+        }
     }
 }
 

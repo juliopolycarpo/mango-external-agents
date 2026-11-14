@@ -930,6 +930,53 @@ the CLI does, and exits at startup with `Error: --json-schema is not a valid JSO
 The schema is inline, because the flag takes a value, not a path. It is visible in a process
 listing, unlike the prompt. Keep secrets out of it.
 
+### Trying it from a terminal: `mea turn --json-schema FILE`
+
+`mea turn --json-schema FILE` takes the path of a file that holds the schema, so the schema is not
+typed into `mea`'s own command line. Vendor document followed:
+[headless: get structured output](https://code.claude.com/docs/en/headless#get-structured-output).
+
+```sh
+cargo run -p mea -- turn --harness claude --json-schema answer.schema.json "Reply with the word ok."
+```
+
+`mea` reads the file as typed (relative to the directory it runs in, not to `--cwd`) and hands its
+text to `ClaudeHarness::with_json_schema`, which owns every check described above; its refusal
+prints unchanged. The schema goes on the vendor `claude` command line, whatever file it came from,
+so a process listing shows it. Keep secrets out of the file.
+
+`mea` refuses before it probes or spawns anything, naming the value it received and the shape it
+expected:
+
+- A file it cannot read, or that is not UTF-8: `(mea turn): expected --json-schema as a readable
+  UTF-8 file holding a JSON Schema object | received "<path>" (<cause>)`.
+- A file over 1 MiB: `(mea turn): expected --json-schema as a file of at most 1048576 bytes |
+  received "<path>" with more than that`.
+- An empty file, or one holding only whitespace: `(mea turn): expected --json-schema as a nonempty
+  file holding a JSON Schema object | received "<path>" with no text`.
+- Any harness but Claude, including a turn with `--harness codex` or `acp:<profile>`:
+  `(mea turn): expected --json-schema with --harness claude | received --json-schema "<path>" with
+  --harness <harness>`. A turn without `--harness` runs Claude.
+- `discover` and `doctor`, which never open a session, and `mea capture`, which records a vendor's
+  own output: `(mea <command>): expected no --json-schema; … | received --json-schema "<path>"`.
+
+Plain output prints the answer on its own labelled line, before `completed`. A blank line may
+precede it: the label starts a fresh line even when assistant text, which ends without a newline,
+came just before.
+
+```text
+structured output: {"word":"ok"}
+```
+
+The value is untrusted vendor output. The line is compact JSON, and every character a terminal may
+act on (C0 and C1 controls, DEL, line and paragraph separators, bidirectional formatting) is
+written as a `\uXXXX` escape. It is cut at 4,096 characters, and a cut line says how many of how
+many it shows. `--json` prints the event whole through the same path as every other event, with
+the answer under `kind.value`. A turn that ends without a valid answer fails the command: the
+harness ends it as an `Error` coded `claude-structured-output-missing` (see "No answer" below),
+`mea turn` prints that event with the vendor message and exits non-zero. The tests replay inline
+frames over a scripted `claude`; no live Claude run backs this section.
+
 ### The answer
 
 With a schema, the turn's `result` record carries the validated value. The reducer maps it onto
