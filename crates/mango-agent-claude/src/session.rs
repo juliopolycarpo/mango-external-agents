@@ -202,6 +202,10 @@ struct Mutable {
     /// start holds a second owner until it installs or reaps its child, then the final owner removes
     /// the file. A session dropped without being closed releases this state too.
     mcp_config: Option<Arc<ConfigFile>>,
+    /// The host's `--json-schema` text, validated at open and passed on every turn.
+    ///
+    /// Set once by [`ClaudeSession::with_json_schema`] before the session is handed out.
+    json_schema: Option<Arc<str>>,
     /// A forced termination can leave Claude's native conversation positioned at an unfinished
     /// prompt. The harness never silently selects a different native id for a strict session;
     /// callers receive an explicit refusal until they open a fresh session themselves.
@@ -396,6 +400,7 @@ impl ClaudeSession {
             resume_pending,
             active: None,
             mcp_config: mcp_config.map(Arc::new),
+            json_schema: None,
             nonresumable: None,
             taint: None,
             last_turn_finished: false,
@@ -415,6 +420,15 @@ impl ClaudeSession {
                 runtime: tokio::runtime::Handle::try_current().ok(),
             }),
         }
+    }
+
+    /// Makes every turn of this session pass `schema` as `--json-schema`.
+    ///
+    /// The text was validated by [`crate::json_schema::compact`] when the host handed it to the
+    /// harness; the argv builder checks it again on every turn.
+    pub(crate) fn with_json_schema(self, schema: Option<Arc<str>>) -> Self {
+        self.shared.lock().json_schema = schema;
+        self
     }
 
     /// Stops whatever turn is running, for one reason.
@@ -1388,9 +1402,12 @@ impl mango_external_agents::Session for ClaudeSession {
             .ids
             .native_session_id
             .clone();
-        let established = {
+        let (established, json_schema) = {
             let state = self.shared.lock();
-            state.established || state.resume_pending
+            (
+                state.established || state.resume_pending,
+                state.json_schema.clone(),
+            )
         };
         let mcp_config = abandoned
             .mcp_lease
@@ -1414,6 +1431,7 @@ impl mango_external_agents::Session for ClaudeSession {
                 .as_ref()
                 .is_some_and(CliSurface::declares_permission_prompts),
             mcp_config: mcp_config.as_deref(),
+            json_schema: json_schema.as_deref(),
         })
         .build()
         {

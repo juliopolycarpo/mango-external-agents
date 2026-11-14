@@ -7,6 +7,7 @@ pub mod commands;
 pub mod deadlines;
 pub mod harness;
 pub mod help;
+pub mod json_schema;
 pub mod mcp;
 pub mod models;
 pub mod permissions;

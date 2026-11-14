@@ -157,6 +157,7 @@ claude --print
        [--permission-prompts none]
        (--session-id <uuid> | --resume <uuid>)
        [--model <id>] [--effort <level>] [--mcp-config <path>]
+       [--json-schema <schema>]
 ```
 
 - **`--print` with both stream-json formats** is the documented headless interface
@@ -885,6 +886,66 @@ A build that does not declare `--mcp-config` returns
 `Error::NotSupported { capability: Capability::McpPassthrough }`; a transport kind this harness
 does not map is refused as host configuration. Accepting either would run every turn without the
 tools somebody configured and report success.
+
+## Structured output: `--json-schema`
+
+`ClaudeHarness::with_json_schema(schema)` is an opt-in. A harness built without it passes no
+`--json-schema`, and the default argv is unchanged. With it, every turn of every session that
+harness opens carries `--json-schema <compact schema>`. Vendor documents followed, both read on
+2026-11-13: [headless.md](https://code.claude.com/docs/en/headless.md) (the flag, and the error
+the CLI prints for an invalid schema) and
+[agent-sdk/structured-outputs.md](https://code.claude.com/docs/en/agent-sdk/structured-outputs.md)
+(the `structured_output` field, the `StructuredOutput` tool call and the failure subtype).
+
+What the harness checks, all before anything is spawned:
+
+- The text parses as JSON and its top level is an object. A bare `-1` is valid JSON and starts
+  with `-`, which the CLI's parser would read as another flag.
+- The argument is the compact re-serialisation, so pretty-printing never puts a newline on argv.
+  Its length is bounded as a Windows command line writes it, not in bytes: Rust's `Command`
+  turns every `"` into `\"` and doubles the backslashes before it, so a quote-dense schema
+  grows. When the launcher runs a `.bat` or `.cmd` shim (an npm `claude.cmd`), Rust also writes
+  each `%` as `%%cd:~,%`, 8 units for 1. The count takes the larger figure for both, so it is an
+  upper bound whichever program the host launches.
+- The bound is a conservative worst case for a batch-shim launch. A `.cmd` launch runs through
+  `cmd.exe /e:ON /v:OFF /d /c "…"`, and `cmd.exe` rejects a line past 8,191 characters, well
+  under the 32,767 units CreateProcess takes. The whole turn line is therefore counted against
+  8,191: the 28-unit prefix and closing quote, 1,024 units reserved for the launcher path the
+  library does not see, and every argument quoted and escaped as above. The schema cap
+  (`MAX_JSON_SCHEMA_ARGUMENT_UNITS`, 6,861 units) is what remains once the flags every turn
+  passes and the longest conditional ones are subtracted, derived from the flag lists rather
+  than chosen, so `with_json_schema` already refuses a schema that can never fit. The model,
+  effort and MCP path vary per turn, so `TurnArgv::build` counts the whole line again whenever
+  a schema is present and refuses with `Error::HostConfiguration` naming the units and the cap,
+  never the schema or a path. A turn without a schema is never refused on length.
+- A host that launches the native binary has more room than this, but gets the same refusal,
+  because the library cannot tell which launcher the host runs. Avoid large schemas on Windows.
+- The build's `--help` declares `--json-schema` (fail closed, like `--mcp-config`). Opening a
+  session on a build that does not is refused instead of running without the schema.
+
+Each refusal is `Error::HostConfiguration` naming the shape expected and the size of what was
+received, never its content. The harness does not check that the object is a valid JSON Schema:
+the CLI does, and exits at startup with `Error: --json-schema is not a valid JSON Schema`.
+
+The schema is inline, because the flag takes a value, not a path. It is visible in a process
+listing, unlike the prompt. Keep secrets out of it.
+
+**Unmeasured: the result mapping.** This harness does not surface the structured answer. The
+vendor documents `structured_output` for `--output-format json` and on the Agent SDK's result
+message. No document read for this change states the field for the CLI's `stream-json` `result`
+record, and the pinned CLI (2.1.322) was not run against an authenticated turn, so the shape was
+not observed. The reducer therefore ignores the field, and a host cannot read the validated value
+through this library yet. Mapping it needs that capture, and a core event to carry it. Two further
+effects of the flag are documented for the SDK stream and unobserved here:
+
+- A `StructuredOutput` tool call the host never defined appears as a `tool_use` and `tool_result`
+  pair, and the reducer reports it as an activity like any other tool call.
+- A run that produces no valid output ends with `error_max_structured_output_retries`. The reducer
+  already names that subtype as `claude-error_max_structured_output_retries`.
+
+What was measured: the pinned contract's `--help` (`fixtures/claude/contract/help.txt`) lists
+`--json-schema <schema>` ("JSON Schema for structured output validation (only works with
+--print)"), and the argv is pinned by a fake-CLI test.
 
 ## The event stream
 

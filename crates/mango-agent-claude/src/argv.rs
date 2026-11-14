@@ -13,6 +13,43 @@ use mango_external_agents::{Error, Result};
 use crate::models;
 use crate::permissions::CliMode;
 
+/// The flags every turn passes right after the program name.
+///
+/// A constant, not a literal inside [`TurnArgv::build`], because
+/// [`MAX_JSON_SCHEMA_ARGUMENT_UNITS`](crate::json_schema::MAX_JSON_SCHEMA_ARGUMENT_UNITS) is
+/// derived from their length.
+pub(crate) const FIXED_FLAGS: [&str; 8] = [
+    "--print",
+    // stdin, so the prompt never appears in a process listing.
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    // Both required for token-level deltas; without them the stream arrives in whole
+    // messages and nothing renders until each block is complete.
+    "--verbose",
+    "--include-partial-messages",
+    // Subagent output, tagged with the tool call that spawned it. Needs 2.1.211, which is
+    // why that is the pinned minimum rather than 2.1.200.
+    "--forward-subagent-text",
+];
+
+/// The longest the flags that depend on the turn can be when a schema is passed, besides the
+/// model, effort and MCP path, which a host chooses and the whole-command-line check counts as
+/// given.
+///
+/// The longest permission mode and `--permission-prompts none`, a resumed session's UUID, and the
+/// schema's own flag name. Pinned against [`CliMode`] and the UUID shape by tests.
+pub(crate) const WORST_CASE_CONDITIONAL_FLAGS: [&str; 7] = [
+    "--permission-mode",
+    "bypassPermissions",
+    "--permission-prompts",
+    "none",
+    "--resume",
+    "00000000-0000-0000-0000-000000000000",
+    "--json-schema",
+];
+
 /// Everything the argv depends on, gathered so the builder decides nothing on its own.
 #[derive(Clone, PartialEq, Eq)]
 pub struct TurnArgv<'a> {
@@ -37,6 +74,12 @@ pub struct TurnArgv<'a> {
     pub declares_permission_prompts: bool,
     /// A `--mcp-config` file this turn should load, when the host configured servers.
     pub mcp_config: Option<&'a str>,
+    /// The JSON Schema the host asked this turn's answer to be validated against.
+    ///
+    /// Raw host text: [`build`](TurnArgv::build) refuses what [`crate::json_schema::compact`]
+    /// refuses and passes the compact form. The caller has already checked that this build
+    /// declares `--json-schema`.
+    pub json_schema: Option<&'a str>,
 }
 
 impl std::fmt::Debug for TurnArgv<'_> {
@@ -61,6 +104,7 @@ impl std::fmt::Debug for TurnArgv<'_> {
                 &self.declares_permission_prompts,
             )
             .field("mcp_config_present", &self.mcp_config.is_some())
+            .field("json_schema_present", &self.json_schema.is_some())
             .finish()
     }
 }
@@ -84,6 +128,7 @@ impl TurnArgv<'_> {
     ///     accepted_efforts: None,
     ///     declares_permission_prompts: false,
     ///     mcp_config: None,
+    ///     json_schema: None,
     /// }
     /// .build()
     /// .expect("expected valid argv");
@@ -118,24 +163,17 @@ impl TurnArgv<'_> {
             });
         }
 
-        let mut argv: Vec<String> = [
-            self.program,
-            "--print",
-            // stdin, so the prompt never appears in a process listing.
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-            // Both required for token-level deltas; without them the stream arrives in whole
-            // messages and nothing renders until each block is complete.
-            "--verbose",
-            "--include-partial-messages",
-            // Subagent output, tagged with the tool call that spawned it. Needs 2.1.211, which is
-            // why that is the pinned minimum rather than 2.1.200.
-            "--forward-subagent-text",
-        ]
-        .map(String::from)
-        .into();
+        // Validated here as well as at open: the fields are public, so a caller can build a
+        // `TurnArgv` that never went through the harness.
+        let json_schema = self
+            .json_schema
+            .map(crate::json_schema::compact)
+            .transpose()?;
+
+        let mut argv: Vec<String> = std::iter::once(self.program)
+            .chain(FIXED_FLAGS)
+            .map(String::from)
+            .collect();
 
         // Stated rather than left to the default when the host chose a mode. The vendor documents `none` as "nobody: anything
         // that would prompt is denied automatically; the permission mode still decides everything
@@ -172,6 +210,15 @@ impl TurnArgv<'_> {
         }
         if let Some(mcp_config) = self.mcp_config {
             argv.extend([String::from("--mcp-config"), String::from(mcp_config)]);
+        }
+        if let Some(json_schema) = json_schema {
+            // Inline, because the flag takes the schema itself rather than a path, so it is
+            // visible in a process listing. The prompt never is.
+            argv.extend([String::from("--json-schema"), json_schema]);
+            // The schema is the one argument a host can make large, so the whole line is checked
+            // against the tightest Windows limit only when one is present. The default argv is
+            // never refused on length.
+            crate::json_schema::check_turn_command_line(&argv)?;
         }
         Ok(argv)
     }
@@ -287,6 +334,7 @@ mod tests {
             accepted_efforts: None,
             declares_permission_prompts: false,
             mcp_config: None,
+            json_schema: None,
         }
     }
 
@@ -584,6 +632,171 @@ mod tests {
     }
 
     #[test]
+    fn passes_a_json_schema_only_when_the_host_supplied_one() {
+        assert_eq!(
+            value_after(
+                &base().build().expect("expected valid argv"),
+                "--json-schema"
+            ),
+            None,
+            "expected the default argv to carry no --json-schema"
+        );
+        let argv = TurnArgv {
+            json_schema: Some("{\n \"type\": \"object\"\n}"),
+            ..base()
+        }
+        .build()
+        .expect("expected valid argv");
+        assert_eq!(
+            value_after(&argv, "--json-schema"),
+            Some(r#"{"type":"object"}"#),
+            "expected the compact schema after --json-schema"
+        );
+    }
+
+    fn x_schema(units: usize) -> String {
+        // `{"d":""}` takes 14 units quoted, and each `x` one more.
+        format!("{{\"d\":\"{}\"}}", "x".repeat(units - 14))
+    }
+
+    /// The worst-case conditional flags are the longest a turn can carry, so a schema at the cap
+    /// fills the batch line exactly and nothing a host can leave out makes it longer.
+    #[test]
+    fn a_schema_at_the_cap_fills_the_batch_line_exactly_on_the_longest_turn() {
+        use crate::json_schema::{
+            BATCH_COMMAND_LINE_LIMIT_UNITS, MAX_JSON_SCHEMA_ARGUMENT_UNITS, turn_command_line_units,
+        };
+
+        let schema = x_schema(MAX_JSON_SCHEMA_ARGUMENT_UNITS);
+        let argv = TurnArgv {
+            mode: Some(CliMode::BypassPermissions),
+            established: true,
+            declares_permission_prompts: true,
+            json_schema: Some(&schema),
+            ..base()
+        }
+        .build()
+        .expect("expected the longest schema turn to fit the batch line");
+        assert_eq!(
+            turn_command_line_units(&argv),
+            BATCH_COMMAND_LINE_LIMIT_UNITS,
+            "expected the capped schema to fill the line | received {} flags",
+            argv.len()
+        );
+    }
+
+    #[test]
+    fn the_worst_case_flags_are_no_shorter_than_any_flag_a_turn_can_pass() {
+        for mode in [
+            CliMode::Manual,
+            CliMode::AcceptEdits,
+            CliMode::Plan,
+            CliMode::Auto,
+            CliMode::DontAsk,
+            CliMode::BypassPermissions,
+        ] {
+            assert!(
+                mode.as_arg().len() <= super::WORST_CASE_CONDITIONAL_FLAGS[1].len(),
+                "expected the worst-case permission mode to be the longest | received {:?}",
+                mode.as_arg()
+            );
+        }
+        assert!(
+            is_vendor_session_id(super::WORST_CASE_CONDITIONAL_FLAGS[5]),
+            "expected the worst-case session placeholder to have the UUID shape"
+        );
+        assert_eq!(super::WORST_CASE_CONDITIONAL_FLAGS[6], "--json-schema");
+    }
+
+    /// The regression for an 8,000-character schema beside the real fixed flags: it was accepted
+    /// under the earlier 16 KiB cap, and the `claude.cmd` line then passed cmd.exe's 8,191.
+    #[test]
+    fn refuses_an_eight_thousand_character_schema_beside_the_real_fixed_flags() {
+        let schema = format!("{{\"d\":\"{}\"}}", "x".repeat(8_000));
+        let error = TurnArgv {
+            json_schema: Some(&schema),
+            ..base()
+        }
+        .build()
+        .expect_err("expected a schema the fixed flags leave no room for to be refused");
+        let mango_external_agents::Error::HostConfiguration { received, .. } = error else {
+            panic!("expected a host-configuration refusal | received {error:?}");
+        };
+        assert!(
+            received.contains("8014 UTF-16 code units"),
+            "expected the schema's escaped length | received {received:?}"
+        );
+        assert!(!received.contains("xxxx"), "received {received:?}");
+    }
+
+    /// A schema inside its own cap still has to share the line with the MCP path, which a host
+    /// sets per session and may be up to 4,096 characters.
+    #[test]
+    fn refuses_a_schema_that_fits_alone_but_not_beside_a_long_mcp_config_path() {
+        let schema = x_schema(6_014);
+        let long = std::env::temp_dir().join("m".repeat(2_000));
+        let long = long.to_str().expect("expected a native UTF-8 fixture path");
+        let error = TurnArgv {
+            mcp_config: Some(long),
+            json_schema: Some(&schema),
+            ..base()
+        }
+        .build()
+        .expect_err("expected the whole line to be refused");
+        let mango_external_agents::Error::HostConfiguration { expected, received } = error else {
+            panic!("expected a host-configuration refusal | received {error:?}");
+        };
+        assert!(expected.contains("8191"), "received {expected:?}");
+        assert!(
+            received.starts_with("a command line of ") && received.ends_with(" UTF-16 code units"),
+            "expected the line's units named | received {received:?}"
+        );
+        assert!(
+            !received.contains("mmmm") && !received.contains("xxxx"),
+            "expected neither the path nor the schema in the message | received {received:?}"
+        );
+
+        // The same schema beside a short path fits, and the long path alone is not a length
+        // problem: no schema, no line check.
+        let short = std::env::temp_dir().join("servers.json");
+        let short = short
+            .to_str()
+            .expect("expected a native UTF-8 fixture path");
+        TurnArgv {
+            mcp_config: Some(short),
+            json_schema: Some(&schema),
+            ..base()
+        }
+        .build()
+        .expect("expected the schema beside a short MCP path to fit");
+        TurnArgv {
+            mcp_config: Some(long),
+            ..base()
+        }
+        .build()
+        .expect("expected the default argv never to be refused on length");
+    }
+
+    #[test]
+    fn refuses_a_json_schema_that_could_become_another_flag_or_is_not_json() {
+        for schema in ["-1", "--dangerously-skip-permissions", "{broken", "[]", ""] {
+            let error = TurnArgv {
+                json_schema: Some(schema),
+                ..base()
+            }
+            .build()
+            .expect_err("expected an unusable schema to be refused");
+            assert!(
+                matches!(
+                    error,
+                    mango_external_agents::Error::HostConfiguration { .. }
+                ),
+                "expected a host-configuration refusal for {schema:?} | received {error:?}"
+            );
+        }
+    }
+
+    #[test]
     fn refuses_direct_argv_values_that_could_change_the_invocation() {
         for argv in [
             TurnArgv {
@@ -621,6 +834,7 @@ mod tests {
                 model: Some("model-secret"),
                 effort: Some("effort-secret"),
                 mcp_config: Some("/tmp/mcp-secret.json"),
+                json_schema: Some("{\"title\":\"schema-secret\"}"),
                 ..base()
             }
         );
@@ -629,6 +843,7 @@ mod tests {
             "model-secret",
             "effort-secret",
             "/tmp/mcp-secret.json",
+            "schema-secret",
         ] {
             assert!(
                 !debug.contains(secret),
@@ -636,6 +851,10 @@ mod tests {
             );
         }
         assert!(debug.contains("model_present: true"), "received {debug:?}");
+        assert!(
+            debug.contains("json_schema_present: true"),
+            "received {debug:?}"
+        );
     }
 
     #[test]
