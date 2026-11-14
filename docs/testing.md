@@ -69,3 +69,9 @@ mango-external-agents --all-features`) stay in the real tree. `scripts/test-chec
 which commands are wrapped. `scripts/test-run-without-self-dev-dependency.sh` reproduces the probe
 in a throwaway workspace: the in-tree `--all-targets` check passes with the feature off, and the
 same check through the runner fails.
+
+## Script tests
+
+Every `scripts/test-*.sh` and `scripts/test-*.py` runs in both `scripts/check.sh` and `ci.yml`, or is
+declared in `scripts/check-script-tests.sh` as run through a parent test that does. That script fails
+for a test that only one of the two runs, one that neither runs, and a stale reference.

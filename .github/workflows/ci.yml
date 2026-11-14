@@ -48,6 +48,8 @@ jobs:
         run: |
           scripts/test-prerelease-toolchain.sh
           scripts/test-prerelease-package.sh
+          scripts/test-check-powerset.sh
+          scripts/test-run-without-self-dev-dependency.sh
       - run: cargo test --doc --workspace --all-features --locked
       - run: cargo doc --no-deps --workspace --all-features --locked
         env:
@@ -83,6 +85,8 @@ jobs:
       - run: python3 scripts/check-resolved-acp-schema.py
       - run: scripts/check-bench-runner.sh
       - run: scripts/test-bench-runner.sh
+      - run: scripts/test-check-script-tests.sh
+      - run: scripts/check-script-tests.sh
       - run: dprint check
 
   msrv:
