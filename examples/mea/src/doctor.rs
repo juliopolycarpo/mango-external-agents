@@ -1,7 +1,7 @@
 //! Stable, credential-free diagnostic output for every registered harness.
 
 use mango_external_agents::normalize::TextLimit;
-use mango_external_agents::{AuthState, Discovery, GateVerdict, HarnessId};
+use mango_external_agents::{AuthState, Discovery, GateVerdict};
 use serde_json::{Value, json};
 
 use crate::DiscoveryReport;
@@ -15,54 +15,6 @@ pub(crate) fn json(reports: &[DiscoveryReport]) -> Value {
 /// token prefixes, and bounded.
 fn shown_error(error: &str) -> String {
     mango_external_agents::redact::bounded(error, TextLimit::ErrorMessage).text
-}
-
-/// What `mea doctor --transport unix-socket` learned by attaching: the server's thread, or the
-/// refusal the harness gave, in its own words.
-pub(crate) struct AttachReport {
-    pub kind: HarnessId,
-    pub result: Result<String, String>,
-}
-
-/// [`json()`], with the attach result under `attach` on the row of the harness that was attached.
-/// Example: `mea doctor --harness codex --transport unix-socket --socket PATH --json`.
-pub(crate) fn json_with_attach(
-    reports: &[DiscoveryReport],
-    attach: Option<&AttachReport>,
-) -> Value {
-    let mut rows = json(reports);
-    let Some(attach) = attach else {
-        return rows;
-    };
-    let outcome = match &attach.result {
-        Ok(thread) => json!({"transport": "unix-socket", "attached": true, "thread": thread}),
-        Err(error) => {
-            json!({"transport": "unix-socket", "attached": false, "error": shown_error(error)})
-        }
-    };
-    let harness = attach.kind.to_string();
-    if let Some(row) = rows
-        .as_array_mut()
-        .and_then(|rows| rows.iter_mut().find(|row| row["harness"] == harness))
-    {
-        row["attach"] = outcome;
-    }
-    rows
-}
-
-/// The attach result as a terminal line. Example: `codex: attach=refused over unix-socket; ...`.
-pub(crate) fn attach_text(attach: &AttachReport) -> String {
-    match &attach.result {
-        Ok(thread) => format!(
-            "{}: attach=ok over unix-socket; thread {thread}",
-            attach.kind
-        ),
-        Err(error) => format!(
-            "{}: attach=refused over unix-socket; {}",
-            attach.kind,
-            shown_error(error)
-        ),
-    }
 }
 
 fn row(report: &DiscoveryReport) -> Value {
@@ -185,60 +137,6 @@ mod tests {
         assert_eq!(output[0]["installed"], true);
         assert_eq!(output[0]["auth"], "logged-out");
         assert_eq!(output[0]["version"], "2.1.0");
-    }
-
-    fn probed_codex() -> DiscoveryReport {
-        DiscoveryReport {
-            kind: HarnessId::codex(),
-            result: Ok(Discovery::not_installed()),
-        }
-    }
-
-    #[test]
-    fn an_attached_socket_adds_the_thread_to_the_codex_row_only() {
-        let attach = AttachReport {
-            kind: HarnessId::codex(),
-            result: Ok(String::from("thread-1")),
-        };
-        let output = json_with_attach(&[probed_codex()], Some(&attach));
-        assert_eq!(
-            output[0]["attach"],
-            json!({"transport": "unix-socket", "attached": true, "thread": "thread-1"})
-        );
-        assert_eq!(
-            attach_text(&attach),
-            "codex: attach=ok over unix-socket; thread thread-1"
-        );
-        assert_eq!(
-            json_with_attach(&[probed_codex()], None),
-            json(&[probed_codex()]),
-            "expected no attach key when no socket was named"
-        );
-    }
-
-    #[test]
-    fn a_refused_attach_carries_the_refusal_and_stays_redacted() {
-        let token = format!(
-            "{}0123456789abcdefghijklmnopqrstuvwxyz",
-            concat!("gh", "p_")
-        );
-        let attach = AttachReport {
-            kind: HarnessId::codex(),
-            result: Err(format!("expected a socket, received {token}")),
-        };
-        let output = json_with_attach(&[probed_codex()], Some(&attach)).to_string();
-        let line = attach_text(&attach);
-        assert!(
-            line.starts_with(
-                "codex: attach=refused over unix-socket; expected a socket, received "
-            ),
-            "{line}"
-        );
-        assert!(
-            !output.contains(&token) && !line.contains(&token),
-            "expected the token out of both outputs | received: {line:?} and {output:?}"
-        );
-        assert!(output.contains("\"attached\":false"), "{output}");
     }
 
     #[test]

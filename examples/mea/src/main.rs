@@ -143,9 +143,6 @@ fn print_banner() {
         "usage: mea discover|doctor [--harness claude|codex|acp:<profile>] [--json] [--cwd DIR]"
     );
     println!(
-        "       mea doctor --harness codex --transport unix-socket --socket PATH [--json] [--cwd DIR] (also attaches)"
-    );
-    println!(
         "       mea turn [--harness claude|codex|acp:<profile>] [--profile ID] [--transport stdio|websocket|unix-socket|acp] [--socket PATH] [--cwd DIR] [--json] [--level read-only|default|full-access] [--cancel-after SECONDS] <prompt>"
     );
     println!(
@@ -311,71 +308,20 @@ async fn discover(options: &Options) -> Result<(), String> {
 }
 
 async fn doctor(options: &Options) -> Result<(), String> {
-    doctor_with(
-        &registry_attaching_to(options.socket.as_deref()),
+    let reports = discover_with(
+        &registry(),
         &host(options.cwd.as_deref())?,
-        options,
+        options.kind.as_ref().map(HarnessChoice::id),
     )
-    .await
-}
-
-/// The probes of every selected harness, plus one attach when the options name a Unix socket.
-///
-/// The probe never touches the socket: it runs the local `codex`. Attaching is the only way to
-/// learn what the server says to this host, so `doctor` opens one session over the socket, reports
-/// the thread it got or the refusal as the harness worded it, and closes. The refusal is a row of
-/// the report, not a failed command, as a probe failure is.
-async fn doctor_with(
-    registry: &HarnessRegistry,
-    host: &HostContext,
-    options: &Options,
-) -> Result<(), String> {
-    let reports =
-        discover_with(registry, host, options.kind.as_ref().map(HarnessChoice::id)).await?;
-    let attach = if options.transport == Some(TransportKind::UnixSocket) {
-        let id = HarnessChoice::Codex.id();
-        let harness = registry.require(&id).map_err(|error| error.to_string())?;
-        Some(doctor::AttachReport {
-            kind: id,
-            result: attach_over_socket(harness.as_ref(), host).await,
-        })
-    } else {
-        None
-    };
+    .await?;
     if options.json {
-        println!("{}", doctor::json_with_attach(&reports, attach.as_ref()));
+        println!("{}", doctor::json(&reports));
     } else {
         for report in &reports {
             println!("{}", doctor::text(report));
         }
-        if let Some(attach) = &attach {
-            println!("{}", doctor::attach_text(attach));
-        }
     }
     Ok(())
-}
-
-/// Opens one session over the Unix socket and closes it, returning the thread the server started.
-///
-/// Opening starts a thread on the server, so the server keeps one empty thread after the close: the
-/// price of asking it anything. Example: a server owned by another user answers with the harness's
-/// own `expected a Unix socket served by this process's own user, received ...` refusal.
-async fn attach_over_socket(
-    harness: &dyn mango_external_agents::Harness,
-    host: &HostContext,
-) -> Result<String, String> {
-    let request = OpenSession::new(format!("mea-doctor-{}", uuid_like()))
-        .over_transport(TransportKind::UnixSocket);
-    let session = harness
-        .open_session(host, request)
-        .await
-        .map_err(|error| refusal(&error))?;
-    let thread = session.ids().native_session_id.to_string();
-    session
-        .close(mango_external_agents::CloseReason::Requested)
-        .await
-        .map_err(|error| refusal(&error))?;
-    Ok(thread)
 }
 
 async fn turn(options: &Options) -> Result<(), String> {
@@ -979,7 +925,7 @@ mod tests {
     }
 }
 
-/// `mea turn` and `mea doctor` over a Unix socket, against a named stand-in for the server.
+/// `mea turn` over a Unix socket, against a named stand-in for the server.
 ///
 /// The stand-in refuses the WebSocket upgrade, so a run crosses a real socket and the harness's
 /// real connect and upgrade, and ends in a refusal whose words the test can name. A full replayed
@@ -998,7 +944,7 @@ mod unix_socket_tests {
     use mango_external_agents::testing::FakeLauncher;
     use mango_external_agents::{EnvSource, HostContext};
 
-    use super::{Options, attach_over_socket, registry_attaching_to, run, turn_with};
+    use super::{Options, registry_attaching_to, run, turn_with};
 
     /// An app-server stand-in on a Unix socket that answers every upgrade with `403 Forbidden`.
     struct UpgradeRefusingSocketServer {
@@ -1132,37 +1078,20 @@ mod unix_socket_tests {
         );
     }
 
-    #[tokio::test]
-    async fn doctor_attaches_through_the_same_socket_and_reports_the_refusal() {
-        let server = UpgradeRefusingSocketServer::start();
-        let registry = registry_attaching_to(Some(&server.path));
-        let harness = registry
-            .require(&super::HarnessChoice::Codex.id())
-            .expect("expected the codex harness");
-        let (host, _launcher) = host_without_processes();
-
-        let outcome = attach_over_socket(harness.as_ref(), &host).await;
-
-        let error = outcome.expect_err("expected the server's 403 to refuse the attach");
-        assert!(
-            error.contains("HTTP 403 Forbidden from the upgrade"),
-            "expected the harness's own refusal (HTTP 403 Forbidden from the upgrade) | received: {error}"
-        );
-        assert_eq!(server.connections(), 1);
-    }
-
     /// The path goes to the harness as typed: its refusal of a relative path is what comes out.
     #[tokio::test]
     async fn a_path_the_parser_never_saw_reaches_the_harness_unchanged() {
-        let registry = registry_attaching_to(Some(Path::new("relative/app-server.sock")));
-        let harness = registry
-            .require(&super::HarnessChoice::Codex.id())
-            .expect("expected the codex harness");
+        let mut options = options_for("turn", Path::new("/run/codex.sock"), &["hello"]);
+        options.socket = Some(PathBuf::from("relative/app-server.sock"));
         let (host, _launcher) = host_without_processes();
 
-        let error = attach_over_socket(harness.as_ref(), &host)
-            .await
-            .expect_err("expected the harness to refuse a relative path");
+        let error = turn_with(
+            &registry_attaching_to(options.socket.as_deref()),
+            &host,
+            &options,
+        )
+        .await
+        .expect_err("expected the harness to refuse a relative path");
 
         assert!(
             error.contains("expected an absolute Unix socket path"),
@@ -1185,6 +1114,26 @@ mod unix_socket_tests {
         assert_eq!(
             error,
             "(mea turn): expected --socket with --transport unix-socket | received --socket without it"
+        );
+    }
+
+    /// `doctor` stays read-only: it never reaches a socket, so it refuses both flags before any probe.
+    #[tokio::test]
+    async fn doctor_refuses_the_socket_before_any_probe() {
+        let args = [
+            "doctor",
+            "--harness",
+            "codex",
+            "--transport",
+            "unix-socket",
+            "--socket",
+            "/run/codex.sock",
+        ]
+        .map(String::from);
+        let error = run(&args).await.expect_err("expected doctor to refuse");
+        assert_eq!(
+            error,
+            "(mea doctor): expected no --socket and no unix-socket transport; doctor probes the local CLI and never opens a session | received --transport unix-socket --socket \"/run/codex.sock\""
         );
     }
 }
