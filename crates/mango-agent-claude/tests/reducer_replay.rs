@@ -13,7 +13,7 @@ use mango_external_agents::{
     Activity, ActivityContent, ActivityKind, ActivityResult, ActivityStatus, Command, ErrorCode,
     EventKind, VendorError,
 };
-use support::READ_TURN;
+use support::{READ_TURN, recorded_lines, recorded_records};
 
 const DENIED_WRITE: &str = include_str!("../fixtures/claude/transcripts/denied-write-turn.jsonl");
 
@@ -28,10 +28,7 @@ fn replay(transcript: &str) -> Replay {
     let mut reducer = TurnReducer::new();
     let mut events = Vec::new();
     let mut init = None;
-    for line in transcript.lines() {
-        let Some(record) = StreamRecord::parse(line) else {
-            continue;
-        };
+    for record in recorded_records(transcript) {
         let reduction = reducer.reduce(&record);
         events.extend(reduction.events);
         init = reduction.init.or(init);
@@ -128,9 +125,8 @@ mod bounding_what_a_block_delivered {
 
     /// Every record of a transcript through `reducer`, as the turn loop feeds it.
     fn events_of(transcript: &str, mut reducer: TurnReducer) -> Vec<EventKind> {
-        transcript
-            .lines()
-            .filter_map(StreamRecord::parse)
+        recorded_records(transcript)
+            .into_iter()
             .flat_map(|record| reducer.reduce(&record).events)
             .collect()
     }
@@ -826,5 +822,134 @@ mod termination {
             vec!["activity_started", "activity_completed", "error"]
         );
         assert!(reducer.finished(), "expected the abort to end the run");
+    }
+}
+
+mod reading_a_recording_with_header_lines {
+    use super::*;
+    use mango_agent_claude::testing::{FakeClaudeCli, Run};
+    use mango_external_agents::{LaunchSpec, ProcessLauncher};
+
+    /// The two header lines `mea capture --harness claude --transcripts` writes, then a blank line
+    /// a hand-trimmed file could carry.
+    const HEADER: &str = "# claude/structured-output: a schema turn\n\
+        # capture {\"claudeVersion\":\"2.1.325 (Claude Code)\",\"captureVersion\":1,\"capturedAtUnixSeconds\":0}\n\
+        \n";
+
+    fn with_header(transcript: &str) -> String {
+        format!("{HEADER}{transcript}")
+    }
+
+    /// Every line the fake child printed on stdout for a turn launch.
+    async fn printed_by_a_turn(cli: &FakeClaudeCli) -> Vec<String> {
+        let launch = LaunchSpec {
+            argv: ["claude", "--print"].map(str::to_owned).to_vec(),
+            cwd: std::env::temp_dir(),
+            env: std::collections::BTreeMap::new(),
+            stdin: true,
+            hide_window: false,
+        };
+        let mut process = cli
+            .spawn(launch)
+            .await
+            .unwrap_or_else(|error| panic!("expected the fake turn to launch | received: {error}"));
+        let mut text = Vec::new();
+        while let Some(chunk) = process
+            .stdout
+            .next_chunk()
+            .await
+            .expect("expected the fake stdout to be readable")
+        {
+            text.extend(chunk);
+        }
+        String::from_utf8(text)
+            .expect("expected the fake to print UTF-8")
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn ignores_header_and_blank_lines() {
+        let headed = with_header(READ_TURN);
+
+        let received = recorded_lines(&headed).expect("expected a headed recording to read");
+        let expected = recorded_lines(READ_TURN).expect("expected the bare recording to read");
+        assert_eq!(
+            received, expected,
+            "expected the header lines to add no record"
+        );
+    }
+
+    #[test]
+    fn reduces_a_headed_recording_to_the_events_of_the_bare_one() {
+        let headed = replay(&with_header(READ_TURN)).events;
+        let bare = replay(READ_TURN).events;
+        assert!(
+            !bare.is_empty(),
+            "expected the bare recording to produce events, received none"
+        );
+        assert_eq!(headed, bare, "expected the same events with a header");
+    }
+
+    #[tokio::test]
+    async fn hands_the_fake_child_only_the_recorded_stream() {
+        let headed = with_header(READ_TURN);
+        let lines = recorded_lines(&headed).expect("expected a headed recording");
+        let cli = FakeClaudeCli::new().with_turn(Run::replaying(&lines.join("\n")));
+
+        let printed = printed_by_a_turn(&cli).await;
+
+        assert_eq!(
+            printed,
+            recorded_lines(READ_TURN).expect("expected the bare recording"),
+            "expected the child to print the records and no header line"
+        );
+        assert!(
+            printed.iter().all(|line| !line.starts_with('#')),
+            "expected no `#` line on stdout | received {printed:?}"
+        );
+    }
+
+    #[test]
+    fn names_the_line_of_a_malformed_record() {
+        let damaged = with_header("{\"type\":\"system\",\"subtype\":\"init\"}\n{\"type\": \n");
+
+        let message =
+            recorded_lines(&damaged).expect_err("expected the damaged line to be refused");
+
+        assert_eq!(
+            message,
+            "(recording line 5): expected a blank line, a `#` header line or one stream-json \
+             object record | received: {\"type\":"
+        );
+    }
+
+    #[test]
+    fn refuses_a_line_that_is_not_an_object_record() {
+        for line in ["Debugger attached.", "[1, 2]", "42"] {
+            let message = recorded_lines(&format!("{{\"type\":\"result\"}}\n{line}\n"))
+                .expect_err("expected a non-record line to be refused");
+            assert!(
+                message.starts_with("(recording line 2): expected")
+                    && message.ends_with(&format!("received: {line}")),
+                "expected line 2 and the received line {line:?} | received: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_every_recorded_claude_transcript_readable() {
+        for (name, transcript) in [
+            ("read-turn", READ_TURN),
+            ("denied-write-turn", DENIED_WRITE),
+        ] {
+            let lines = recorded_lines(transcript)
+                .unwrap_or_else(|message| panic!("expected {name} to read | received: {message}"));
+            assert!(
+                !lines.is_empty(),
+                "expected {name} to hold records, received none"
+            );
+        }
     }
 }
