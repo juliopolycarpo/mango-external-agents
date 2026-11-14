@@ -26,7 +26,7 @@ on:
     paths:
       - .github/workflows/fresh-dependencies.yml
       - scripts/fresh-receipt.sh
-      - scripts/check-msrv-features.sh
+      - scripts/check-features.sh
 
 permissions:
   contents: read
@@ -57,7 +57,7 @@ jobs:
           key: fresh
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
-          tool: cargo-nextest,cargo-deny
+          tool: cargo-nextest,cargo-deny,cargo-hack
       - id: resolve
         name: Resolve every dependency to its newest compatible release
         # No colour: the workflow-wide `always` puts escape codes in front of the status words the
@@ -132,12 +132,12 @@ jobs:
       # The MSRV lane in ci.yml builds the committed lock, so a compatible release that breaks the
       # minimum toolchain would only surface when someone next updates the lock. Build the resolved
       # tree with the same toolchain, and run the same isolated per-package feature checks (one
-      # definition, scripts/check-msrv-features.sh, shared with ci.yml) against the fresh graph.
+      # definition, scripts/check-features.sh, shared with ci.yml) against the fresh graph.
       - id: gate_install_msrv
         name: Install the declared minimum toolchain
         if: ${{ !cancelled() && steps.resolve.outcome == 'success' }}
         run: |
-          toolchain=$(scripts/check-msrv-features.sh --print-toolchain)
+          toolchain=$(scripts/check-features.sh --print-toolchain)
           echo "MSRV_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
           rustup toolchain install "$toolchain" --profile minimal
       - id: gate_msrv_workspace
@@ -147,7 +147,7 @@ jobs:
       - id: gate_msrv_isolated_features
         name: Minimum toolchain, isolated feature checks
         if: ${{ !cancelled() && steps.gate_install_msrv.outcome == 'success' }}
-        run: scripts/check-msrv-features.sh --locked
+        run: scripts/check-features.sh msrv --locked
       # Runs after any outcome except a missing resolution step (checkout failed, nothing to keep).
       - id: receipt
         name: Write the receipt

@@ -131,7 +131,7 @@ echo 'release tag signature checks passed'
 # A tag must pass the isolated minimum-Rust feature check before the publish job exists to run, and
 # a release workflow change can only be exercised by a real tag, so its shape is pinned here. The
 # verify job installs the toolchain the script itself names (no version literal to drift from
-# `rust-version`), runs `scripts/check-msrv-features.sh --locked`, and never selects the minimum for
+# `rust-version`), runs `scripts/check-features.sh msrv --locked`, and never selects the minimum for
 # the other steps: `check.sh` and `check-publish.sh` stay on the pinned toolchain. Comment lines are
 # ignored so a note cannot satisfy a check. Every refusal names the behaviour, the file and what
 # the file holds instead. RELEASE_WORKFLOW points the check at another file.
@@ -144,12 +144,12 @@ check_release_workflow() {
   local file=$1
   local verify check_line install_line found
   verify=$(workflow_job "$file" verify)
-  if ! grep -qF -- 'scripts/check-msrv-features.sh --locked' <<<"$verify"; then
-    echo "expected the release verify job in $file to run the isolated minimum-Rust feature check 'scripts/check-msrv-features.sh --locked' before publishing, received no such step" >&2
+  if ! grep -qF -- 'scripts/check-features.sh msrv --locked' <<<"$verify"; then
+    echo "expected the release verify job in $file to run the isolated minimum-Rust feature check 'scripts/check-features.sh msrv --locked' before publishing, received no such step" >&2
     return 1
   fi
-  if ! grep -qF -- 'rustup toolchain install' <<<"$verify" || ! grep -qF -- 'check-msrv-features.sh --print-toolchain' <<<"$verify"; then
-    echo "expected the release verify job in $file to install the minimum toolchain named by 'scripts/check-msrv-features.sh --print-toolchain', received no such install step" >&2
+  if ! grep -qF -- 'rustup toolchain install' <<<"$verify" || ! grep -qF -- 'check-features.sh --print-toolchain' <<<"$verify"; then
+    echo "expected the release verify job in $file to install the minimum toolchain named by 'scripts/check-features.sh --print-toolchain', received no such install step" >&2
     return 1
   fi
   install_line=$(grep -nF -- 'rustup toolchain install' <<<"$verify" | head -n 1)
@@ -157,7 +157,7 @@ check_release_workflow() {
     echo "expected the minimum toolchain install in $file to read its version from the script, received a literal version: ${install_line#*:}" >&2
     return 1
   fi
-  check_line=$(grep -nF -- 'scripts/check-msrv-features.sh --locked' <<<"$verify" | head -n 1)
+  check_line=$(grep -nF -- 'scripts/check-features.sh msrv --locked' <<<"$verify" | head -n 1)
   if [ "${install_line%%:*}" -ge "${check_line%%:*}" ]; then
     echo "expected the minimum toolchain to be installed before the isolated feature check in $file, received the install at verify line ${install_line%%:*} and the check at line ${check_line%%:*}" >&2
     return 1
@@ -202,13 +202,13 @@ expect_workflow_refusal() {
       ;;
   esac
 }
-grep -v 'check-msrv-features.sh --locked' "$release_workflow" > "$workflow_dir/release.yml"
+grep -v 'check-features.sh msrv --locked' "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal 'to run the isolated minimum-Rust feature check'
 grep -v 'rustup toolchain install' "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal 'to install the minimum toolchain named by'
 sed 's/rustup toolchain install "/rustup toolchain install 1.97.0 "/' "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal 'to read its version from the script, received a literal version'
-awk '/rustup toolchain install/ { held = $0; next } { print } /scripts\/check-msrv-features.sh --locked/ { print held }' \
+awk '/rustup toolchain install/ { held = $0; next } { print } /scripts\/check-features.sh msrv --locked/ { print held }' \
   "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal 'to be installed before the isolated feature check'
 sed 's/needs: verify$/needs: []/' "$release_workflow" > "$workflow_dir/release.yml"

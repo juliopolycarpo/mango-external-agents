@@ -4,7 +4,7 @@
 # script warns once, skips that gate and returns the status of the others.
 #
 # Only CI covers: the macOS and Windows builds, the minimum Rust version (run it here with
-# scripts/check-msrv-features.sh --locked), the scheduled fresh-dependency and vendor-drift lanes,
+# scripts/check-features.sh msrv --locked), the scheduled fresh-dependency and vendor-drift lanes,
 # the pull request title check (scripts/check-pr-title.sh) and the release workflow's publication
 # gate.
 # Usage: scripts/check.sh [--skip-format]
@@ -45,9 +45,9 @@ run scripts/test-check-tls.sh
 run scripts/check-standalone.sh
 run cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 run cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
-# The same command as the `rust` job in ci.yml; scripts/test-check-powerset.sh pins the two together.
+# The same driver and lane as the `rust` job in ci.yml; scripts/test-check-powerset.sh pins the two together.
 if cargo hack --version >/dev/null 2>&1; then
-  run cargo hack clippy --feature-powerset --depth 2 --all-targets --locked -p mango-external-agents -p mango-agent-claude -p mango-agent-codex -p mango-agent-acp -- -D warnings
+  run scripts/check-features.sh powerset --locked
 else
   echo "warning: cargo-hack not found on PATH; skipped the depth-2 feature powerset that CI runs (cargo install cargo-hack --locked)" >&2
 fi

@@ -69,9 +69,9 @@ jobs:
       # The compiler comes from `rust-version` in Cargo.toml through the script that checks it, as in
       # ci.yml's MSRV job, so the release cannot drift from the declared minimum. Installing it does
       # not select it: the steps below keep the toolchain pinned in rust-toolchain.toml, and only
-      # check-msrv-features.sh asks cargo for the minimum by name.
+      # check-features.sh asks cargo for the minimum by name.
       - name: Install the declared minimum toolchain
-        run: rustup toolchain install "$(scripts/check-msrv-features.sh --print-toolchain)" --profile minimal
+        run: rustup toolchain install "$(scripts/check-features.sh --print-toolchain)" --profile minimal
       - run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
@@ -93,7 +93,7 @@ jobs:
       # builds the whole workspace on the pinned toolchain, which proves neither the minimum nor
       # isolation. A tag that fails here publishes nothing.
       - name: Isolated feature checks on the declared minimum
-        run: scripts/check-msrv-features.sh --locked
+        run: scripts/check-features.sh msrv --locked
       # Expanded package sources contain ordinary tests/ directories. The pinned cache action
       # treats them as nested build targets and logs missing target/trybuild errors on save.
       - name: Remove successful publication scratch before caching
