@@ -196,18 +196,26 @@ that is not the install tree:
 npm install --prefix "$ADAPTER_DIR" --ignore-scripts --no-audit --no-fund \
   @agentclientprotocol/claude-agent-acp@0.107.0
 PATH="$ADAPTER_DIR/node_modules/.bin:$PATH" CLAUDE_CONFIG_DIR="$(mktemp -d)" \
-  cargo run -p mea -- capture --harness acp --profile claude-agent-acp --out fixtures/acp/claude-agent-acp
+  cargo run -p mea -- capture --harness acp --profile claude-agent-acp \
+  --vendor-cli "$ADAPTER_DIR/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude" \
+  --out fixtures/acp/claude-agent-acp
 
 npm install --prefix "$ADAPTER_DIR" --ignore-scripts --no-audit --no-fund \
   @agentclientprotocol/codex-acp@2.6.0
 PATH="$ADAPTER_DIR/node_modules/.bin:$PATH" CODEX_HOME="$(mktemp -d)" \
-  cargo run -p mea -- capture --harness acp --profile codex-acp --out fixtures/acp/codex-acp
+  cargo run -p mea -- capture --harness acp --profile codex-acp \
+  --vendor-cli "$ADAPTER_DIR/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex" \
+  --out fixtures/acp/codex-acp
 ```
 
 `$ADAPTER_DIR` is a different empty directory for each adapter, and each config home must exist
 (`mktemp -d` creates it): `codex-acp` answers a missing `CODEX_HOME` with a JSON-RPC error, and the
 capture reports it as invalid vendor data. Run `scripts/package-fixtures.py` afterwards.
-`version.json` holds the adapter's own version; the vendor CLI beneath it is not recorded.
+`version.json` holds the adapter's own version, and under `vendorCli` the `--version` of the binary
+named by `--vendor-cli`. `mea` does not look for that binary: each adapter picks it by its own
+rules, which are not a documented contract. The path above is the Linux x64 platform package; other
+platforms name another package under the same scope. `vendorCli.source` says the version was named
+by the operator, and only the file name is stored. Without the flag the member is absent.
 Do that only when the agent is a version worth recording, and update the profile's
 `VerificationEvidence` in the same change — the record names a build and a day, and a capture that
 moved without it is a claim about the wrong one.

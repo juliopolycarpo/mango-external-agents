@@ -153,7 +153,7 @@ fn print_banner() {
         "       mea turn [--harness claude|codex|acp:<profile>] [--profile ID] [--transport stdio|websocket|unix-socket|acp] [--socket PATH] [--model ID] [--json-schema FILE] [--cwd DIR] [--json] [--level read-only|default|full-access] [--cancel-after SECONDS] <prompt>"
     );
     println!(
-        "       mea capture --harness claude|codex|acp[:profile] [--profile ID] [--out DIR] [--workspace DIR] [--transcripts [--model ID]]"
+        "       mea capture --harness claude|codex|acp[:profile] [--profile ID] [--out DIR] [--workspace DIR] [--vendor-cli PROGRAM] [--transcripts [--model ID]]"
     );
     println!(
         "       mea capture codex [--scenario NAME] [--model ID] [--out DIR] [--workspace DIR] (archival transcripts)"
@@ -482,7 +482,15 @@ async fn capture(arguments: &[String]) -> Result<(), String> {
             .await
         }
         HarnessChoice::Claude => capture::claude(&out, &workspace.path).await,
-        HarnessChoice::Acp(profile) => capture::acp(&out, &workspace.path, profile.as_str()).await,
+        HarnessChoice::Acp(profile) => {
+            capture::acp(
+                &out,
+                &workspace.path,
+                profile.as_str(),
+                options.vendor_cli.as_deref(),
+            )
+            .await
+        }
     };
     result.map_err(|error| command_failure(&error))
 }

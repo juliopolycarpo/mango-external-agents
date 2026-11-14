@@ -3,5 +3,13 @@
     "codex-acp",
     "--version"
   ],
-  "output": "@agentclientprotocol/codex-acp 2.6.0"
+  "output": "@agentclientprotocol/codex-acp 2.6.0",
+  "vendorCli": {
+    "source": "named by the operator, not located by mea",
+    "command": [
+      "codex",
+      "--version"
+    ],
+    "output": "codex-cli 0.166.0"
+  }
 }

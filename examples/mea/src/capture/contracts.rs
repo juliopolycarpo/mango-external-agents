@@ -21,6 +21,9 @@ pub mod manifest;
 /// The built-in ACP profile that the drift workflow installs on every operating system.
 pub const DEFAULT_ACP_CAPTURE_PROFILE: &str = "opencode";
 
+/// How `version.json` says a vendor CLI version got there: the operator named the binary.
+const VENDOR_CLI_SOURCE: &str = "named by the operator, not located by mea";
+
 /// A public capture command must answer promptly or leave the caller a useful failure.
 const CONTRACT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -64,20 +67,36 @@ pub async fn codex_contract(out_dir: &Path, workspace: &Path) -> Result<()> {
 /// The command sends no `authenticate` or `session/new` request. `profile_id` must name a profile
 /// compiled into `mango-agent-acp`.
 ///
+/// `vendor_cli` names the binary an adapter fronts, for the profiles whose adapter runs one
+/// (`claude-agent-acp`, `codex-acp`). Its `--version` is recorded in `version.json` as `vendorCli`.
+/// `mea` takes the name as given and never searches for the binary.
+///
 /// # Examples
 ///
 /// `mea capture --harness acp --profile opencode --out fixtures/acp/opencode --workspace /tmp/mea-capture`
 ///
 /// # Errors
 ///
-/// Returns an error for an unknown profile, an unsuccessful probe, or a malformed JSON-RPC answer.
-pub async fn acp(out_dir: &Path, workspace: &Path, profile_id: &str) -> Result<()> {
+/// Returns an error for an unknown profile, an unsuccessful probe, a malformed JSON-RPC answer, or a
+/// `vendor_cli` that does not print exactly one `--version` line.
+pub async fn acp(
+    out_dir: &Path,
+    workspace: &Path,
+    profile_id: &str,
+    vendor_cli: Option<&str>,
+) -> Result<()> {
     let profile =
         mango_agent_acp::builtin_profile(profile_id).ok_or_else(|| Error::HostConfiguration {
             expected: "a built-in ACP profile",
             received: profile_id.to_owned(),
         })?;
-    acp_with(&capture_host(workspace)?, out_dir, profile.as_ref()).await
+    acp_with(
+        &capture_host(workspace)?,
+        out_dir,
+        profile.as_ref(),
+        vendor_cli,
+    )
+    .await
 }
 
 async fn claude_with(host: &HostContext, out_dir: &Path) -> Result<()> {
@@ -215,6 +234,7 @@ async fn acp_with(
     host: &HostContext,
     out_dir: &Path,
     profile: &mango_agent_acp::AcpProfile,
+    vendor_cli: Option<&str>,
 ) -> Result<()> {
     let version = command_output(
         host,
@@ -222,16 +242,23 @@ async fn acp_with(
         profile.vendor_environment_keys,
     )
     .await?;
+    // Probed before `initialize` and before any file is written: a refused vendor answer leaves
+    // no half-recorded capture behind.
+    let vendor = match vendor_cli {
+        Some(program) => Some(vendor_cli_version(host, profile, program).await?),
+        None => None,
+    };
     let response = acp_initialize(host, profile).await?;
     let contract = contract_dir(out_dir);
     write_json(&contract.join("initialize.json"), &response)?;
-    write_json(
-        &contract.join("version.json"),
-        &json!({
-            "command": profile.resolved_version_argv(&ExecutablePath::default()),
-            "output": version,
-        }),
-    )?;
+    let mut version_file = json!({
+        "command": profile.resolved_version_argv(&ExecutablePath::default()),
+        "output": version,
+    });
+    if let (Some(vendor), Some(members)) = (vendor, version_file.as_object_mut()) {
+        members.insert(String::from("vendorCli"), vendor);
+    }
+    write_json(&contract.join("version.json"), &version_file)?;
     manifest::write(
         &contract,
         &json!({
@@ -576,6 +603,63 @@ fn copy_generated_schema(source: &Path, target: &Path) -> Result<()> {
     write_text(target, &contents)
 }
 
+/// The command `version.json` records for a named vendor CLI: its file name and `--version`.
+///
+/// The operator names the program, often by a path inside an install tree. The path is a machine
+/// path and stays out of the committed file, so only the final component is kept.
+///
+/// # Errors
+///
+/// Returns an error naming `program` when it has no file name, such as `..`.
+fn vendor_cli_command(program: &str) -> Result<Vec<String>> {
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::HostConfiguration {
+            expected: "--vendor-cli to name an executable by a path or a program name",
+            received: format!("{program:?}"),
+        })?;
+    Ok(vec![name.to_owned(), String::from("--version")])
+}
+
+/// What the named vendor CLI prints for `--version`, shaped for `version.json`.
+///
+/// `mea` does not look for the binary beneath an adapter: each adapter picks it by its own rules,
+/// which are not a documented contract. The operator names it instead, so the member says so rather
+/// than claiming the adapter was seen running that binary. The probe goes through the same
+/// cleanup-owned launcher and the profile's vendor environment as every other public capture.
+///
+/// # Errors
+///
+/// Returns an error naming `program` when it does not exit successfully with exactly one line.
+async fn vendor_cli_version(
+    host: &HostContext,
+    profile: &mango_agent_acp::AcpProfile,
+    program: &str,
+) -> Result<Value> {
+    let recorded = vendor_cli_command(program)?;
+    let refuse = |received: String| Error::HostConfiguration {
+        expected: "--vendor-cli to name an executable whose --version prints exactly one line",
+        received: format!("{program:?}: {received}"),
+    };
+    let output = command_output(
+        host,
+        vec![program.to_owned(), String::from("--version")],
+        profile.vendor_environment_keys,
+    )
+    .await
+    .map_err(|error| refuse(error.to_string()))?;
+    let lines = output.lines().count();
+    if lines != 1 {
+        return Err(refuse(format!("{lines} lines")));
+    }
+    Ok(json!({
+        "source": VENDOR_CLI_SOURCE,
+        "command": recorded,
+        "output": output,
+    }))
+}
+
 fn command_name(argv: &[String]) -> String {
     argv.first()
         .map(|program| mango_external_agents::redact::program_name(program))
@@ -590,7 +674,7 @@ mod tests {
     use super::{
         CONTRACT_TIMEOUT, acp_initialize, acp_with, claude_surface, claude_with,
         codex_contract_with, codex_portable_help, command_name, command_output,
-        copy_generated_schema, normalize_acp_initialize, write_json,
+        copy_generated_schema, normalize_acp_initialize, vendor_cli_command, write_json,
     };
     use crate::capture::tests::{CaptureCleanupLauncher, CaptureStop, capture_host_with_limits};
     use mango_external_agents::testing::{FakeLauncher, FakeProcess};
@@ -857,7 +941,7 @@ mod tests {
         let profile =
             mango_agent_acp::builtin_profile("opencode").expect("expected OpenCode profile");
 
-        acp_with(&host(Arc::clone(&launcher)), &out, profile.as_ref())
+        acp_with(&host(Arc::clone(&launcher)), &out, profile.as_ref(), None)
             .await
             .expect("expected an ACP public contract capture");
 
@@ -869,6 +953,167 @@ mod tests {
         assert!(!writes[0].contains("session/new"));
         assert_eq!(launcher.live_children(), 0);
         std::fs::remove_dir_all(out).expect("expected temporary capture cleanup");
+    }
+
+    /// A fake launcher that answers the adapter version, the named vendor version, then `initialize`.
+    fn adapter_over_vendor_launcher(vendor_stdout: &[&str]) -> Arc<FakeLauncher> {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(
+            FakeProcess::transcript(["@agentclientprotocol/codex-acp 2.6.0"]).with_exit(success()),
+        );
+        launcher.push(
+            FakeProcess::transcript(vendor_stdout.iter().copied().map(String::from))
+                .with_exit(success()),
+        );
+        launcher.push(initialize_responder());
+        launcher
+    }
+
+    fn initialize_responder() -> FakeProcess {
+        FakeProcess::responding(|line| {
+            if line.contains("\"method\":\"initialize\"") {
+                return vec![String::from(
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}"#,
+                )];
+            }
+            Vec::new()
+        })
+    }
+
+    fn named_vendor_cli() -> String {
+        std::env::temp_dir()
+            .join("mea-vendor-install")
+            .join("codex")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn read_version_file(out: &std::path::Path) -> serde_json::Value {
+        let text = std::fs::read_to_string(out.join("contract/version.json"))
+            .expect("expected a version file");
+        serde_json::from_str(&text).expect("expected version.json to be JSON")
+    }
+
+    #[tokio::test]
+    async fn named_vendor_cli_version_is_recorded_beside_the_adapter_version() {
+        let launcher = adapter_over_vendor_launcher(&["codex-cli 0.166.0"]);
+        let out = temp_dir("acp-vendor");
+        let profile = mango_agent_acp::builtin_profile("codex-acp").expect("expected a profile");
+        let vendor_cli = named_vendor_cli();
+
+        acp_with(
+            &host(Arc::clone(&launcher)),
+            &out,
+            profile.as_ref(),
+            Some(&vendor_cli),
+        )
+        .await
+        .expect("expected a capture that names the vendor CLI");
+
+        let launches = launcher.launches();
+        assert_eq!(
+            launches[1].argv,
+            vec![vendor_cli.clone(), String::from("--version")],
+            "expected the second launch to be the named vendor CLI's --version"
+        );
+        let recorded = read_version_file(&out);
+        assert_eq!(recorded["output"], "@agentclientprotocol/codex-acp 2.6.0");
+        assert_eq!(
+            recorded["vendorCli"],
+            json!({
+                "source": "named by the operator, not located by mea",
+                "command": ["codex", "--version"],
+                "output": "codex-cli 0.166.0",
+            }),
+            "expected the vendor CLI beneath the adapter in version.json, by file name only"
+        );
+        assert!(
+            !recorded.to_string().contains("mea-vendor-install"),
+            "expected no machine path in version.json | received {recorded}"
+        );
+        let manifest = std::fs::read_to_string(out.join("contract/manifest.json"))
+            .expect("expected a manifest");
+        assert!(
+            manifest.contains("2.6.0") && !manifest.contains("0.166.0"),
+            "expected capturedFrom to stay the adapter line | received {manifest}"
+        );
+        assert_eq!(launcher.live_children(), 0);
+        std::fs::remove_dir_all(out).expect("expected temporary capture cleanup");
+    }
+
+    #[tokio::test]
+    async fn version_file_without_a_named_vendor_cli_keeps_its_two_members() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(FakeProcess::transcript(["1.18.30"]).with_exit(success()));
+        launcher.push(initialize_responder());
+        let out = temp_dir("acp-no-vendor");
+        let profile = mango_agent_acp::builtin_profile("opencode").expect("expected a profile");
+
+        acp_with(&host(launcher), &out, profile.as_ref(), None)
+            .await
+            .expect("expected a capture without a vendor CLI");
+
+        let recorded = read_version_file(&out);
+        let members: Vec<&str> = recorded
+            .as_object()
+            .expect("expected an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            members,
+            ["command", "output"],
+            "expected version.json members command, output | received {recorded}"
+        );
+        std::fs::remove_dir_all(out).expect("expected temporary capture cleanup");
+    }
+
+    #[tokio::test]
+    async fn unusable_vendor_cli_answers_write_no_fixture_and_name_the_program() {
+        let vendor_cli = named_vendor_cli();
+        for (stdout, expected) in [
+            (vec![], "a public probe which writes stdout"),
+            (vec!["codex-cli 0.166.0", "extra line"], "2 lines"),
+        ] {
+            let launcher = adapter_over_vendor_launcher(&stdout);
+            let out = temp_dir("acp-vendor-refused");
+            let profile =
+                mango_agent_acp::builtin_profile("codex-acp").expect("expected a profile");
+
+            let refused = acp_with(
+                &host(Arc::clone(&launcher)),
+                &out,
+                profile.as_ref(),
+                Some(&vendor_cli),
+            )
+            .await
+            .expect_err("expected an unusable vendor answer to be refused");
+
+            let message = refused.to_string();
+            // The refusal quotes the program with `{:?}`, which doubles the backslashes of a
+            // Windows temp path, so the expected text is quoted the same way.
+            let quoted = format!("{vendor_cli:?}");
+            assert!(
+                message.contains(&quoted) && message.contains(expected),
+                "expected an error naming {quoted} and {expected:?} | received {message}"
+            );
+            assert!(
+                !out.join("contract").exists(),
+                "expected no fixture file after a refused vendor probe"
+            );
+            assert_eq!(launcher.live_children(), 0);
+            std::fs::remove_dir_all(out).expect("expected temporary capture cleanup");
+        }
+    }
+
+    #[test]
+    fn vendor_cli_without_a_file_name_is_refused() {
+        let refused = vendor_cli_command("..").expect_err("expected a nameless program refused");
+
+        assert!(
+            refused.to_string().contains("\"..\""),
+            "expected the refusal to name the received value | received {refused}"
+        );
     }
 
     #[tokio::test]

@@ -879,6 +879,10 @@ pub(crate) struct CaptureOptions {
     /// A transcript scenario of either harness; [`CaptureOptions::kind`] checks which one.
     #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(crate::capture::all_scenario_names()))]
     pub scenario: Option<String>,
+    /// The vendor CLI an ACP adapter fronts, named by the operator so `version.json` can record its
+    /// `--version`; `mea` never looks for it, because the adapter's own resolution is no contract.
+    #[arg(long)]
+    pub vendor_cli: Option<String>,
 }
 
 impl CaptureOptions {
@@ -900,6 +904,13 @@ impl CaptureOptions {
         if self.transcripts && !matches!(selected, HarnessChoice::Codex | HarnessChoice::Claude) {
             return Err(format!(
                 "expected codex or claude for --transcripts, received {selected}"
+            ));
+        }
+        if let Some(program) = &self.vendor_cli
+            && !matches!(selected, HarnessChoice::Acp(_))
+        {
+            return Err(format!(
+                "(mea capture): expected --vendor-cli only with an ACP contract capture (--harness acp --profile ID) | received --vendor-cli {program:?} with --harness {selected}"
             ));
         }
         self.check_scenario(&selected)?;
@@ -1268,6 +1279,50 @@ mod capture_tests {
                     "(mea capture): expected --json-schema only with --harness claude --transcripts --scenario structured-output | received --json-schema {path:?} with {received}"
                 )),
                 "expected {words:?} to be refused with the value it received"
+            );
+        }
+    }
+
+    #[test]
+    fn a_vendor_cli_is_accepted_only_for_an_acp_contract_capture() {
+        let path = std::env::temp_dir().join("codex").display().to_string();
+        let accepted = CaptureOptions::parse(&capture_arguments(&[
+            "--harness",
+            "acp",
+            "--profile",
+            "codex-acp",
+            "--vendor-cli",
+            path.as_str(),
+        ]))
+        .expect("expected valid capture arguments");
+        assert!(accepted.kind().is_ok());
+        assert_eq!(accepted.vendor_cli.as_deref(), Some(path.as_str()));
+
+        for (words, received) in [
+            (vec!["--harness", "claude"], "--harness claude"),
+            (vec!["--harness", "codex"], "--harness codex"),
+            (vec!["codex"], "--harness codex"),
+            (
+                vec![
+                    "--harness",
+                    "claude",
+                    "--transcripts",
+                    "--scenario",
+                    "structured-output",
+                ],
+                "--harness claude",
+            ),
+        ] {
+            let mut typed = words.clone();
+            typed.extend(["--vendor-cli", path.as_str()]);
+            let refused = CaptureOptions::parse(&capture_arguments(&typed))
+                .and_then(|options| options.kind());
+            assert_eq!(
+                refused.err(),
+                Some(format!(
+                    "(mea capture): expected --vendor-cli only with an ACP contract capture (--harness acp --profile ID) | received --vendor-cli {path:?} with {received}"
+                )),
+                "expected {typed:?} to be refused with the value it received"
             );
         }
     }
