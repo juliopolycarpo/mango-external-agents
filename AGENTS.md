@@ -24,7 +24,8 @@ It is a library, not a daemon: no listener, no service, no telemetry, no login h
 3. Trace one layer outward at a time: core traits → harness crate → fixtures → `mea` → docs.
 4. Run the smallest relevant validation first (one `cargo nextest run -p <crate> --all-features`
    filter), then `scripts/check.sh` before handoff. Without `--all-features`, targets gated on a
-   feature (the `testing` integration tests) are skipped silently and the run still passes.
+   feature (the `testing` integration tests) are skipped silently and the run still passes;
+   `docs/testing.md` records why a self dev-dependency does not replace the flag.
 
 ## Layout
 
