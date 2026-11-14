@@ -12,6 +12,8 @@ mod contracts;
 mod gateway;
 #[path = "replay/redaction.rs"]
 mod redaction;
+#[path = "replay/subagent.rs"]
+mod subagent;
 mod support;
 #[path = "replay/teardown.rs"]
 mod teardown;

@@ -56,6 +56,12 @@ bytes, and that is the point of keeping them:
 - `claude/historical/contract/` contains the old `auth status` shape.
 - `claude/help/` covers versions before and after features the parser supports.
 - `claude/transcripts/` and the Codex JSONL files record real vendor conversations.
+- `codex/subagent.jsonl` is a maintainer capture from an authenticated Codex 0.167.2 run on
+  2026-11-14 with model `gpt-5.6-terra`, recorded by `mea capture --harness codex --transcripts
+  --scenario subagent --model gpt-5.6-terra`. `mea` qualified it: it holds `subAgentActivity` items
+  with a nonempty `agentThreadId`. Like the other transcripts it has no manifest; its `# capture`
+  header and `# model:` line state the build and model, and `tests/replay/subagent.rs` in
+  `mango-agent-codex` fails if the file loses them. It is one run on one `free` account.
 
 A historical fixture remains captured and never hand-edited. Keep it when it continues to prove a
 compatibility case. Replace it only with a new capture that proves the same case on a consciously
