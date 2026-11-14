@@ -153,6 +153,17 @@ record the manual 0.1.0 publication on 2026-09-19, its artifact/tag identity and
 turns and Windows checks performed afterwards. That bootstrap receipt does not qualify a later
 release.
 
+## Where each feature set is checked
+
+| Check                                                                           | Covers                                                                              | Runs                                                                    |
+| ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `cargo hack clippy --feature-powerset --depth 2` (`scripts/check.sh`, `ci.yml`) | every feature pair of the core and of the Claude, Codex and ACP crates, all targets | stable toolchain, CI Linux, macOS and Windows lanes, `scripts/check.sh` |
+| `scripts/check-msrv-features.sh`                                                | each package alone, library targets only, on the declared minimum Rust              | release verify job, by hand                                             |
+
+The powerset names all four library crates in the one command, so a feature added to a harness
+crate is linted in combination with the others without a script edit. `scripts/test-check-powerset.sh`
+fails when the command drops one of them.
+
 ## Pre-releases
 
 A pre-release tag (`v$RELEASE_VERSION` with a suffix such as `-rc.1`) publishes to crates.io as a pre-release version, which Cargo

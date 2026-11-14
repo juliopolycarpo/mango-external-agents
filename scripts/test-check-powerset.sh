@@ -20,6 +20,14 @@ if [ "$ci_count" -ne 1 ]; then
   fail "expected exactly one 'cargo hack clippy --feature-powerset' step in .github/workflows/ci.yml, received $ci_count: $ci_steps"
 fi
 ci_args=${ci_steps#cargo }
+# Every published library crate gets its own feature powerset; the harness crates' features are
+# otherwise checked only by scripts/check-msrv-features.sh.
+for crate in mango-external-agents mango-agent-claude mango-agent-codex mango-agent-acp; do
+  case " $ci_args " in
+    *" -p $crate "*) ;;
+    *) fail "expected the ci.yml powerset to name package $crate | received: $ci_args" ;;
+  esac
+done
 
 mkdir -p "$work/scripts" "$work/bin"
 cp scripts/check.sh "$work/scripts/check.sh"
