@@ -220,7 +220,7 @@ async fn a_refused_launch_is_readable_by_flag_names_without_its_values() {
         "--model",
         "sk-ant-canary-argument",
         "--resume=sk-ant-canary-equals",
-        "-p",
+        "--effort",
         "canary prompt text",
     ];
 
@@ -229,7 +229,7 @@ async fn a_refused_launch_is_readable_by_flag_names_without_its_values() {
     assert_eq!(
         cli.refused_launch_shapes(),
         vec![
-            "claude with 7 arguments: flags --print, --model, --resume, -p; 2 values redacted"
+            "claude with 7 arguments: flags --print, --model, --resume, --effort; 2 values redacted"
                 .to_owned()
         ],
         "expected refused_launch_shapes() to name the flags and count the rest"
@@ -241,7 +241,7 @@ async fn a_dash_led_value_is_counted_and_never_named_as_a_flag() {
     let cli = FakeClaudeCli::new();
     let words = [
         "claude",
-        "--append-system-prompt",
+        "--model",
         "-----BEGIN canary key",
         "--",
         "-9canary",
@@ -252,8 +252,49 @@ async fn a_dash_led_value_is_counted_and_never_named_as_a_flag() {
     let shapes = cli.refused_launch_shapes();
     assert_eq!(
         shapes,
-        vec!["claude with 5 arguments: flags --append-system-prompt; 3 values redacted".to_owned()],
+        vec!["claude with 5 arguments: flags --model; 3 values redacted".to_owned()],
         "expected only flag-shaped words named | received: {shapes:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_flag_shaped_value_after_a_known_flag_is_counted_and_never_named() {
+    let cli = FakeClaudeCli::new();
+    let words = [
+        "claude",
+        "--model",
+        "-sk-ant-canary-value",
+        "--session-id=--canary-equals-value",
+    ];
+
+    refusal(cli.spawn(launch(&words)).await, &words);
+
+    let shapes = cli.refused_launch_shapes();
+    assert_eq!(
+        shapes,
+        vec!["claude with 4 arguments: flags --model, --session-id; 1 values redacted".to_owned()],
+        "expected a flag-shaped value to be counted, not named | received: {shapes:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_flag_the_library_never_emits_is_counted_and_never_named() {
+    let cli = FakeClaudeCli::new();
+    let words = [
+        "claude",
+        "--print",
+        "--dangerously-skip-permissions",
+        "-p",
+        "--canary-flag=value",
+    ];
+
+    refusal(cli.spawn(launch(&words)).await, &words);
+
+    let shapes = cli.refused_launch_shapes();
+    assert_eq!(
+        shapes,
+        vec!["claude with 5 arguments: flags --print; 3 values redacted".to_owned()],
+        "expected only the flags the turn argv builder emits to be named | received: {shapes:?}"
     );
 }
 

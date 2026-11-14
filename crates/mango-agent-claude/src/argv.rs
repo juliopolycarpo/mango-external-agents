@@ -50,6 +50,29 @@ pub(crate) const WORST_CASE_CONDITIONAL_FLAGS: [&str; 7] = [
     "--json-schema",
 ];
 
+/// Every flag name [`TurnArgv::build`] can put on a turn's command line, with no value.
+///
+/// The fake CLI names a refused launch's flags from this list and counts every other word, so a
+/// flag-shaped value such as `-sk-ant-abc` is never printed. Tests pin the list against the argv
+/// the builder produces: a flag added to `build` without an entry here fails them.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) const TURN_FLAG_NAMES: [&str; 14] = [
+    "--print",
+    "--input-format",
+    "--output-format",
+    "--verbose",
+    "--include-partial-messages",
+    "--forward-subagent-text",
+    "--permission-mode",
+    "--permission-prompts",
+    "--resume",
+    "--session-id",
+    "--model",
+    "--effort",
+    "--mcp-config",
+    "--json-schema",
+];
+
 /// Everything the argv depends on, gathered so the builder decides nothing on its own.
 #[derive(Clone, PartialEq, Eq)]
 pub struct TurnArgv<'a> {
@@ -682,6 +705,53 @@ mod tests {
             BATCH_COMMAND_LINE_LIMIT_UNITS,
             "expected the capped schema to fill the line | received {} flags",
             argv.len()
+        );
+    }
+
+    /// Every combination of the optional flags: the names `build` emits and `TURN_FLAG_NAMES`
+    /// lists must be the same set, so the fake CLI neither prints a value nor hides a real flag.
+    #[test]
+    fn the_turn_flag_names_are_exactly_the_flags_build_can_emit() {
+        let schema = r#"{"type":"object"}"#;
+        let efforts = [String::from("high")];
+        // `/tmp/...` is not absolute on Windows, so the path comes from the host's temp dir.
+        let mcp_path = std::env::temp_dir().join("servers.json");
+        let mcp_path = mcp_path
+            .to_str()
+            .expect("expected a native UTF-8 fixture path");
+        let mut emitted = std::collections::BTreeSet::new();
+        for established in [false, true] {
+            for mode in [None, Some(CliMode::Manual)] {
+                for declares_permission_prompts in [false, true] {
+                    for with_options in [false, true] {
+                        let turn = TurnArgv {
+                            established,
+                            mode,
+                            declares_permission_prompts,
+                            model: with_options.then_some("opus"),
+                            effort: with_options.then_some("high"),
+                            accepted_efforts: Some(&efforts),
+                            mcp_config: with_options.then_some(mcp_path),
+                            json_schema: with_options.then_some(schema),
+                            ..base()
+                        };
+                        let argv = turn.build().expect("expected valid argv");
+                        emitted.extend(
+                            argv.into_iter()
+                                .skip(1)
+                                .filter(|word| word.starts_with("--")),
+                        );
+                    }
+                }
+            }
+        }
+        let listed: std::collections::BTreeSet<String> = super::TURN_FLAG_NAMES
+            .iter()
+            .map(|flag| (*flag).to_owned())
+            .collect();
+        assert_eq!(
+            listed, emitted,
+            "expected TURN_FLAG_NAMES to equal the flags TurnArgv::build emits | received left: listed, right: emitted"
         );
     }
 
