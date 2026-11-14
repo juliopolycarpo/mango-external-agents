@@ -50,7 +50,8 @@ unparsed and verbatim except for one allowlisted row: `app`, the desktop-app lau
 `codex --help` because only the macOS and Windows builds list it (observed in the pinned job of
 #368), and the contract must read the same on all three systems. The allowlist is
 `PLATFORM_ONLY_CODEX_COMMANDS` in `examples/mea/src/capture/contracts.rs`. A new subcommand, a native ACP mode, or a changed `--listen` transport
-list fails the Codex latest-contract job and opens the managed `drift(codex)` issue. The probes are
+list fails the Codex latest-contract job and opens the managed `drift(codex)` issue. A native ACP mode in either CLI is the
+trigger for revisiting [the ACP convergence assessment](acp-convergence.md). The probes are
 read-only, need no login and spawn only the CLI the host supplies.
 
 The Claude scheduled lane also checks Anthropic's [headless CLI reference](https://code.claude.com/docs/en/headless)
