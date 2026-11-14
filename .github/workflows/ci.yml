@@ -85,6 +85,8 @@ jobs:
       - run: python3 scripts/check-resolved-acp-schema.py
       - run: scripts/check-bench-runner.sh
       - run: scripts/test-bench-runner.sh
+      - run: scripts/test-check-script-tests.sh
+      - run: scripts/check-script-tests.sh
       - run: dprint check
 
   msrv:
