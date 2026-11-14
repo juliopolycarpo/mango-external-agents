@@ -684,8 +684,8 @@ impl FakeClaudeCli {
         Error::Launch {
             program: spec.argv.first().cloned().unwrap_or_default(),
             message: format!(
-                "unscripted launch, expected --version, --help, auth status or a queued turn | received {unscripted} ({} arguments); read FakeClaudeCli::refused_launch_shapes for the flags, or refused_launches for the argv",
-                spec.argv.len()
+                "unscripted launch, expected --version, --help, auth status or a queued turn | received {unscripted} ({}); read FakeClaudeCli::refused_launch_shapes for the flags, or refused_launches for the argv",
+                counted(spec.argv.len(), "argument")
             ),
         }
     }
@@ -788,9 +788,17 @@ fn refused_shape(spec: &LaunchSpec) -> String {
         format!("flags {}", flags.join(", "))
     };
     format!(
-        "{program} with {} arguments: {flag_names}; {redacted} values redacted",
-        spec.argv.len()
+        "{program} with {}: {flag_names}; {} redacted",
+        counted(spec.argv.len(), "argument"),
+        counted(redacted, "value"),
     )
+}
+
+/// `count` followed by `noun`, pluralised with an `s` unless the count is one: `1 value`,
+/// `0 values`, `2 values`.
+fn counted(count: usize, noun: &str) -> String {
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} {noun}{plural}")
 }
 
 fn is_auth_status(argv: &[String]) -> bool {
