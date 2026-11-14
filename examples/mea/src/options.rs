@@ -246,11 +246,18 @@ pub(crate) const JSON_SCHEMA_FILE_MAX_BYTES: u64 = 1024 * 1024;
 /// `ClaudeHarness::with_json_schema`'s call, and its refusal is printed unchanged.
 /// Example: `--json-schema answer.schema.json`.
 pub(crate) fn read_json_schema_file(path: &Path) -> Result<String, String> {
+    read_json_schema_file_for("turn", path)
+}
+
+/// [`read_json_schema_file`] for a command that is not `turn`, so a refusal names the command the
+/// operator ran. Example: `read_json_schema_file_for("capture", path)` opens with `(mea capture):`.
+pub(crate) fn read_json_schema_file_for(command: &str, path: &Path) -> Result<String, String> {
     use std::io::Read;
 
     let expected = "expected --json-schema as a readable UTF-8 file holding a JSON Schema object";
-    let refused =
-        |error: &dyn fmt::Display| format!("(mea turn): {expected} | received {path:?} ({error})");
+    let refused = |error: &dyn fmt::Display| {
+        format!("(mea {command}): {expected} | received {path:?} ({error})")
+    };
     // Bytes first: a cut at the bound can split a character, which must read as "too large"
     // rather than as invalid UTF-8.
     let mut bytes = Vec::new();
@@ -262,13 +269,13 @@ pub(crate) fn read_json_schema_file(path: &Path) -> Result<String, String> {
         .map_err(|error| refused(&error))?;
     if bytes.len() as u64 > JSON_SCHEMA_FILE_MAX_BYTES {
         return Err(format!(
-            "(mea turn): expected --json-schema as a file of at most {JSON_SCHEMA_FILE_MAX_BYTES} bytes | received {path:?} with more than that"
+            "(mea {command}): expected --json-schema as a file of at most {JSON_SCHEMA_FILE_MAX_BYTES} bytes | received {path:?} with more than that"
         ));
     }
     let text = String::from_utf8(bytes).map_err(|error| refused(&error))?;
     if text.trim().is_empty() {
         return Err(format!(
-            "(mea turn): expected --json-schema as a nonempty file holding a JSON Schema object | received {path:?} with no text"
+            "(mea {command}): expected --json-schema as a nonempty file holding a JSON Schema object | received {path:?} with no text"
         ));
     }
     Ok(text)
@@ -864,10 +871,12 @@ pub(crate) struct CaptureOptions {
     /// The Codex model id every transcript conversation opens its thread with.
     #[arg(long)]
     pub model: Option<String>,
-    /// Parsed only to be refused: a capture records a vendor's contract and takes no host schema.
+    /// The schema file a Claude transcript scenario asks the CLI to answer under; refused anywhere
+    /// else, because a capture otherwise records a vendor's contract and takes no host schema.
     #[arg(long)]
     pub json_schema: Option<PathBuf>,
-    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(crate::capture::scenario_names()))]
+    /// A transcript scenario of either harness; [`CaptureOptions::kind`] checks which one.
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(crate::capture::all_scenario_names()))]
     pub scenario: Option<String>,
 }
 
@@ -882,28 +891,18 @@ impl CaptureOptions {
 
     /// Resolves the requested vendor. Example: `acp` uses the documented default capture profile.
     pub fn kind(&self) -> Result<HarnessChoice, String> {
-        if let Some(path) = &self.json_schema {
-            return Err(format!(
-                "(mea capture): expected no --json-schema; capture records a vendor's own output and never takes a host schema | received --json-schema {path:?}"
-            ));
-        }
         let name = self.harness.as_deref().unwrap_or("codex");
         let default_profile =
             (name == "acp").then_some(crate::capture::DEFAULT_ACP_CAPTURE_PROFILE);
         let selected = kind(Some(name), self.profile.as_deref().or(default_profile))?
             .ok_or("expected a capture harness, received none")?;
-        if self.transcripts && selected != HarnessChoice::Codex {
+        if self.transcripts && !matches!(selected, HarnessChoice::Codex | HarnessChoice::Claude) {
             return Err(format!(
-                "expected codex for --transcripts, received {selected}"
+                "expected codex or claude for --transcripts, received {selected}"
             ));
         }
-        if self.scenario.is_some()
-            && (selected != HarnessChoice::Codex || (self.legacy.is_none() && !self.transcripts))
-        {
-            return Err(format!(
-                "expected a Codex transcript capture for --scenario, received {selected} without transcript selection"
-            ));
-        }
+        self.check_scenario(&selected)?;
+        self.check_json_schema(&selected)?;
         if let Some(model) = &self.model {
             model_id("capture", model)?;
             let transcript =
@@ -920,6 +919,75 @@ impl CaptureOptions {
             }
         }
         Ok(selected)
+    }
+
+    /// The scenario pairing: a Codex scenario goes with Codex transcripts, a Claude one with
+    /// `--harness claude --transcripts`, and a Claude transcript capture always names its scenario
+    /// because the only one it has needs a schema the operator has to choose.
+    fn check_scenario(&self, selected: &HarnessChoice) -> Result<(), String> {
+        let codex_transcripts =
+            *selected == HarnessChoice::Codex && (self.legacy.is_some() || self.transcripts);
+        let claude_transcripts = *selected == HarnessChoice::Claude && self.transcripts;
+        let Some(scenario) = &self.scenario else {
+            return if claude_transcripts {
+                Err(format!(
+                    "(mea capture): expected --scenario with a Claude transcript capture, one of {} | received --harness claude --transcripts without --scenario",
+                    crate::capture::claude_scenario_names().join(", ")
+                ))
+            } else {
+                Ok(())
+            };
+        };
+        let (kind, names) = if codex_transcripts {
+            ("Codex", crate::capture::scenario_names())
+        } else if claude_transcripts {
+            ("Claude", crate::capture::claude_scenario_names())
+        } else {
+            return Err(format!(
+                "(mea capture): expected --scenario with a transcript capture (--harness codex|claude --transcripts or `codex`) | received --scenario {scenario:?} with --harness {selected}{}",
+                if self.transcripts {
+                    ""
+                } else {
+                    " without --transcripts"
+                }
+            ));
+        };
+        if names.contains(&scenario.as_str()) {
+            Ok(())
+        } else {
+            Err(format!(
+                "(mea capture): expected a {kind} transcript scenario, one of {} | received --scenario {scenario:?} with --harness {selected}",
+                names.join(", ")
+            ))
+        }
+    }
+
+    /// The `--json-schema` pairing: a Claude scenario that asks the CLI for a structured answer
+    /// needs the file, and nothing else takes it.
+    ///
+    /// The file is read later, by `main`, so a refusal here costs no I/O. Anywhere else a schema
+    /// is refused rather than ignored: the capture would record a conversation that never used it.
+    fn check_json_schema(&self, selected: &HarnessChoice) -> Result<(), String> {
+        let needs_schema = *selected == HarnessChoice::Claude
+            && self.transcripts
+            && self
+                .scenario
+                .as_deref()
+                .is_some_and(crate::capture::claude_scenario_needs_schema);
+        match (&self.json_schema, needs_schema) {
+            (Some(_), true) | (None, false) => Ok(()),
+            (None, true) => Err(format!(
+                "(mea capture): expected --json-schema FILE with --scenario {} | received no --json-schema",
+                self.scenario.as_deref().unwrap_or_default()
+            )),
+            (Some(path), false) => Err(format!(
+                "(mea capture): expected --json-schema only with --harness claude --transcripts --scenario {} | received --json-schema {path:?} with --harness {selected}{}",
+                crate::capture::claude_scenario_names().join("|"),
+                self.scenario
+                    .as_deref()
+                    .map_or_else(String::new, |scenario| format!(" --scenario {scenario}"))
+            )),
+        }
     }
 }
 
@@ -977,6 +1045,92 @@ mod capture_tests {
                 );
                 assert_eq!(options.scenario.as_deref(), Some(name));
             }
+        }
+    }
+
+    #[test]
+    fn a_claude_scenario_is_accepted_only_for_claude_transcripts_with_its_schema() {
+        let typed = std::env::temp_dir()
+            .join("answer.schema.json")
+            .display()
+            .to_string();
+        for name in crate::capture::claude_scenario_names() {
+            let options = CaptureOptions::parse(&capture_arguments(&[
+                "--harness",
+                "claude",
+                "--transcripts",
+                "--scenario",
+                name,
+                "--json-schema",
+                &typed,
+            ]))
+            .expect("expected a registered Claude scenario to parse");
+            assert_eq!(options.kind(), Ok(HarnessChoice::Claude));
+            assert_eq!(options.scenario.as_deref(), Some(name));
+            assert_eq!(options.json_schema, Some(std::path::PathBuf::from(&typed)));
+        }
+    }
+
+    #[test]
+    fn a_scenario_is_refused_with_the_harness_it_does_not_belong_to() {
+        let typed = std::env::temp_dir()
+            .join("answer.schema.json")
+            .display()
+            .to_string();
+        for (words, expected) in [
+            (
+                vec![
+                    "--harness",
+                    "codex",
+                    "--transcripts",
+                    "--scenario",
+                    "structured-output",
+                ],
+                "(mea capture): expected a Codex transcript scenario, one of handshake, turn, approval, interrupt, review, review-base-branch, review-commit, review-custom, permission-transitions, user-defaults, subagent | received --scenario \"structured-output\" with --harness codex",
+            ),
+            (
+                vec!["codex", "--scenario", "structured-output"],
+                "(mea capture): expected a Codex transcript scenario, one of handshake, turn, approval, interrupt, review, review-base-branch, review-commit, review-custom, permission-transitions, user-defaults, subagent | received --scenario \"structured-output\" with --harness codex",
+            ),
+            (
+                vec![
+                    "--harness",
+                    "claude",
+                    "--transcripts",
+                    "--scenario",
+                    "subagent",
+                    "--json-schema",
+                    &typed,
+                ],
+                "(mea capture): expected a Claude transcript scenario, one of structured-output | received --scenario \"subagent\" with --harness claude",
+            ),
+            (
+                vec![
+                    "--harness",
+                    "claude",
+                    "--scenario",
+                    "structured-output",
+                    "--json-schema",
+                    &typed,
+                ],
+                "(mea capture): expected --scenario with a transcript capture (--harness codex|claude --transcripts or `codex`) | received --scenario \"structured-output\" with --harness claude without --transcripts",
+            ),
+            (
+                vec!["--harness", "claude", "--transcripts"],
+                "(mea capture): expected --scenario with a Claude transcript capture, one of structured-output | received --harness claude --transcripts without --scenario",
+            ),
+            (
+                vec!["--harness", "acp:cursor", "--transcripts"],
+                "expected codex or claude for --transcripts, received acp:cursor",
+            ),
+        ] {
+            let refused = CaptureOptions::parse(&capture_arguments(&words))
+                .and_then(|options| options.kind());
+            assert_eq!(
+                refused.err().as_deref(),
+                Some(expected),
+                "expected {words:?} to be refused with the value it received"
+            );
         }
     }
 
@@ -1054,27 +1208,113 @@ mod capture_tests {
     fn capture_refuses_a_schema_it_would_never_use() {
         let path = std::env::temp_dir().join("answer.schema.json");
         let typed = path.display().to_string();
-        for words in [
-            vec!["--harness", "claude", "--json-schema", typed.as_str()],
-            vec![
-                "--harness",
-                "codex",
-                "--transcripts",
-                "--json-schema",
-                typed.as_str(),
-            ],
-            vec!["codex", "--json-schema", typed.as_str()],
+        for (words, received) in [
+            (
+                vec!["--harness", "claude", "--json-schema", typed.as_str()],
+                "--harness claude",
+            ),
+            (
+                vec![
+                    "--harness",
+                    "codex",
+                    "--transcripts",
+                    "--json-schema",
+                    typed.as_str(),
+                ],
+                "--harness codex",
+            ),
+            (
+                vec!["codex", "--json-schema", typed.as_str()],
+                "--harness codex",
+            ),
+            (
+                vec![
+                    "codex",
+                    "--scenario",
+                    "turn",
+                    "--json-schema",
+                    typed.as_str(),
+                ],
+                "--harness codex --scenario turn",
+            ),
         ] {
             let refused = CaptureOptions::parse(&capture_arguments(&words))
                 .and_then(|options| options.kind());
             assert_eq!(
                 refused.err(),
                 Some(format!(
-                    "(mea capture): expected no --json-schema; capture records a vendor's own output and never takes a host schema | received --json-schema {path:?}"
+                    "(mea capture): expected --json-schema only with --harness claude --transcripts --scenario structured-output | received --json-schema {path:?} with {received}"
                 )),
                 "expected {words:?} to be refused with the value it received"
             );
         }
+    }
+
+    #[test]
+    fn a_schema_scenario_is_refused_without_its_schema() {
+        let refused = CaptureOptions::parse(&capture_arguments(&[
+            "--harness",
+            "claude",
+            "--transcripts",
+            "--scenario",
+            "structured-output",
+        ]))
+        .and_then(|options| options.kind());
+
+        assert_eq!(
+            refused.err().as_deref(),
+            Some(
+                "(mea capture): expected --json-schema FILE with --scenario structured-output | received no --json-schema"
+            )
+        );
+    }
+
+    #[test]
+    fn a_model_is_still_refused_for_a_claude_transcript_capture() {
+        let typed = std::env::temp_dir()
+            .join("answer.schema.json")
+            .display()
+            .to_string();
+        let refused = CaptureOptions::parse(&capture_arguments(&[
+            "--harness",
+            "claude",
+            "--transcripts",
+            "--scenario",
+            "structured-output",
+            "--json-schema",
+            &typed,
+            "--model",
+            "claude-sonnet-5",
+        ]))
+        .and_then(|options| options.kind());
+
+        assert_eq!(
+            refused.err().as_deref(),
+            Some(
+                "(mea capture): expected --model with a Codex transcript capture (--harness codex --transcripts or `codex`) | received --model \"claude-sonnet-5\" with --harness claude"
+            )
+        );
+    }
+
+    #[test]
+    fn the_capture_reader_names_capture_not_turn_in_its_refusals() {
+        let missing = std::env::temp_dir().join("mea-capture-no-such-schema.json");
+
+        let refused = read_json_schema_file_for("capture", &missing)
+            .expect_err("expected a missing file to be refused");
+
+        assert!(
+            refused.starts_with(&format!(
+                "(mea capture): expected --json-schema as a readable UTF-8 file holding a JSON Schema object | received {missing:?} ("
+            )),
+            "received: {refused}"
+        );
+        assert!(
+            read_json_schema_file(&missing)
+                .expect_err("expected a missing file to be refused")
+                .starts_with("(mea turn): "),
+            "expected the turn reader to keep naming turn"
+        );
     }
 }
 

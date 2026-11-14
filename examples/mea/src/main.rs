@@ -160,6 +160,9 @@ fn print_banner() {
         "       mea capture codex [--scenario NAME] [--model ID] [--out DIR] [--workspace DIR] (archival transcripts)"
     );
     println!(
+        "       mea capture --harness claude --transcripts --scenario structured-output --json-schema FILE [--out DIR] [--workspace DIR] (archival transcript)"
+    );
+    println!(
         "       mea digests [--out DIR] [--check] (rewrite or verify capture manifest digests)"
     );
     println!("ACP profiles: {}", acp_profile_ids().join(", "));
@@ -457,6 +460,21 @@ async fn capture(arguments: &[String]) -> Result<(), String> {
             .await
         }
         HarnessChoice::Codex => capture::codex_contract(&out, &workspace.path).await,
+        HarnessChoice::Claude if options.transcripts => {
+            // `CaptureOptions::kind` has already paired the scenario with its schema.
+            let schema = options
+                .json_schema
+                .as_deref()
+                .map(|path| options::read_json_schema_file_for("capture", path))
+                .transpose()?;
+            capture::claude_transcripts(
+                &out,
+                &workspace.path,
+                options.scenario.as_deref().unwrap_or_default(),
+                schema.as_deref(),
+            )
+            .await
+        }
         HarnessChoice::Claude => capture::claude(&out, &workspace.path).await,
         HarnessChoice::Acp(profile) => capture::acp(&out, &workspace.path, profile.as_str()).await,
     };

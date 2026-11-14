@@ -133,7 +133,7 @@ anything the harness depends on was not determined.
 
 ## Fixture capture
 
-`mea capture --harness claude` runs only `claude --version` and `claude --help`. It writes the raw
+`mea capture --harness claude` (without `--transcripts`) runs only `claude --version` and `claude --help`. It writes the raw
 help text, a parsed CLI surface, and a version record under `fixtures/claude/contract/`. The command
 does not read `claude auth status`, open a session, or send a prompt, so the pinned drift job can
 reproduce the directory without a login.
@@ -143,6 +143,50 @@ reproduce the directory without a login.
 older CLI surface and authenticated turns that cannot be reproduced byte-for-byte. Keep them fixed;
 do not regenerate them during a routine drift check. [Fixture rules](../fixtures/README.md) record
 the distinction.
+
+## Transcript capture
+
+`mea capture --harness claude --transcripts --scenario structured-output --json-schema FILE`
+records one real schema turn. It is the only capture that runs a Claude turn, so it needs the CLI
+already signed in, and it spends a few tokens of that account. It never signs in, opens a browser or
+reads a token: a signed-out CLI is refused with the vendor's own login command printed for the
+operator to run.
+
+The turn goes through `ClaudeHarness` with the schema read by the same file reader `mea turn
+--json-schema` uses, so the argv is the harness's own. The harness has no raw-line API, so the
+recorder hands the host a launcher that forwards every launch to the real one and copies the stdout
+of the turn launch (the one with `--output-format stream-json`); `--version`, `--help` and
+`auth status` pass through untouched. The session is opened read-only with approvals routed to the
+user (`--permission-mode plan`), so the transcript does not depend on the operator's own default
+mode. The prompt asks for no tool but `StructuredOutput`. If an approval or a question arrives
+anyway the capture fails and leaves it unanswered.
+
+The file is `fixtures/claude/transcripts/structured-output.jsonl` under `--out`: two `#` header lines
+(`# claude/structured-output: ...` and `# capture {"claudeVersion": ..., "captureVersion": ...,
+"capturedAtUnixSeconds": ...}`, where `claudeVersion` is the line `claude --version` printed), then
+one redacted stream-json record per line. Unlike the bare lines of the older transcripts it starts
+with `#` lines, so a reader has to skip them. It has no manifest.
+
+Qualification runs on the redacted lines, so a qualified file is the one on disk. It needs an
+`assistant` record with a `tool_use` named `StructuredOutput` and a last `result` record whose
+`structured_output` is a JSON object. A run without both writes `structured-output.unqualified.jsonl`
+with `# unqualified capture` and fails; a failed run, or a child whose stop could not be confirmed,
+writes `structured-output.partial.jsonl` with `# incomplete capture` and fails. Neither replaces a
+qualified file, and a later qualified run removes them.
+
+Redaction keeps wire structure and drops what a machine or a model wrote. Strings survive only under
+a short list of structural members (`type`, `subtype`, `role`, `id`, `tool_use_id`, `session_id`,
+`uuid`, `model`, `stop_reason`, `terminal_reason`, `permissionMode`, `claude_code_version`) and as the
+name of a tool call that is not an `mcp__` tool; every other string becomes `[REDACTED]`, including
+the `tools`, `mcp_servers` and `commands` entries that name the user's installation. `cwd` is always
+written as `/workspace`, and the capture's own directory, home directory and login are rewritten in
+every key and retained value. A member whose name is credential or account shaped
+(`credential_expires_at`, `*_token`, `email`, `organization*`, `account*`, and similar) is replaced
+whatever its value type, because `credential_expires_at` is a number and a rule about strings does
+not reach it. Everything under `input` and `structured_output` is treated as the model's answer, so
+the answer's strings are redacted and its shape stays. Lines that are not JSON objects are dropped.
+Numbers survive, including the usage counts, the cost and the `rate_limit_event` window utilisation
+and reset times, which describe the account's plan usage at capture time.
 
 ## The surface driven
 
@@ -957,8 +1001,12 @@ expected:
 - Any harness but Claude, including a turn with `--harness codex` or `acp:<profile>`:
   `(mea turn): expected --json-schema with --harness claude | received --json-schema "<path>" with
   --harness <harness>`. A turn without `--harness` runs Claude.
-- `discover` and `doctor`, which never open a session, and `mea capture`, which records a vendor's
-  own output: `(mea <command>): expected no --json-schema; … | received --json-schema "<path>"`.
+- `discover` and `doctor`, which never open a session: `(mea <command>): expected no --json-schema;
+  … | received --json-schema "<path>"`.
+- `mea capture` with anything but `--harness claude --transcripts --scenario structured-output`:
+  `(mea capture): expected --json-schema only with --harness claude --transcripts --scenario … |
+  received --json-schema "<path>" with --harness <harness>`. That scenario without the flag is
+  refused too.
 
 Plain output prints the answer on its own labelled line, before `completed`. A blank line may
 precede it: the label starts a fresh line even when assistant text, which ends without a newline,
@@ -997,8 +1045,8 @@ of `{word: string}` and the prompt "Reply with the word ok." The records came in
 (`subtype: success`). The `result` carried the value as `structured_output`, an object, and again as
 `result`, a string. It also carried `credential_expires_at`. No permission or control request was
 raised for the `StructuredOutput` call, so there is nothing for a host to broker. The pin was not
-re-run, and the tests replay inline frames reduced from that run (`mea capture` has no Claude
-transcript recorder), not a fixture.
+re-run, and the tests replay inline frames reduced from that run, not a fixture. `mea capture
+--harness claude --transcripts` can now record this turn; see [Transcript capture](#transcript-capture).
 
 Vendor documents followed: [headless: get structured output](https://code.claude.com/docs/en/headless#get-structured-output), which names
 `structured_output` and says a run without valid output has no such field, and [Agent SDK: structured outputs](https://code.claude.com/docs/en/agent-sdk/structured-outputs), which documents

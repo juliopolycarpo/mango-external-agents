@@ -12,7 +12,8 @@ use mango_external_agents::{
 use super::{Options, run, turn_registry, turn_with};
 
 /// `claude --help` as Claude Code 2.1.270 printed it, which declares `--json-schema`.
-const HELP_WITH_JSON_SCHEMA: &str = include_str!("../../../fixtures/claude/help/2.1.270.txt");
+pub(crate) const HELP_WITH_JSON_SCHEMA: &str =
+    include_str!("../../../fixtures/claude/help/2.1.270.txt");
 
 /// An excerpt of 2.1.260, a build that predates `--json-schema`.
 const HELP_WITHOUT_JSON_SCHEMA: &str = include_str!("../../../fixtures/claude/help/2.1.260.txt");
@@ -43,14 +44,14 @@ fn schema_turn_lines() -> Vec<String> {
 
 /// A `claude` that answers `--version`, `--help` and `auth status` as a signed-in build with this
 /// help text, and plays `turn_lines` for any other launch.
-struct ScriptedClaudeCli {
+pub(crate) struct ScriptedClaudeCli {
     launcher: FakeLauncher,
     help: &'static str,
     turn_lines: Vec<String>,
 }
 
 impl ScriptedClaudeCli {
-    fn new(help: &'static str, turn_lines: Vec<String>) -> Self {
+    pub(crate) fn new(help: &'static str, turn_lines: Vec<String>) -> Self {
         Self {
             launcher: FakeLauncher::new(),
             help,
@@ -59,7 +60,7 @@ impl ScriptedClaudeCli {
     }
 
     /// The argv of every launch that was a turn rather than a probe.
-    fn turn_argvs(&self) -> Vec<Vec<String>> {
+    pub(crate) fn turn_argvs(&self) -> Vec<Vec<String>> {
         self.launcher
             .launches()
             .into_iter()
@@ -292,7 +293,7 @@ async fn run_refuses_a_schema_where_it_would_not_be_used() {
         (
             vec!["capture", "--harness", "claude", "--json-schema", &typed],
             format!(
-                "(mea capture): expected no --json-schema; capture records a vendor's own output and never takes a host schema | received --json-schema {path:?}"
+                "(mea capture): expected --json-schema only with --harness claude --transcripts --scenario structured-output | received --json-schema {path:?} with --harness claude"
             ),
         ),
     ];

@@ -22,8 +22,13 @@ use serde_json::{Map, Value, json};
 
 use crate::redact;
 
+mod claude_transcript;
 mod contracts;
 
+pub use claude_transcript::{
+    claude as claude_transcripts, scenario_names as claude_scenario_names,
+    scenario_needs_schema as claude_scenario_needs_schema,
+};
 pub use contracts::{DEFAULT_ACP_CAPTURE_PROFILE, acp, claude, codex_contract, manifest};
 
 /// Which direction a recorded line went.
@@ -102,6 +107,16 @@ const SCENARIOS: &[Scenario] = &[
 /// The named Codex transcript scenarios, for the CLI's `--scenario` parser.
 pub fn scenario_names() -> Vec<&'static str> {
     SCENARIOS.iter().map(|scenario| scenario.name).collect()
+}
+
+/// Every transcript scenario name either harness registers, for the CLI's `--scenario` parser.
+///
+/// The harness pairing is checked by the options, which know which harness was chosen.
+pub fn all_scenario_names() -> Vec<&'static str> {
+    scenario_names()
+        .into_iter()
+        .chain(claude_scenario_names())
+        .collect()
 }
 
 /// Records every Codex scenario, or only `selected`, into `out_dir`.
