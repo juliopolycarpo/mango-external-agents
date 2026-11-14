@@ -945,6 +945,52 @@ async fn opening_with_explicit_effort_applies_it_on_the_thread_and_reports_accep
     );
 }
 
+/// The request's model is the `model` member of `thread/start`: the host's choice reaches the
+/// app-server without a write to the user's `config.toml`.
+#[tokio::test]
+async fn opening_with_an_explicit_model_sends_it_as_the_thread_start_model_member() {
+    let (host, launcher) = host_replaying(&["handshake"]);
+    let mut request = OpenSession::new("chat-1");
+    request.configuration =
+        ConfigurationPatch::new().model(ConfigurationChange::Set(String::from("gpt-requested")));
+    CodexHarness::new()
+        .open_session(&host, request)
+        .await
+        .expect("expected a session on the requested model");
+
+    let start = launcher
+        .written()
+        .into_iter()
+        .find(|line| line.contains("thread/start"))
+        .expect("expected a thread start");
+    let frame: serde_json::Value = serde_json::from_str(&start).expect("expected JSON");
+    assert_eq!(
+        frame["params"]["model"], "gpt-requested",
+        "expected thread/start to carry the requested model | received {frame}"
+    );
+}
+
+/// Without a request the member is absent, so the app-server keeps the user's configured model.
+#[tokio::test]
+async fn opening_without_a_model_leaves_the_thread_start_model_member_absent() {
+    let (host, launcher) = host_replaying(&["handshake"]);
+    CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session on the user's configured model");
+
+    let start = launcher
+        .written()
+        .into_iter()
+        .find(|line| line.contains("thread/start"))
+        .expect("expected a thread start");
+    let frame: serde_json::Value = serde_json::from_str(&start).expect("expected JSON");
+    assert!(
+        frame["params"].get("model").is_none(),
+        "expected no model member on thread/start | received {frame}"
+    );
+}
+
 /// The server may apply a model other than the one asked for, and no effort at all. What it
 /// echoes is the observed configuration; what was asked for stays the accepted one, and an effort
 /// the echo left null is not reported as observed.
