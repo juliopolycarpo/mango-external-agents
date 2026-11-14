@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SELECTIONS = {
     "claude": [
         "help/2.1.227.txt", "help/2.1.260.txt", "help/2.1.270.txt",
-        "transcripts/read-turn.jsonl", "transcripts/denied-write-turn.jsonl",
+        "transcripts/*.jsonl",
         "contract", "historical/contract",
     ],
     "codex": ["**/*.jsonl"],
