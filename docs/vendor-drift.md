@@ -72,9 +72,15 @@ Each page must still contain a phrase it carries today (`Claude Code Docs`, `--p
 `codex exec`). A page that moved, emptied or stopped answering exits 2, "could not verify", and does
 not pass as clean. Either outcome opens the managed `drift(<vendor>)` issue. The contract
 comparison still runs, so when a release ships the mode the issue carries the help diff too. The
-issue body for a mention is the generic failure text; the workflow log names the page and the
-matching line. The step runs on the schedule only, so a vendor page cannot block a pull request.
-Its tests use the named fake fetcher `scripts/test-fixtures/fake-doc-curl.sh` and reach no network.
+issue body carries a "Documentation watch" section: each page URL that needs attention and the
+matching line text with its line number (at most three lines per page, each cut at 200 characters,
+with the count shown), a note for a page that could
+not be downloaded or lost its phrase, and any stale allowlist entry. The section holds public page
+text and public URLs only; the workflow passes a report path as the script's second argument, and
+the file exists only when the watch fails. The step runs on the schedule only, so a vendor page
+cannot block a pull request. Its tests use the named fake fetcher
+`scripts/test-fixtures/fake-doc-curl.sh` and reach no network. The workflow step that joins the
+section to the issue body is exercised locally, not in CI.
 
 An accepted mention (say, an index line about a third-party adapter) goes in the reviewed
 allowlist, [`scripts/vendor-acp-docs-allowlist.txt`](../scripts/vendor-acp-docs-allowlist.txt), not
@@ -86,7 +92,7 @@ contains it, or the same text under the other vendor fails again and gets a new 
 entry in the same change that records the decision in [the ACP convergence assessment](acp-convergence.md).
 
 An entry that no watched page carries any more is stale. The watch fails on it, exit 1, and names it
-in the workflow log, so the weekly issue asks for the entry to be deleted; a dead entry would
+in the issue body and the workflow log, so the weekly issue asks for the entry to be deleted; a dead entry would
 otherwise excuse the line if it came back. The stale check is skipped when a page could not be read
 (exit 2), because that page may still carry the line. A malformed entry, an unknown vendor or an
 empty reason exits 2 before any page is read.

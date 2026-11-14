@@ -6,6 +6,7 @@
 #
 # Usage: scripts/write-vendor-drift-report.sh <vendor> <committed-path> <observed-path> <report-file>
 #        scripts/write-vendor-drift-report.sh --failure <vendor> <stage> <report-file>
+#        scripts/write-vendor-drift-report.sh --docs <vendor> <docs-report> <report-file>
 set -euo pipefail
 
 readonly MAX_DIFF_BYTES=60000
@@ -16,6 +17,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/vendor-contract-lib.sh"
 usage() {
   echo "usage: scripts/write-vendor-drift-report.sh <vendor> <committed-path> <observed-path> <report-file>" >&2
   echo "       scripts/write-vendor-drift-report.sh --failure <vendor> <stage> <report-file>" >&2
+  echo "       scripts/write-vendor-drift-report.sh --docs <vendor> <docs-report> <report-file>" >&2
 }
 
 write_report() {
@@ -95,7 +97,46 @@ write_failure_report() {
   } > "$report"
 }
 
+# Adds the documentation watch result to the report file. A report that already exists (the
+# contract diff) keeps its text and gains a section; otherwise this writes a new report. The docs
+# report is what `check-vendor-acp-docs.sh` wrote: page URLs and public page lines. When the watch
+# failed before it wrote one (a malformed allowlist), the section says so and points at the run.
+write_docs_report() {
+  local vendor="$1"
+  local docs_report="$2"
+  local report="$3"
+
+  mkdir -p "$(dirname "$report")"
+  if [ ! -f "$report" ]; then
+    {
+      echo "<!-- vendor-drift:$vendor -->"
+      echo "# Vendor drift: $vendor"
+    } > "$report"
+  fi
+  {
+    echo
+    echo "## Documentation watch"
+    echo
+    echo "The documentation watch for an ACP page or command failed in this run: a vendor document"
+    echo "now mentions ACP outside the reviewed allowlist, or could not be read."
+    echo
+    if [ -f "$docs_report" ] && [ ! -L "$docs_report" ]; then
+      cat -- "$docs_report"
+    else
+      echo "The watch wrote no page detail. Inspect this workflow run for its output."
+    fi
+  } >> "$report"
+}
+
 main() {
+  if [ $# -gt 0 ] && [ "$1" = '--docs' ]; then
+    if [ $# -ne 4 ]; then
+      usage
+      return 2
+    fi
+    write_docs_report "$2" "$3" "$4"
+    return
+  fi
   if [ $# -gt 0 ] && [ "$1" = '--failure' ]; then
     if [ $# -ne 4 ]; then
       usage

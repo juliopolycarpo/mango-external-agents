@@ -10,11 +10,16 @@
 # reviewed line per entry with the reason. The watch subtracts those lines before it fails, and it
 # fails on an entry that no longer matches so a stale decision cannot excuse a later mention.
 #
+# With a report file, the watch also writes what a maintainer needs to triage without opening the
+# run log: each page URL that needs attention and its matching line text (public page text and
+# public URLs only, never curl output). The drift workflow appends it to the managed issue body;
+# the file does not exist when the watch passes.
+#
 # Exit status 0: no unreviewed ACP mention. 1: a document mentions ACP outside the allowlist, or an
 # allowlist entry matches no line. 2: a document could not be read or no longer looks like the page
 # it was pinned to (a moved page would otherwise pass silently), or the allowlist is malformed.
 #
-# Usage: scripts/check-vendor-acp-docs.sh <claude|codex>
+# Usage: scripts/check-vendor-acp-docs.sh <claude|codex> [report-file]
 set -euo pipefail
 
 # Case-insensitive; `\b` keeps a hash or a longer word that merely contains "acp" from matching,
@@ -26,7 +31,7 @@ readonly ACP_PATTERN='\bacp\b|agent[ -]?client[ -]?protocol'
 ACP_DOCS_ALLOWLIST="${ACP_DOCS_ALLOWLIST:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vendor-acp-docs-allowlist.txt}"
 
 usage() {
-  echo 'usage: scripts/check-vendor-acp-docs.sh <claude|codex>' >&2
+  echo 'usage: scripts/check-vendor-acp-docs.sh <claude|codex> [report-file]' >&2
 }
 
 # Prints `url|anchor` per document. The anchor is text the page carries today; a page that stops
@@ -68,24 +73,48 @@ accepted_lines() {
   ' "$ACP_DOCS_ALLOWLIST"
 }
 
+# Appends one section to the report file, if there is one: the page URL, a sentence, and optional
+# page text in a code fence. Page text arrives prefixed with its line number, so a page line cannot
+# open or close a fence. Only public page text goes in; curl output never does.
+report_section() {
+  local report_file="$1"
+  local url="$2"
+  local sentence="$3"
+  local text="${4:-}"
+  if [ -z "$report_file" ]; then
+    return 0
+  fi
+  {
+    printf '### %s\n\n%s\n' "$url" "$sentence"
+    if [ -n "$text" ]; then
+      printf '\n```text\n%s\n```\n' "$text"
+    fi
+    printf '\n'
+  } >> "$report_file"
+}
+
 # Optional 4th argument: file of accepted line texts. Optional 5th: file that collects the accepted
-# lines this document used, so the caller can find entries nothing matched.
+# lines this document used, so the caller can find entries nothing matched. Optional 6th: report
+# file that gains a section for this document when it fails.
 validate_document() {
   local url="$1"
   local anchor="$2"
   local document="$3"
   local accepted_file="${4:-}"
   local seen_file="${5:-}"
+  local report_file="${6:-}"
   local numbered
   local text
   local unaccepted=()
   local matches
+  local shown
   if [ ! -f "$document" ]; then
     printf 'expected document file %s for %s, received none\n' "$document" "$url" >&2
     return 2
   fi
   if ! grep -Fq -- "$anchor" "$document"; then
     printf 'expected %s to contain %s, received no such text\n' "$url" "$anchor" >&2
+    report_section "$report_file" "$url" "The page no longer contains the text \`$anchor\`: it may have moved or been replaced."
     return 2
   fi
   while IFS= read -r numbered; do
@@ -100,8 +129,14 @@ validate_document() {
     fi
   done < <(grep -nEi -- "$ACP_PATTERN" "$document" || true)
   if [ "${#unaccepted[@]}" -gt 0 ]; then
+    shown=3
+    if [ "${#unaccepted[@]}" -lt "$shown" ]; then
+      shown="${#unaccepted[@]}"
+    fi
     matches=$(printf '%s\n' "${unaccepted[@]:0:3}" | cut -c 1-200)
     printf 'expected no ACP page or command in %s, received:\n%s\n' "$url" "$matches" >&2
+    report_section "$report_file" "$url" \
+      "Lines naming ACP that no reviewed allowlist entry accepts, with their line numbers (showing $shown of ${#unaccepted[@]}; each line is cut at 200 characters):" "$matches"
     return 1
   fi
   printf 'no ACP mention in %s\n' "$url"
@@ -112,6 +147,7 @@ fetch_and_validate_document() {
   local anchor="$2"
   local accepted_file="${3:-}"
   local seen_file="${4:-}"
+  local report_file="${5:-}"
   local document
   local status
   document=$(mktemp "${TMPDIR:-/tmp}/mea-vendor-acp-doc.XXXXXX")
@@ -120,9 +156,10 @@ fetch_and_validate_document() {
   trap "rm -f -- $(printf '%q' "$document")" RETURN
   if ! curl --fail --silent --show-error --location "$url" --output "$document"; then
     printf 'expected to read %s, received a failed download\n' "$url" >&2
+    report_section "$report_file" "$url" 'The page could not be downloaded.'
     return 2
   fi
-  if validate_document "$url" "$anchor" "$document" "$accepted_file" "$seen_file"; then
+  if validate_document "$url" "$anchor" "$document" "$accepted_file" "$seen_file" "$report_file"; then
     status=0
   else
     status=$?
@@ -132,12 +169,29 @@ fetch_and_validate_document() {
   return "$status"
 }
 
+# Appends the stale allowlist entries to the report file, if there is one. The entries are public
+# page lines committed to this repository.
+report_stale_entries() {
+  local report_file="$1"
+  local stale="$2"
+  if [ -z "$report_file" ]; then
+    return 0
+  fi
+  {
+    printf '### Reviewed allowlist\n\n'
+    printf 'Entries that no watched page carries any more. Remove or update them:\n\n'
+    # Numbered like the page lines so that none of them can open or close the fence.
+    printf '```text\n%s\n```\n\n' "$(printf '%s\n' "$stale" | awk '{ print NR ":" $0 }')"
+  } >> "$report_file"
+}
+
 # Reads every document before it answers, so one run lists each page that needs triage. An
 # unreadable page (2) outranks a mention (1): "could not verify" is the stronger statement. An
 # allowlist entry that no page used is reported only when every page was read, since an unread page
 # could still carry the line.
 check_vendor() {
   local vendor="$1"
+  local report_file="${2:-}"
   local documents
   local url
   local anchor
@@ -146,6 +200,11 @@ check_vendor() {
   local scratch
   local stale
   documents=$(vendor_documents "$vendor") || return $?
+  if [ -n "$report_file" ]; then
+    # A report from an earlier run must not outlive a passing one.
+    mkdir -p "$(dirname "$report_file")"
+    rm -f -- "$report_file"
+  fi
   scratch=$(mktemp -d "${TMPDIR:-/tmp}/mea-vendor-acp-allowlist.XXXXXX")
   # Capture the quoted local path while this function still owns it.
   # shellcheck disable=SC2064
@@ -153,7 +212,7 @@ check_vendor() {
   accepted_lines "$vendor" > "$scratch/accepted" || return $?
   : > "$scratch/seen"
   while IFS='|' read -r url anchor; do
-    if fetch_and_validate_document "$url" "$anchor" "$scratch/accepted" "$scratch/seen"; then
+    if fetch_and_validate_document "$url" "$anchor" "$scratch/accepted" "$scratch/seen" "$report_file"; then
       status=0
     else
       status=$?
@@ -167,6 +226,7 @@ check_vendor() {
     if [ -n "$stale" ]; then
       printf 'expected every %s entry in %s to match a line in a watched page, received no match for:\n%s\n' \
         "$vendor" "$ACP_DOCS_ALLOWLIST" "$stale" >&2
+      report_stale_entries "$report_file" "$stale"
       worst=1
     fi
   fi
@@ -174,11 +234,11 @@ check_vendor() {
 }
 
 main() {
-  if [ $# -ne 1 ]; then
+  if [ $# -lt 1 ] || [ $# -gt 2 ]; then
     usage
     return 2
   fi
-  check_vendor "$1"
+  check_vendor "$@"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

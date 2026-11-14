@@ -104,7 +104,7 @@ jobs:
         id: acp-docs
         if: (matrix.vendor == 'claude' || matrix.vendor == 'codex') && steps.install.outcome == 'success'
         continue-on-error: true
-        run: scripts/check-vendor-acp-docs.sh "${{ matrix.vendor }}"
+        run: scripts/check-vendor-acp-docs.sh "${{ matrix.vendor }}" "$RUNNER_TEMP/vendor-drift-result/${{ matrix.vendor }}/acp-docs.md"
       - name: Capture the latest public contract
         id: capture
         if: steps.install.outcome == 'success'
@@ -137,19 +137,27 @@ jobs:
             echo drift > "$state"
             exit 0
           fi
-          if [ "$vendor" = 'claude' ] && [ "${{ steps.bare-reference.outcome }}" != 'success' ]; then
-            scripts/write-vendor-drift-report.sh --failure "$vendor" 'the documented --bare default reference watch' "$report"
-            echo drift > "$state"
-            exit 0
-          fi
-          # The documentation watch does not return early: the contract comparison below still runs,
-          # so a drift issue about an ACP page carries the help diff when there is one.
+          # The documentation watch result joins every report below, including the early exits, and
+          # does not return early itself: the contract comparison still runs, so a drift issue about
+          # an ACP page carries the help diff when there is one.
           docs_failed=false
+          docs_report="$result_dir/acp-docs.md"
           if [ "$vendor" != 'acp-opencode' ] && [ "${{ steps.acp-docs.outcome }}" != 'success' ]; then
             docs_failed=true
           fi
+          if [ "$vendor" = 'claude' ] && [ "${{ steps.bare-reference.outcome }}" != 'success' ]; then
+            scripts/write-vendor-drift-report.sh --failure "$vendor" 'the documented --bare default reference watch' "$report"
+            if [ "$docs_failed" = true ]; then
+              scripts/write-vendor-drift-report.sh --docs "$vendor" "$docs_report" "$report"
+            fi
+            echo drift > "$state"
+            exit 0
+          fi
           if [ "${{ steps.capture.outcome }}" != 'success' ]; then
             scripts/write-vendor-drift-report.sh --failure "$vendor" 'public contract capture' "$report"
+            if [ "$docs_failed" = true ]; then
+              scripts/write-vendor-drift-report.sh --docs "$vendor" "$docs_report" "$report"
+            fi
             echo drift > "$state"
             exit 0
           fi
@@ -184,13 +192,10 @@ jobs:
               echo no-drift > "$state"
               exit 0
             fi
-            scripts/write-vendor-drift-report.sh --failure "$vendor" 'documentation watch for an ACP page or command' "$report"
-          elif [ "$docs_failed" = true ]; then
-            {
-              echo
-              echo 'The documentation watch for an ACP page or command also failed in this run: a vendor'
-              echo 'document now mentions ACP, or could not be read. The workflow log names the page.'
-            } >> "$report"
+          fi
+          if [ "$docs_failed" = true ]; then
+            # Appends to the contract diff report when there is one, and writes the report otherwise.
+            scripts/write-vendor-drift-report.sh --docs "$vendor" "$docs_report" "$report"
           fi
           echo drift > "$state"
       - name: Bound the drift result
