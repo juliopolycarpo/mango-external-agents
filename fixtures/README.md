@@ -34,8 +34,8 @@ transcripts the file is archival and has no manifest, with `# claude/...` and `#
 header lines that give the `claude --version` line and the capture time, and it is redacted at write
 time (credential-shaped members such as `credential_expires_at`, account identity, the capture's
 paths). `--model ID` runs the turn on that model and adds a `# model: ID` line after the first
-header line, as the Codex recorder does; without it there is no such line and the account's own
-default applies. The labels and cleanup rules above apply: `# incomplete capture` in
+header line, as the Codex recorder does, with the id redacted by the model-id rule below; without it
+there is no such line and the account's own default applies. The labels and cleanup rules above apply: `# incomplete capture` in
 `structured-output.partial.jsonl` when the run fails or the child's stop is unconfirmed, `#
 unqualified capture` in `structured-output.unqualified.jsonl` when the file lacks an assistant
 `StructuredOutput` tool call or a final `result` with an object `structured_output`. The file is an
@@ -47,8 +47,8 @@ build. The next subsection lists what the file keeps and drops.
 
 The recorder redacts each line before it is held in memory. A string survives only under a short
 list of structural members (`type`, `subtype`, `role`, `id`, `tool_use_id`, `parent_tool_use_id`,
-`session_id`, `uuid`, `model`, `stop_reason`, `terminal_reason`, `permissionMode`,
-`claude_code_version`) and as the name of a non-`mcp__` tool call. Every other string becomes
+`session_id`, `uuid`, `stop_reason`, `terminal_reason`, `permissionMode`, `claude_code_version`;
+`model` is kept under its own rule below) and as the name of a non-`mcp__` tool call. Every other string becomes
 `[REDACTED]`, so a field a later Claude Code adds is private until someone reviews it. `cwd` is
 written as `/workspace`, and the capture's directory, home directory and login are rewritten in
 every key and retained value. Lines that are not JSON objects are dropped.
@@ -65,6 +65,14 @@ Redacted whatever the value type:
 - `subagent_stats.by_type`: its keys are subagent type names, which a user can define themselves.
 - Strings inside `input`, `structured_output` and `wire_tool_inputs` (the same tool input again,
   keyed by tool-use id), even under a name such as `type` or `id`.
+- A model id that is not a plain vendor name, in `model`, in the keys of `modelUsage` and
+  `model_usage_since_last_result`, and on the `# model:` header line. On Bedrock or Vertex an id can
+  be an ARN with an AWS account id, a project path, or an inference-profile name the user chose.
+  The rule is an allow-list: an alias (`opus`, `sonnet[1m]`), a `claude-…` id (`claude-sonnet-5`,
+  `claude-opus-4-1@20250805`) or a Bedrock id with its optional region prefix
+  (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`) is kept, and anything else becomes
+  `[REDACTED]`. A family word or numeric segment the rule has not seen redacts the id until the
+  rule is reviewed. Two redacted usage keys stay two entries (`[REDACTED]`, `[REDACTED]#2`).
 
 Retained on purpose:
 
@@ -74,11 +82,11 @@ Retained on purpose:
   call, the same ids are already kept under `id` and `tool_use_id`, and a call has to pair with its
   result.
 - Per-turn usage, cost and timing: token counts, `total_cost_usd`, `duration_ms`, `modelUsage`
-  (keyed by model id), `subagent_stats` counters and the boolean feature flags of `init`. They
+  (keyed by a plain model id), `subagent_stats` counters and the boolean feature flags of `init`. They
   describe this turn, not the plan.
 - `permissionMode`. The recorder passes `--permission-mode plan` itself, so the value is the
   capture's request and not the operator's default.
-- `session_id`, `uuid`, `model` and `claude_code_version`, as before.
+- `session_id`, `uuid` and `claude_code_version`, as before, and a plain vendor `model` id.
 
 ## Three classes of fixture
 

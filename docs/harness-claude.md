@@ -171,7 +171,8 @@ with `#` lines, so a reader has to skip them. It has no manifest.
 goes through `OpenSession` as the configuration's model and becomes `--model ID` on the turn's argv,
 after the harness's own shape check; a value that would read as a flag is refused before any process
 starts. The file then carries a `# model: ID` line between the label and `# capture`, the line a
-Codex transcript has. Without the flag nothing changes: no `--model` on argv, no `# model:` line,
+Codex transcript has. A Claude id that is not a plain vendor name (an ARN, a Vertex project path or
+an inference-profile name) is written as `[REDACTED]`, like the same id in the body. Without the flag nothing changes: no `--model` on argv, no `# model:` line,
 and the account's configured model applies. Any other `mea capture` is refused with
 ``(mea capture): expected --model with a transcript capture (--harness codex|claude --transcripts,
 or `codex`) | received --model "<id>" with --harness <harness>``.

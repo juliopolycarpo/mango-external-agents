@@ -394,6 +394,177 @@ fn turn_scoped_numbers_and_the_requested_permission_mode_are_kept() {
     );
 }
 
+/// Model ids that carry an AWS account, a Google Cloud project or a name the user chose, each with
+/// the private part that must not reach a transcript.
+const ACCOUNT_SHAPED_MODEL_IDS: &[(&str, &str, &str)] = &[
+    (
+        "a Bedrock inference-profile ARN",
+        "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "123456789012",
+    ),
+    (
+        "a Bedrock application inference-profile ARN",
+        "arn:aws:bedrock:eu-west-1:210987654321:application-inference-profile/k3j9x0q2w1ab",
+        "210987654321",
+    ),
+    (
+        "a Vertex project path",
+        "projects/acme-payments-4821/locations/us-east5/publishers/anthropic/models/claude-sonnet-4-5@20250929",
+        "acme-payments-4821",
+    ),
+    (
+        "an inference-profile name the user chose",
+        "acme-payments-claude-profile",
+        "acme-payments",
+    ),
+];
+
+/// Model ids a vendor assigns, which describe the build and nobody's account.
+const PLAIN_VENDOR_MODEL_IDS: &[&str] = &[
+    "claude-sonnet-5",
+    "claude-haiku-4-5-20251001",
+    "claude-3-5-sonnet-20241022",
+    "claude-opus-4-1@20250805",
+    "claude-sonnet-4-5-20250929[1m]",
+    "anthropic.claude-opus-5-v1:0",
+    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "opus",
+    "sonnet[1m]",
+];
+
+#[test]
+fn a_model_member_is_redacted_when_the_id_carries_an_account_or_a_user_chosen_name() {
+    for (shape, id, private) in ACCOUNT_SHAPED_MODEL_IDS {
+        let line = redacted_record(&json!({"type": "assistant", "message": {"model": id}}));
+        assert!(
+            !line.to_string().contains(private),
+            "expected `model` to hold no {private:?} for {shape} | received: {line}"
+        );
+        assert_eq!(
+            line["message"]["model"],
+            redact::PLACEHOLDER,
+            "expected {shape} ({id:?}) to become {} | received: {line}",
+            redact::PLACEHOLDER
+        );
+    }
+}
+
+#[test]
+fn a_plain_vendor_model_id_is_kept_in_the_model_member_and_the_usage_keys() {
+    for id in PLAIN_VENDOR_MODEL_IDS {
+        let line = redacted_record(&json!({"type": "result", "model": id,
+            "modelUsage": {*id: {"costUSD": 0.01}},
+            "model_usage_since_last_result": {*id: {"costUSD": 0.01}}}));
+        assert_eq!(
+            line["model"], *id,
+            "expected the plain vendor id to be kept | received: {line}"
+        );
+        for member in ["modelUsage", "model_usage_since_last_result"] {
+            assert_eq!(
+                line[member][*id]["costUSD"], 0.01,
+                "expected {id:?} kept as a key of {member} | received: {line}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_model_usage_key_that_carries_an_account_is_redacted_and_its_counters_survive() {
+    for member in ["modelUsage", "model_usage_since_last_result"] {
+        for (shape, id, private) in ACCOUNT_SHAPED_MODEL_IDS {
+            let line = redacted_record(&json!({"type": "result",
+                member: {*id: {"inputTokens": 7, "costUSD": 0.5}}}));
+            assert!(
+                !line.to_string().contains(private),
+                "expected the keys of {member} to hold no {private:?} for {shape} | received: {line}"
+            );
+            assert_eq!(
+                line[member][redact::PLACEHOLDER]["inputTokens"],
+                7,
+                "expected one redacted key carrying the counters of {shape} in {member} | received: {line}"
+            );
+        }
+    }
+}
+
+#[test]
+fn two_redacted_model_usage_keys_stay_two_entries() {
+    let line = redacted_record(&json!({"type": "result", "modelUsage": {
+        ACCOUNT_SHAPED_MODEL_IDS[0].1: {"inputTokens": 1},
+        ACCOUNT_SHAPED_MODEL_IDS[2].1: {"inputTokens": 2},
+        "claude-sonnet-5": {"inputTokens": 4}}}));
+
+    let usage = line["modelUsage"].as_object().expect("expected a map");
+    let mut counts: Vec<i64> = usage
+        .values()
+        .filter_map(|entry| entry["inputTokens"].as_i64())
+        .collect();
+    counts.sort_unstable();
+    assert_eq!(
+        counts,
+        [1, 2, 4],
+        "expected a counter per model, none lost to a key collision | received: {line}"
+    );
+}
+
+#[test]
+fn which_model_ids_are_plain_vendor_names() {
+    for id in PLAIN_VENDOR_MODEL_IDS {
+        assert!(
+            is_plain_vendor_model_id(id),
+            "expected {id:?} to be a plain vendor id"
+        );
+    }
+    for id in ACCOUNT_SHAPED_MODEL_IDS
+        .iter()
+        .map(|(_, id, _)| id)
+        .chain(&[
+            // A family this list has not reviewed, a 12-digit account id and a bare Bedrock prefix.
+            "claude-acme-prod",
+            "claude-123456789012",
+            "us.anthropic.acme-claude",
+            "anthropic.claude-opus-5-v1:0:extra",
+            "claude-opus-5\nacme",
+            "",
+        ])
+    {
+        assert!(
+            !is_plain_vendor_model_id(id),
+            "expected {id:?} to be user- or account-shaped"
+        );
+    }
+}
+
+#[test]
+fn a_redacted_model_id_keeps_the_placeholder_and_a_plain_one_is_returned_whole() {
+    assert_eq!(redact_model_id("claude-sonnet-5"), "claude-sonnet-5");
+    assert_eq!(
+        redact_model_id(ACCOUNT_SHAPED_MODEL_IDS[0].1),
+        redact::PLACEHOLDER
+    );
+}
+
+#[test]
+fn a_key_taken_in_the_map_gets_the_next_free_ordinal() {
+    let mut map = Map::new();
+    assert_eq!(unused_key(&map, String::from("[REDACTED]")), "[REDACTED]");
+    map.insert(String::from("[REDACTED]"), Value::Null);
+    assert_eq!(unused_key(&map, String::from("[REDACTED]")), "[REDACTED]#2");
+    map.insert(String::from("[REDACTED]#2"), Value::Null);
+    assert_eq!(unused_key(&map, String::from("[REDACTED]")), "[REDACTED]#3");
+}
+
+#[test]
+fn an_answer_property_named_model_is_redacted_whatever_its_value() {
+    let line = redacted_record(&json!({"type": "assistant",
+        "wire_tool_inputs": {"toolu_1": {"model": "claude-sonnet-5"}}}));
+    assert_eq!(
+        line["wire_tool_inputs"]["toolu_1"]["model"],
+        redact::PLACEHOLDER,
+        "expected a model-named property of the answer to stay the model's text | received: {line}"
+    );
+}
+
 #[test]
 fn a_line_keeps_its_protocol_structure_and_loses_what_the_machine_and_model_wrote() {
     let facts = MachineFacts::new();
@@ -680,6 +851,30 @@ fn a_header_names_the_model_between_the_label_and_the_capture_metadata_when_one_
         ],
         "expected the Codex header shape: label, `# model: ID`, then the rest"
     );
+}
+
+#[test]
+fn a_header_model_line_redacts_an_id_that_carries_an_account_and_keeps_a_plain_one() {
+    for (shape, id, private) in ACCOUNT_SHAPED_MODEL_IDS {
+        let lines = header(&SCENARIOS[0], None, None, Some(id));
+        assert!(
+            !lines.join("\n").contains(private),
+            "expected no {private:?} in the header for {shape} | received: {lines:?}"
+        );
+        assert_eq!(
+            lines[1],
+            format!("# model: {}", redact::PLACEHOLDER),
+            "expected {shape} ({id:?}) to be redacted on the model line | received: {lines:?}"
+        );
+    }
+    for id in PLAIN_VENDOR_MODEL_IDS {
+        let lines = header(&SCENARIOS[0], None, None, Some(id));
+        assert_eq!(
+            lines[1],
+            format!("# model: {id}"),
+            "expected the plain vendor id to be kept | received: {lines:?}"
+        );
+    }
 }
 
 #[test]
