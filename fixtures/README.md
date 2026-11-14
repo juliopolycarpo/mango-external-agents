@@ -72,6 +72,13 @@ Redacted whatever the value type:
 - `subagent_stats.by_type`: its keys are subagent type names, which a user can define themselves.
 - Strings inside `input`, `structured_output` and `wire_tool_inputs` (the same tool input again,
   keyed by tool-use id), even under a name such as `type` or `id`.
+- Strings inside `tool_input` (the arguments of a denied call, repeated under `permission_denials`)
+  and `tool_use_result` (the tool's output), under the same rule: a tool author names those
+  fields, so a parameter called `type`, `id` or `role` loses its value too. The names and numbers
+  stay, and a name no review lists is still reported as below; the structural names and `model` are
+  the exception, since the recorder already knows them. A `tool_use_result` recorded before this
+  rule keeps a vendor string such as `"type": "text"`; the committed transcripts are archival and
+  are not rewritten.
 - A model id that is not a plain vendor name, in `model`, in the keys of `modelUsage` and
   `model_usage_since_last_result`, and on the `# model:` header line. On Bedrock or Vertex an id can
   be an ARN with an AWS account id, a project path, or an inference-profile name the user chose.

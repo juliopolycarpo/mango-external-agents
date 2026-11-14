@@ -502,6 +502,14 @@ const STRUCTURAL_STRING_MEMBERS: &[&str] = &[
 /// are kept as the values of `id` and `tool_use_id` so a call still pairs with its result.
 const ANSWER_MEMBERS: &[&str] = &["input", "structured_output", "wire_tool_inputs"];
 
+/// Members whose subtree is a tool's data: the call's arguments repeated under
+/// `permission_denials`, and the tool's result. A tool author names the fields, so one called
+/// `type`, `id` or `role` is the author's and its string is replaced like any other.
+///
+/// Unlike [`ANSWER_MEMBERS`], the members below are still judged by name for the drift report: the
+/// vendor owns this record's frame, and a field it adds there is worth a review.
+const TOOL_DATA_MEMBERS: &[&str] = &["tool_input", "tool_use_result"];
+
 /// The members of a `rate_limit_event` that identify the record rather than describe the account.
 /// The record reports plan usage (utilisation, reset times, overage state, the names of the
 /// windows an account has), and every other member is replaced whole, so a member a later Claude
@@ -703,6 +711,8 @@ struct ValueContext {
     tool_call: bool,
     /// The value is inside a member of [`ANSWER_MEMBERS`].
     answer: bool,
+    /// The value is inside a member of [`TOOL_DATA_MEMBERS`]: no member name keeps its string.
+    tool_data: bool,
     /// The value sits under a key of a [`MODEL_KEYED_MEMBERS`] map, which the transcript writes
     /// through [`redact_model_id`].
     model_key: bool,
@@ -773,6 +783,7 @@ fn redact_value(
                     let inner = ValueContext {
                         tool_call,
                         answer: context.answer || ANSWER_MEMBERS.contains(&name.as_str()),
+                        tool_data: context.tool_data || TOOL_DATA_MEMBERS.contains(&name.as_str()),
                         model_key: model_keyed,
                         user_key: user_chosen,
                     };
@@ -794,11 +805,22 @@ fn redact_value(
             // Whatever the CLI says its directory is, the transcript says the fixture's: a
             // symlinked or canonicalised spelling of the workspace is not rewritten by value.
             Some("cwd") => Value::String(String::from(redact::FIXTURE_CWD)),
-            Some("name") if context.tool_call && !context.answer && !text.starts_with("mcp__") => {
+            Some("name")
+                if context.tool_call
+                    && !context.answer
+                    && !context.tool_data
+                    && !text.starts_with("mcp__") =>
+            {
                 Value::String(redact::rewrite_paths(&text, paths))
             }
-            Some("model") if !context.answer => Value::String(redact_model_id(&text)),
-            Some(member) if !context.answer && STRUCTURAL_STRING_MEMBERS.contains(&member) => {
+            Some("model") if !context.answer && !context.tool_data => {
+                Value::String(redact_model_id(&text))
+            }
+            Some(member)
+                if !context.answer
+                    && !context.tool_data
+                    && STRUCTURAL_STRING_MEMBERS.contains(&member) =>
+            {
                 Value::String(redact::rewrite_paths(&text, paths))
             }
             _ => {
@@ -806,6 +828,9 @@ fn redact_value(
                     && !context.answer
                     && !context.user_key
                     && !REVIEWED_REDACTED_STRING_MEMBERS.contains(&member)
+                    // A name the recorder keeps elsewhere, replaced here because a tool wrote it:
+                    // the rule is known, so the report has nothing to review.
+                    && !(context.tool_data && is_kept_elsewhere(member))
                 {
                     // As the transcript writes the key, so the report holds nothing the file does not.
                     drift.note_unseen(&if context.model_key {
@@ -825,6 +850,12 @@ fn redact_value(
             other
         }
     }
+}
+
+/// Whether the walk keeps a string under `member` outside a tool's data: a structural member, or
+/// `model`, which keeps it under its own rule.
+fn is_kept_elsewhere(member: &str) -> bool {
+    STRUCTURAL_STRING_MEMBERS.contains(&member) || member == "model"
 }
 
 /// Whether [`REVIEWED_RETAINED_MEMBERS`] lists `member`.
