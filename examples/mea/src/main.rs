@@ -536,8 +536,6 @@ fn transport_report(selection: TransportSelection) -> String {
     )
 }
 
-/// A session id nobody has to be able to reproduce.
-///
 /// The words for a refusal whose typed fields carry what `Display` deliberately bounds, or `None`
 /// when the library's own sentence is enough.
 ///
@@ -624,6 +622,8 @@ fn vendor_refusal(vendor: &mango_external_agents::VendorError) -> String {
     line
 }
 
+/// A session id nobody has to be able to reproduce.
+///
 /// `mea` is not a host that retries, so the only requirement is that two runs do not collide.
 fn uuid_like() -> u128 {
     std::time::SystemTime::now()
