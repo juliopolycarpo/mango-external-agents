@@ -2004,6 +2004,45 @@ mod a_turn {
         );
     }
 
+    /// Measured against claude 2.1.325 (docs/harness-claude.md, "Measured with `--model`"): the
+    /// alias `haiku` is accepted and `system/init` reports the full id it resolved to. The alias
+    /// stays the accepted setting and the resolved id is the observed one; neither overwrites the
+    /// other.
+    #[tokio::test]
+    async fn keeps_a_model_alias_accepted_and_the_resolved_id_observed() {
+        const ALIAS: &str = "haiku";
+        const RESOLVED: &str = "claude-haiku-5-5";
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::replaying(&format!(
+            r#"{{"type":"system","subtype":"init","model":"{RESOLVED}"}}
+{{"type":"result","is_error":false}}"#
+        ))));
+        let session = open(&launcher).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "reply ok").with_configuration(
+                ConfigurationPatch::new().model(ConfigurationChange::Set(String::from(ALIAS))),
+            ))
+            .await
+            .expect("expected a turn with a model alias");
+        drain(&mut turn).await;
+
+        let configuration = session.snapshot().configuration.clone();
+        assert_eq!(
+            value_after(&launcher.turn_argvs()[0], "--model"),
+            Some(ALIAS),
+            "expected the alias on argv as given"
+        );
+        assert_eq!(
+            configuration.accepted.model.as_deref(),
+            Some(ALIAS),
+            "expected the accepted model to stay the alias the host chose"
+        );
+        assert_eq!(
+            configuration.observed.model.as_deref(),
+            Some(RESOLVED),
+            "expected the observed model to be the id system/init reported"
+        );
+    }
+
     /// A configuration value reaches the child process argv. Reject it before reserving or
     /// starting a child, because dropping it would run under settings the host did not choose.
     #[tokio::test]
