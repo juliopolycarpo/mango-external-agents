@@ -90,6 +90,66 @@ calls would open a drift issue. The top-level help and the documentation watch a
 ACP flag in a subcommand's help before any watched page names it stays unwatched:
 [#451](https://github.com/juliopolycarpo/mango-external-agents/issues/451).
 
+## Adapter captures: not a scheduled lane
+
+[#454](https://github.com/juliopolycarpo/mango-external-agents/issues/454) asked whether the
+`claude-agent-acp` and `codex-acp` `initialize` captures can be pinned and recaptured in CI. They
+can. They stay labelled maintainer captures anyway: no lane records them again, the installer and
+`PINNED_VENDORS` are unchanged, and the refresh recipe in [fixtures/README.md](../fixtures/README.md)
+is the only path.
+
+Evidence, read on 2026-11-14 on one Linux x86-64 machine with Node 26.13.0 and npm 12.2.2. Nothing
+ran on a CI runner. Each adapter was installed with `npm install --prefix DIR --ignore-scripts` into
+a fresh empty directory at an exact version and captured with `mea capture --harness acp` from another
+directory, with empty `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `HOME`:
+
+| Question                                  | `claude-agent-acp` 0.107.0                                                                                        | `codex-acp` 2.6.0                                                                                                                                    |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Install                                   | 108 packages, none with an install script                                                                         | 25 packages, none with an install script                                                                                                             |
+| What the adapter's manifest pins          | every dependency exact: SDK 0.3.323, so `claude` 2.1.323, and the platform packages too                           | ranges: `@openai/codex ^0.166.0`, `@agentclientprotocol/sdk ~2.4.0`, `zod ^4.0.0`                                                                    |
+| Resolved today                            | the same tree on both installs                                                                                    | `@openai/codex` 0.166.0, the only 0.166.x on npm; `@agentclientprotocol/sdk` 2.4.0; `zod` 4.6.7                                                      |
+| Release assets                            | 8 archives of 195 to 228 MB, each with a GitHub API digest                                                        | none, npm only                                                                                                                                       |
+| Two installs, then a capture each         | both lockfiles equal, apart from the directory name; both captures equal each other and the committed `contract/` | same                                                                                                                                                 |
+| Credential, `authenticate`, `session/new` | none sent; nothing written under the empty home                                                                   | none sent; no credential file written (the state files in the next row only)                                                                         |
+| What a capture started (strace, one run)  | the SDK's bundled `claude` binary, argv not recorded; no network connection                                       | `codex app-server`, which wrote `installation_id` and SQLite files under `CODEX_HOME` and ran `git-remote-https` for `github.com/openai/plugins.git` |
+
+The caret on a `0.x` line stops below 0.167.0, so only a later 0.166.x could move the Codex binary
+beneath `codex-acp`. Two installs minutes apart do not test that float, and a recapture on the day of
+the committed one does not test drift over time.
+
+Whether a recapture adds signal beyond the Claude and Codex CLI lanes depends on which recapture:
+
+- **Pinned** (a committed lockfile and `npm ci --ignore-scripts`): deterministic, and it replays the
+  committed bytes. It changes only when a maintainer edits the lockfile, which the manifest digest
+  test already covers. It adds no signal.
+- **Latest** (the newest adapter each Monday): it sees what the CLI lanes cannot. `initialize` moves
+  with the adapter release and not with the CLI. Against the committed 0.107.0 and 2.6.0 captures:
+
+  | Adapter version             | Members the committed capture has and this version lacks                          |
+  | --------------------------- | --------------------------------------------------------------------------------- |
+  | `claude-agent-acp` 0.103.0  | `agentCapabilities.auth.status`; `sessionCapabilities.options`, `status`, `title` |
+  | `claude-agent-acp` 0.105.0  | `sessionCapabilities.options`                                                     |
+  | `codex-acp` 2.5.0 and 2.3.0 | `sessionCapabilities.title`                                                       |
+
+  Nothing reads those members. `capabilities_from` in `crates/mango-agent-acp/src/harness.rs` takes
+  `loadSession`, `promptCapabilities.image` and `sessionCapabilities.list`, and all three are equal
+  across every version tried. A drift issue would ask for no decision. The cadence makes it frequent:
+  `claude-agent-acp` published six releases from 2026-11-10 to 2026-11-13 and `codex-acp` six from
+  2026-10-10 to 2026-11-08.
+
+The cost side: the lane would need a Node toolchain beside the Rust and `gh` ones, run third-party
+adapter code and a vendor binary in CI, give the Codex adapter a path to clone from GitHub, and, for
+Claude's archives, download 195 to 228 MB per run. The adapters are also not a vendor-documented
+surface, which is criterion 1 of [the convergence assessment](acp-convergence.md#decision-criteria);
+criteria 1 and 3 fail before a reproducible contract (criterion 2) could change that verdict. The
+issue asked for a lane only if the verdict moved toward a profile, and it did not.
+
+A lane becomes worth building when that verdict moves. Then, per adapter: a committed
+`package.json` and lockfile with `npm ci --ignore-scripts` into an empty directory for `codex-acp`,
+where the manifest leaves ranges; the release archive for `claude-agent-acp`, which fits
+`scripts/install-vendor-cli.sh`; and `PINNED_VENDORS` and the installer extended together, since a
+`mea` test compares them.
+
 To inspect a Codex schema without touching the checkout, use:
 
 ```bash

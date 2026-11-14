@@ -157,17 +157,19 @@ them again, so a difference is a vendor change and the drift lane says so. Their
 install — `claude`, `codex` and `opencode` — and nothing else: `mea` derives the member from that
 list and a test compares the two, so a capture cannot claim a pin the installer does not have.
 
-**Labelled maintainer captures.** Recorded on a maintainer's machine against an agent CI cannot
-install at a version. Nothing re-records them, so their manifests carry `"reproducible": false`
+**Labelled maintainer captures.** Recorded on a maintainer's machine against an agent CI does not
+install at a pinned version. Nothing re-records them, so their manifests carry `"reproducible": false`
 together with the two facts a reader is owed instead: `capturedFrom`, the version line the CLI
 printed, and `capturedAt`, the day. Routine drift checks leave them alone.
 
 `fixtures/acp/cursor/` and `fixtures/acp/grok/` are this class. They exist because those two
 profiles are the ones `mango-agent-acp` marks verified, and a claim a host is told to trust should
 rest on a file rather than on a source comment. `fixtures/acp/codex-acp/` and
-`fixtures/acp/claude-agent-acp/` are this class too: the adapters are npm packages, which the
-installer script does not handle, and an exact adapter version still leaves the vendor CLI beneath it
-to the adapter's own dependency range. Refreshing one means having the agent installed:
+`fixtures/acp/claude-agent-acp/` are this class too, by decision and not for lack of a way:
+both adapters install into an empty directory and recapture byte for byte, but no scheduled lane
+would add signal, see [Adapter captures](../docs/vendor-drift.md#adapter-captures-not-a-scheduled-lane).
+They are npm packages, which the installer script does not handle. Refreshing one means having the
+agent installed:
 
 ```sh
 cargo run -p mea -- capture --harness acp --profile cursor --out fixtures/acp/cursor
@@ -191,11 +193,29 @@ PATH="$ADAPTER_DIR/node_modules/.bin:$PATH" CODEX_HOME="$(mktemp -d)" \
   cargo run -p mea -- capture --harness acp --profile codex-acp --out fixtures/acp/codex-acp
 ```
 
-`$ADAPTER_DIR` is a different empty directory for each adapter. Run `scripts/package-fixtures.py`
-afterwards. `version.json` holds the adapter's own version; the vendor CLI beneath it is not recorded.
+`$ADAPTER_DIR` is a different empty directory for each adapter, and each config home must exist
+(`mktemp -d` creates it): `codex-acp` answers a missing `CODEX_HOME` with a JSON-RPC error, and the
+capture reports it as invalid vendor data. Run `scripts/package-fixtures.py` afterwards.
+`version.json` holds the adapter's own version; the vendor CLI beneath it is not recorded.
 Do that only when the agent is a version worth recording, and update the profile's
 `VerificationEvidence` in the same change — the record names a build and a day, and a capture that
 moved without it is a claim about the wrong one.
+
+Run the recipe when one of these holds, and not on a schedule:
+
+- A profile's `VerificationEvidence` is being updated, or a session is about to be driven against the
+  adapter.
+- `npm view @agentclientprotocol/<package> dist-tags.latest` is newer than the manifest's
+  `capturedFrom` and a change under review reads an `initialize` member
+  (`capabilities_from` in `crates/mango-agent-acp/src/harness.rs` reads `loadSession`,
+  `promptCapabilities.image` and `sessionCapabilities.list`).
+- [The convergence assessment](../docs/acp-convergence.md) is reopened.
+
+To see what moved without touching the checkout, capture into a scratch directory with the same
+environment and compare it with the committed files (`--out "$(mktemp -d)"` then
+`diff -r "$OUT/contract" fixtures/acp/<profile>/contract`). After an adapter release, expect
+`manifest.json`, `version.json` and `agentInfo.version` to differ; any other difference is the change
+to read.
 
 **Historical sets, deliberately not regenerated.** A present-day command cannot reproduce their
 bytes, and that is the point of keeping them:

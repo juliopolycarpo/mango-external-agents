@@ -710,7 +710,7 @@ alone — each handshake was captured, no session was opened, and none is verifi
 the agent.
 
 None of `cursor-agent`, `grok`, `codex-acp` and `claude-agent-acp` has a pinned installer in
-`scripts/install-vendor-cli.sh`, so their captures declare `reproducible: false` and name the build and the day instead. CI cannot reproduce
+`scripts/install-vendor-cli.sh`, so their captures declare `reproducible: false` and name the build and the day instead. No CI lane reproduces
 them; they are a maintainer's record of one machine, held to the tree by their digests like every
 other capture. A host can say all of this in its own interface; see `docs/harness-acp.md`.
 
