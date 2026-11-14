@@ -4,98 +4,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use mango_external_agents::testing::{FakeLauncher, FakeProcess};
-use mango_external_agents::{
-    EnvSource, HostContext, LaunchSpec, ManagedProcess, ProcessLauncher, Result,
+use mango_agent_claude::testing::{
+    DEFAULT_HELP as HELP_WITHOUT_JSON_SCHEMA, FakeClaudeCli, HELP_WITH_JSON_SCHEMA, Run,
 };
+use mango_external_agents::{EnvSource, HostContext};
 
 use super::{Options, run, turn_registry, turn_with};
 
-/// `claude --help` as Claude Code 2.1.270 printed it, which declares `--json-schema`.
-pub(crate) const HELP_WITH_JSON_SCHEMA: &str =
-    include_str!("../../../fixtures/claude/help/2.1.270.txt");
-
-/// An excerpt of 2.1.260, a build that predates `--json-schema`.
-const HELP_WITHOUT_JSON_SCHEMA: &str = include_str!("../../../fixtures/claude/help/2.1.260.txt");
-
-const SIGNED_IN: &str = r#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}"#;
-
-/// A `--json-schema` turn as Claude Code 2.1.325 streamed it, reduced to the members the harness
-/// reads. These lines are inline, not a captured fixture; `mea capture --transcripts` records the real thing.
-fn schema_turn_lines() -> Vec<String> {
-    let answer = serde_json::json!({"word": "ok"});
-    [
-        serde_json::json!({"type": "system", "subtype": "init",
-            "session_id": "b01414e7-4b4b-43a2-9109-a33e21664340", "model": "claude-sonnet-5"}),
-        serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": [
-            {"type": "tool_use", "id": "toolu_answer", "name": "StructuredOutput",
-             "input": answer}]}}),
-        serde_json::json!({"type": "user", "message": {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "toolu_answer",
-             "content": "Structured output provided successfully"}]}}),
-        serde_json::json!({"type": "result", "subtype": "success", "is_error": false,
-            "result": answer.to_string(), "structured_output": answer,
-            "usage": {"input_tokens": 3, "output_tokens": 5}}),
-    ]
-    .iter()
-    .map(ToString::to_string)
-    .collect()
-}
-
-/// A `claude` that answers `--version`, `--help` and `auth status` as a signed-in build with this
-/// help text, and plays `turn_lines` for any other launch.
-pub(crate) struct ScriptedClaudeCli {
-    launcher: FakeLauncher,
-    help: &'static str,
-    turn_lines: Vec<String>,
-}
-
-impl ScriptedClaudeCli {
-    pub(crate) fn new(help: &'static str, turn_lines: Vec<String>) -> Self {
-        Self {
-            launcher: FakeLauncher::new(),
-            help,
-            turn_lines,
-        }
-    }
-
-    /// The argv of every launch that was a turn rather than a probe.
-    pub(crate) fn turn_argvs(&self) -> Vec<Vec<String>> {
-        self.launcher
-            .launches()
-            .into_iter()
-            .map(|spec| spec.argv)
-            .filter(|argv| !is_probe(argv))
-            .collect()
-    }
-}
-
-fn is_probe(argv: &[String]) -> bool {
-    argv.iter()
-        .any(|argument| argument == "--version" || argument == "--help")
-        || argv
-            .get(1..3)
-            .is_some_and(|words| words == ["auth", "status"])
-}
-
-#[async_trait::async_trait]
-impl ProcessLauncher for ScriptedClaudeCli {
-    async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
-        let printed: Vec<String> = if spec.argv.iter().any(|word| word == "--version") {
-            vec![String::from("2.1.270 (Claude Code)")]
-        } else if spec.argv.iter().any(|word| word == "--help") {
-            self.help.lines().map(String::from).collect()
-        } else if is_probe(&spec.argv) {
-            vec![String::from(SIGNED_IN)]
-        } else {
-            self.turn_lines.clone()
-        };
-        self.launcher.push(FakeProcess::transcript(printed));
-        self.launcher.spawn(spec).await
-    }
-}
-
-fn host_over(launcher: Arc<ScriptedClaudeCli>) -> HostContext {
+fn host_over(launcher: Arc<FakeClaudeCli>) -> HostContext {
     HostContext::builder()
         .launcher(launcher)
         .cwd(std::env::temp_dir())
@@ -135,10 +51,12 @@ async fn a_turn_passes_the_schema_file_to_the_vendor_command_line() {
         "{\n  \"type\": \"object\",\n  \"properties\": { \"word\": { \"type\": \"string\" } }\n}\n",
     );
     let options = turn_options(&path);
-    let cli = Arc::new(ScriptedClaudeCli::new(
-        HELP_WITH_JSON_SCHEMA,
-        schema_turn_lines(),
-    ));
+    let cli = Arc::new(
+        FakeClaudeCli::new()
+            .with_help(HELP_WITH_JSON_SCHEMA)
+            .with_turn(Run::answering_schema(&serde_json::json!({"word": "ok"})))
+            .refusing_unscripted_turns(),
+    );
 
     turn_with(
         &turn_registry(&options).expect("expected a registry with the schema"),
@@ -186,10 +104,12 @@ async fn a_turn_without_the_flag_puts_no_schema_on_the_command_line() {
         &["--harness", "claude", "Reply with the word ok."].map(String::from),
     )
     .expect("expected valid claude turn arguments");
-    let cli = Arc::new(ScriptedClaudeCli::new(
-        HELP_WITH_JSON_SCHEMA,
-        schema_turn_lines(),
-    ));
+    let cli = Arc::new(
+        FakeClaudeCli::new()
+            .with_help(HELP_WITH_JSON_SCHEMA)
+            .with_turn(Run::answering_schema(&serde_json::json!({"word": "ok"})))
+            .refusing_unscripted_turns(),
+    );
 
     turn_with(
         &turn_registry(&options).expect("expected the plain registry"),
@@ -219,7 +139,12 @@ async fn a_build_without_the_flag_is_refused_by_the_harness_in_its_own_words() {
     let directory = tempfile::tempdir().expect("expected a scratch directory");
     let path = schema_file(&directory, r#"{"type":"object"}"#);
     let options = turn_options(&path);
-    let cli = Arc::new(ScriptedClaudeCli::new(HELP_WITHOUT_JSON_SCHEMA, Vec::new()));
+    // No turn is scripted: a launch past the help check is a refusal that names its argv.
+    let cli = Arc::new(
+        FakeClaudeCli::new()
+            .with_help(HELP_WITHOUT_JSON_SCHEMA)
+            .refusing_unscripted_turns(),
+    );
 
     let error = turn_with(
         &turn_registry(&options).expect("expected a registry with the schema"),
@@ -304,30 +229,19 @@ async fn run_refuses_a_schema_where_it_would_not_be_used() {
     }
 }
 
-/// A schema turn whose `result` succeeded but carries no `structured_output`, as Claude Code
-/// 2.1.325 ended a turn whose schema no answer could satisfy.
-fn unanswered_schema_turn_lines() -> Vec<String> {
-    [
-        serde_json::json!({"type": "system", "subtype": "init",
-            "session_id": "b01414e7-4b4b-43a2-9109-a33e21664340", "model": "claude-sonnet-5"}),
-        serde_json::json!({"type": "result", "subtype": "success", "is_error": false,
-            "result": "I could not satisfy the schema.",
-            "usage": {"input_tokens": 3, "output_tokens": 5}}),
-    ]
-    .iter()
-    .map(ToString::to_string)
-    .collect()
-}
-
 #[tokio::test]
 async fn a_schema_turn_without_an_answer_fails_with_the_harness_code_and_message() {
     let directory = tempfile::tempdir().expect("expected a scratch directory");
     let path = schema_file(&directory, r#"{"type":"object"}"#);
     let options = turn_options(&path);
-    let cli = Arc::new(ScriptedClaudeCli::new(
-        HELP_WITH_JSON_SCHEMA,
-        unanswered_schema_turn_lines(),
-    ));
+    let cli = Arc::new(
+        FakeClaudeCli::new()
+            .with_help(HELP_WITH_JSON_SCHEMA)
+            .with_turn(Run::leaving_schema_unanswered(
+                "I could not satisfy the schema.",
+            ))
+            .refusing_unscripted_turns(),
+    );
 
     let error = turn_with(
         &turn_registry(&options).expect("expected a registry with the schema"),

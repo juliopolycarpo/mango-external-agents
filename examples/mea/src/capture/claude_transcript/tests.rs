@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
+use mango_agent_claude::testing::{FakeClaudeCli, HELP_WITH_JSON_SCHEMA, Run, SIGNED_OUT};
 use mango_external_agents::testing::{FakeHarness, FakeLauncher, FakeProcess};
 use mango_external_agents::{
     ActivityKind, EventSink, ExitStatus, Interaction, InteractionId, InteractionKind,
@@ -12,7 +13,17 @@ use mango_external_agents::{
 };
 
 use super::*;
-use crate::json_schema_tests::{HELP_WITH_JSON_SCHEMA, ScriptedClaudeCli};
+
+/// A signed-in `claude` whose help declares `--json-schema`, playing `turn_lines` for its one
+/// turn and refusing any turn past it, so a second launch fails naming its argv.
+fn scripted_cli(turn_lines: Vec<String>) -> Arc<FakeClaudeCli> {
+    Arc::new(
+        FakeClaudeCli::new()
+            .with_help(HELP_WITH_JSON_SCHEMA)
+            .with_turn(Run::replaying(&turn_lines.join("\n")))
+            .refusing_unscripted_turns(),
+    )
+}
 
 const SCHEMA: &str = r#"{"type":"object","properties":{"word":{"type":"string"}}}"#;
 /// A credential-shaped string no redaction rule names a value for.
@@ -599,10 +610,7 @@ async fn the_tap_keeps_nothing_from_a_probe_launch() {
 async fn a_qualified_capture_writes_the_redacted_transcript_and_nothing_private() {
     let facts = MachineFacts::new();
     let out = tempfile::tempdir().expect("expected an output directory");
-    let cli = Arc::new(ScriptedClaudeCli::new(
-        HELP_WITH_JSON_SCHEMA,
-        answered_turn_lines(&facts),
-    ));
+    let cli = scripted_cli(answered_turn_lines(&facts));
 
     capture_over(cli.clone(), out.path(), &facts, Some(SCHEMA))
         .await
@@ -692,10 +700,7 @@ async fn a_qualified_capture_removes_the_diagnostics_an_earlier_attempt_left() {
     ] {
         std::fs::write(directory.join(stale), "# stale\n").expect("expected a stale file");
     }
-    let cli = Arc::new(ScriptedClaudeCli::new(
-        HELP_WITH_JSON_SCHEMA,
-        answered_turn_lines(&facts),
-    ));
+    let cli = scripted_cli(answered_turn_lines(&facts));
 
     capture_over(cli, out.path(), &facts, Some(SCHEMA))
         .await
@@ -732,7 +737,7 @@ async fn a_turn_that_never_answered_is_kept_unqualified_and_fails_naming_what_is
             {"type": "text", "text": "mango"}]}}),
         json!({"type": "result", "subtype": "success", "is_error": false, "result": "mango"}),
     ]);
-    let cli = Arc::new(ScriptedClaudeCli::new(HELP_WITH_JSON_SCHEMA, plain_answer));
+    let cli = scripted_cli(plain_answer);
 
     let error = capture_over(cli, out.path(), &facts, Some(SCHEMA))
         .await
@@ -763,42 +768,19 @@ async fn a_turn_that_never_answered_is_kept_unqualified_and_fails_naming_what_is
     );
 }
 
-/// A CLI whose `auth status` says nobody is signed in; everything else runs as on the scripted one.
-struct SignedOutClaudeCli {
-    cli: Arc<ScriptedClaudeCli>,
-    status_probes: FakeLauncher,
-}
-
-#[async_trait::async_trait]
-impl ProcessLauncher for SignedOutClaudeCli {
-    async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
-        if spec
-            .argv
-            .get(1..3)
-            .is_some_and(|words| words == ["auth", "status"])
-        {
-            self.status_probes
-                .push(FakeProcess::transcript([r#"{"loggedIn":false}"#]));
-            return self.status_probes.spawn(spec).await;
-        }
-        self.cli.spawn(spec).await
-    }
-}
-
 #[tokio::test]
 async fn a_signed_out_cli_is_refused_without_signing_in_or_starting_a_turn() {
     let facts = MachineFacts::new();
     let out = tempfile::tempdir().expect("expected an output directory");
-    let cli = Arc::new(ScriptedClaudeCli::new(
-        HELP_WITH_JSON_SCHEMA,
-        answered_turn_lines(&facts),
-    ));
-    let signed_out = Arc::new(SignedOutClaudeCli {
-        cli: cli.clone(),
-        status_probes: FakeLauncher::new(),
-    });
+    let cli = Arc::new(
+        FakeClaudeCli::new()
+            .with_help(HELP_WITH_JSON_SCHEMA)
+            .with_auth(SIGNED_OUT)
+            .with_turn(Run::replaying(&answered_turn_lines(&facts).join("\n")))
+            .refusing_unscripted_turns(),
+    );
 
-    let error = capture_over(signed_out.clone(), out.path(), &facts, Some(SCHEMA))
+    let error = capture_over(cli.clone(), out.path(), &facts, Some(SCHEMA))
         .await
         .expect_err("expected a signed-out CLI to be refused");
 
@@ -814,16 +796,24 @@ async fn a_signed_out_cli_is_refused_without_signing_in_or_starting_a_turn() {
         "received: {received}"
     );
     assert!(cli.turn_argvs().is_empty(), "expected no turn launch");
-    let status_probes: Vec<Vec<String>> = signed_out
-        .status_probes
+    // Every `auth` launch: the fake refuses any subcommand but `status`, so a login attempt would
+    // not appear here and would fail the capture with its own refusal instead.
+    let auth_launches: Vec<Vec<String>> = cli
         .launches()
         .into_iter()
         .map(|spec| spec.argv)
+        .filter(|argv| argv.get(1).is_some_and(|word| word == "auth"))
         .collect();
     assert_eq!(
-        status_probes.len(),
+        auth_launches.len(),
         1,
-        "expected the one status probe, and no login launch | received: {status_probes:?}"
+        "expected the one status probe, and no login launch | received: {auth_launches:?}"
+    );
+    assert_eq!(
+        auth_launches[0].get(2).map(String::as_str),
+        Some("status"),
+        "expected the probe to be `auth status` | received: {:?}",
+        auth_launches[0]
     );
     assert!(
         !transcript_dir(out.path())
@@ -935,9 +925,9 @@ impl ProcessControl for UnstoppableControl {
     }
 }
 
-/// A CLI whose turn child cannot be stopped; probes run as on [`ScriptedClaudeCli`].
+/// A CLI whose turn child cannot be stopped; probes run as on the shared fake.
 struct UnstoppableTurnCli {
-    cli: Arc<ScriptedClaudeCli>,
+    cli: Arc<FakeClaudeCli>,
 }
 
 #[async_trait::async_trait]
@@ -959,10 +949,7 @@ async fn a_turn_whose_child_cannot_be_stopped_leaves_only_an_incomplete_diagnost
     let facts = MachineFacts::new();
     let out = tempfile::tempdir().expect("expected an output directory");
     let cli = Arc::new(UnstoppableTurnCli {
-        cli: Arc::new(ScriptedClaudeCli::new(
-            HELP_WITH_JSON_SCHEMA,
-            answered_turn_lines(&facts),
-        )),
+        cli: scripted_cli(answered_turn_lines(&facts)),
     });
 
     let result = capture_over(cli, out.path(), &facts, Some(SCHEMA)).await;

@@ -19,6 +19,49 @@ workspace = true
 # The library has no benchmarks of its own, so `cargo bench` skips its unit tests.
 bench = false
 
+[features]
+default = []
+# The named fake Claude CLI this crate's own tests replay, for a host writing tests of its own.
+testing = ["mango-external-agents/testing"]
+
+# Each of these drives the harness end to end against the fake CLI, which only exists under
+# `testing`. Declared so the `--no-default-features` lane skips the target instead of failing to
+# resolve the import.
+[[test]]
+name = "cleanup_required"
+path = "tests/cleanup_required.rs"
+required-features = ["testing"]
+
+[[test]]
+name = "conformance"
+path = "tests/conformance.rs"
+required-features = ["testing"]
+
+[[test]]
+name = "deadlines"
+path = "tests/deadlines.rs"
+required-features = ["testing"]
+
+[[test]]
+name = "fake_cli"
+path = "tests/fake_cli.rs"
+required-features = ["testing"]
+
+[[test]]
+name = "harness_over_a_fake_cli"
+path = "tests/harness_over_a_fake_cli.rs"
+required-features = ["testing"]
+
+[[test]]
+name = "reducer_replay"
+path = "tests/reducer_replay.rs"
+required-features = ["testing"]
+
+[[test]]
+name = "resumability"
+path = "tests/resumability.rs"
+required-features = ["testing"]
+
 [dependencies]
 # `stdio` because this dialect is a child process per turn and per probe; the
 # core's other transport kinds are not reachable from it.

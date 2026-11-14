@@ -1196,6 +1196,29 @@ how many bytes they take, never a value. A debug-logged tool result reads
 subagent forwarded, each permission denial's message and the call ids that key them, so it reports
 how many of each it holds and how many bytes, never the text or an id.
 
+## Testing against a fake `claude`: the `testing` feature
+
+The `testing` feature (off by default; it adds nothing to a normal build) exposes
+`mango_agent_claude::testing::FakeClaudeCli`, the launcher this crate's own tests and `mea`'s
+`--json-schema` tests run against. It spawns nothing. It answers the three probes from its argv:
+`--version`, `--help` (the 2.1.260 text unless `with_help` says otherwise, and
+`HELP_WITH_JSON_SCHEMA` for a build that declares `--json-schema`) and `auth status` (signed in
+unless `with_auth(SIGNED_OUT)`). Every other launch is a turn and plays the next `Run` queued with
+`with_turn`: a captured transcript through `Run::replaying`, a child that exits or stalls, or the
+`--json-schema` frames through `Run::answering_schema` and `Run::leaving_schema_unanswered`. Those
+frames are inline, not captured fixtures; `mea capture --transcripts` records the real thing.
+
+It records every launch (`launches`, `turn_argvs`) and every line written to a child's stdin
+(`written`). `refusing_unscripted_turns` turns a turn nobody scripted into a launch error that
+names the received argv, and any `auth` subcommand other than `status` is always refused: the
+library never logs in, so the fake never pretends to.
+
+A host turns it on in its own `[dev-dependencies]` with `features = ["testing"]` on
+`mango-agent-claude`, so the fake never reaches a release build.
+
+The fake is a named fake, not a vendor contract: a vendor fact belongs in `fixtures/claude/`,
+captured by `mea capture`, and the fake replays it.
+
 ## Deliberate differences from the mangostudio TypeScript adapter
 
 - The turn stream is a **bounded** channel; a host that stops reading applies backpressure to the

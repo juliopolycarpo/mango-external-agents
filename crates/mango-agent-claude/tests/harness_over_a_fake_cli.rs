@@ -2246,31 +2246,6 @@ mod a_turn {
         );
     }
 
-    /// A `--json-schema` turn as Claude Code 2.1.325 streamed it (#362), reduced to the members the
-    /// harness reads and replayed as inline lines: `mea capture` has no Claude transcript recorder,
-    /// so this is not a fixture.
-    fn schema_turn_lines() -> Vec<String> {
-        let answer = serde_json::json!({"word": "ok"});
-        [
-            serde_json::json!({"type": "system", "subtype": "init",
-                "session_id": "b01414e7-4b4b-43a2-9109-a33e21664340", "model": "claude-sonnet-5"}),
-            serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": [
-                {"type": "tool_use", "id": "toolu_answer", "name": "StructuredOutput",
-                 "input": answer}]}}),
-            serde_json::json!({"type": "user", "message": {"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "toolu_answer",
-                 "content": "Structured output provided successfully"}]}}),
-            serde_json::json!({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed"}}),
-            serde_json::json!({"type": "result", "subtype": "success", "is_error": false,
-                "result": answer.to_string(), "structured_output": answer,
-                "credential_expires_at": "CANARY-credential-expiry",
-                "usage": {"input_tokens": 3, "output_tokens": 5}}),
-        ]
-        .iter()
-        .map(ToString::to_string)
-        .collect()
-    }
-
     /// The whole path a schema turn takes: the argv carries the schema, the stream's tool call is
     /// not an activity, and the answer arrives after the turn started and before `Completed`.
     #[tokio::test]
@@ -2280,7 +2255,7 @@ mod a_turn {
         let launcher = Arc::new(
             FakeClaudeCli::new()
                 .with_help(HELP_2_1_270)
-                .with_turn(Run::replaying(&schema_turn_lines().join("\n"))),
+                .with_turn(Run::answering_schema(&serde_json::json!({"word": "ok"}))),
         );
         let session = ClaudeHarness::new()
             .with_json_schema(schema)
@@ -2322,40 +2297,9 @@ mod a_turn {
         );
         let written = serde_json::to_string(&events).expect("expected the events to serialise");
         assert!(
-            !written.contains("CANARY-credential-expiry"),
+            !written.contains(mango_agent_claude::testing::CREDENTIAL_EXPIRY_CANARY),
             "expected the vendor's credential expiry to stay off every event | received: {written}"
         );
-    }
-
-    /// A `--json-schema` turn on Claude Code 2.1.325 with an unsatisfiable schema (`n` with
-    /// `minimum: 10`, `maximum: 5`) as it streamed (#382), reduced to the members the harness reads
-    /// and replayed as inline lines. Two `StructuredOutput` calls come back `is_error: true`, the
-    /// model gives up in prose, and the `result` is `success` with no `structured_output`.
-    fn unsatisfiable_schema_turn_lines(prose: &str) -> Vec<String> {
-        [
-            serde_json::json!({"type": "system", "subtype": "init",
-                "session_id": "b01414e7-4b4b-43a2-9109-a33e21664340", "model": "claude-sonnet-5"}),
-            serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": [
-                {"type": "tool_use", "id": "toolu_first", "name": "StructuredOutput",
-                 "input": {"n": 7}}]}}),
-            serde_json::json!({"type": "user", "message": {"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "toolu_first", "is_error": true,
-                 "content": "Output does not match required schema: /n: must be <= 5"}]}}),
-            serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": [
-                {"type": "tool_use", "id": "toolu_second", "name": "StructuredOutput",
-                 "input": {"n": 7}}]}}),
-            serde_json::json!({"type": "user", "message": {"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "toolu_second", "is_error": true,
-                 "content": "Output does not match required schema: /n: must be >= 10"}]}}),
-            serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": [
-                {"type": "text", "text": prose}]}}),
-            serde_json::json!({"type": "result", "subtype": "success", "is_error": false,
-                "terminal_reason": "completed", "result": prose,
-                "usage": {"input_tokens": 3, "output_tokens": 5}}),
-        ]
-        .iter()
-        .map(ToString::to_string)
-        .collect()
     }
 
     /// A schema turn that ends with no answer is a failed turn, not a completed one, and the
@@ -2365,9 +2309,11 @@ mod a_turn {
         let schema =
             r#"{"properties":{"n":{"maximum":5,"minimum":10,"type":"integer"}},"type":"object"}"#;
         let prose = "CANARY-model-prose the schema cannot be satisfied";
-        let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270).with_turn(
-            Run::replaying(&unsatisfiable_schema_turn_lines(prose).join("\n")),
-        ));
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_help(HELP_2_1_270)
+                .with_turn(Run::leaving_schema_unanswered(prose)),
+        );
         let session = ClaudeHarness::new()
             .with_json_schema(schema)
             .expect("expected a usable schema")
@@ -2413,10 +2359,8 @@ mod a_turn {
         let launcher = Arc::new(
             FakeClaudeCli::new()
                 .with_help(HELP_2_1_270)
-                .with_turn(Run::replaying(
-                    &unsatisfiable_schema_turn_lines("gave up in prose").join("\n"),
-                ))
-                .with_turn(Run::replaying(&schema_turn_lines().join("\n"))),
+                .with_turn(Run::leaving_schema_unanswered("gave up in prose"))
+                .with_turn(Run::answering_schema(&serde_json::json!({"word": "ok"}))),
         );
         let session = ClaudeHarness::new()
             .with_json_schema(schema)
@@ -2481,9 +2425,8 @@ mod a_turn {
     /// Without a schema the same frames complete: nothing asked for an answer.
     #[tokio::test]
     async fn the_same_turn_without_a_schema_completes() {
-        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::replaying(
-            &unsatisfiable_schema_turn_lines("plain prose").join("\n"),
-        )));
+        let launcher =
+            Arc::new(FakeClaudeCli::new().with_turn(Run::leaving_schema_unanswered("plain prose")));
         let session = open(&launcher).await;
         let mut turn = session
             .start_turn(TurnRequest::new("turn-1", "Reply with n."))

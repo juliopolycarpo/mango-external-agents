@@ -39,5 +39,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 [dev-dependencies]
 # `mea turn --cancel-after` is driven end to end against the scripted ACP agent.
 mango-agent-acp = { workspace = true, features = ["testing"] }
+# `mea turn --json-schema` is driven end to end against the scripted Claude CLI.
+mango-agent-claude = { workspace = true, features = ["testing"] }
 mango-external-agents = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["test-util"] }
