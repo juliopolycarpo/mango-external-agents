@@ -107,6 +107,10 @@ jobs:
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-deny,dprint,git-cliff,shellcheck@0.11.0
+      # install-action has no actionlint manifest; the installer checks the pinned SHA-256 and adds
+      # the directory to PATH. actionlint calls the shellcheck installed above on each run: block.
+      # Before the tests below so their real-tool cases run in CI.
+      - run: scripts/install-actionlint.sh "$RUNNER_TEMP/actionlint-bin"
       # scripts/check-script-tests.sh parses this file with PyYAML. Declared here so the lane does
       # not depend on what the runner image happens to ship; a no-op when it is already installed.
       - run: sudo apt-get install --yes --no-install-recommends python3-yaml
@@ -129,9 +133,11 @@ jobs:
       - run: scripts/test-check-script-tests.sh
       - run: scripts/check-script-tests.sh
       - run: scripts/test-check-shellcheck.sh
+      - run: scripts/test-check-actionlint.sh
       - run: scripts/test-install-actionlint.sh
       - run: scripts/check-shellcheck.sh
       - run: scripts/test-prune-rust-caches.sh
+      - run: scripts/check-actionlint.sh
       - run: dprint check
 
   msrv:

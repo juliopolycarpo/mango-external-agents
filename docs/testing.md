@@ -146,3 +146,29 @@ workflow runs it with `--delete` after each successful `CI` push run on `main`, 
 dispatch with a `dry-run` input that defaults to true.
 `scripts/test-prune-rust-caches.sh` covers the policy with a named fake `gh`
 (`scripts/test-fixtures/fake-gh-cache-cli.sh`).
+
+## Workflow lint
+
+The shell inside a workflow's `run:` blocks is not under `scripts/`, so shellcheck's gate never sees
+it. `scripts/check-actionlint.sh` runs actionlint over `.github/workflows/*.yml`: it checks the
+workflow syntax and `${{ }}` expressions and passes each `run:` block to shellcheck. actionlint
+skips that pass without a message when shellcheck is not on `PATH`, so the gate fails when either
+tool is missing rather than reporting a clean run with the blocks unchecked. It prints both versions.
+
+`taiki-e/install-action` has no actionlint manifest, so the Policy job installs it with
+`scripts/install-actionlint.sh <bin-dir>`. The helper downloads the exact release asset from
+rhysd/actionlint, refuses to extract it unless its SHA-256 matches
+`scripts/actionlint-pinned-sha256sums.txt`, and appends the directory to `GITHUB_PATH` in a
+workflow step. The pinned version is `ACTIONLINT_VERSION` in the helper; a bump changes it and the
+registry together. Locally, run the helper into a directory of your choice and put that on `PATH`.
+The shellcheck the Policy job installs is the one actionlint calls.
+
+`scripts/check.sh` runs the gate when both tools are on `PATH` and otherwise warns once and skips it.
+The release workflow's verify job does not install actionlint, so there the gate is skipped with that
+warning unless the runner image provides it.
+
+A finding that is intentional gets `# shellcheck disable=SCxxxx # reason` on the first line of the
+`run:` block, never an `-ignore` flag in the gate. `scripts/test-check-actionlint.sh` covers the
+gate with a named fake actionlint and, when both real tools are installed, with a `run:` block that
+has a finding and one that carries a reasoned directive. `scripts/test-install-actionlint.sh` covers
+the installer with a named fake curl and uname.
