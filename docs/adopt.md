@@ -499,6 +499,7 @@ do not present those invalid choices to the host.
 | `QuestionAsked` / `QuestionResolved`                        | Add or remove a question prompt — never an approval prompt    |
 | `Usage` / `ThreadUsage` / `AccountLimits`                   | Update usage displays without inferring prices                |
 | `Notice`                                                    | Show a banner or status line; display only, never model input |
+| `StructuredOutput`                                          | Hand the validated JSON to the caller that asked for it       |
 | `Error`                                                     | Show the bounded error and retain the failed turn's identity  |
 | `Completed`                                                 | Stop the turn relay and release its pending UI state          |
 | `cancel(ConsentRevoked)`                                    | Stop work when the user revokes the session's consent         |
@@ -510,10 +511,12 @@ assistant output back into the host model's context as instructions. That covers
 vendor-generated text, not only `TextDelta`: a compaction summary (the content of an activity of kind
 `Compaction`) and a `Notice` are for display only. A `Notice` is also best effort and turn-scoped:
 it is not part of the transcript, its `error` severity does not mean the turn failed, and a host
-that ignores the event loses nothing it needs. The `mea` host provides an
-executable example of `TokioLauncher`, terminal approval decisions, terminal question answers and
-event consumption without the runtime's browser or database dependencies. Its question path is the
-one worth copying: it reads `QuestionForm`, numbers the choices, and never touches the broker.
+that ignores the event loses nothing it needs. A `StructuredOutput` is data the vendor wrote, up to
+256 KiB: validate it against your own schema before acting on it, and never pass it to the host
+model as an instruction. The `mea` host provides an executable example of `TokioLauncher`,
+terminal approval decisions, terminal question answers and event consumption without the
+runtime's browser or database dependencies. Its question path is the one worth copying: it
+reads `QuestionForm`, numbers the choices, and never touches the broker.
 
 An unknown question form keeps its vendor label in
 `UnsupportedQuestion::UnrecognisedForm::received` for explicit typed access. Normalization bounds

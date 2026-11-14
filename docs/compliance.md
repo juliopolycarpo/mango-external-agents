@@ -49,7 +49,8 @@ own deployment.
 - **Vendor assistant text is never replayed** into the host's own model context by the library.
   The same holds for the other text a vendor generates: a compaction summary (an activity's
   content) and a notice (`EventKind::Notice`) are for display only, and a host must not feed either
-  to its own model as instructions.
+  to its own model as instructions. A structured answer (`EventKind::StructuredOutput`) is data for
+  the code that asked for it, bounded to 256 KiB, never an instruction.
 - **Redaction.** A vendor's own diagnostic text is redacted for credential-shaped text before it is
   bounded, wherever it enters, and a vendor's transcript content is not. What is redacted where:
 

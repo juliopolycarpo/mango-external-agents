@@ -198,6 +198,15 @@ them together: the per-file ceilings multiply out to megabytes against a turn bu
 megabytes. Files past the budget keep their row — the path and the counts, which is what a host
 lists — and lose their contents, and `truncated` says so.
 
+`EventKind::StructuredOutput` carries one JSON value a harness reports as validated against a schema the
+host supplied, and it is absent from every turn where no harness reports one. It arrives before
+`Completed` and is not a terminal, like `Cancelled`, so a host that ignores it still sees its turn
+end. The value is vendor-derived and bounded to `STRUCTURED_OUTPUT_MAX_BYTES` (256 KiB of compact
+JSON, the number `DIFF_MAX_CONTENT_LENGTH` has, counted in bytes). An oversized value is refused whole, never cut: `EventKind::structured_output` and
+`EventKind::normalized` return `LimitExceeded` naming the cap and the size received, because a
+truncated document is no longer the answer the schema validated and a host could not tell. `Debug`
+prints no part of it.
+
 `Extensions` is the long tail: a flat, scalar-only map, capped at 32 entries, with bounded keys and
 values, run through the same credential redaction a stderr tail is. It is **observational**.
 Nothing read from it is executed, dispatched or turned into an RPC, and there is deliberately no

@@ -117,8 +117,9 @@ const ACTIVITY_OVERHEAD_BYTES: usize = 512;
 /// (its capacity, because sanitizing can leave a short string in a large buffer), and an activity
 /// (started, updated or completed) is its detail plus its content (a diff of up to
 /// [`DIFF_MAX_CONTENT_LENGTH`](mango_external_agents::content::DIFF_MAX_CONTENT_LENGTH) code
-/// points, or output). Every other kind is small, bounded by the library's field limits, and is
-/// counted by its encoded JSON length instead.
+/// points, or output). Every other kind is bounded by the library's field limits and is counted by
+/// its encoded JSON length instead, which for a structured answer (up to
+/// [`STRUCTURED_OUTPUT_MAX_BYTES`](mango_external_agents::STRUCTURED_OUTPUT_MAX_BYTES)) is its value.
 fn event_bytes(event: &AgentEvent) -> usize {
     let payload = match &event.kind {
         EventKind::TextDelta { text } | EventKind::ReasoningDelta { text } => text.capacity(),
@@ -598,6 +599,19 @@ mod tests {
             cost,
             size_of::<AgentEvent>() + encoded,
             "expected the event size plus the encoded kind | received {cost}"
+        );
+    }
+
+    /// A structured answer is the one non-text kind that can be large, and it is counted by its
+    /// JSON like every other kind that is not an activity or a delta.
+    #[tokio::test]
+    async fn a_structured_answer_costs_its_event_plus_its_encoded_value() {
+        let value = serde_json::Value::String("v".repeat(100_000));
+        let kind = EventKind::structured_output(value).expect("expected a value that fits");
+        let cost = event_bytes(&event(kind).await);
+        assert!(
+            cost >= size_of::<AgentEvent>() + 100_000,
+            "expected the event size plus the 100000 bytes of the value | received {cost}"
         );
     }
 
