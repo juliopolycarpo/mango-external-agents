@@ -15,6 +15,10 @@ if ! command -v shellcheck >/dev/null 2>&1; then
   exit 1
 fi
 
+# The version goes in the log: a hosted runner image ships its own shellcheck, and this line shows
+# which binary judged the scripts.
+shellcheck --version | sed -n 's/^version: */shellcheck version /p'
+
 # Sorted so the invocation, and a finding's order in the output, does not depend on directory order.
 mapfile -t scripts < <(find scripts -type f -name '*.sh' | LC_ALL=C sort)
 if [ "${#scripts[@]}" -eq 0 ]; then

@@ -19,10 +19,15 @@ mkdir -p "$work/repo/scripts/test-fixtures" "$work/empty/scripts"
 : > "$work/repo/scripts/gamma.py"
 : > "$work/repo/scripts/notes.txt"
 
-# FakeShellcheck: logs one argument per line to FAKE_SHELLCHECK_LOG and exits FAKE_SHELLCHECK_STATUS.
+# FakeShellcheck: answers --version like the real tool; otherwise logs one argument per line to
+# FAKE_SHELLCHECK_LOG and exits FAKE_SHELLCHECK_STATUS.
 mkdir -p "$work/fakebin" "$work/nobin"
 cat > "$work/fakebin/shellcheck" <<'FAKE_SHELLCHECK'
 #!/usr/bin/env bash
+if [ "${1-}" = --version ]; then
+  printf 'ShellCheck - shell script analysis tool\nversion: 9.9.9-fake\nlicense: GNU General Public License, version 3\n'
+  exit 0
+fi
 printf '%s\n' "$@" > "$FAKE_SHELLCHECK_LOG"
 echo "FakeShellcheck: reporting as asked" >&2
 exit "${FAKE_SHELLCHECK_STATUS:-0}"
@@ -49,6 +54,7 @@ expected_args=$'scripts/alpha.sh\nscripts/test-fixtures/fake-beta.sh'
 received_args=$(cat "$work/shellcheck.log")
 [ "$received_args" = "$expected_args" ] || fail "expected shellcheck to receive only the .sh files under scripts/, sorted | received: $received_args"
 grep -q 'shellcheck: 2 scripts clean' <<<"$stdout_text" || fail "expected the gate to report 2 scripts clean | received: $stdout_text"
+grep -qx 'shellcheck version 9.9.9-fake' <<<"$stdout_text" || fail "expected the gate to print the version of the shellcheck that ran | received: $stdout_text"
 
 # Case 2: shellcheck reports a finding: its status and output reach the caller.
 run_gate "$work/fakebin:$PATH" "$work/repo" 1
