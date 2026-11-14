@@ -336,7 +336,12 @@ async fn a_schema_turn_without_an_answer_fails_with_the_harness_code_and_message
     .await
     .expect_err("expected a turn that ended without an answer to fail");
 
-    // The vendor's message is on the error event line printed above this summary (pinned in
-    // `turn.rs`); the summary names the code, so a script sees the failure and its cause.
-    assert_eq!(error, "claude-structured-output-missing: vendor failure");
+    // The error event line above the summary carries the message too (pinned in `turn.rs`); the
+    // summary repeats it, so a script that reads only the summary sees the failure and its cause.
+    assert!(
+        error.starts_with(
+            "claude-structured-output-missing: vendor failure: Claude Code ended a --json-schema turn without an answer"
+        ),
+        "expected the code and the vendor's message in the summary | received: {error}"
+    );
 }
