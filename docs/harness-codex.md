@@ -1124,6 +1124,12 @@ surface has no Windows equivalent.
   socket it started or discovered. The path must be absolute and fit `sockaddr_un` (107 bytes on
   Linux, 103 elsewhere); a symlink works, and its own path is the one measured. No error or `Debug`
   line carries the path.
+- **Same user only.** After connecting and before the upgrade, the harness reads the listener's
+  credentials from the kernel (`SO_PEERCRED`) and refuses a server whose uid differs from this
+  process's effective uid, as `Error::HostConfiguration` naming both uids. A path in a shared
+  directory can be bound by whoever got there first, and nothing is sent to that server. The effect:
+  a socket served by another user is refused, notably a root-owned managed daemon socket for a host
+  that does not run as root. Run the server as the host's user, or run the host as the server's.
 - **The upgrade.** The harness connects, sends `GET / HTTP/1.1` with `Host: localhost` and the
   standard WebSocket upgrade headers, and speaks the same JSON-RPC dialect as stdio, one message per
   text frame. A 0.167.2 server accepted that request with `101 Switching Protocols`, and answered
@@ -1156,8 +1162,8 @@ surface has no Windows equivalent.
 - **Limits.** Connect plus upgrade is bounded by `Limits::request_timeout`; a server that accepts
   and never answers is `Error::Timeout`. Messages are capped at `Limits::line.max_line_bytes`
   after decoding, so the reducer's three-times bound is never the one that binds on this transport.
-- **Refusal shapes.** A missing path, a path that is relative or too long, and a `401` or `403` are
-  `Error::HostConfiguration`. A socket nobody listens on is `Error::Link` naming the
+- **Refusal shapes.** A missing path, a path that is relative or too long, a server of another
+  user, and a `401` or `403` are `Error::HostConfiguration`. A socket nobody listens on is `Error::Link` naming the
   `io::ErrorKind`. Each is raised before `thread/start`, so each carries `Dispatch::NotSubmitted`.
 - **Scope.** Only `open_session` attaches. `probe`, `discover` and `list_native_sessions` still run
   the `codex` executable over stdio and need it installed.

@@ -5,6 +5,9 @@
 //! framing and caps of [`websocket`](super::websocket). Nothing here starts, stops or signals the
 //! server: it is the host's, and other clients may be attached to it.
 //!
+//! The server must run as this process's own user: the kernel's credentials for the listener are
+//! checked before the upgrade is sent, and a socket served by anyone else is refused.
+//!
 //! There is no credential on this path. A server that answers the upgrade with `401` or `403`
 //! wants a token, and the library refuses that as host configuration instead of presenting one.
 
@@ -71,14 +74,24 @@ impl std::fmt::Debug for UnixSocketTransport {
 /// # Errors
 ///
 /// - [`Error::HostConfiguration`] for a path that is not absolute or does not fit a socket address,
-///   and for a server that answers the upgrade with `401` or `403`: it wants a token, which this
+///   for a server that runs as another user than this process, and for a server that answers the upgrade with `401` or `403`: it wants a token, which this
 ///   library never presents.
 /// - [`Error::Timeout`] when the connect and upgrade do not finish within the bound.
 /// - [`Error::Link`] when nothing listens at the path or the upgrade failed otherwise.
 pub async fn open(spec: &UnixSocketSpec, limits: &Limits) -> Result<UnixSocketTransport> {
+    open_as(spec, limits, own_euid().await?).await
+}
+
+/// [`open`] for a process whose effective uid is `own_uid`: the seam a test uses to stand in for a
+/// server of another user, which it cannot start.
+async fn open_as(
+    spec: &UnixSocketSpec,
+    limits: &Limits,
+    own_uid: u32,
+) -> Result<UnixSocketTransport> {
     check_path(&spec.path)?;
     let (upgraded, severable) =
-        tokio::time::timeout(limits.request_timeout, upgrade(&spec.path, limits))
+        tokio::time::timeout(limits.request_timeout, upgrade(&spec.path, limits, own_uid))
             .await
             .map_err(|_| Error::Timeout {
                 operation: String::from("Unix socket connect and upgrade"),
@@ -95,11 +108,13 @@ pub async fn open(spec: &UnixSocketSpec, limits: &Limits) -> Result<UnixSocketTr
 async fn upgrade(
     path: &Path,
     limits: &Limits,
+    own_uid: u32,
 ) -> Result<(
     tokio_tungstenite::WebSocketStream<UnixStream>,
     StdUnixStream,
 )> {
     let stream = UnixStream::connect(path).await.map_err(io_failure)?;
+    refuse_other_user(&stream, own_uid)?;
     // `try_clone` duplicates the descriptor, not the connection: both handles are one socket, and
     // the non-blocking mode `into_std` keeps is shared, so the clone's `shutdown` never blocks.
     let stream = stream.into_std().map_err(io_failure)?;
@@ -117,6 +132,36 @@ async fn upgrade(
         .await
         .map_err(|error| refusal(&error))?;
     Ok((socket, severable))
+}
+
+/// Refuses a server that runs as a different user than this process, before a byte is sent to it.
+///
+/// The socket's path is the host's to choose, and a path in a shared directory can be bound by
+/// anyone who got there first. The kernel's credentials for the listener are the one fact about the
+/// peer that it cannot spoof, so the upgrade, and every message after it, goes only to a server
+/// that runs as the same effective uid. The effect: a socket served by another user, such as a
+/// root-owned managed daemon, is refused for a host that does not run as that user. The text carries
+/// the two uids, never the path.
+fn refuse_other_user(stream: &UnixStream, own_uid: u32) -> Result<()> {
+    let peer_uid = stream.peer_cred().map_err(io_failure)?.uid();
+    if peer_uid == own_uid {
+        return Ok(());
+    }
+    Err(Error::HostConfiguration {
+        expected: "a Unix socket served by this process's own user",
+        received: format!(
+            "a server running as uid {peer_uid}, this process running as uid {own_uid}"
+        ),
+    })
+}
+
+/// The effective uid of this process.
+///
+/// Read from the kernel as the credentials of a socket pair this call creates, which carry the
+/// creator's effective uid: the standard library has no `geteuid`, and `unsafe` is forbidden.
+async fn own_euid() -> Result<u32> {
+    let (own, _other) = UnixStream::pair().map_err(io_failure)?;
+    Ok(own.peer_cred().map_err(io_failure)?.uid())
 }
 
 /// A socket call that failed, as its `io::ErrorKind` and no path.
@@ -287,7 +332,7 @@ mod tests {
     use tokio_tungstenite::tungstenite::http::StatusCode;
     use tokio_tungstenite::{accept_async, accept_hdr_async};
 
-    use super::open;
+    use super::{open, open_as, own_euid};
     use crate::error::Error;
     use crate::host::Limits;
     use crate::transport::UnixSocketSpec;
@@ -571,6 +616,67 @@ mod tests {
         tokio::net::UnixStream::connect(&server.path)
             .await
             .expect("expected the server to still accept connections");
+    }
+
+    /// The uid the kernel reports for the fake server, which runs in this process.
+    async fn uid_of_server_at(path: &std::path::Path) -> u32 {
+        tokio::net::UnixStream::connect(path)
+            .await
+            .expect("expected a connection")
+            .peer_cred()
+            .expect("expected peer credentials")
+            .uid()
+    }
+
+    #[tokio::test]
+    async fn this_process_reports_the_uid_the_kernel_gives_its_own_sockets() {
+        let server = FakeUnixSocketServer::start(Behaviour::Echo);
+        assert_eq!(
+            own_euid().await.expect("expected an effective uid"),
+            uid_of_server_at(&server.path).await,
+            "expected own_euid to match the uid of a peer running as this process"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_running_as_this_user_is_accepted() {
+        let server = FakeUnixSocketServer::start(Behaviour::Echo);
+        let own = own_euid().await.expect("expected an effective uid");
+
+        open_as(&server.spec(), &Limits::default(), own)
+            .await
+            .expect("expected a server of the same user to be accepted");
+    }
+
+    /// A socket of another user, such as a root-owned managed daemon, is refused before anything is
+    /// sent to it: the upgrade is never written, and the refusal names both uids and no path.
+    #[tokio::test]
+    async fn a_server_running_as_another_user_is_refused_before_the_upgrade() {
+        let server = FakeUnixSocketServer::start(Behaviour::Echo);
+        let peer = own_euid().await.expect("expected an effective uid");
+        let expected_user = peer + 1;
+
+        let error = open_as(&server.spec(), &Limits::default(), expected_user)
+            .await
+            .expect_err("expected a refusal, received a link");
+
+        let received =
+            format!("a server running as uid {peer}, this process running as uid {expected_user}");
+        assert!(
+            matches!(&error, Error::HostConfiguration { expected, received: shown }
+                if *expected == "a Unix socket served by this process's own user"
+                    && shown == &received),
+            "expected host configuration naming both uids ({received:?}), received {error:?}"
+        );
+        assert!(
+            !error.to_string().contains(&*server.path.to_string_lossy()),
+            "expected no socket path in the refusal, received {error}"
+        );
+        assert_eq!(
+            server.seen_upgrade(),
+            None,
+            "expected the upgrade never to be sent to a server of another user"
+        );
     }
 
     #[tokio::test]
