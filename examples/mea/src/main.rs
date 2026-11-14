@@ -19,7 +19,6 @@ mod workspace;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use failure::describe as command_failure;
 use mango_external_agents::launcher::TokioLauncher;
 use mango_external_agents::{
     ApprovalRouting, AuthState, ConfigurationChange, EnvSource, ExecutablePath, Harness, HarnessId,
@@ -239,9 +238,7 @@ async fn discover_with(
             let host = host.clone();
             (
                 kind,
-                tokio::spawn(
-                    async move { harness.discover(&host).await.map_err(|e| e.to_string()) },
-                ),
+                tokio::spawn(async move { harness.discover(&host).await.map_err(|e| refusal(&e)) }),
             )
         })
         .collect();
@@ -540,22 +537,49 @@ fn refusal(error: &mango_external_agents::Error) -> String {
     }
 }
 
+/// The final summary of a failed command, with the vendor's own words when the vendor failed it.
+///
+/// [`failure::describe`] keeps the cleanup and pid notes but prints a vendor failure as its bare
+/// `<code>: vendor failure`. This puts [`vendor_refusal`]'s reason, vendor code and request id in
+/// place of that prefix, also when an operation annotated the error (dispatch, cleanup).
+fn command_failure(error: &mango_external_agents::Error) -> String {
+    let described = failure::describe(error);
+    let mango_external_agents::Error::Vendor(vendor) = error.cause() else {
+        return described;
+    };
+    match described.strip_prefix(&vendor.to_string()) {
+        Some(notes) => format!("{}{notes}", vendor_refusal(vendor)),
+        None => described,
+    }
+}
+
 /// A vendor's refusal with the vendor's own words, which the library's formatter leaves out.
 ///
 /// An operator running a smoke turn needs the reason: a service that is degraded, a model that
 /// does not exist and a child that died at launch all read `<code>: vendor failure` otherwise.
 /// The message is read for credential names and the well-known token prefixes again here, and
-/// bounded, whatever built the error.
+/// bounded, whatever built the error. That read removes the C0 and C1 controls and the
+/// bidirectional formatting characters before its rules run, so a credential split by an escape
+/// sequence is still hidden. What survives it and a terminal may act on (line breaks, tabs,
+/// U+2028 and U+2029) is written as a visible escape, so the summary stays on one line. A message
+/// cut at its limit says so.
 fn vendor_refusal(vendor: &mango_external_agents::VendorError) -> String {
-    let message = mango_external_agents::redact::bounded(
-        &vendor.message,
-        mango_external_agents::normalize::TextLimit::ErrorMessage,
-    )
-    .text;
+    use mango_external_agents::normalize::TextLimit;
+
+    let limit = TextLimit::ErrorMessage.max_code_points();
+    let bounded = mango_external_agents::redact::bounded(&vendor.message, TextLimit::ErrorMessage);
+    let message = turn::escape_terminal_text(bounded.text.trim());
     let mut line = vendor.to_string();
-    if !message.trim().is_empty() {
+    if !message.is_empty() {
         line.push_str(": ");
-        line.push_str(message.trim());
+        line.push_str(&message);
+        // `truncated` is also set when a control character was merely removed, so the kept length
+        // has to have reached the limit as well before the text counts as cut.
+        if bounded.truncated && bounded.text.chars().count() >= limit {
+            line.push_str(&format!(
+                " ... [truncated: first {limit} characters of the message shown]"
+            ));
+        }
     }
     if let Some(code) = &vendor.vendor_code {
         line.push_str(&format!(" (vendor code {code})"));
@@ -692,13 +716,117 @@ mod tests {
         );
     }
 
+    fn vendor_failure(message: &str) -> Error {
+        Error::Vendor(mango_external_agents::VendorError::new(
+            mango_external_agents::ErrorCode::from_static("claude-structured-output-missing"),
+            message,
+        ))
+    }
+
+    /// The final summary of a failed command names the code the vendor reported and the reason it
+    /// gave: a script that reads only the summary cannot otherwise tell why a turn failed.
+    #[test]
+    fn a_command_failure_summary_names_the_vendor_code_and_message() {
+        let shown = super::command_failure(&vendor_failure("the schema was not satisfied"));
+        assert_eq!(
+            shown, "claude-structured-output-missing: vendor failure: the schema was not satisfied",
+            "expected the vendor code and message | received: {shown}"
+        );
+    }
+
+    /// A vendor error that an operation annotated (here with its dispatch) keeps its message.
+    #[test]
+    fn a_command_failure_summary_keeps_the_message_of_an_annotated_vendor_error() {
+        let annotated = vendor_failure("the vendor took it and failed it")
+            .with_dispatch(mango_external_agents::Dispatch::Accepted);
+        let shown = super::command_failure(&annotated);
+        assert_eq!(
+            shown,
+            "claude-structured-output-missing: vendor failure: the vendor took it and failed it",
+            "expected the message under the dispatch annotation | received: {shown}"
+        );
+    }
+
+    /// The message is vendor text printed at a terminal: nothing in it may act on the terminal,
+    /// and a line break may not read as a second line of the tool's own output.
+    #[test]
+    fn a_command_failure_summary_escapes_control_characters_in_the_vendor_message() {
+        let shown = super::command_failure(&vendor_failure(
+            "line one\nline two\ttabbed \u{1b}[31mred\u{1b}[0m bell\u{7} bidi\u{202e}gnp.exe \u{2028}end",
+        ));
+        assert!(
+            !shown.chars().any(super::turn::is_terminal_active),
+            "expected no terminal-active character in the summary | received: {shown:?}"
+        );
+        // A line break, a tab and U+2028 survive the redaction read and become visible escapes.
+        // The escape sequences' own bytes are removed by that read, and the words stay.
+        for expected in [
+            "line one\\nline two\\ttabbed",
+            "red",
+            "bell",
+            "bidi",
+            "gnp.exe",
+            "\\u2028end",
+        ] {
+            assert!(
+                shown.contains(expected),
+                "expected the summary to hold {expected:?} | received: {shown:?}"
+            );
+        }
+    }
+
+    /// Longer than `TextLimit::ErrorMessage` allows, so the cut says so and says how much stayed.
+    #[test]
+    fn a_command_failure_summary_cuts_an_over_long_vendor_message_with_a_marker() {
+        let limit = mango_external_agents::normalize::TextLimit::ErrorMessage.max_code_points();
+        let shown = super::command_failure(&vendor_failure(&"x".repeat(limit + 500)));
+        let expected = format!(
+            "claude-structured-output-missing: vendor failure: {} ... [truncated: first {limit} characters of the message shown]",
+            "x".repeat(limit)
+        );
+        assert_eq!(
+            shown, expected,
+            "expected the message cut at {limit} characters with a marker"
+        );
+    }
+
+    /// A message that fits, even one that held a control character the redaction read removed, is
+    /// not reported as cut.
+    #[test]
+    fn a_command_failure_summary_does_not_claim_a_cut_for_a_short_message() {
+        let shown = super::command_failure(&vendor_failure("short\u{1b}[0m"));
+        assert!(
+            !shown.contains("truncated"),
+            "expected no truncation marker on a short message | received: {shown}"
+        );
+    }
+
+    /// An empty message leaves the code alone, with no dangling separator.
+    #[test]
+    fn a_command_failure_summary_for_an_empty_vendor_message_is_the_bare_code() {
+        for message in ["", "  \n\t "] {
+            let shown = super::command_failure(&vendor_failure(message));
+            assert_eq!(
+                shown, "claude-structured-output-missing: vendor failure",
+                "expected the bare code for message {message:?} | received: {shown}"
+            );
+        }
+    }
+
     /// A probe-only harness that records dispatch without running a vendor CLI.
     struct CountingDiscoveryHarness {
         descriptor: HarnessDescriptor,
         probes: Arc<AtomicUsize>,
+        /// The vendor message a probe fails with; `None` probes as not installed.
+        probe_failure: Option<&'static str>,
     }
 
     impl CountingDiscoveryHarness {
+        fn failing_probe(mut self, message: &'static str) -> Self {
+            self.probe_failure = Some(message);
+            self
+        }
+
         fn new(identity: HarnessIdentity, probes: Arc<AtomicUsize>) -> Self {
             Self {
                 descriptor: HarnessDescriptor {
@@ -714,6 +842,7 @@ mod tests {
                     vendor_environment_keys: &[],
                 },
                 probes,
+                probe_failure: None,
             }
         }
     }
@@ -730,6 +859,12 @@ mod tests {
 
         async fn probe(&self, _host: &HostContext) -> Result<Discovery> {
             self.probes.fetch_add(1, Ordering::Relaxed);
+            if let Some(message) = self.probe_failure {
+                return Err(Error::Vendor(mango_external_agents::VendorError::new(
+                    mango_external_agents::ErrorCode::from_static("probe-failed"),
+                    message,
+                )));
+            }
             Ok(Discovery::not_installed())
         }
 
@@ -827,6 +962,26 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].kind, HarnessId::codex());
         assert_eq!(probes.load(Ordering::Relaxed), registry.len() + 1);
+    }
+
+    /// A sweep that cannot probe one harness reports why, not only the code.
+    #[tokio::test]
+    async fn a_failed_discovery_report_carries_the_vendors_message() {
+        let registry = HarnessRegistry::new(vec![Arc::new(
+            CountingDiscoveryHarness::new(HarnessIdentity::codex(), Arc::default())
+                .failing_probe("the version probe timed out"),
+        ) as Arc<dyn Harness>])
+        .expect("expected a fake registry");
+
+        let reports = discover_with(&registry, &fake_host(), None)
+            .await
+            .expect("expected discovery to finish");
+
+        assert_eq!(
+            reports[0].result.as_ref().err().map(String::as_str),
+            Some("probe-failed: vendor failure: the version probe timed out"),
+            "expected the probe's code and message in the report"
+        );
     }
 
     #[tokio::test]

@@ -159,7 +159,7 @@ async fn run_turn(
     with_cleanup(outcome, closed, |primary| {
         eprintln!(
             "turn failed before cleanup: {}",
-            crate::failure::describe(primary)
+            crate::command_failure(primary)
         );
     })
 }
@@ -709,14 +709,7 @@ const STRUCTURED_OUTPUT_LABEL: &str = "structured output: ";
 ///
 /// For example, `{"verdict":"pass"}` prints as `structured output: {"verdict":"pass"}`.
 fn structured_output_line(value: &serde_json::Value) -> String {
-    let mut escaped = String::new();
-    for character in value.to_string().chars() {
-        if is_terminal_active(character) {
-            escaped.push_str(&format!("\\u{:04x}", u32::from(character)));
-        } else {
-            escaped.push(character);
-        }
-    }
+    let escaped = escape_terminal_text(&value.to_string());
     let limit = TextLimit::Detail.max_code_points();
     let total = escaped.chars().count();
     if total <= limit {
@@ -728,8 +721,29 @@ fn structured_output_line(value: &serde_json::Value) -> String {
     )
 }
 
+/// `text` with every character a terminal may act on written as a visible escape.
+///
+/// A line feed, carriage return and tab become `\n`, `\r` and `\t`, so the text stays on one line;
+/// every other terminal-active character becomes `\uXXXX`. Compact JSON holds none of the three
+/// whitespace controls raw, so escaping a serialised value changes nothing the serialiser wrote.
+pub(crate) fn escape_terminal_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            active if is_terminal_active(active) => {
+                escaped.push_str(&format!("\\u{:04x}", u32::from(active)));
+            }
+            plain => escaped.push(plain),
+        }
+    }
+    escaped
+}
+
 /// Whether a terminal may act on this character, or it can hide or reorder the text around it.
-fn is_terminal_active(character: char) -> bool {
+pub(crate) fn is_terminal_active(character: char) -> bool {
     character.is_control()
         || matches!(
             u32::from(character),
@@ -1902,6 +1916,24 @@ mod tests {
         }
     }
 
+    /// A vendor failure whose process cleanup is still owed keeps its message and the pid note.
+    #[test]
+    fn a_vendor_failure_under_a_cleanup_control_keeps_its_message_and_the_pid_note() {
+        let error = Error::CleanupRequired {
+            control: Arc::new(CleanupControl(Some(4242))),
+            source: Box::new(Error::Vendor(VendorError::new(
+                ErrorCode::from_static("scripted-vendor-failure"),
+                "the scripted vendor failure",
+            ))),
+        };
+        let summary = crate::command_failure(&error);
+        assert_eq!(
+            summary,
+            "scripted-vendor-failure: vendor failure: the scripted vendor failure; process-tree cleanup is unconfirmed for launched pid 4242; inspect the process before retrying",
+            "expected the vendor message ahead of the cleanup note | received: {summary}"
+        );
+    }
+
     /// Both process identities remain reportable before CLI result precedence discards one error.
     #[test]
     fn double_cleanup_failures_report_both_owners_without_repeating_a_stop() {
@@ -2537,6 +2569,20 @@ mod tests {
             answer_printed_as(&value),
             value,
             "expected the escaped line to stay JSON that reads back as the answer"
+        );
+    }
+
+    #[test]
+    fn escape_terminal_text_writes_whitespace_controls_by_name_and_the_rest_by_code() {
+        let escaped = super::escape_terminal_text("a\nb\rc\td\u{1b}e\u{202e}f\u{2029}g");
+        assert_eq!(
+            escaped, "a\\nb\\rc\\td\\u001be\\u202ef\\u2029g",
+            "expected each terminal-active character written as an escape | received: {escaped:?}"
+        );
+        assert_eq!(
+            super::escape_terminal_text("plain é 日 🍋"),
+            "plain é 日 🍋",
+            "expected printable text left alone"
         );
     }
 
