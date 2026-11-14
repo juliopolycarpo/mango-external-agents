@@ -27,6 +27,7 @@ on:
       - .github/workflows/fresh-dependencies.yml
       - scripts/fresh-receipt.sh
       - scripts/check-features.sh
+      - scripts/run-without-self-dev-dependency.sh
 
 permissions:
   contents: read
@@ -114,7 +115,7 @@ jobs:
       - id: gate_clippy_no_default_features
         name: Clippy (workspace, no default features)
         if: ${{ !cancelled() && steps.resolve.outcome == 'success' }}
-        run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+        run: scripts/run-without-self-dev-dependency.sh cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
       - id: gate_nextest
         name: Tests
         if: ${{ !cancelled() && steps.resolve.outcome == 'success' }}

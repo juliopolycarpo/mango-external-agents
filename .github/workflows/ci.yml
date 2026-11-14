@@ -41,7 +41,7 @@ jobs:
           tool: cargo-hack,cargo-nextest
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+      - run: scripts/run-without-self-dev-dependency.sh cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
       - run: scripts/check-features.sh powerset --locked
       - run: cargo nextest run --workspace --all-features --locked
       - if: matrix.os == 'ubuntu-latest'

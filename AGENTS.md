@@ -22,10 +22,11 @@ It is a library, not a daemon: no listener, no service, no telemetry, no login h
 1. Read this file, then `docs/compliance.md` if the change touches a vendor surface.
 2. Start from the closest entrypoint: a trait in core, a harness reducer, a fixture, a test.
 3. Trace one layer outward at a time: core traits → harness crate → fixtures → `mea` → docs.
-4. Run the smallest relevant validation first (one `cargo nextest run -p <crate> --all-features`
-   filter), then `scripts/check.sh` before handoff. Without `--all-features`, targets gated on a
-   feature (the `testing` integration tests) are skipped silently and the run still passes;
-   `docs/testing.md` records why a self dev-dependency does not replace the flag.
+4. Run the smallest relevant validation first (one `cargo nextest run -p <crate>` filter), then
+   `scripts/check.sh` before handoff. Each library crate lists itself as a dev-dependency with its
+   test features, so the bare command runs the feature-gated targets too. Lanes that build test
+   targets of a reduced feature set go through `scripts/run-without-self-dev-dependency.sh`;
+   `docs/testing.md` explains why.
 
 ## Layout
 

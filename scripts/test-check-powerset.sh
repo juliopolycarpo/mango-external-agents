@@ -37,16 +37,36 @@ for file in .github/workflows/ci.yml scripts/check.sh; do
     fail "expected $file to run cargo hack only through scripts/check-features.sh | received: $stray"
   fi
 done
+# The workspace clippy with no default features selects test targets, so it needs the copy as well.
+for file in .github/workflows/ci.yml .github/workflows/fresh-dependencies.yml scripts/check.sh; do
+  bare=$(grep -v '^ *#' "$file" | grep -c 'clippy --workspace --all-targets --no-default-features' || true)
+  wrapped=$(grep -v '^ *#' "$file" | grep -c 'run-without-self-dev-dependency.sh cargo clippy --workspace --all-targets --no-default-features' || true)
+  if [ "$bare" -ne 1 ] || [ "$wrapped" -ne 1 ]; then
+    fail "expected $file to run the workspace clippy with --no-default-features once, through scripts/run-without-self-dev-dependency.sh | received $bare run(s), $wrapped wrapped"
+  fi
+done
 expected_powerset="cargo hack clippy --feature-powerset --depth 2 --all-targets --locked $packages -- -D warnings"
+# The lanes that select test targets run inside the copy without the self dev-dependency; the
+# wrapper's own log line is how this test sees that, since FakeWithoutSelf only logs and execs.
+wrapper_prefix='without-self-dev-dependency:'
 
 mkdir -p "$work/scripts" "$work/bin"
 cp scripts/check.sh scripts/check-features.sh "$work/scripts/"
 # The driver reads the declared minimum from the workspace manifest in its msrv lane.
 cp Cargo.toml "$work/Cargo.toml"
 
-# FakeGate: stands in for every directly executed script that check.sh runs, except the driver.
-# The driver is the unit under test and stays real.
-gates=$(grep -oE 'run scripts/[A-Za-z0-9._-]+\.(sh|py)' scripts/check.sh | sed 's/^run //' | sort -u | grep -vxF scripts/check-features.sh)
+# FakeWithoutSelf: stands in for scripts/run-without-self-dev-dependency.sh. It logs the wrapped
+# command, then runs it in place; the real script has its own test.
+cat > "$work/scripts/run-without-self-dev-dependency.sh" <<'FAKE_WITHOUT_SELF'
+#!/usr/bin/env bash
+echo "without-self-dev-dependency: $*" >> "$FAKE_CARGO_LOG"
+exec "$@"
+FAKE_WITHOUT_SELF
+chmod +x "$work/scripts/run-without-self-dev-dependency.sh"
+
+# FakeGate: stands in for every directly executed script that check.sh runs, except the driver
+# (the unit under test, which stays real) and the runner (FakeWithoutSelf above).
+gates=$(grep -oE 'run scripts/[A-Za-z0-9._-]+\.(sh|py)' scripts/check.sh | sed 's/^run //' | sort -u | grep -vxF -e scripts/check-features.sh -e scripts/run-without-self-dev-dependency.sh)
 for gate in $gates; do
   printf '#!/usr/bin/env bash\nexit 0\n' > "$work/$gate"
   chmod +x "$work/$gate"
@@ -105,6 +125,11 @@ hack_runs=$(printf '%s\n' "$cargo_log" | grep -c '^cargo hack clippy ' || true)
 if [ "$hack_runs" -ne 1 ] || ! printf '%s\n' "$cargo_log" | grep -Fxq "$expected_powerset"; then
   fail "expected scripts/check.sh to run the powerset once: '$expected_powerset' | received $hack_runs run(s) among: $(printf '%s\n' "$cargo_log" | grep '^cargo hack clippy ' || echo none)"
 fi
+# The all-targets powerset must run inside the copy: in the real tree the self dev-dependency would
+# widen every reduced-feature target to the test features.
+if ! printf '%s\n' "$cargo_log" | grep -Fxq "$wrapper_prefix $expected_powerset"; then
+  fail "expected the powerset to run through scripts/run-without-self-dev-dependency.sh: '$wrapper_prefix $expected_powerset' | received: $(printf '%s\n' "$cargo_log" | grep -F "$wrapper_prefix" || echo none)"
+fi
 
 # One feature pair failing Clippy fails the script, which then never reports success.
 run_check installed 'hack clippy'
@@ -158,6 +183,12 @@ if [ "$status" -ne 0 ]; then
   fail "expected scripts/check-features.sh msrv to pass with cargo-hack and every cargo call green | received exit $status: $(cat "$work/stderr")"
 fi
 cargo_log=$(cat "$work/cargo.log")
+# Only the line that builds test targets runs in the copy; the library-only runs keep the real tree.
+wrapped=$(printf '%s\n' "$cargo_log" | grep -F "$wrapper_prefix" || true)
+expected_wrapped="$wrapper_prefix cargo +$toolchain check -p mango-external-agents --no-default-features --all-targets --locked"
+if [ "$wrapped" != "$expected_wrapped" ]; then
+  fail "expected the msrv lane to wrap only the bare-core all-targets check: '$expected_wrapped' | received: ${wrapped:-none}"
+fi
 for expected in \
   "cargo +$toolchain hack check --each-feature --skip default --exclude-all-features --locked $packages" \
   "cargo +$toolchain check -p mango-external-agents --all-features --locked" \

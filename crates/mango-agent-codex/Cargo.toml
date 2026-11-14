@@ -37,6 +37,7 @@ serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
+mango-agent-codex = { path = ".", features = ["testing", "unix-socket"] }
 mango-external-agents = { workspace = true, features = ["launcher-tokio", "stdio", "testing"] }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }
 

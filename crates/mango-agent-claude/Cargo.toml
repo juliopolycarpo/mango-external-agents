@@ -80,6 +80,7 @@ tokio = { workspace = true, features = ["fs", "macros", "rt", "sync", "time"] }
 nix = { workspace = true, features = ["user"] }
 
 [dev-dependencies]
+mango-agent-claude = { path = ".", features = ["testing"] }
 mango-external-agents = { workspace = true, features = ["stdio", "testing"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 
