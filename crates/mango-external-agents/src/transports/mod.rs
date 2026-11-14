@@ -4,6 +4,8 @@
 //! harness's reducer — is written once and works over any of them. Which kinds a harness accepts
 //! is declared in its descriptor and enforced before anything is spawned.
 
+#[cfg(feature = "websocket")]
+mod socket;
 #[cfg(feature = "stdio")]
 pub mod stdio;
 #[cfg(feature = "websocket")]
