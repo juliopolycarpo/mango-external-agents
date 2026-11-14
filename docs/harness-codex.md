@@ -1406,8 +1406,9 @@ repeated cursor. The sent `model/list` pages and their answers are part of the t
 first header line, so a fixture states what it ran on; a capture without the flag has neither the
 line nor the check, and the committed fixtures are unchanged. The `user-defaults` scenario exists to
 record the user's own defaults, so under `--model` it records the user's defaults for everything
-except the model. Contract captures and the other harnesses refuse the flag with `(mea capture):
-expected --model with a Codex transcript capture ... | received ...`.
+except the model. Contract captures and the harnesses with no transcript recorder refuse the flag with `(mea
+capture): expected --model with a transcript capture ... | received ...`; Claude takes it too, see
+[the Claude guide](harness-claude.md#transcript-capture).
 
 The approval fixture records a **refusal**. A fixture that captured a grant would be a recording of
 this tool letting an agent out of its sandbox, checked into the repository.

@@ -33,7 +33,9 @@ through `ClaudeHarness`; a launcher wrapper copies the stdout of the turn launch
 transcripts the file is archival and has no manifest, with `# claude/...` and `# capture {json}`
 header lines that give the `claude --version` line and the capture time, and it is redacted at write
 time (credential-shaped members such as `credential_expires_at`, account identity, the capture's
-paths). The labels and cleanup rules above apply: `# incomplete capture` in
+paths). `--model ID` runs the turn on that model and adds a `# model: ID` line after the first
+header line, as the Codex recorder does; without it there is no such line and the account's own
+default applies. The labels and cleanup rules above apply: `# incomplete capture` in
 `structured-output.partial.jsonl` when the run fails or the child's stop is unconfirmed, `#
 unqualified capture` in `structured-output.unqualified.jsonl` when the file lacks an assistant
 `StructuredOutput` tool call or a final `result` with an object `structured_output`. The file is an
