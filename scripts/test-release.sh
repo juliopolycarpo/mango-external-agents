@@ -374,6 +374,46 @@ printf '[dev-dependencies]\nsibling = "1.0"\n\n[target."cfg(unix)".dependencies]
 for accepted in target-widened different-targets root-dev-target-normal; do
   scripts/check-dev-dependencies.sh "$dev_fixture/$accepted.toml" >/dev/null
 done
+# A crate's dev-dependency on itself is dropped on purpose: it turns on the gated test features for
+# a bare `cargo nextest run -p <crate>`. Only the exact shape is accepted, in the root table.
+printf '[package]\nname = "selfish"\n\n[dev-dependencies]\nselfish = { path = ".", features = ["testing", "unix-socket"] }\n' > "$dev_fixture/self-kept.toml"
+scripts/check-dev-dependencies.sh "$dev_fixture/self-kept.toml" >/dev/null
+self_shapes=(
+  'selfish = { path = "." }'
+  'selfish = { path = ".", features = [] }'
+  'selfish = { path = ".", features = ["default"] }'
+  'selfish = { path = ".", features = ["testing"], default-features = false }'
+  'selfish = { path = ".", version = "0.1.0", features = ["testing"] }'
+  'selfish = { path = "../selfish", features = ["testing"] }'
+  'selfish = "0.1.0"'
+)
+for shape in "${self_shapes[@]}"; do
+  printf '[package]\nname = "selfish"\n\n[dev-dependencies]\n%s\n' "$shape" > "$dev_fixture/self-shape.toml"
+  if scripts/check-dev-dependencies.sh "$dev_fixture/self-shape.toml" >/dev/null 2>"$dev_fixture/self-shape.err"; then
+    echo "expected rejection of the self dev-dependency '$shape', received success" >&2
+    exit 1
+  fi
+  grep -Fq "self-shape.toml: [dev-dependencies] selfish = " "$dev_fixture/self-shape.err" &&
+    grep -Fq "expected a crate's dev-dependency on itself only in [dev-dependencies]" "$dev_fixture/self-shape.err" || {
+    echo "expected the rejection of '$shape' to name the entry and the self shape, received: $(cat "$dev_fixture/self-shape.err")" >&2
+    exit 1
+  }
+done
+printf '[package]\nname = "selfish"\n\n[target.x86_64-unknown-linux-gnu.dev-dependencies]\nselfish = { path = ".", features = ["testing"] }\n' > "$dev_fixture/self-target.toml"
+if scripts/check-dev-dependencies.sh "$dev_fixture/self-target.toml" >/dev/null 2>"$dev_fixture/self-target.err"; then
+  echo 'expected rejection of the self dev-dependency under a target table, received success' >&2
+  exit 1
+fi
+grep -Fq 'self-target.toml: [target.x86_64-unknown-linux-gnu.dev-dependencies] selfish = ' "$dev_fixture/self-target.err" || {
+  echo "expected the rejection to name the target table, received: $(cat "$dev_fixture/self-target.err")" >&2
+  exit 1
+}
+# Another crate's name is not exempt: a path-only entry for a sibling stays refused.
+printf '[package]\nname = "selfish"\n\n[dev-dependencies]\nsibling = { path = ".", features = ["testing"] }\n' > "$dev_fixture/sibling-dot.toml"
+if scripts/check-dev-dependencies.sh "$dev_fixture/sibling-dot.toml" >/dev/null 2>&1; then
+  echo 'expected rejection of a path-only entry for a crate other than the package, received success' >&2
+  exit 1
+fi
 rm -rf "$dev_fixture"
 trap - EXIT
 scripts/check-dev-dependencies.sh >/dev/null
@@ -474,6 +514,35 @@ printf '[dependencies]\nagent-client-protocol-schema = { package = "other-schema
 expect_workspace_rejection root.toml crates/mango-agent-acp/Cargo.toml 'mango-agent-acp/Cargo.toml: [dependencies] agent-client-protocol-schema = ' "'package': 'other-schema'"
 printf '[dependencies]\nagent-client-protocol-schema = { version = "=1.0.0" }\n' > "$workspace_fixture/crates/mango-agent-acp/Cargo.toml"
 expect_workspace_rejection root.toml crates/mango-agent-acp/Cargo.toml 'mango-agent-acp/Cargo.toml: [dependencies] agent-client-protocol-schema = ' "=1.0.0"
+# A crate's dev-dependency on itself needs no workspace inheritance; any other shape is refused.
+printf '[package]\nname = "selfish"\n\n[dev-dependencies]\nselfish = { path = ".", features = ["testing", "unix-socket"] }\nplain.workspace = true\nshared.workspace = true\n' > "$workspace_fixture/self-kept.toml"
+python3 scripts/check-workspace-dependencies.py "$workspace_fixture/root.toml" "$workspace_fixture/self-kept.toml"
+self_workspace_shapes=(
+  'selfish = { path = "." }'
+  'selfish = { path = ".", features = [] }'
+  'selfish = { path = ".", features = ["default"] }'
+  'selfish = { path = ".", features = ["testing"], default-features = false }'
+  'selfish = { path = ".", version = "1.0", features = ["testing"] }'
+  'selfish = { workspace = true, features = ["testing"] }'
+)
+for shape in "${self_workspace_shapes[@]}"; do
+  printf '[package]\nname = "selfish"\n\n[dev-dependencies]\n%s\nplain.workspace = true\n' "$shape" > "$workspace_fixture/self-shape.toml"
+  if python3 scripts/check-workspace-dependencies.py "$workspace_fixture/root.toml" "$workspace_fixture/self-shape.toml" 2>"$workspace_fixture/rejection.err"; then
+    echo "expected rejection of the self dev-dependency '$shape', received success" >&2
+    exit 1
+  fi
+  for required in 'self-shape.toml: [dev-dependencies] selfish = ' "expected a crate's dev-dependency on itself written as"; do
+    grep -Fq "$required" "$workspace_fixture/rejection.err" || {
+      echo "expected the rejection of '$shape' to contain '$required', received: $(cat "$workspace_fixture/rejection.err")" >&2
+      exit 1
+    }
+  done
+done
+# Only the root dev table is exempt, and only for the package's own name.
+printf '[package]\nname = "selfish"\n\n[target.x.dev-dependencies]\nselfish = { path = ".", features = ["testing"] }\nplain.workspace = true\n' > "$workspace_fixture/self-target.toml"
+expect_workspace_rejection root.toml self-target.toml 'self-target.toml: [target.x.dev-dependencies] selfish = ' "'path': '.'"
+printf '[package]\nname = "selfish"\n\n[dev-dependencies]\nother = { path = ".", features = ["testing"] }\nplain.workspace = true\n' > "$workspace_fixture/other-dot.toml"
+expect_workspace_rejection root.toml other-dot.toml 'other-dot.toml: [dev-dependencies] other = ' "'path': '.'"
 rm -rf "$workspace_fixture"
 trap - EXIT
 python3 scripts/check-workspace-dependencies.py Cargo.toml crates/*/Cargo.toml examples/*/Cargo.toml

@@ -5,6 +5,11 @@
 it turned on are gone when the tarball's tests are built. `workspace = true`, or a `version` beside
 the `path`, keeps it.
 
+The one exception is a crate's dev-dependency on itself, `name = { path = ".", features = [...] }`
+in the root `[dev-dependencies]`. Dropping it is the point: it makes a bare `cargo nextest run -p
+<crate>` run the feature-gated targets, and the published manifest must not depend on the crate
+itself. Any other entry named like the crate is refused; docs/testing.md explains the entry.
+
 A dev-dependency whose specification equals the `[dependencies]` entry of the same name adds
 nothing: tests already see every normal dependency. It is refused so a second copy of a version
 requirement cannot drift from the first. An entry that turns on a feature the normal one does not
@@ -37,13 +42,30 @@ def specification(spec):
     return spec if isinstance(spec, dict) else {"version": spec}
 
 
+def is_self_dev_dependency(spec):
+    """True for exactly `{ path = ".", features = [one or more names] }`, never `default`."""
+    return (
+        isinstance(spec, dict)
+        and set(spec) == {"path", "features"}
+        and spec["path"] == "."
+        and isinstance(spec["features"], list)
+        and len(spec["features"]) > 0
+        and all(isinstance(feature, str) and feature != "default" for feature in spec["features"])
+    )
+
+
 def offenders(path):
     """Yields (kind, line) for each dev-dependency of the manifest at `path` that is refused."""
     with open(path, "rb") as handle:
         manifest = tomllib.load(handle)
+    package_name = manifest.get("package", {}).get("name")
     for label, table, normal_tables in dev_dependency_tables(manifest):
         for name, spec in table.items():
             line = f'{path}: [{label}] {name} = {spec}'
+            if name == package_name:
+                if label != "dev-dependencies" or not is_self_dev_dependency(spec):
+                    yield "self", line
+                continue
             # Compare both candidates: a different target entry must not hide a root match.
             if any(
                 name in dependencies and specification(spec) == specification(dependencies[name])
@@ -62,6 +84,9 @@ def main(paths):
         return 2
     found = [offender for path in paths for offender in offenders(path)]
     expectations = {
+        "self": "expected a crate's dev-dependency on itself only in [dev-dependencies], written "
+        'as name = { path = ".", features = [...] } with at least one feature other than '
+        "default, received:",
         "dropped": "expected each dev-dependency to use workspace = true or carry a version beside "
         "its path, because cargo drops a path-only entry from the published manifest, received:",
         "redundant": "expected each dev-dependency to differ from the [dependencies] entry of the "

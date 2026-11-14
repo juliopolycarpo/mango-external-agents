@@ -8,7 +8,10 @@
 #
 # An entry that repeats the `[dependencies]` entry of the same name is refused as well: tests see
 # every normal dependency already, so the copy is only a second version requirement to keep in
-# step. The parsing is in check-dev-dependencies.py.
+# step.
+#
+# The exception to the first rule is a crate's dev-dependency on itself, with its test features:
+# packaging is meant to drop it. The parsing is in check-dev-dependencies.py.
 #
 # Usage: scripts/check-dev-dependencies.sh [manifest...]
 #   with no arguments, every publishable crate's manifest under crates/ is checked.

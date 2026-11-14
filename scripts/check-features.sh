@@ -4,8 +4,8 @@
 # edit and a new feature needs none (cargo-hack reads the features from each manifest).
 #
 #   powerset  the development toolchain from rust-toolchain.toml. Clippy over every feature pair
-#             (depth 2) of each crate, all targets, warnings denied. Run by CI's `rust` job and
-#             scripts/check.sh.
+#             (depth 2) of each crate, all targets, warnings denied, in a copy without the crates'
+#             self dev-dependency (see below). Run by CI's `rust` job and scripts/check.sh.
 #   msrv      the workspace `rust-version`, not the development toolchain. A compile check of
 #             library targets, one package at a time: the bare crate and each feature alone, plus the
 #             core with all features and the bare core with all targets. Run by CI's `msrv` job, the
@@ -18,6 +18,12 @@
 # one shared build. The msrv lane checks library targets only, except for the final bare-core line:
 # building a test or bench target adds the dev-dependencies' own features (tokio's `net`,
 # `rt-multi-thread`), which would hide a missing feature on the library itself.
+#
+# Every lane that selects test, example or bench targets runs through
+# scripts/run-without-self-dev-dependency.sh. Each crate lists itself as a dev-dependency with its
+# test features, and cargo unifies those into every target of the crate, library included, once a
+# dev target is selected, so `--all-targets` in the real tree builds no reduced-feature library or
+# test target. The copy has the entry removed; the library-only runs above never see it.
 #
 # Extra arguments go to every cargo call (`--locked` for the committed lock; none for a freshly
 # resolved one). A missing cargo-hack or toolchain is an error here; only scripts/check.sh chooses
@@ -80,7 +86,7 @@ done
 run() { echo "▶ $*"; "$@"; }
 
 if [ "$lane" = powerset ]; then
-  run cargo hack clippy --feature-powerset --depth 2 --all-targets ${extra[@]+"${extra[@]}"} "${packages[@]}" -- -D warnings
+  run scripts/run-without-self-dev-dependency.sh cargo hack clippy --feature-powerset --depth 2 --all-targets ${extra[@]+"${extra[@]}"} "${packages[@]}" -- -D warnings
   exit 0
 fi
 
@@ -97,5 +103,5 @@ rustc "+$toolchain" --version --verbose
 # is the build a host that supplies its own transport and launcher compiles.
 run cargo "+$toolchain" hack check --each-feature --skip default --exclude-all-features ${extra[@]+"${extra[@]}"} "${packages[@]}"
 run cargo "+$toolchain" check -p "$core_crate" --all-features ${extra[@]+"${extra[@]}"}
-run cargo "+$toolchain" check -p "$core_crate" --no-default-features --all-targets ${extra[@]+"${extra[@]}"}
+run scripts/run-without-self-dev-dependency.sh cargo "+$toolchain" check -p "$core_crate" --no-default-features --all-targets ${extra[@]+"${extra[@]}"}
 echo "✓ isolated feature checks passed on Rust $toolchain"

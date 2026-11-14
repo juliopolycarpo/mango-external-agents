@@ -1,49 +1,71 @@
 # Running one crate's tests
 
-Run a single crate with the feature flag:
-
 ```sh
-cargo nextest run -p <crate> --all-features
+cargo nextest run -p <crate>
 ```
 
-Without `--all-features`, targets gated on a feature are skipped and the run still passes. Counts
-at 0.8.0:
+Each library crate lists itself as a dev-dependency with its test features, so the bare command
+runs the feature-gated targets (`testing`, `unix-socket`, `websocket`, `launcher-tokio`) and
+matches `--all-features`. The counts are identical with and without the flag:
 
 | Command                                       | core | claude | codex | acp |
 | --------------------------------------------- | ---: | -----: | ----: | --: |
-| `cargo nextest run -p <crate>`                | 1213 |    337 |   721 | 310 |
-| `cargo nextest run -p <crate> --all-features` | 1271 |    651 |   743 | 631 |
+| `cargo nextest run -p <crate>`                | 1271 |    656 |   743 | 631 |
+| `cargo nextest run -p <crate> --all-features` | 1271 |    656 |   743 | 631 |
 
-The gated targets are the `testing` integration tests of Claude and ACP, the `unix-socket` tests of
-Codex, and the `websocket`, `unix-socket`, `launcher-tokio` and `testing` tests of the core.
-
-## Why the flag stays
-
-A path-only dev-dependency of a crate on itself makes the bare command run everything:
+## The entry
 
 ```toml
 [dev-dependencies]
 mango-agent-claude = { path = ".", features = ["testing"] }
 ```
 
-`cargo package` drops it from the published manifest, `scripts/check-dev-dependencies.sh` and
-`scripts/check-versions.sh` can be taught to accept exactly that entry, and `cargo nextest run -p
-<crate>` then matches `--all-features` in all four crates. It was built and measured, and it is
-not adopted: cargo unifies the entry's features into every target of the crate, library included,
-whenever dev targets are selected.
+The core takes `launcher-tokio`, `testing`, `unix-socket` and `websocket`. Claude and ACP take
+`testing`. Codex takes `testing` and `unix-socket`. With each crate's defaults that is
+`--all-features`.
 
-Probe: with `#[cfg(not(feature = "testing"))] compile_error!(...)` in the core's `lib.rs`,
+- `cargo package` drops a path-only dev-dependency from the published manifest, so no published
+  crate depends on itself.
+- `scripts/check-dev-dependencies.py` and `scripts/check-workspace-dependencies.py` accept exactly
+  that shape: the crate's own name in the root `[dev-dependencies]`, `path = "."`, and a non-empty
+  `features` list without `default`. Any other entry named like the crate is refused.
+  `scripts/test-release.sh` covers the accepted shape and each refused one.
+- The tarball has no entry, so `scripts/test-packages.sh` runs the extracted packages with
+  `--all-features`.
 
-- without the entry, `cargo hack clippy --feature-powerset --depth 2 --all-targets -p mango-external-agents`
-  fails on the probe, as it should;
-- with the entry, the same command and `cargo clippy --all-targets --no-default-features` both
-  pass, and the library is built with `default`, `launcher-tokio`, `stdio`, `testing`,
-  `unix-socket` and `websocket` under `--no-default-features`.
+## Feature lanes
 
-Every `--all-targets` feature lane in `scripts/check.sh` and CI would stay green while no longer
-building a reduced-feature library or test target. That is the coverage the `required-features`
-declarations and the powerset exist to give, so it costs more than the flag. Only
-`scripts/check-msrv-features.sh`, which checks library targets alone, would be unaffected.
+Once a test, example or bench target is selected, cargo unifies the entry's features into every
+target of the crate, library included. `cargo clippy --all-targets --no-default-features -p
+mango-external-agents` builds the library with `default`, `launcher-tokio`, `stdio`, `testing`,
+`unix-socket` and `websocket`. A lane that selects those targets stays green while it builds no
+reduced-feature library or test target.
 
-The entry becomes safe once those lanes build the library without `--all-targets` and keep reduced
-feature test targets some other way. Until then, use `--all-features`.
+The probe is `#[cfg(not(feature = "testing"))] compile_error!(...)` in the core's `lib.rs` or in an
+integration test:
+
+| Lane                                                                               | Self entry | Probe fires |
+| ---------------------------------------------------------------------------------- | ---------- | ----------- |
+| `cargo hack clippy --feature-powerset --depth 2 -p mango-external-agents`          | present    | yes         |
+| the same with `--all-targets`                                                      | present    | no          |
+| the same with `--all-targets` through `scripts/run-without-self-dev-dependency.sh` | removed    | yes         |
+
+Without `--all-targets` cargo builds no dev target and resolves no dev-dependency, so a
+library-only lane is unaffected by the entry. A lane with test targets is not: no cargo switch
+ignores one dev-dependency, and `cargo hack --no-dev-deps` drops the others too.
+`scripts/run-without-self-dev-dependency.sh` runs a command in a scratch copy of the workspace
+whose manifests lack the entry and whose `Cargo.lock` lacks the self edges. It refuses a copy whose
+lock differs by anything else, a self entry it cannot strip, and a workspace with no entry.
+
+These lanes run through it:
+
+- `scripts/check-features.sh powerset`: clippy over every feature pair, all targets.
+- The bare core with all targets, the last line of `scripts/check-features.sh msrv`.
+- `cargo clippy --workspace --all-targets --no-default-features` in `scripts/check.sh`, `ci.yml`
+  and `fresh-dependencies.yml`.
+
+The library-only runs (`cargo hack check --each-feature` in the msrv lane, `cargo check -p
+mango-external-agents --all-features`) stay in the real tree. `scripts/test-check-powerset.sh` pins
+which commands are wrapped. `scripts/test-run-without-self-dev-dependency.sh` reproduces the probe
+in a throwaway workspace: the in-tree `--all-targets` check passes with the feature off, and the
+same check through the runner fails.

@@ -80,6 +80,7 @@ windows = { workspace = true, features = ["Win32_System_Threading"], optional = 
 [dev-dependencies]
 # The oracle for `http_endpoint`: tests compare validation with the former harness parser.
 http.workspace = true
+mango-external-agents = { path = ".", features = ["launcher-tokio", "testing", "unix-socket", "websocket"] }
 # Short private directories for the Unix socket fakes: a socket path is capped near 100 bytes.
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }

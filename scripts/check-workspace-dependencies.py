@@ -5,7 +5,10 @@ Members inherit each dependency with ``workspace = true`` and choose their own a
 The workspace chooses versions and default features; members cannot explicitly request ``default``.
 Dependency feature forwarding in ``[features]`` follows the same rules. These checks govern
 manifest entries, not Cargo's feature unification across dependency edges.
-The sole exception is the exact, feature-free ``agent-client-protocol-schema`` registry pin in the
+A crate may list itself under `[dev-dependencies]` as `name = { path = ".", features = [...] }` so a
+bare `cargo nextest run -p <crate>` runs its feature-gated targets; it names no version to inherit
+and is dropped from the published manifest. docs/testing.md explains the entry.
+The other exception is the exact, feature-free ``agent-client-protocol-schema`` registry pin in the
 ACP manifest. No other manifest or workspace entry may name that crate, and root patches and
 replacements cannot override it. Cargo configuration outside these manifests is not checked.
 A third-party workspace entry no member takes is refused too, so a floor cannot outlive the last
@@ -54,13 +57,30 @@ def unused_offenders(root, members):
             yield "unused", f"{root}: [workspace.dependencies] {name} = {spec}"
 
 
+def is_self_dev_dependency(spec):
+    """True for exactly `{ path = ".", features = [one or more names] }`, never `default`."""
+    return (
+        isinstance(spec, dict)
+        and set(spec) == {"path", "features"}
+        and spec["path"] == "."
+        and isinstance(spec["features"], list)
+        and len(spec["features"]) > 0
+        and all(isinstance(feature, str) and feature != "default" for feature in spec["features"])
+    )
+
+
 def member_offenders(path, schema_manifest, workspace_schema_names):
     """Yields a reason and declaration for each member entry that violates the policy."""
     manifest = load(path)
+    package_name = manifest.get("package", {}).get("name")
     schema_names = {SCHEMA} | workspace_schema_names
     for label, table in dependency_tables(manifest):
         for name, spec in table.items():
             line = f"{path}: [{label}] {name} = {spec}"
+            if label == "dev-dependencies" and name == package_name:
+                if not is_self_dev_dependency(spec):
+                    yield "self", line
+                continue
             package = spec.get("package", name) if isinstance(spec, dict) else name
             if name == SCHEMA or package == SCHEMA:
                 schema_names.add(name)
@@ -159,6 +179,9 @@ def main(arguments):
         "inheritance": "expected each member dependency to use workspace = true, received:",
         "defaults": "expected inherited dependencies to omit default-features and the default "
         "feature so the workspace controls defaults, received:",
+        "self": "expected a crate's dev-dependency on itself written as "
+        'name = { path = ".", features = [...] } with at least one feature other than default, '
+        "received:",
         "features": "expected workspace dependency entries to omit features, received:",
         "unused": "expected every third-party workspace dependency to be declared by a member, "
         "received an entry no member takes:",
