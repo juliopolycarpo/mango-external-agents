@@ -35,7 +35,8 @@ The Codex initialize response is unchanged; initialize capabilities add explicit
 The inventory retains nineteen item families, adds GCP account support and optional subagent
 model/reasoning fields, and changes image-generation fields handled by the generic fallback.
 Decoder and named-fake tests cover those consumed changes. Public capture is not an
-authenticated vendor turn, a real subagent replay, or a publication.
+authenticated vendor turn or a publication; the real subagent capture is a separate, later
+recording (see [Fixtures](#fixtures)).
 
 ### Explicit gateway readiness
 
@@ -1322,7 +1323,7 @@ the condition the ACP convergence watch in #363 waits for.
 
 `fixtures/codex/` also holds archival conversations recorded by `mea capture codex` against a real
 `codex app-server`: `handshake`, `turn`, `approval`, `interrupt`, `review`, three additional review
-targets, `permission-transitions` and `user-defaults`. The redaction happens in the capture
+targets, `permission-transitions` and `user-defaults`, plus the opt-in `subagent` (below). The redaction happens in the capture
 (`examples/mea/src/redact.rs`). Incoming frames retain the wire shape, enum values and opaque
 identifiers that replay needs, while every other vendor string becomes `[REDACTED]`. Fixtures are
 protocol evidence, not a record of a model answer, command, tool result, review or reasoning.
@@ -1348,6 +1349,36 @@ This follows the official [app-server protocol](https://developers.openai.com/co
 and [subagent configuration](https://learn.chatgpt.com/docs/agent-configuration/subagents).
 Feature availability must be checked against the captured CLI version; enabling a process flag
 does not prove that the selected model emitted an attributed item.
+
+### The real subagent capture
+
+`fixtures/codex/subagent.jsonl` is one qualified capture: Codex 0.167.2, recorded on 2026-11-14
+(`capturedAtUnixSeconds` 1794636868 in its `# capture` header) with
+`mea capture --harness codex --transcripts --scenario subagent --model gpt-5.6-terra`. It is a
+maintainer capture that CI cannot reproduce, so it stays fixed; refreshing it means repeating that
+command on a machine with a working login. The transcript shows the parent turn start, a
+`subAgentActivity` item (`kind: started`) on `item/started` and `item/completed` that names the
+child in a nonempty `agentThreadId`, the child thread running its own turn, a
+`collabAgentToolCall`, and a second `subAgentActivity` (`kind: completed`, item id
+`subagent-completed-...`) before the parent's `turn/completed`.
+`tests/replay/subagent.rs` replays those bytes through `CodexHarness`: the child id becomes
+`Activity::subagent_id` on both subagent items; the parent turn stays the host's and ends once,
+since the child thread's own `turn/completed` does not end it; the `[REDACTED]` `agentPath`,
+`senderThreadId` and `tool` parse without being carried; and no approval, question, broker call,
+or response frame follows. A second test reads the fixture's header and server frames, so a
+synthetic file in its place fails by name. These tests are separate from the schema-shaped
+attribution tests that predate the capture.
+
+What the capture does not show:
+
+- It is one run, on one account type (a ChatGPT `free` plan), and the account's default model was
+  refused, so the capture passed `--model` with a model that account lists.
+- The `collabAgentToolCall` arrives with `[REDACTED]` sender and tool and an empty
+  `receiverThreadIds`, so no link from that call to the child is observed. `parent_id` stays
+  absent, and the harness does not infer one.
+- The child thread's own frames (`turn/started`, token usage, `turn/completed`) are on the shared
+  connection and are ignored as another conversation's, not attributed.
+- The model's reply text is redacted, so the capture says nothing about subagent output.
 
 `--model ID` opens every conversation's thread on that model instead of the user's configured
 one, and works with `--harness codex --transcripts` and with `mea capture codex`:
@@ -1416,7 +1447,8 @@ own id in `item_id`. The per-variant inventory regenerated from Codex 0.154.0's 
 `Activity::subagent_id` through `Activity::by_subagent`. The collaboration family's `senderThreadId`
 and `receiverThreadIds` do not identify this item. Missing or empty child identities stay absent,
 and no parent call id is inferred. This identity is for display only, never a host tool executor.
-The offline tests parse schema-shaped wire values; no authenticated subagent frame was captured.
+The offline tests parse schema-shaped wire values; the replay of the real 0.167.2 capture
+(see [Fixtures](#fixtures)) checks that the same attribution holds on the vendor's own frames.
 
 In 0.8, `ThreadItem::SubAgentActivity` gains `agent_thread_id: Option<String>`. A host constructing
 the wire variant must supply it (`None` preserves the previous behavior); a host matching the
@@ -1447,7 +1479,9 @@ The [crate README](../crates/mango-agent-codex/README.md#host-tests) describes t
 
 - No `ws://` transport, which the vendor labels experimental and unsupported, and the Unix socket
   attaches sessions only: `probe`, `discover` and `list_native_sessions` stay on stdio (see above).
-- Subagent attribution has pinned schema evidence but no authenticated replay capture yet.
+- Subagent attribution has one real capture (Codex 0.167.2, one `free` account, one model) and
+  the pinned schema. No capture links the collaboration tool call to the child, so no parent call
+  id is carried.
 - Claude-style plan structure has no counterpart; `plan` is freeform text at this pin.
 - `PermissionLevel` sends `AskForApproval::Never` (`never`) for read-only/full access and
   `AskForApproval::OnRequest` (`on-request`) for default access. `Untrusted` is modeled but
