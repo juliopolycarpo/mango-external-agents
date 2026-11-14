@@ -116,6 +116,25 @@ fn a_result_record_does_not_print_the_final_answer_or_errors() {
     assert_names("StreamRecord", &record, "result");
 }
 
+/// A `--json-schema` run's `result` carries the validated answer twice and the vendor's credential
+/// expiry. A debug-logged record must print none of them.
+#[test]
+fn a_structured_result_record_does_not_print_the_answer_or_the_credential_expiry() {
+    let record = record(
+        r#"{"type":"result","subtype":"success","is_error":false,
+            "result":"{\"word\":\"CANARY-answer-text\"}",
+            "structured_output":{"word":"CANARY-answer-object"},
+            "credential_expires_at":"CANARY-credential-expiry"}"#,
+    );
+    let canaries = [
+        ("result", "CANARY-answer-text"),
+        ("structured_output", "CANARY-answer-object"),
+        ("credential_expires_at", "CANARY-credential-expiry"),
+    ];
+    assert_omits("StreamRecord", &record, &canaries);
+    assert_omits("ResultRecord", &record.result(), &canaries);
+}
+
 #[test]
 fn the_init_record_and_a_permission_denial_do_not_print_their_members() {
     let init = record(

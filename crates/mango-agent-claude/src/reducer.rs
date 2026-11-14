@@ -2174,4 +2174,97 @@ mod tests {
             "expected a closed call's full buffer not to carry into a new call of the same id"
         );
     }
+
+    /// A `--json-schema` turn as Claude Code 2.1.325 streamed it, reduced to the members the
+    /// reducer reads. Measured on a live run (#362) and replayed here as inline frames, not a
+    /// fixture: `mea capture` has no Claude transcript recorder. `credential_expiry` stands in for
+    /// the `credential_expires_at` value, which is the vendor's and is never forwarded.
+    fn structured_answer_turn(credential_expiry: &str) -> Vec<String> {
+        let answer = json!({"word": "ok"});
+        vec![
+            json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_answer", "name": "StructuredOutput",
+                 "input": answer}]}})
+            .to_string(),
+            json!({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_answer",
+                 "content": "Structured output provided successfully"}]}})
+            .to_string(),
+            json!({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed"}})
+                .to_string(),
+            json!({"type": "result", "subtype": "success", "is_error": false,
+                   "result": answer.to_string(), "structured_output": answer,
+                   "credential_expires_at": credential_expiry,
+                   "usage": {"input_tokens": 3, "output_tokens": 5}})
+            .to_string(),
+        ]
+    }
+
+    /// Every event of `lines`, in order.
+    fn reduce_all(lines: &[String]) -> Vec<EventKind> {
+        let mut reducer = TurnReducer::new();
+        lines
+            .iter()
+            .flat_map(|line| reduce(&mut reducer, line))
+            .collect()
+    }
+
+    /// `EventKind`'s `Debug` prints metadata only, so a leak test has to read what a host reads:
+    /// the serialised event.
+    fn written(events: &[EventKind]) -> String {
+        serde_json::to_string(events).expect("expected the events to serialise")
+    }
+
+    /// Both result arms: the success one the answer rides on, and the failure one whose message,
+    /// code and vendor code are the fields a stray value could most plausibly be copied into.
+    #[test]
+    fn a_result_forwards_no_credential_expiry_on_success_or_failure() {
+        let canary = "CANARY-credential-expiry";
+        let succeeded = reduce_all(&structured_answer_turn(canary));
+        let failed = reduce_all(&[
+            json!({"type": "result", "subtype": "error_during_execution",
+                            "is_error": true, "api_error_status": 529,
+                            "errors": ["The run failed."],
+                            "terminal_reason": "aborted_streaming",
+                            "credential_expires_at": canary})
+            .to_string(),
+        ]);
+        for (arm, events, terminal) in [
+            ("success", &succeeded, EventKind::Completed),
+            (
+                "failure",
+                &failed,
+                EventKind::Error {
+                    error: VendorError::new(
+                        ErrorCode::from_static("claude-error_during_execution"),
+                        "The run failed.",
+                    )
+                    .with_vendor_code("529", true),
+                },
+            ),
+        ] {
+            let received = written(events);
+            assert!(
+                !received.contains(canary),
+                "expected the {arm} arm to forward no credential_expires_at | received: {received}"
+            );
+            assert_eq!(
+                events.last(),
+                Some(&terminal),
+                "expected the {arm} arm to end as before | received: {events:?}"
+            );
+        }
+    }
+
+    /// The same value arrives as `structured_output` and again as `result`, a string. Neither is
+    /// assistant text, so no `TextDelta` may carry the answer.
+    #[test]
+    fn the_result_text_of_a_structured_answer_is_not_delivered_as_assistant_text() {
+        let events = reduce_all(&structured_answer_turn("CANARY-credential-expiry"));
+        let received = text_of(&events);
+        assert_eq!(
+            received, "",
+            "expected no assistant text from the result record | received: {received:?}"
+        );
+    }
 }
