@@ -960,7 +960,9 @@ expected:
 - `discover` and `doctor`, which never open a session, and `mea capture`, which records a vendor's
   own output: `(mea <command>): expected no --json-schema; … | received --json-schema "<path>"`.
 
-Plain output prints the answer on its own labelled line, before `completed`:
+Plain output prints the answer on its own labelled line, before `completed`. A blank line may
+precede it: the label starts a fresh line even when assistant text, which ends without a newline,
+came just before.
 
 ```text
 structured output: {"word":"ok"}
@@ -970,9 +972,10 @@ The value is untrusted vendor output. The line is compact JSON, and every charac
 act on (C0 and C1 controls, DEL, line and paragraph separators, bidirectional formatting) is
 written as a `\uXXXX` escape. It is cut at 4,096 characters, and a cut line says how many of how
 many it shows. `--json` prints the event whole through the same path as every other event, with
-the answer under `kind.value`. A turn that completes without such a line got no valid answer
-(see "No answer" below). The tests replay inline frames over a scripted `claude`; no live Claude
-run backs this section.
+the answer under `kind.value`. A turn that ends without a valid answer fails the command: the
+harness ends it as an `Error` coded `claude-structured-output-missing` (see "No answer" below),
+`mea turn` prints that event with the vendor message and exits non-zero. The tests replay inline
+frames over a scripted `claude`; no live Claude run backs this section.
 
 ### The answer
 

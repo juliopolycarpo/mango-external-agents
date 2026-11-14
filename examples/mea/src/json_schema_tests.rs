@@ -302,3 +302,41 @@ async fn run_refuses_a_schema_where_it_would_not_be_used() {
         assert_eq!(error, expected, "expected {words:?} refused with its value");
     }
 }
+
+/// A schema turn whose `result` succeeded but carries no `structured_output`, as Claude Code
+/// 2.1.325 ended a turn whose schema no answer could satisfy.
+fn unanswered_schema_turn_lines() -> Vec<String> {
+    [
+        serde_json::json!({"type": "system", "subtype": "init",
+            "session_id": "b01414e7-4b4b-43a2-9109-a33e21664340", "model": "claude-sonnet-5"}),
+        serde_json::json!({"type": "result", "subtype": "success", "is_error": false,
+            "result": "I could not satisfy the schema.",
+            "usage": {"input_tokens": 3, "output_tokens": 5}}),
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect()
+}
+
+#[tokio::test]
+async fn a_schema_turn_without_an_answer_fails_with_the_harness_code_and_message() {
+    let directory = tempfile::tempdir().expect("expected a scratch directory");
+    let path = schema_file(&directory, r#"{"type":"object"}"#);
+    let options = turn_options(&path);
+    let cli = Arc::new(ScriptedClaudeCli::new(
+        HELP_WITH_JSON_SCHEMA,
+        unanswered_schema_turn_lines(),
+    ));
+
+    let error = turn_with(
+        &turn_registry(&options).expect("expected a registry with the schema"),
+        &host_over(Arc::clone(&cli)),
+        &options,
+    )
+    .await
+    .expect_err("expected a turn that ended without an answer to fail");
+
+    // The vendor's message is on the error event line printed above this summary (pinned in
+    // `turn.rs`); the summary names the code, so a script sees the failure and its cause.
+    assert_eq!(error, "claude-structured-output-missing: vendor failure");
+}
