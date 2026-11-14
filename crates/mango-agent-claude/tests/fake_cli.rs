@@ -212,6 +212,99 @@ async fn a_refused_turn_keeps_its_argv_out_of_the_error_and_on_the_fake() {
 }
 
 #[tokio::test]
+async fn a_refused_launch_is_readable_by_flag_names_without_its_values() {
+    let cli = FakeClaudeCli::new();
+    let words = [
+        "claude",
+        "--print",
+        "--model",
+        "sk-ant-canary-argument",
+        "--resume=sk-ant-canary-equals",
+        "-p",
+        "canary prompt text",
+    ];
+
+    refusal(cli.spawn(launch(&words)).await, &words);
+
+    assert_eq!(
+        cli.refused_launch_shapes(),
+        vec![
+            "claude with 7 arguments: flags --print, --model, --resume, -p; 2 values redacted"
+                .to_owned()
+        ],
+        "expected refused_launch_shapes() to name the flags and count the rest"
+    );
+}
+
+#[tokio::test]
+async fn a_dash_led_value_is_counted_and_never_named_as_a_flag() {
+    let cli = FakeClaudeCli::new();
+    let words = [
+        "claude",
+        "--append-system-prompt",
+        "-----BEGIN canary key",
+        "--",
+        "-9canary",
+    ];
+
+    refusal(cli.spawn(launch(&words)).await, &words);
+
+    let shapes = cli.refused_launch_shapes();
+    assert_eq!(
+        shapes,
+        vec!["claude with 5 arguments: flags --append-system-prompt; 3 values redacted".to_owned()],
+        "expected only flag-shaped words named | received: {shapes:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_launch_with_no_flags_names_the_argument_count_only() {
+    let cli = FakeClaudeCli::new();
+    let words = ["claude", "auth", "login"];
+
+    refusal(cli.spawn(launch(&words)).await, &words);
+
+    assert_eq!(
+        cli.refused_launch_shapes(),
+        vec!["claude with 3 arguments: no flags; 2 values redacted".to_owned()],
+        "expected a flag-free refusal to say so | received: {:?}",
+        cli.refused_launch_shapes()
+    );
+}
+
+#[tokio::test]
+async fn a_fake_that_refused_nothing_has_no_refused_launch_shapes() {
+    let cli = FakeClaudeCli::new().with_turn(Run::completing());
+
+    spawned_and_printed(&cli, &["claude", "--print"]).await;
+
+    assert!(
+        cli.refused_launch_shapes().is_empty(),
+        "expected no refused launch shapes | received: {:?}",
+        cli.refused_launch_shapes()
+    );
+}
+
+#[tokio::test]
+async fn the_refusal_error_points_at_the_shape_helper_and_stays_free_of_argv() {
+    let cli = FakeClaudeCli::new();
+    let words = ["claude", "--print", "--model", "sk-ant-canary-argument"];
+
+    let message = refusal(cli.spawn(launch(&words)).await, &words);
+
+    assert!(
+        message.contains("refused_launch_shapes"),
+        "expected the refusal to name FakeClaudeCli::refused_launch_shapes | received: {message}"
+    );
+    for argv_word in ["--model", "--print", "sk-ant-canary-argument"] {
+        assert!(
+            !message.contains(argv_word),
+            "expected Error::Launch to carry no argv, found {argv_word} | received: {message}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_scripted_turn_plays_and_the_next_one_is_refused() {
     let cli = FakeClaudeCli::new().with_turn(Run::replaying("scripted"));
 
