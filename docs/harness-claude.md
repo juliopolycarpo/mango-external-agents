@@ -1046,8 +1046,8 @@ of `{word: string}` and the prompt "Reply with the word ok." The records came in
 `tool_use` named `StructuredOutput` whose input was the value, a `user` message with its
 `tool_result` ("Structured output provided successfully"), `rate_limit_event`, then the `result`
 (`subtype: success`). The `result` carried the value as `structured_output`, an object, and again as
-`result`, a string. It also carried `credential_expires_at`. No permission or control request was
-raised for the `StructuredOutput` call, so there is nothing for a host to broker. The pin was not
+`result`, a string. It also carried `credential_expires_at`, a string. No permission or control
+request was raised for the `StructuredOutput` call, so there is nothing for a host to broker. The pin was not
 re-run, and the tests replay inline frames reduced from that run, not a fixture. `mea capture
 --harness claude --transcripts` can now record this turn; see [Transcript capture](#transcript-capture).
 
