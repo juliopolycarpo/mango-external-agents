@@ -1034,7 +1034,10 @@ const REVIEWED_RETAINED_MEMBERS: &[(&str, ChildKeys)] = &[
     ("time_to_request_ms", ChildKeys::Leaf),
     ("tool_input", ChildKeys::UserChosen),
     ("tool_result_meta", ChildKeys::Vendor),
-    ("tool_use_result", ChildKeys::Vendor),
+    // A built-in tool's result has the vendor's keys (`file`, `numLines`), but an MCP tool's has
+    // whatever its author chose, and a record does not say which tool produced it, so the keys are
+    // treated as data for every tool.
+    ("tool_use_result", ChildKeys::UserChosen),
     ("totalLines", ChildKeys::Leaf),
     ("total_cost_usd", ChildKeys::Leaf),
     ("ttft_ms", ChildKeys::Leaf),
