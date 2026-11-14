@@ -90,6 +90,11 @@ carries `|` itself, which is why the separator is a TAB. The watch subtracts an 
 equals a whole line of one of that vendor's watched pages, so a reworded line, a longer line that
 contains it, or the same text under the other vendor fails again and gets a new review. Add the
 entry in the same change that records the decision in [the ACP convergence assessment](acp-convergence.md).
+The record is the entry's exact line text as a whole line of that page's "Accepted documentation
+mentions" section, inside a `text` code fence (a fence keeps dprint from reflowing a table row). The
+check is offline: `scripts/test-vendor-drift.sh` runs `unrecorded_allowlist_entries` over the
+committed allowlist and assessment, in `scripts/check.sh` and CI, and fails naming each entry that
+has no such line. A line elsewhere on the page, or inside the section but reworded, does not count.
 
 An entry that no watched page carries any more is stale. The watch fails on it, exit 1, and names it
 in the issue body and the workflow log, so the weekly issue asks for the entry to be deleted; a dead entry would

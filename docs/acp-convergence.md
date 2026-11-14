@@ -215,3 +215,15 @@ The lane does not watch two things:
 - An adapter's own `initialize` answer. It is captured once and no lane records it again. That is a
   decision, not a limit: it moves between adapter releases, and nothing the library reads has moved
   across the versions compared (see above).
+
+## Accepted documentation mentions
+
+A vendor page line that names ACP and that the project decided to keep, for example an index line
+about a third-party adapter, is accepted in
+[`scripts/vendor-acp-docs-allowlist.txt`](../scripts/vendor-acp-docs-allowlist.txt) and recorded
+here. Record each entry as its exact line text, on a line of its own inside a `text` code fence,
+followed by the vendor and why it does not meet criterion 1. `scripts/test-vendor-drift.sh` fails
+when an allowlist entry is not a whole line of this section, and names the entry
+([vendor-drift.md](vendor-drift.md)).
+
+No entry is accepted at this revision.
