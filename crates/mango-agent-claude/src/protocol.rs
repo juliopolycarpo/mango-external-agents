@@ -454,6 +454,20 @@ impl<'a> ResultRecord<'a> {
         non_empty(self.fields, "result")
     }
 
+    /// The validated answer of a `--json-schema` run, when the record carries one as a JSON object.
+    ///
+    /// Claude Code 2.1.325 writes it on the success `result` beside `result`, which repeats it as
+    /// a string. A value that is not an object (absent, `null`, a string, an array) reads as
+    /// nothing: the vendor documents the field as an object and says a run without valid output
+    /// has none, so a changed shape narrows to "absent" like every other field here.
+    ///
+    /// <https://code.claude.com/docs/en/headless#get-structured-output>
+    pub fn structured_output(&self) -> Option<&'a Value> {
+        self.fields
+            .get("structured_output")
+            .filter(|value| value.is_object())
+    }
+
     /// The vendor's own stable code for why the run ended.
     ///
     /// `max_turns`, `aborted_streaming`, `hook_stopped`, `prompt_too_long`, `budget_exhausted`,
@@ -695,6 +709,33 @@ mod tests {
             r#"{"message":{"content":[{"type":"tool_result","content":[{"text":"one"},{"text":""},"two",5]}]}}"#,
         );
         assert_eq!(blocks.content_blocks()[0].result_text(), "one\ntwo");
+    }
+
+    #[test]
+    fn a_structured_output_reads_only_as_a_json_object() {
+        let object = record(r#"{"type":"result","structured_output":{"word":"ok"}}"#);
+        assert_eq!(
+            object.result().structured_output(),
+            Some(&serde_json::json!({"word": "ok"}))
+        );
+        let empty = record(r#"{"type":"result","structured_output":{}}"#);
+        assert_eq!(
+            empty.result().structured_output(),
+            Some(&serde_json::json!({})),
+            "expected an empty object to be an answer"
+        );
+        for shape in [r#""ok""#, "[1]", "7", "true", "null"] {
+            let line = format!(r#"{{"type":"result","structured_output":{shape}}}"#);
+            assert_eq!(
+                record(&line).result().structured_output(),
+                None,
+                "expected {shape} to read as absent"
+            );
+        }
+        assert_eq!(
+            record(r#"{"type":"result"}"#).result().structured_output(),
+            None
+        );
     }
 
     #[test]
