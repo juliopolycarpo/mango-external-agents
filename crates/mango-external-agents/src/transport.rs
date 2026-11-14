@@ -184,8 +184,12 @@ impl UnixSocketSpec {
     /// ```
     /// use mango_external_agents::UnixSocketSpec;
     ///
-    /// let spec = UnixSocketSpec::new("/run/user/1000/app-server.sock");
+    /// // Built from the temp directory so the path is absolute on every platform this type exists
+    /// // on, Windows included, where a `/run/...` path is not.
+    /// let path = std::env::temp_dir().join("app-server.sock");
+    /// let spec = UnixSocketSpec::new(&path);
     /// assert!(spec.path.is_absolute());
+    /// assert_eq!(spec.path, path);
     /// ```
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
