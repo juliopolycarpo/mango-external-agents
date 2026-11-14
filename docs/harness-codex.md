@@ -1142,9 +1142,15 @@ surface has no Windows equivalent.
 point `mea` at its socket from another:
 
 ```sh
-codex app-server --listen unix:///tmp/codex-app-server.sock
-cargo run -p mea -- turn --harness codex --transport unix-socket --socket /tmp/codex-app-server.sock "summarise this repository"
+dir="${XDG_RUNTIME_DIR:-$HOME/.cache}/codex-app-server"
+mkdir -p "$dir" && chmod 700 "$dir"
+codex app-server --listen "unix://$dir/app-server.sock"
+cargo run -p mea -- turn --harness codex --transport unix-socket --socket "$dir/app-server.sock" "summarise this repository"
 ```
+
+The server refuses a socket whose parent directory is not owner-only (mode 0700), so a path directly
+under `/tmp` does not work. Observed on Codex 0.167.2 over a real attach; the host sees the server's
+own refusal, and the library does not repeat the check.
 
 `--socket` is required with `--transport unix-socket`, refused with any other transport, and must be
 an absolute path. `mea` passes it to the harness as typed and prints the harness's refusals as they
