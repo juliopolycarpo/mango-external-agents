@@ -876,7 +876,9 @@ run; a host can say so in its own interface, and nothing here pretends otherwise
 A capture is not automatically reproducible. `scripts/install-vendor-cli.sh` pins `claude`, `codex`
 and `opencode` and nothing else, so `fixtures/acp/cursor/`, `fixtures/acp/grok/`,
 `fixtures/acp/codex-acp/` and `fixtures/acp/claude-agent-acp/` declare `reproducible: false` and
-record `capturedFrom` and `capturedAt` in place of a promise CI cannot keep.
+record `capturedFrom` and `capturedAt` in place of a promise no lane keeps. Both adapters can be
+recaptured; [the decision not to schedule it](vendor-drift.md#adapter-captures-not-a-scheduled-lane)
+rests on what a recapture would add.
 
 The two adapter captures say what they measured in [the convergence assessment](acp-convergence.md#what-the-adapter-handshakes-measured): `loadSession`,
 `sessionCapabilities.list` and `promptCapabilities.image` are advertised by both. `version.json`

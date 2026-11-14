@@ -141,12 +141,18 @@ What it settles for the table above:
 - `configOptions`, and with it the model catalog cell, stays unmeasured. An agent returns it from
   `session/new`, and a capture never sends that: it opens no session.
 
-Criterion 2 is not met, and this is a decision rather than an oversight. `scripts/install-vendor-cli.sh`
-downloads an exact vendor release asset and checks its digest. Neither adapter is an asset it knows,
-and an exact `npm install` of the adapter pins only the top level: `codex-acp` declares
-`@openai/codex` as `^0.166.0`, so the binary beneath it is whatever the range resolves to on the
-day. Both manifests therefore say `reproducible: false` and carry `capturedFrom` and `capturedAt`.
-The install and capture recipe is in [fixtures/README.md](../fixtures/README.md).
+Criterion 2 is not met, and this is a decision rather than an oversight
+([#454](https://github.com/juliopolycarpo/mango-external-agents/issues/454)). Both adapters install
+into an empty directory with `npm install --ignore-scripts` and recapture byte for byte without a
+login, so the criterion could be met. `scripts/install-vendor-cli.sh` does not know either adapter,
+though. `claude-agent-acp` declares exact dependencies, so its whole tree follows the adapter version;
+`codex-acp` declares `@openai/codex` as `^0.166.0`, so the binary beneath it floats within 0.166.x
+unless a lockfile pins it. Building the lane waits for criterion 1, because a reproducible contract
+cannot move the verdict while the vendors ship no ACP mode, and a recapture of the latest adapter
+reports additions that nothing in the library reads. The evidence is in
+[vendor-drift.md](vendor-drift.md#adapter-captures-not-a-scheduled-lane). Both manifests say
+`reproducible: false` and carry `capturedFrom` and `capturedAt`. The install and capture recipe,
+and when to run it, is in [fixtures/README.md](../fixtures/README.md).
 
 ## Decision criteria
 
@@ -205,5 +211,6 @@ The lane does not watch two things:
 - An ACP flag under another subcommand's help before any watched page names it. Subcommand help is
   kept out of the public contracts ([vendor-drift.md](vendor-drift.md)):
   [#451](https://github.com/juliopolycarpo/mango-external-agents/issues/451).
-- An adapter's own `initialize` answer. It is captured once and no lane records it again, because
-  neither adapter is pinned (see above).
+- An adapter's own `initialize` answer. It is captured once and no lane records it again. That is a
+  decision, not a limit: it moves between adapter releases, and nothing the library reads has moved
+  across the versions compared (see above).
