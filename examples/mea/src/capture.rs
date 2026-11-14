@@ -755,7 +755,11 @@ fn model_list_page(answer: &Value) -> Option<(Vec<String>, Option<String>)> {
         .filter(|model| model["hidden"] != json!(true))
         .map(|model| model["id"].as_str().map(str::to_owned))
         .collect::<Option<Vec<_>>>()?;
-    let next = answer["result"]["nextCursor"].as_str().map(str::to_owned);
+    // An empty cursor is no next page, as in the harness's `read_model_catalog`.
+    let next = answer["result"]["nextCursor"]
+        .as_str()
+        .filter(|cursor| !cursor.is_empty())
+        .map(str::to_owned);
     Some((ids, next))
 }
 
@@ -1958,6 +1962,48 @@ mod tests {
         );
         let empty = json!({"id": 1, "result": {"data": [], "nextCursor": null}});
         assert_eq!(model_list_page(&empty), Some((Vec::new(), None)));
+    }
+
+    /// The harness's catalog read drops an empty cursor, so a server that spells "no next page" as
+    /// `""` ends that walk; this check has to end on it too.
+    #[test]
+    fn an_empty_next_cursor_is_no_next_page_like_a_null_one() {
+        let page = json!({"id": 1, "result": {"data": [{"id": "a"}], "nextCursor": ""}});
+        assert_eq!(
+            model_list_page(&page),
+            Some((vec![String::from("a")], None)),
+            "expected nextCursor \"\" to read as no next page"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_list_ending_on_an_empty_cursor_refuses_an_unlisted_id_without_a_second_request()
+     {
+        let launcher = Arc::new(FakeLauncher::new());
+        let mut server = ModelCatalogServer::paged(&[&["gpt-a"]]);
+        server.endless = true;
+        server.repeating_cursor = Some("");
+        launcher.push(server.process());
+
+        let error = record(
+            &host(launcher.clone()),
+            handshake(),
+            &std::env::temp_dir(),
+            None,
+            Some("gpt-z"),
+        )
+        .await
+        .expect_err("expected an unlisted id to be refused");
+
+        assert_eq!(
+            error.to_string(),
+            "expected a --model id that model/list names, received \"gpt-z\"; listed ids: gpt-a"
+        );
+        assert_eq!(
+            model_checks(&written_frames(&launcher)).len(),
+            1,
+            "expected the walk to stop after the page whose nextCursor was empty"
+        );
     }
 
     #[test]
