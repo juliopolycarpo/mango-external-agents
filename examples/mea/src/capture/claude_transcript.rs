@@ -13,6 +13,7 @@
 //! The recorder never signs in. It runs the CLI the operator already logged in, the way `mea turn`
 //! does, and refuses a signed-out one.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -108,15 +109,32 @@ pub async fn claude(
         home: &home,
         user: &user,
     };
-    claude_with(&host, &tap, out_dir, scenario, schema, model, paths).await
+    claude_with(
+        &host,
+        &tap,
+        &StderrNotices,
+        out_dir,
+        scenario,
+        schema,
+        model,
+        paths,
+    )
+    .await
 }
 
 /// [`claude`] on a host and tap the caller built, so a test can inject its own launcher.
 ///
 /// `host` must launch through `tap`, or the transcript stays empty and the capture reports it.
+/// `notices` receives the operator-facing lines that follow a written transcript, see
+/// [`DriftReport`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the host, its tap, the notice sink, then the five facts of one capture"
+)]
 async fn claude_with(
     host: &HostContext,
     tap: &TurnLineTap,
+    notices: &dyn CaptureNotices,
     out_dir: &Path,
     selected: &str,
     schema: Option<&str>,
@@ -194,10 +212,11 @@ async fn claude_with(
     let conversation = converse(session.as_ref(), scenario).await;
     let closed = session.close(CloseReason::Requested).await;
     // Redacted before anything is written or judged: what qualifies is what the file holds.
+    let mut drift = DriftReport::default();
     let body: Vec<String> = tap
         .take_lines()
         .iter()
-        .filter_map(|line| redact_line(line, paths))
+        .filter_map(|line| redact_line(line, paths, &mut drift))
         .collect();
     let outcome = crate::failure::with_cleanup(conversation, closed, |primary| {
         eprintln!("{}", primary_failure_line(scenario.name, primary));
@@ -216,6 +235,7 @@ async fn claude_with(
                 &join(&header, Some("# incomplete capture"), &body),
             )?;
             println!("  retained incomplete capture {}", partial.display());
+            drift.announce(notices, scenario.name);
             return Err(error);
         }
     };
@@ -225,6 +245,7 @@ async fn claude_with(
             &join(&header, Some("# unqualified capture"), &body),
         )?;
         println!("  retained unqualified capture {}", unqualified.display());
+        drift.announce(notices, scenario.name);
         return Err(Error::Protocol {
             expected: String::from(
                 "a captured assistant StructuredOutput tool_use and a final result whose structured_output is a JSON object",
@@ -244,6 +265,7 @@ async fn claude_with(
         }
     }
     println!("  wrote {}", qualified.display());
+    drift.announce(notices, scenario.name);
     Ok(())
 }
 
@@ -628,11 +650,13 @@ fn unused_key(map: &Map<String, Value>, key: String) -> String {
 ///
 /// Text that is not JSON has no structure to keep and could say anything (a shell banner, a
 /// warning with a path in it), so it is dropped rather than copied.
-fn redact_line(raw: &str, paths: Paths<'_>) -> Option<String> {
+///
+/// The names of the members the walk replaced by default are noted in `drift`, never their values.
+fn redact_line(raw: &str, paths: Paths<'_>, drift: &mut DriftReport) -> Option<String> {
     let record: Value = serde_json::from_str(raw).ok()?;
     record
         .is_object()
-        .then(|| redact_value(record, None, ValueContext::default(), paths).to_string())
+        .then(|| redact_value(record, None, ValueContext::default(), paths, drift).to_string())
 }
 
 /// What the walk knows about the object a value sits in.
@@ -642,6 +666,9 @@ struct ValueContext {
     tool_call: bool,
     /// The value is inside a member of [`ANSWER_MEMBERS`].
     answer: bool,
+    /// The value sits under a key of a [`MODEL_KEYED_MEMBERS`] map, which the transcript writes
+    /// through [`redact_model_id`].
+    model_key: bool,
 }
 
 fn redact_value(
@@ -649,6 +676,7 @@ fn redact_value(
     member: Option<&str>,
     context: ValueContext,
     paths: Paths<'_>,
+    drift: &mut DriftReport,
 ) -> Value {
     match value {
         Value::Object(members) => {
@@ -669,25 +697,35 @@ fn redact_value(
             let mut redacted = Map::new();
             for (name, value) in members {
                 // Keys are rewritten too: a map keyed by a path would carry it.
-                let key = if model_keyed {
+                let written = if model_keyed {
                     redact_model_id(&name)
                 } else {
                     redact::rewrite_paths(&name, paths)
                 };
-                let key = unused_key(&redacted, key);
-                let denied = is_credential_member(&name)
-                    || USER_KEYED_MEMBERS.contains(&name.as_str())
+                let key = unused_key(&redacted, written.clone());
+                // The rules that deny a member because no review kept it, not because its name is
+                // credential-shaped: a new shape shows up here, so the operator is told its name.
+                let denied_by_default = USER_KEYED_MEMBERS.contains(&name.as_str())
                     || (rate_limit_event && !RATE_LIMIT_EVENT_STRUCTURE.contains(&name.as_str()))
                     || (init_record && !INIT_STRUCTURE.contains(&name.as_str()));
+                let denied = is_credential_member(&name) || denied_by_default;
                 // A null carries nothing, so it stays null.
                 let kept = if denied && !value.is_null() {
+                    // A schema property inside the model's answer is the operator's own name.
+                    if denied_by_default
+                        && !context.answer
+                        && !REVIEWED_DENIED_MEMBERS.contains(&name.as_str())
+                    {
+                        drift.note_denied(&written);
+                    }
                     placeholder()
                 } else {
                     let inner = ValueContext {
                         tool_call,
                         answer: context.answer || ANSWER_MEMBERS.contains(&name.as_str()),
+                        model_key: model_keyed,
                     };
-                    redact_value(value, Some(&name), inner, paths)
+                    redact_value(value, Some(&name), inner, paths, drift)
                 };
                 redacted.insert(key, kept);
             }
@@ -698,7 +736,7 @@ fn redact_value(
         Value::Array(items) => Value::Array(
             items
                 .into_iter()
-                .map(|item| redact_value(item, member, context, paths))
+                .map(|item| redact_value(item, member, context, paths, drift))
                 .collect(),
         ),
         Value::String(text) => match member {
@@ -712,9 +750,179 @@ fn redact_value(
             Some(member) if !context.answer && STRUCTURAL_STRING_MEMBERS.contains(&member) => {
                 Value::String(redact::rewrite_paths(&text, paths))
             }
-            _ => placeholder(),
+            _ => {
+                if let Some(member) = member
+                    && !context.answer
+                    && !REVIEWED_REDACTED_STRING_MEMBERS.contains(&member)
+                {
+                    // As the transcript writes the key, so the report holds nothing the file does not.
+                    drift.note_unseen(&if context.model_key {
+                        redact_model_id(member)
+                    } else {
+                        redact::rewrite_paths(member, paths)
+                    });
+                }
+                placeholder()
+            }
         },
         other => other,
+    }
+}
+
+/// Members the deny-by-default rules replace that the committed Claude transcripts under
+/// `fixtures/claude/transcripts/` already show: the user-configuration members of `system/init`, the plan facts of `rate_limit_event` and
+/// the keyed `by_type` map. They are denied on every run, so the report leaves them out and a name
+/// that is not here stands out. Sorted.
+const REVIEWED_DENIED_MEMBERS: &[&str] = &[
+    "agents",
+    "analytics_disabled",
+    "apiKeySource",
+    "by_type",
+    "fast_mode_disabled_reason",
+    "fast_mode_state",
+    "mcp_servers",
+    "memory_paths",
+    "messaging_socket_path",
+    "output_style",
+    "product_feedback_disabled",
+    "rate_limit_info",
+    "tools",
+];
+
+/// String members the default rule replaces that the committed Claude transcripts under
+/// `fixtures/claude/transcripts/` already show, so they are expected and not reported as new. Their
+/// text is the model's, the machine's or the vendor's free text, which is why the default replaces
+/// it. The string lists of `system/init` that [`INIT_STRUCTURE`] keeps (`capabilities`, `skills`,
+/// `slash_commands`, `terminal_slash_commands`) are here too: their names are replaced, their
+/// length stays. Sorted; a new entry records that the name is understood, not that its value may be
+/// kept.
+const REVIEWED_REDACTED_STRING_MEMBERS: &[&str] = &[
+    "auto",
+    "canonicalModel",
+    "capabilities",
+    "content",
+    "fast_mode_disabled_reason",
+    "fast_mode_state",
+    "filePath",
+    "file_path",
+    "inference_geo",
+    "message",
+    "name",
+    "non_execution_kind",
+    "partial_json",
+    "path",
+    "provider",
+    "request_id",
+    "result",
+    "service_tier",
+    "signature",
+    "skills",
+    "slash_commands",
+    "source",
+    "speed",
+    "status",
+    "terminal_slash_commands",
+    "text",
+    "thinking",
+    "timestamp",
+    "tool_name",
+    "tool_use_result",
+    "version",
+];
+
+/// How many names of each kind the drift report prints before it only counts the rest.
+const DRIFT_NAMES_SHOWN: usize = 12;
+
+/// How many characters of one name the drift report prints. A data-keyed map can have a key of any
+/// length.
+const DRIFT_NAME_CHARS: usize = 48;
+
+/// The member names a recording met that no review has seen, collected while the lines are
+/// redacted. It holds names only: the value of a member never enters it, so printing the report
+/// cannot leak what redaction removed.
+#[derive(Default)]
+struct DriftReport {
+    /// Members replaced whole because nothing allowed them (outside the `system/init` or
+    /// `rate_limit_event` allow-list, or a data-keyed map such as `by_type`) and that
+    /// [`REVIEWED_DENIED_MEMBERS`] does not list.
+    denied: BTreeSet<String>,
+    /// Members whose string the default rule replaced and that [`REVIEWED_REDACTED_STRING_MEMBERS`]
+    /// does not list.
+    unseen: BTreeSet<String>,
+}
+
+impl DriftReport {
+    fn note_denied(&mut self, name: &str) {
+        self.denied.insert(name.to_owned());
+    }
+
+    fn note_unseen(&mut self, name: &str) {
+        self.unseen.insert(name.to_owned());
+    }
+
+    /// One line per kind that is not empty. Each gives the count of distinct names and the first
+    /// [`DRIFT_NAMES_SHOWN`] of them in sorted order, every name escaped for a terminal and cut at
+    /// [`DRIFT_NAME_CHARS`] characters.
+    fn lines(&self, scenario: &str) -> Vec<String> {
+        [
+            ("members replaced by the deny-by-default rule", &self.denied),
+            (
+                "members not seen before, their strings replaced",
+                &self.unseen,
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, names)| !names.is_empty())
+        .map(|(what, names)| {
+            let shown: Vec<String> = names
+                .iter()
+                .take(DRIFT_NAMES_SHOWN)
+                .map(|name| shortened(&crate::turn::escape_terminal_text(name)))
+                .collect();
+            let more = names.len().saturating_sub(DRIFT_NAMES_SHOWN);
+            let more = if more > 0 {
+                format!(", and {more} more")
+            } else {
+                String::new()
+            };
+            format!(
+                "claude/{scenario}: {what} ({}): {}{more}; review them against the lists in claude_transcript.rs",
+                names.len(),
+                shown.join(", "),
+            )
+        })
+        .collect()
+    }
+
+    /// Hands the report to the operator, once the transcript it describes is on disk.
+    fn announce(&self, notices: &dyn CaptureNotices, scenario: &str) {
+        for line in self.lines(scenario) {
+            notices.notice(&line);
+        }
+    }
+}
+
+/// `name` cut to [`DRIFT_NAME_CHARS`] characters, with `...` where it was cut.
+fn shortened(name: &str) -> String {
+    if name.chars().count() <= DRIFT_NAME_CHARS {
+        return name.to_owned();
+    }
+    let kept: String = name.chars().take(DRIFT_NAME_CHARS).collect();
+    format!("{kept}...")
+}
+
+/// Where the recorder's operator-facing lines go, so a test can read them.
+trait CaptureNotices {
+    fn notice(&self, line: &str);
+}
+
+/// The notices as the operator sees them: stderr, like the failure lines, so a redirected stdout
+/// keeps only the progress lines.
+struct StderrNotices;
+
+impl CaptureNotices for StderrNotices {
+    fn notice(&self, line: &str) {
+        eprintln!("{line}");
     }
 }
 
