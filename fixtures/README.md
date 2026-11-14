@@ -78,8 +78,8 @@ Redacted whatever the value type:
   there are replaced as well, by `0` and `false`: an account number, an amount or a flag over a
   customer's data is the author's, and the replacement keeps the field's type where a `[REDACTED]`
   string would not. A `null` stays. The names stay. A string or an object under a name no review
-  lists is still reported as below (the structural names and `model` are the exception, since the
-  recorder already knows them); a number or boolean under one is replaced and not reported. The
+  lists is still reported as below, unless it is a direct key of the map, which the key line below lists (the structural names and `model` are the
+  exception, since the recorder already knows them); a number or boolean under one is replaced and not reported. The
   same call's arguments also sit under `input` and `wire_tool_inputs`, which keep their numbers
   as the model's answer, so this rule removes them from `tool_input` only. A `tool_use_result` recorded before this rule keeps a vendor string such as
   `"type": "text"` and its numbers (`numLines`, `totalLines`); the committed transcripts are
@@ -128,17 +128,21 @@ member that is redacted without anyone noticing. After it writes the transcript 
 - `members not seen before, their numbers, booleans and objects kept`: members whose number,
   boolean or object the recorder kept and that `REVIEWED_RETAINED_MEMBERS` does not list. An array
   is judged by the member that holds it. A number or boolean under `tool_input` or
-  `tool_use_result` is replaced, so it is never listed here; an object there still is. A key under `modelUsage` is a model id and is not a name.
+  `tool_use_result` is replaced, so it is never listed here; an object below the direct keys still is. A key under `modelUsage` is a model id and is not a name.
   A `mea` test replays the committed `fixtures/claude/transcripts/` through the recorder and fails
   when any of the three lists is incomplete for them, so the lists stay in step with what the
   fixtures show.
 - `keys inside user-chosen maps, written to the transcript as given`: the direct keys of a member
-  that `REVIEWED_RETAINED_MEMBERS` declares `UserChosen`, today `tool_input`, the parameters of a
-  tool call that a tool author named. A key there is data, so no list can review it: every key is
-  listed on every run that has one, a name a reviewed list holds included, and is not also judged
-  as a member name. Only the direct keys are listed; the members below them are judged by name.
-  The committed transcripts show `content` and `file_path` on this line, and a `mea` test pins
-  that.
+  that `REVIEWED_RETAINED_MEMBERS` declares `UserChosen`, today `tool_input` (the parameters of a
+  tool call that a tool author named) and `tool_use_result` (the tool's output). A key there is
+  data, so no list can review it: every key is listed on every run that has one, a name a reviewed
+  list holds included, and is not also judged as a member name. Only the direct keys are listed;
+  the members below them are judged by name. `tool_use_result` is declared this way for every
+  tool: a built-in tool's result has the vendor's keys (`file`, `numLines`), but an MCP tool's has
+  whatever its author chose, and the record does not say which tool wrote it. The cost is that a
+  new vendor key in a built-in result is listed beside the others and not reported as new. The
+  committed transcripts show `content`, `file`, `file_path` and `type` on this line, and a `mea`
+  test pins that.
 
 `REVIEWED_RETAINED_MEMBERS` states for each member who chose the keys under it: `Leaf` (a number or
 a boolean), `Vendor` (the vendor's structure, judged by name as above), `ModelIds` (a map keyed by

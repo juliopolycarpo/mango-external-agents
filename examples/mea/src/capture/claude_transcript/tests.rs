@@ -752,7 +752,7 @@ fn a_structural_name_replaced_inside_tool_data_is_not_reported_as_a_new_member()
 #[test]
 fn a_string_named_outside_every_list_inside_tool_data_is_still_reported() {
     let drift = drift_over(&lines_of(&[
-        json!({"type": "user", "tool_use_result": {"novelNote": "x", "type": "y"}}),
+        json!({"type": "user", "tool_use_result": {"wrapper": {"novelNote": "x", "type": "y"}}}),
     ]));
 
     assert_eq!(
@@ -2994,8 +2994,9 @@ fn a_reviewed_member_declared_without_the_children_it_holds_is_caught() {
     );
 }
 
-/// The committed transcripts show one tool call's parameters under `permission_denials`.
-const COMMITTED_USER_CHOSEN_KEYS: &[&str] = &["content", "file_path"];
+/// The committed transcripts show one tool call's parameters under `permission_denials` and the
+/// keys of a built-in tool's result under `tool_use_result`.
+const COMMITTED_USER_CHOSEN_KEYS: &[&str] = &["content", "file", "file_path", "type"];
 
 #[test]
 fn the_committed_claude_transcripts_report_only_the_keys_of_their_user_chosen_maps() {
@@ -3024,6 +3025,104 @@ fn a_key_of_a_user_chosen_map_is_reported_whether_or_not_a_list_holds_its_name()
         keys,
         vec![TOOL_PARAMETER_KEY, "event", "message", "usage"],
         "expected every direct key of tool_input, a reviewed name included"
+    );
+}
+
+#[test]
+fn every_member_the_walk_treats_as_a_tool_authors_data_is_declared_user_chosen() {
+    for member in TOOL_DATA_MEMBERS {
+        assert_eq!(
+            child_keys_of(member),
+            Some(ChildKeys::UserChosen),
+            "expected {member:?} in TOOL_DATA_MEMBERS declared UserChosen in REVIEWED_RETAINED_MEMBERS | received: {:?}",
+            child_keys_of(member)
+        );
+    }
+}
+
+/// A result key an MCP tool author chose, which no reviewed list holds.
+const MCP_RESULT_KEY: &str = "ledgerBalanceDue";
+
+/// An MCP tool's result as Claude Code records it: whatever keys the tool's author chose, with an
+/// object, a number and a boolean under them.
+fn mcp_shaped_tool_result() -> Value {
+    json!({MCP_RESULT_KEY: 3, "ledgerEntry": {"sku": "x"}, "isOverdrawn": true})
+}
+
+#[test]
+fn the_keys_of_an_mcp_tools_result_are_reported_as_user_chosen_and_not_as_vendor_drift() {
+    let drift = drift_over(&lines_of(&[
+        json!({"type": "user", "tool_use_result": mcp_shaped_tool_result()}),
+    ]));
+
+    let keys: Vec<&str> = drift.map_keys.iter().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        vec!["isOverdrawn", MCP_RESULT_KEY, "ledgerEntry"],
+        "expected every direct key of the MCP result listed as a user-chosen key"
+    );
+    assert!(
+        !drift.retained.contains("ledgerEntry") && !drift.retained.contains(MCP_RESULT_KEY),
+        "expected no key of the MCP result judged as a retained member name | received: {:?}",
+        drift.retained
+    );
+}
+
+#[test]
+fn the_keys_of_an_mcp_content_array_result_are_reported_and_the_members_below_are_judged() {
+    let drift = drift_over(&lines_of(&[json!({"type": "user", "tool_use_result": [
+        {"type": "text", "text": "x", "ledgerNote": "y", "ledgerEntry": {"deeperName": {"leaf": 1}}}]})]));
+
+    let keys: Vec<&str> = drift.map_keys.iter().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        vec!["ledgerEntry", "ledgerNote", "text", "type"],
+        "expected the direct keys of each array entry listed"
+    );
+    assert!(
+        drift.unseen.is_empty() && drift.retained.contains("deeperName"),
+        "expected a user-chosen key skipped and a member below it judged | received strings: {:?} retained: {:?}",
+        drift.unseen,
+        drift.retained
+    );
+}
+
+#[test]
+fn a_tool_result_that_is_a_bare_string_or_number_has_no_user_chosen_key() {
+    let drift = drift_over(&lines_of(&[
+        json!({"type": "user", "tool_use_result": "Error: refused"}),
+        json!({"type": "user", "tool_use_result": 7}),
+    ]));
+
+    assert!(
+        drift.map_keys.is_empty(),
+        "expected no key from a result with no object | received: {:?}",
+        drift.map_keys
+    );
+}
+
+#[test]
+fn a_tool_result_key_is_still_written_to_the_transcript_whatever_the_report_says() {
+    let line =
+        redacted_record(&json!({"type": "user", "tool_use_result": mcp_shaped_tool_result()}));
+
+    assert_eq!(
+        line["tool_use_result"],
+        json!({MCP_RESULT_KEY: 0, "ledgerEntry": {"sku": redact::PLACEHOLDER}, "isOverdrawn": false}),
+        "expected the keys kept and every value replaced | received: {line}"
+    );
+}
+
+#[test]
+fn a_tool_result_inside_the_models_answer_is_the_schemas_own_and_not_reported() {
+    let drift = drift_over(&lines_of(&[
+        json!({"type": "result", "structured_output": {"tool_use_result": {MCP_RESULT_KEY: 1}}}),
+    ]));
+
+    assert!(
+        drift.map_keys.is_empty(),
+        "expected no key from inside the answer | received: {:?}",
+        drift.map_keys
     );
 }
 
