@@ -486,6 +486,11 @@ fn refusal(error: &mango_external_agents::Error) -> String {
         mango_external_agents::Error::VersionGate { found, minimum } => {
             format!("expected version {minimum} or newer, received {found}")
         }
+        // The login command is typed on the error and left out of its `Display`. The spawn path
+        // prints it after `discover`; an attach skips `discover`, so the refusal has to carry it.
+        mango_external_agents::Error::AuthRequired { login_hint } => {
+            format!("not signed in; run `{login_hint}`")
+        }
         mango_external_agents::Error::Vendor(vendor) => vendor_refusal(vendor),
         other => other.to_string(),
     }
@@ -577,6 +582,17 @@ mod tests {
             refusal(&gate),
             "expected version 2.1.211 or newer, received 2.1.9"
         );
+    }
+
+    /// An attach skips the local probe, so a signed-out server is refused inside `open_session`
+    /// and this is the only place the operator is told which login command to run: the library's
+    /// own sentence says to inspect the typed hint without printing it.
+    #[test]
+    fn a_signed_out_server_names_the_login_command() {
+        let signed_out = Error::AuthRequired {
+            login_hint: String::from("codex login"),
+        };
+        assert_eq!(refusal(&signed_out), "not signed in; run `codex login`");
     }
 
     /// Everything else keeps the library's own bounded sentence.
