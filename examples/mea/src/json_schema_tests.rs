@@ -137,7 +137,7 @@ async fn a_build_without_the_flag_is_refused_by_the_harness_in_its_own_words() {
     let directory = tempfile::tempdir().expect("expected a scratch directory");
     let path = schema_file(&directory, r#"{"type":"object"}"#);
     let options = turn_options(&path);
-    // No turn is scripted: a launch past the help check is a refusal that names its argv.
+    // No turn is scripted: a launch past the help check is a refusal, recorded in refused_launches.
     let cli = Arc::new(FakeClaudeCli::new().with_help(HELP_WITHOUT_JSON_SCHEMA));
 
     let error = turn_with(

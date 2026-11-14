@@ -180,16 +180,29 @@ async fn a_completing_run_answers_with_an_empty_result() {
 }
 
 #[tokio::test]
-async fn a_refused_turn_names_the_argv_it_received() {
+async fn a_refused_turn_keeps_its_argv_out_of_the_error_and_on_the_fake() {
     let cli = FakeClaudeCli::new();
-    let words = ["claude", "--print", "--model", "sonnet"];
+    let words = ["claude", "--print", "--model", "sk-ant-canary-argument"];
 
     let message = refusal(cli.spawn(launch(&words)).await, &words);
 
     assert!(
-        message.contains("a turn with no Run queued")
-            && message.contains(r#"["claude", "--print", "--model", "sonnet"]"#),
-        "expected the refusal to name the unscripted turn and its argv | received: {message}"
+        message.contains("a turn with no Run queued") && message.contains("4 arguments"),
+        "expected the refusal to name the unscripted turn and its argument count | received: {message}"
+    );
+    assert!(
+        !message.contains("sk-ant-canary-argument"),
+        "expected Error::Launch to carry no argv | received: {message}"
+    );
+    let refused: Vec<Vec<String>> = cli
+        .refused_launches()
+        .into_iter()
+        .map(|spec| spec.argv)
+        .collect();
+    assert_eq!(
+        refused,
+        vec![words.map(String::from).to_vec()],
+        "expected refused_launches() to hold the received argv"
     );
     assert!(
         cli.launches().is_empty(),
@@ -218,16 +231,25 @@ async fn a_scripted_turn_plays_and_the_next_one_is_refused() {
 }
 
 #[tokio::test]
-async fn an_auth_subcommand_other_than_status_is_refused_with_its_argv() {
+async fn an_auth_subcommand_other_than_status_is_refused_and_its_argv_recorded() {
     let cli = FakeClaudeCli::new();
     let words = ["claude", "auth", "login"];
 
     let message = refusal(cli.spawn(launch(&words)).await, &words);
 
     assert!(
-        message.contains("auth subcommand other than `status`")
-            && message.contains(r#"["claude", "auth", "login"]"#),
-        "expected the refusal to name the subcommand and its argv | received: {message}"
+        message.contains("auth subcommand other than `status`") && !message.contains("login\""),
+        "expected the refusal to name the subcommand and no argv | received: {message}"
+    );
+    let refused: Vec<Vec<String>> = cli
+        .refused_launches()
+        .into_iter()
+        .map(|spec| spec.argv)
+        .collect();
+    assert_eq!(
+        refused,
+        vec![words.map(String::from).to_vec()],
+        "expected refused_launches() to hold the received argv"
     );
 }
 

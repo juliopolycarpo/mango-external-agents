@@ -1210,7 +1210,8 @@ frames are inline, not captured fixtures; `mea capture --transcripts` records th
 
 It records every launch (`launches`, `turn_argvs`) and every line written to a child's stdin
 (`written`). A turn nobody scripted is a launch error, so a test never passes over a launch it
-did not queue; `Run::completing` scripts a turn whose output does not matter. Any `auth`
+did not queue, and `refused_launches` holds the argv it received (the error carries none, like every
+`Error::Launch`); `Run::completing` scripts a turn whose output does not matter. Any `auth`
 subcommand other than `status` is always refused: the library never logs in, so the fake never
 pretends to.
 
