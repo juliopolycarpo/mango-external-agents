@@ -193,7 +193,8 @@ mode surfaces there, or in the documentation watch below.
     documentation index or CLI reference now mentions ACP. The workflow log names the page and the
     line ([vendor-drift.md](vendor-drift.md)).
 - **Not a trigger:** the same watch failing because a page could not be read or no longer has its
-  anchor phrase. That is a broken watch to repair, not a vendor signal.
+  anchor phrase, or because a reviewed allowlist entry matches no line any more. Those are a broken
+  watch to repair or an entry to delete, not a vendor signal.
 - **Action:** whoever triages it reopens this assessment: cite the vendor document that describes
   the mode, re-read the capability table against a fresh `initialize` capture, decide criterion by
   criterion, and record the outcome here with a new read date. A documentation page without a

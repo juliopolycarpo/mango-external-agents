@@ -1,0 +1,8 @@
+# Reviewed ACP mentions that scripts/check-vendor-acp-docs.sh accepts instead of failing.
+#
+# Format, one entry per line, fields separated by a single TAB:
+#   vendor<TAB>exact line text<TAB>reason
+# The line text must equal a whole line of a watched page (see docs/vendor-drift.md). When the page
+# changes the line, the entry stops matching and the new wording is reviewed again. An entry that
+# matches no line fails the watch: delete it. Record the decision in docs/acp-convergence.md in the
+# same change that adds the entry.
