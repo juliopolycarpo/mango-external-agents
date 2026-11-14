@@ -78,7 +78,7 @@ tag_bin=$(mktemp -d)
 tag_log=$tag_bin/gh.log
 ln -s "$PWD/scripts/test-fixtures/fake-tag-verification-cli.sh" "$tag_bin/gh"
 check_tag() {
-  env PATH="$tag_bin:$PATH" FAKE_GH_LOG=$tag_log FAKE_TAG_NAME=v0.4.0 "$@" \
+  env PATH="$tag_bin:$PATH" FAKE_GH_LOG="$tag_log" FAKE_TAG_NAME=v0.4.0 "$@" \
     scripts/check-release-tag-signature.sh owner/repository "$TAG_VERSION" "$RELEASE_COMMIT"
 }
 expect_tag_refusal() {
@@ -173,6 +173,18 @@ check_release_workflow() {
     echo "expected cargo-hack installation before scripts/check.sh in $file, received install at verify line ${install_line%%:*} and check at line ${check_line%%:*}" >&2
     return 1
   fi
+  # A hosted runner image carries its own shellcheck, so without the pinned install check.sh would
+  # lint the release with whatever version the image has.
+  found=$(grep -nE '^[[:space:]]+tool:[[:space:]]*([^,]+,)*shellcheck@[0-9]+[.][0-9]+[.][0-9]+(,|[[:space:]]*$)' <<<"$verify" | head -n 1 || true)
+  if [ -z "$found" ]; then
+    echo "expected the release verify job in $file to install shellcheck at an exact version before scripts/check.sh, received no shellcheck@<version> tool entry" >&2
+    return 1
+  fi
+  # check_line is still the line of `scripts/check.sh` in the verify job.
+  if [ "${found%%:*}" -ge "${check_line%%:*}" ]; then
+    echo "expected the release verify job in $file to install shellcheck at an exact version before scripts/check.sh, received the install at verify line ${found%%:*} and the check at line ${check_line%%:*}" >&2
+    return 1
+  fi
   found=$(workflow_job "$file" crates | grep -E '^[[:space:]]+needs:[[:space:]]*verify[[:space:]]*$' || true)
   if [ -z "$found" ]; then
     echo "expected the publish job (crates) in $file to need the verify job, received no 'needs: verify'" >&2
@@ -213,12 +225,17 @@ awk '/rustup toolchain install/ { held = $0; next } { print } /scripts\/check-fe
 expect_workflow_refusal 'to be installed before the isolated feature check'
 sed 's/needs: verify$/needs: []/' "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal 'to need the verify job'
+# shellcheck disable=SC2016 # the workflow line must contain the literal $GITHUB_ENV
 { cat "$release_workflow"; printf '      - run: echo "RUSTUP_TOOLCHAIN=1.97.0" >> "$GITHUB_ENV"\n'; } > "$workflow_dir/release.yml"
 expect_workflow_refusal 'to leave the pinned toolchain selected for every other step'
 sed 's/cargo-hack,//' "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal 'to install cargo-hack for the stable feature powerset'
 sed 's/cargo-hack/cargo-hacker/' "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal 'to install cargo-hack for the stable feature powerset'
+sed 's/,shellcheck@[0-9.]*//' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'to install shellcheck at an exact version'
+sed 's/shellcheck@[0-9.]*/shellcheck/' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'to install shellcheck at an exact version'
 awk '/^[[:space:]]+tool:/ { held = $0; next } { print } /- run: scripts\/check[.]sh$/ { print held }' \
   "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal 'cargo-hack installation before scripts/check.sh'
@@ -340,6 +357,7 @@ if scripts/check-dev-dependencies.sh "$dev_fixture/repeated.toml" >/dev/null 2>"
   echo "expected rejection of the dev-dependency that repeats [dependencies] in repeated.toml, received success" >&2
   exit 1
 fi
+# shellcheck disable=SC2015 # the `||` branch reports a failure of either grep; it is not an else of a command that can fail
 grep -q "differ from the \[dependencies\] entry" "$dev_fixture/repeated.err" &&
   grep -q "repeated.toml: \[dev-dependencies\] sibling = " "$dev_fixture/repeated.err" || {
   echo "expected the rejection to name repeated.toml, the dependency and the redundancy, received: $(cat "$dev_fixture/repeated.err")" >&2
@@ -353,6 +371,7 @@ for target in 'cfg(unix)' x86_64-unknown-linux-gnu; do
     echo "expected rejection of repeated sibling in target '$target', received success" >&2
     exit 1
   fi
+  # shellcheck disable=SC2015 # the `||` branch reports a failure of either grep; it is not an else of a command that can fail
   grep -Fq "[target.$target.dev-dependencies] sibling = " "$dev_fixture/target-repeated.err" &&
     grep -q "differ from the \[dependencies\] entry" "$dev_fixture/target-repeated.err" || {
     echo "expected rejection to name target '$target', sibling and redundancy, received: $(cat "$dev_fixture/target-repeated.err")" >&2
@@ -393,6 +412,7 @@ for shape in "${self_shapes[@]}"; do
     echo "expected rejection of the self dev-dependency '$shape', received success" >&2
     exit 1
   fi
+  # shellcheck disable=SC2015 # the `||` branch reports a failure of either grep; it is not an else of a command that can fail
   grep -Fq "self-shape.toml: [dev-dependencies] selfish = " "$dev_fixture/self-shape.err" &&
     grep -Fq "expected a crate's dev-dependency on itself only in [dev-dependencies]" "$dev_fixture/self-shape.err" || {
     echo "expected the rejection of '$shape' to name the entry and the self shape, received: $(cat "$dev_fixture/self-shape.err")" >&2
@@ -554,6 +574,7 @@ echo 'workspace dependency checks passed'
 readme_fixture=$(mktemp -d)
 trap 'rm -rf "$readme_fixture"' EXIT
 write_readme() {
+  # shellcheck disable=SC2016 # the fixture README must contain literal backticks
   printf '# crate\n\n```toml\n[dependencies]\nmango-external-agents = "%s"\nmango-agent-acp = "%s"\n```\n' "$2" "$3" > "$readme_fixture/$1.md"
 }
 expect_readme_refusal() {

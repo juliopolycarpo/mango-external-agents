@@ -90,3 +90,25 @@ Naming a test in `ci.yml` is not enough. `scripts/ci-script-steps.py` parses the
 
 It does not follow shell conditionals inside a `run:` block, `set +e`, or `matrix.include` entries.
 `scripts/test-check-script-tests.sh` pins each rule against a scratch workflow.
+
+## Shell lint
+
+`scripts/check-shellcheck.sh` runs shellcheck over every `*.sh` under `scripts/`, the fakes in
+`scripts/test-fixtures/` included. `.shellcheckrc` makes it follow `# shellcheck source=`
+directives. The Policy job in `ci.yml` installs shellcheck through `taiki-e/install-action` at an
+exact version (`shellcheck@0.11.0`, so a new release cannot add findings to an unrelated change),
+runs the gate, and fails when the tool is missing. The release workflow's verify job installs the
+same version before `scripts/check.sh`, because GitHub's runner images ship their own shellcheck
+and the probe in `check.sh` would otherwise pick it up; `scripts/test-release.sh` pins that entry.
+The gate prints the version it ran under.
+
+`scripts/check.sh` runs the gate when shellcheck is on `PATH` and otherwise warns once and skips
+it, as it does for cargo-hack. To get the CI version without a system-wide install, take the
+`shellcheck-v0.11.0.linux.x86_64.tar.xz` release asset from koalaman/shellcheck into an empty
+directory, check its SHA-256 against the digest GitHub lists for the asset, extract it, and put the
+`shellcheck` binary on `PATH` for the run.
+
+A finding that is intentional gets `# shellcheck disable=SCxxxx # reason` above the command, never
+a blanket exclusion in the gate. A directive cannot sit between the lines of a pipeline: put it
+before the whole command. `scripts/test-check-shellcheck.sh` covers the gate with a named fake
+shellcheck and, when the real tool is installed, with a script that has a finding.

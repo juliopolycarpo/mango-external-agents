@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The local counterpart of CI's Linux lanes on the pinned toolchain: format, lint (including the
-# depth-2 feature powerset), test, docs and policy. The powerset needs cargo-hack; without it the
-# script warns once, skips that gate and returns the status of the others.
+# depth-2 feature powerset), test, docs and policy. The powerset needs cargo-hack and the shell
+# lint needs shellcheck; without one the script warns once, skips that gate and returns the status
+# of the others.
 #
 # Only CI covers: the macOS and Windows builds, the minimum Rust version (run it here with
 # scripts/check-features.sh msrv --locked), the scheduled fresh-dependency and vendor-drift lanes,
@@ -43,7 +44,14 @@ run scripts/test-fresh-receipt.sh
 run scripts/test-check-powerset.sh
 run scripts/test-run-without-self-dev-dependency.sh
 run scripts/test-check-script-tests.sh
+run scripts/test-check-shellcheck.sh
 run scripts/check-script-tests.sh
+# CI's Policy job installs shellcheck and runs the same gate; here it is optional like cargo-hack.
+if command -v shellcheck >/dev/null 2>&1; then
+  run scripts/check-shellcheck.sh
+else
+  echo "warning: shellcheck not found on PATH; skipped the shell lint that CI runs (see docs/testing.md)" >&2
+fi
 run scripts/test-check-tls.sh
 run scripts/check-standalone.sh
 run cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
