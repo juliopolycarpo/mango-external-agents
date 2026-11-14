@@ -12,6 +12,7 @@ version=${BASH_REMATCH[1]}
 core=${version%%-*}
 IFS=. read -r -a components <<< "$core"
 for component in "${components[@]}"; do
+  # shellcheck disable=SC2071 # string comparison on purpose: equal-length decimals order the same as text
   if [ "${#component}" -gt 20 ] || { [ "${#component}" -eq 20 ] && [[ "$component" > 18446744073709551615 ]]; }; then
     echo "expected a SemVer core component within u64, received '$component' in '$ref'" >&2
     exit 1
