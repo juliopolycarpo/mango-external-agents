@@ -158,8 +158,21 @@ async fn queued_turns_play_in_order_and_each_prints_its_own_lines() {
 }
 
 #[tokio::test]
-async fn an_unscripted_turn_completes_with_an_empty_result_by_default() {
+async fn an_unscripted_turn_is_refused_by_default() {
     let cli = FakeClaudeCli::new();
+    let words = ["claude", "--print"];
+
+    let message = refusal(cli.spawn(launch(&words)).await, &words);
+
+    assert!(
+        message.contains("a turn with no Run queued"),
+        "expected a default fake to refuse a turn with no Run queued | received: {message}"
+    );
+}
+
+#[tokio::test]
+async fn a_completing_run_answers_with_an_empty_result() {
+    let cli = FakeClaudeCli::new().with_turn(Run::completing());
 
     let lines = spawned_and_printed(&cli, &["claude", "--print"]).await;
 
@@ -167,16 +180,29 @@ async fn an_unscripted_turn_completes_with_an_empty_result_by_default() {
 }
 
 #[tokio::test]
-async fn refusing_unscripted_turns_names_the_argv_it_received() {
-    let cli = FakeClaudeCli::new().refusing_unscripted_turns();
-    let words = ["claude", "--print", "--model", "sonnet"];
+async fn a_refused_turn_keeps_its_argv_out_of_the_error_and_on_the_fake() {
+    let cli = FakeClaudeCli::new();
+    let words = ["claude", "--print", "--model", "sk-ant-canary-argument"];
 
     let message = refusal(cli.spawn(launch(&words)).await, &words);
 
     assert!(
-        message.contains("a turn with no Run queued")
-            && message.contains(r#"["claude", "--print", "--model", "sonnet"]"#),
-        "expected the refusal to name the unscripted turn and its argv | received: {message}"
+        message.contains("a turn with no Run queued") && message.contains("4 arguments"),
+        "expected the refusal to name the unscripted turn and its argument count | received: {message}"
+    );
+    assert!(
+        !message.contains("sk-ant-canary-argument"),
+        "expected Error::Launch to carry no argv | received: {message}"
+    );
+    let refused: Vec<Vec<String>> = cli
+        .refused_launches()
+        .into_iter()
+        .map(|spec| spec.argv)
+        .collect();
+    assert_eq!(
+        refused,
+        vec![words.map(String::from).to_vec()],
+        "expected refused_launches() to hold the received argv"
     );
     assert!(
         cli.launches().is_empty(),
@@ -186,10 +212,8 @@ async fn refusing_unscripted_turns_names_the_argv_it_received() {
 }
 
 #[tokio::test]
-async fn refusing_unscripted_turns_still_plays_a_scripted_one_and_then_refuses_the_next() {
-    let cli = FakeClaudeCli::new()
-        .with_turn(Run::replaying("scripted"))
-        .refusing_unscripted_turns();
+async fn a_scripted_turn_plays_and_the_next_one_is_refused() {
+    let cli = FakeClaudeCli::new().with_turn(Run::replaying("scripted"));
 
     assert_eq!(
         spawned_and_printed(&cli, &["claude", "--print"]).await,
@@ -207,22 +231,31 @@ async fn refusing_unscripted_turns_still_plays_a_scripted_one_and_then_refuses_t
 }
 
 #[tokio::test]
-async fn an_auth_subcommand_other_than_status_is_refused_with_its_argv() {
+async fn an_auth_subcommand_other_than_status_is_refused_and_its_argv_recorded() {
     let cli = FakeClaudeCli::new();
     let words = ["claude", "auth", "login"];
 
     let message = refusal(cli.spawn(launch(&words)).await, &words);
 
     assert!(
-        message.contains("auth subcommand other than `status`")
-            && message.contains(r#"["claude", "auth", "login"]"#),
-        "expected the refusal to name the subcommand and its argv | received: {message}"
+        message.contains("auth subcommand other than `status`") && !message.contains("login\""),
+        "expected the refusal to name the subcommand and no argv | received: {message}"
+    );
+    let refused: Vec<Vec<String>> = cli
+        .refused_launches()
+        .into_iter()
+        .map(|spec| spec.argv)
+        .collect();
+    assert_eq!(
+        refused,
+        vec![words.map(String::from).to_vec()],
+        "expected refused_launches() to hold the received argv"
     );
 }
 
 #[tokio::test]
 async fn a_refusal_is_a_launch_error_for_the_program_it_received() {
-    let cli = FakeClaudeCli::new().refusing_unscripted_turns();
+    let cli = FakeClaudeCli::new();
 
     let Err(error) = cli.spawn(launch(&["claude", "--print"])).await else {
         panic!("expected a refusal | received: a running child");
@@ -236,7 +269,7 @@ async fn a_refusal_is_a_launch_error_for_the_program_it_received() {
 
 #[tokio::test]
 async fn a_line_written_to_a_turn_child_is_recorded() {
-    let cli = FakeClaudeCli::new();
+    let cli = FakeClaudeCli::new().with_turn(Run::completing());
     let mut process = cli
         .spawn(launch(&["claude", "--print"]))
         .await

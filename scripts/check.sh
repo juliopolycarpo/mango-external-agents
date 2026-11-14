@@ -47,7 +47,7 @@ run cargo clippy --workspace --all-targets --all-features --locked -- -D warning
 run cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
 # The same command as the `rust` job in ci.yml; scripts/test-check-powerset.sh pins the two together.
 if cargo hack --version >/dev/null 2>&1; then
-  run cargo hack clippy --feature-powerset --depth 2 --all-targets --locked -p mango-external-agents -- -D warnings
+  run cargo hack clippy --feature-powerset --depth 2 --all-targets --locked -p mango-external-agents -p mango-agent-claude -p mango-agent-codex -p mango-agent-acp -- -D warnings
 else
   echo "warning: cargo-hack not found on PATH; skipped the depth-2 feature powerset that CI runs (cargo install cargo-hack --locked)" >&2
 fi

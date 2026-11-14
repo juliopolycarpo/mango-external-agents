@@ -223,6 +223,22 @@ impl Run {
         ]))
     }
 
+    /// A child that ends its turn with an empty successful `result` and nothing else.
+    ///
+    /// For a test that needs a turn to launch and finish but does not read what it said.
+    ///
+    /// ```
+    /// use mango_agent_claude::testing::Run;
+    ///
+    /// let Run::Transcript { lines, .. } = Run::completing() else {
+    ///     panic!("expected a transcript run");
+    /// };
+    /// assert_eq!(lines, [r#"{"type":"result","is_error":false}"#]);
+    /// ```
+    pub fn completing() -> Self {
+        Self::replaying(r#"{"type":"result","is_error":false}"#)
+    }
+
     /// A child that writes `transcript`'s non-blank lines and exits cleanly.
     pub fn replaying(transcript: &str) -> Self {
         Self::Transcript {
@@ -265,9 +281,9 @@ impl Run {
 ///
 /// A launch whose argv has `--version` or `--help` anywhere, or `auth status` as its first two
 /// arguments, is a probe and is answered from the build's own text. Any other launch is a turn and
-/// plays the next [`Run`] queued with [`with_turn`](Self::with_turn). With nothing queued a turn
-/// completes with an empty `result`, unless [`refusing_unscripted_turns`](Self::refusing_unscripted_turns)
-/// asks for a refusal.
+/// plays the next [`Run`] queued with [`with_turn`](Self::with_turn). With nothing queued a turn is
+/// refused with a launch error, so a test never passes over a launch it did not script; queue
+/// [`Run::completing`] for a turn whose output does not matter.
 ///
 /// # Example
 ///
@@ -276,8 +292,7 @@ impl Run {
 ///
 /// let cli = FakeClaudeCli::new()
 ///     .with_auth(SIGNED_OUT)
-///     .with_turn(Run::exiting(1))
-///     .refusing_unscripted_turns();
+///     .with_turn(Run::exiting(1));
 /// assert!(cli.launches().is_empty(), "nothing has launched yet");
 /// ```
 pub struct FakeClaudeCli {
@@ -286,6 +301,8 @@ pub struct FakeClaudeCli {
     auth: Mutex<String>,
     turns: Mutex<VecDeque<Run>>,
     launches: Mutex<Vec<LaunchSpec>>,
+    /// Launches the script did not cover, kept apart from `launches` so the error can stay argv-free.
+    refused: Mutex<Vec<LaunchSpec>>,
     written: Arc<Mutex<Vec<String>>>,
     children: Mutex<Vec<Arc<Child>>>,
     stderr: Mutex<Vec<u8>>,
@@ -311,8 +328,6 @@ pub struct FakeClaudeCli {
     input_closed: Arc<Notify>,
     /// Whether a turn child's stdout needs one more pass of the runtime before a line is ready.
     output_needs_a_pass: bool,
-    /// Whether a turn launched with no [`Run`] queued is refused instead of answered.
-    refuses_unscripted_turns: bool,
 }
 
 impl Default for FakeClaudeCli {
@@ -322,7 +337,7 @@ impl Default for FakeClaudeCli {
 }
 
 impl FakeClaudeCli {
-    /// A build that answers every probe and completes every turn without saying anything.
+    /// A build that answers every probe and plays only the turns a test queued.
     pub fn new() -> Self {
         Self {
             version: Mutex::new(String::from(DEFAULT_VERSION)),
@@ -330,6 +345,7 @@ impl FakeClaudeCli {
             auth: Mutex::new(String::from(SIGNED_IN)),
             turns: Mutex::new(VecDeque::new()),
             launches: Mutex::new(Vec::new()),
+            refused: Mutex::new(Vec::new()),
             written: Arc::new(Mutex::new(Vec::new())),
             children: Mutex::new(Vec::new()),
             stderr: Mutex::new(Vec::new()),
@@ -346,19 +362,7 @@ impl FakeClaudeCli {
             spawned: Notify::new(),
             input_closed: Arc::new(Notify::new()),
             output_needs_a_pass: false,
-            refuses_unscripted_turns: false,
         }
-    }
-
-    /// Refuses a turn launched while no [`Run`] is queued, with a launch error naming its argv.
-    ///
-    /// Without this a turn nobody scripted completes with an empty `result`, which lets a test
-    /// pass over a launch it never meant to allow. A refused launch is not recorded in
-    /// [`launches`](Self::launches).
-    #[must_use]
-    pub fn refusing_unscripted_turns(mut self) -> Self {
-        self.refuses_unscripted_turns = true;
-        self
     }
 
     /// Prints this instead of the default `--version` banner.
@@ -448,6 +452,15 @@ impl FakeClaudeCli {
     /// Every launch, in order.
     pub fn launches(&self) -> Vec<LaunchSpec> {
         lock(&self.launches).clone()
+    }
+
+    /// Every launch the script did not cover, in order, with the argv it received.
+    ///
+    /// A refusal is an [`Error::Launch`], which never carries an argv because a host's argv can
+    /// hold secrets; its message gives the reason and the argument count, and this is where the
+    /// argv itself is read. A refused launch is not in [`launches`](Self::launches).
+    pub fn refused_launches(&self) -> Vec<LaunchSpec> {
+        lock(&self.refused).clone()
     }
 
     /// Every turn's argv, in order — the launches that are not one of the three probes.
@@ -653,7 +666,20 @@ impl FakeClaudeCli {
         child.changed.notify_waiters();
     }
 
-    fn run_for(&self, argv: &[String]) -> Result<(Run, Vec<u8>)> {
+    /// Records `spec` as refused and builds the launch error for it, with no argv in the message.
+    fn refuse(&self, spec: &LaunchSpec, unscripted: &str) -> Error {
+        lock(&self.refused).push(spec.clone());
+        Error::Launch {
+            program: spec.argv.first().cloned().unwrap_or_default(),
+            message: format!(
+                "unscripted launch, expected --version, --help, auth status or a queued turn | received {unscripted} ({} arguments); read FakeClaudeCli::refused_launches for the argv",
+                spec.argv.len()
+            ),
+        }
+    }
+
+    fn run_for(&self, spec: &LaunchSpec) -> Result<(Run, Vec<u8>)> {
+        let argv = &spec.argv;
         if argv.iter().any(|argument| argument == "--version") {
             return Ok((Run::replaying(&lock(&self.version)), Vec::new()));
         }
@@ -666,37 +692,19 @@ impl FakeClaudeCli {
         // The library never logs in, so an `auth` subcommand other than `status` is not something
         // a script should answer: it would be a turn that quietly succeeded.
         if argv.get(1).is_some_and(|word| word == "auth") {
-            return Err(refused_launch(
-                argv,
+            return Err(self.refuse(
+                spec,
                 "an auth subcommand other than `status`, which this fake never answers",
             ));
         }
         let queued = lock(&self.turns).pop_front();
         let run = match queued {
             Some(run) => run,
-            None if self.refuses_unscripted_turns => {
-                return Err(refused_launch(
-                    argv,
-                    "a turn with no Run queued through with_turn",
-                ));
+            None => {
+                return Err(self.refuse(spec, "a turn with no Run queued through with_turn"));
             }
-            None => Run::replaying(r#"{"type":"result","is_error":false}"#),
         };
         Ok((run, lock(&self.stderr).clone()))
-    }
-}
-
-/// The error a launch the script does not cover fails with, naming the argv it received.
-///
-/// The argv is written into the message on purpose: [`Error::Launch`] keeps argv out of a library's
-/// own errors because it can carry a host's secrets, but a fake only ever sees the argv a test
-/// built, and the argv is the one fact that tells a test author what to script.
-fn refused_launch(argv: &[String], unscripted: &str) -> Error {
-    Error::Launch {
-        program: argv.first().cloned().unwrap_or_default(),
-        message: format!(
-            "unscripted launch, expected --version, --help, auth status or a queued turn | received {unscripted}: argv {argv:?}"
-        ),
     }
 }
 
@@ -743,7 +751,7 @@ fn lock<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[async_trait::async_trait]
 impl ProcessLauncher for FakeClaudeCli {
     async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
-        let (run, stderr_bytes) = self.run_for(&spec.argv)?;
+        let (run, stderr_bytes) = self.run_for(&spec)?;
         let is_turn = !is_probe(&spec.argv);
         let gate = is_turn.then(|| lock(&self.spawn_gate).clone()).flatten();
         if let Some(gate) = gate {

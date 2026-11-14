@@ -1935,7 +1935,7 @@ mod opening_a_session {
 
     #[tokio::test]
     async fn prefers_the_executable_the_request_resolved_over_the_harnesss_own() {
-        let launcher = Arc::new(FakeClaudeCli::new());
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::completing()));
         let request =
             OpenSession::new("chat-1").with_executable(ExecutablePath::resolved("/srv/claude"));
         let session = ClaudeHarness::new()
@@ -3580,7 +3580,11 @@ mod mcp_passthrough {
 
     #[tokio::test]
     async fn loads_the_hosts_servers_from_a_file_rather_than_from_the_command_line() {
-        let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_help(HELP_2_1_270)
+                .with_turn(Run::completing()),
+        );
         let session = open_with_servers(&launcher).await;
         session
             .start_turn(TurnRequest::new("turn-1", "hello"))
@@ -4016,7 +4020,11 @@ mod mcp_passthrough {
             .expect("expected a runtime whose blocking pool this test owns");
 
         runtime.block_on(async {
-            let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+            let launcher = Arc::new(
+                FakeClaudeCli::new()
+                    .with_help(HELP_2_1_270)
+                    .with_turn(Run::completing()),
+            );
             let scratch = support::private_scratch("stop-scratch");
             let host = HostContext::builder()
                 .launcher(launcher.clone())
@@ -4141,7 +4149,11 @@ mod mcp_passthrough {
 
     #[tokio::test]
     async fn passes_the_host_authorised_scratch_path_to_the_child_unchanged() {
-        let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_help(HELP_2_1_270)
+                .with_turn(Run::completing()),
+        );
         let scratch = support::private_scratch("host-scratch");
         let host = HostContext::builder()
             .launcher(launcher.clone())
@@ -4388,7 +4400,11 @@ mod mcp_passthrough {
 
     #[tokio::test]
     async fn the_file_leaves_with_the_session_that_wrote_it() {
-        let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_help(HELP_2_1_270)
+                .with_turn(Run::completing()),
+        );
         let session = open_with_servers(&launcher).await;
         session
             .start_turn(TurnRequest::new("turn-1", "hello"))
@@ -4824,7 +4840,11 @@ mod mcp_passthrough {
 
     #[tokio::test]
     async fn an_artifact_removal_failure_still_closes_the_session() {
-        let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_help(HELP_2_1_270)
+                .with_turn(Run::completing()),
+        );
         let session = open_with_servers(&launcher).await;
         session
             .start_turn(TurnRequest::new("turn-1", "hello"))
@@ -4880,7 +4900,11 @@ mod mcp_passthrough {
 
     #[tokio::test]
     async fn a_session_with_no_servers_writes_no_file_and_passes_no_flag() {
-        let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_help(HELP_2_1_270)
+                .with_turn(Run::completing()),
+        );
         let session = open(&launcher).await;
         session
             .start_turn(TurnRequest::new("turn-1", "hello"))
@@ -4927,7 +4951,11 @@ mod json_schema_passthrough {
 
     #[tokio::test]
     async fn the_default_harness_passes_no_schema_even_on_a_build_that_declares_the_flag() {
-        let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_help(HELP_2_1_270)
+                .with_turn(Run::completing()),
+        );
         let argv = first_turn_argv(ClaudeHarness::new(), &launcher).await;
         assert_eq!(
             value_after(&argv, "--json-schema"),
@@ -4938,7 +4966,11 @@ mod json_schema_passthrough {
 
     #[tokio::test]
     async fn passes_the_compact_schema_on_the_turn_command_line() {
-        let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_help(HELP_2_1_270)
+                .with_turn(Run::completing()),
+        );
         let harness = ClaudeHarness::new()
             .with_json_schema(SCHEMA)
             .expect("expected a usable schema");
