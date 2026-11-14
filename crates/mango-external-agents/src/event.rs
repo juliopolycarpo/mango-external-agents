@@ -23,6 +23,23 @@ use crate::operation::{AttemptId, OperationRef};
 use crate::permission::{ApprovalDecision, PermissionRequest};
 use crate::session::CancelReason;
 
+/// The most bytes of JSON one [`EventKind::StructuredOutput`] may carry.
+///
+/// Counted as the compact serialisation of the value, the same measure the turn buffer budgets an
+/// event at. The same number as [`DIFF_MAX_CONTENT_LENGTH`](crate::content::DIFF_MAX_CONTENT_LENGTH),
+/// the other large structured payload an event carries, counted in bytes where that one counts code
+/// points, and far inside the default 8 MiB turn buffer. A value cannot be cut and stay valid
+/// against its schema, so past this size [`EventKind::structured_output`] refuses it.
+///
+/// # Example
+///
+/// ```
+/// use mango_external_agents::STRUCTURED_OUTPUT_MAX_BYTES;
+///
+/// assert_eq!(STRUCTURED_OUTPUT_MAX_BYTES, 256 * 1024);
+/// ```
+pub const STRUCTURED_OUTPUT_MAX_BYTES: usize = 256 * 1024;
+
 /// The host's own id for a session.
 ///
 /// Distinct from the vendor's `native_session_id`: this one the host minted and can rely on, and
@@ -131,7 +148,8 @@ impl AgentEvent {
     ///
     /// [`EventKind::Cancelled`] is a marker rather than a terminal: it is emitted immediately
     /// before [`EventKind::Completed`] and never instead of it, so a host that does not recognise
-    /// it still sees its turn end.
+    /// it still sees its turn end. [`EventKind::StructuredOutput`] is a marker the same way, ahead
+    /// of the terminal rather than adjacent to it.
     pub fn is_terminal(&self) -> bool {
         matches!(self.kind, EventKind::Completed | EventKind::Error { .. })
     }
@@ -268,6 +286,34 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
     },
+    /// The structured answer a harness validated for this turn, as JSON.
+    ///
+    /// Present only when the host asked a harness for one, such as through a schema it supplied,
+    /// and the harness reported one; every other turn carries none. Emitted before
+    /// [`EventKind::Completed`], and refused after the terminal like any event. A marker, not a
+    /// terminal: the turn still ends on [`EventKind::Completed`] or [`EventKind::Error`].
+    ///
+    /// The value is vendor-derived data, bounded to [`STRUCTURED_OUTPUT_MAX_BYTES`] and otherwise
+    /// passed through as the vendor wrote it. A host must treat it as untrusted input and must not
+    /// feed it to its own model as an instruction. It is the answer, not the transcript: the
+    /// assistant text that produced it is never replayed. Its `Debug` shows nothing of it.
+    ///
+    /// Build one with [`EventKind::structured_output`], which refuses a value over the bound.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::EventKind;
+    ///
+    /// let answer = EventKind::structured_output(serde_json::json!({ "verdict": "pass" }))
+    ///     .expect("a small value fits the bound");
+    /// assert!(matches!(&answer, EventKind::StructuredOutput { value } if value["verdict"] == "pass"));
+    /// assert_eq!(format!("{answer:?}"), "StructuredOutput");
+    /// ```
+    StructuredOutput {
+        /// The answer, as the vendor reported it.
+        value: serde_json::Value,
+    },
     /// The turn stopped before it finished.
     ///
     /// A marker, not a terminal: [`EventKind::Completed`] still follows.
@@ -351,6 +397,7 @@ impl fmt::Debug for EventKind {
                 .field("title_bytes", &title.len())
                 .field("has_description", &description.is_some())
                 .finish(),
+            Self::StructuredOutput { .. } => formatter.write_str("StructuredOutput"),
             Self::Cancelled { reason } => formatter
                 .debug_struct("Cancelled")
                 .field("reason", reason)
@@ -407,6 +454,46 @@ impl EventKind {
         })
     }
 
+    /// A [`EventKind::StructuredOutput`] carrying `value`, or [`Error::LimitExceeded`](crate::Error::LimitExceeded) when its
+    /// compact JSON is longer than [`STRUCTURED_OUTPUT_MAX_BYTES`].
+    ///
+    /// The one place that decides whether a vendor's structured answer fits, so a harness can
+    /// emit an [`EventKind::Error`] for an oversized one instead of an event. [`Self::normalized`]
+    /// applies the same rule to a value built by hand or read off the wire. The value is refused
+    /// whole rather than cut, because a truncated JSON document no longer holds the answer the
+    /// schema validated, and a host cannot tell that from a real one.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::LimitExceeded`](crate::Error::LimitExceeded) naming the cap and the size received, in bytes of compact JSON.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::{Error, EventKind, STRUCTURED_OUTPUT_MAX_BYTES};
+    ///
+    /// let fits = serde_json::json!({ "ok": true });
+    /// assert!(EventKind::structured_output(fits).is_ok());
+    ///
+    /// let oversized = serde_json::Value::String("x".repeat(STRUCTURED_OUTPUT_MAX_BYTES));
+    /// let refused = EventKind::structured_output(oversized).expect_err("over the bound");
+    /// assert!(matches!(
+    ///     refused,
+    ///     Error::LimitExceeded { limit: STRUCTURED_OUTPUT_MAX_BYTES, .. }
+    /// ));
+    /// ```
+    pub fn structured_output(value: serde_json::Value) -> Result<Self> {
+        let received = compact_json_len(&value);
+        if received > STRUCTURED_OUTPUT_MAX_BYTES {
+            return Err(crate::Error::LimitExceeded {
+                subject: "bytes of one structured output",
+                limit: STRUCTURED_OUTPUT_MAX_BYTES,
+                received,
+            });
+        }
+        Ok(Self::StructuredOutput { value })
+    }
+
     /// This event with every vendor-supplied value bounded, and an error's message and a notice's
     /// text redacted of credential-shaped text first.
     ///
@@ -420,7 +507,10 @@ impl EventKind {
     /// to the vendor would name a different object. A [`EventKind::Notice`] built by hand whose
     /// title is blank, or has nothing left once control characters are stripped, is refused the
     /// same way, with the title as received in the error; [`Self::notice`] returns `None` for
-    /// such a title instead, which is how a harness finds that out first.
+    /// such a title instead, which is how a harness finds that out first. A
+    /// [`EventKind::StructuredOutput`] over [`STRUCTURED_OUTPUT_MAX_BYTES`] is refused as
+    /// [`Error::LimitExceeded`](crate::Error::LimitExceeded), never cut; [`Self::structured_output`] returns the same error
+    /// first.
     pub fn normalized(self) -> Result<Self> {
         Ok(match self {
             Self::TurnStarted { native_turn_id } => Self::TurnStarted {
@@ -483,6 +573,7 @@ impl EventKind {
                     });
                 }
             },
+            Self::StructuredOutput { value } => Self::structured_output(value)?,
             Self::Error { error } => Self::Error {
                 error: normalize_error(error),
             },
@@ -495,6 +586,31 @@ impl EventKind {
             | Self::Completed) => unchanged,
         })
     }
+}
+
+/// The bytes of `value`'s compact JSON, counted without building the string.
+///
+/// A value larger than the cap is counted in full so the refusal can name its real size; the
+/// vendor line cap already bounds what can be in memory.
+fn compact_json_len(value: &serde_json::Value) -> usize {
+    #[derive(Default)]
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter::default();
+    // A `Value` always serialises (its keys are strings) and this writer never fails, so the
+    // `Err` arm is unreachable; reading it as over the cap is the safe side if it ever happened.
+    if serde_json::to_writer(&mut counter, value).is_err() {
+        return usize::MAX;
+    }
+    counter.0
 }
 
 /// How prominent a vendor suggests a [`EventKind::Notice`] is.
@@ -1643,7 +1759,7 @@ mod tests {
     use super::{
         AccountLimits, Activity, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate,
         Command, Credits, EventKind, NoticeSeverity, RateLimitWindow, ResetCredit, ResetCredits,
-        SpendControl,
+        STRUCTURED_OUTPUT_MAX_BYTES, SpendControl,
     };
     use crate::content::{ActivityContent, FileChange, PlanStep, PlanStepStatus};
     use crate::error::{Error, ErrorCode, VendorError};
@@ -2938,5 +3054,122 @@ mod tests {
             rendered.contains("Notice") && rendered.contains("Other"),
             "expected the kind and severity class to be named | received: {rendered}"
         );
+    }
+
+    /// A JSON string of `n` ASCII bytes is `n + 2` bytes once quoted.
+    fn string_value_of_json_len(len: usize) -> serde_json::Value {
+        serde_json::Value::String("x".repeat(len - 2))
+    }
+
+    #[test]
+    fn a_structured_output_within_the_bound_is_carried_unchanged() {
+        let value = serde_json::json!({ "verdict": "pass", "findings": [1, 2.5, null, "a"] });
+        let kind = EventKind::structured_output(value.clone()).expect("expected a value that fits");
+        assert_eq!(kind, EventKind::StructuredOutput { value });
+    }
+
+    #[test]
+    fn a_structured_output_of_exactly_the_bound_fits_and_one_byte_more_is_refused() {
+        let at_bound = string_value_of_json_len(STRUCTURED_OUTPUT_MAX_BYTES);
+        assert!(EventKind::structured_output(at_bound).is_ok());
+
+        let past_bound = string_value_of_json_len(STRUCTURED_OUTPUT_MAX_BYTES + 1);
+        let refused = EventKind::structured_output(past_bound).expect_err("expected a refusal");
+        assert!(
+            matches!(
+                refused,
+                Error::LimitExceeded {
+                    subject: "bytes of one structured output",
+                    limit: STRUCTURED_OUTPUT_MAX_BYTES,
+                    received,
+                } if received == STRUCTURED_OUTPUT_MAX_BYTES + 1
+            ),
+            "expected a limit error naming {STRUCTURED_OUTPUT_MAX_BYTES} and {} | received: {refused:?}",
+            STRUCTURED_OUTPUT_MAX_BYTES + 1
+        );
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "expected at most {STRUCTURED_OUTPUT_MAX_BYTES} bytes of one structured output, received {}",
+                STRUCTURED_OUTPUT_MAX_BYTES + 1
+            )
+        );
+    }
+
+    /// The size is the compact JSON, so escaping counts: a string of control characters is six
+    /// bytes each, and one third of the cap in characters is already over it.
+    #[test]
+    fn a_structured_output_is_measured_as_the_json_it_serialises_to() {
+        let escaped = serde_json::Value::String("\u{1}".repeat(STRUCTURED_OUTPUT_MAX_BYTES / 3));
+        let refused = EventKind::structured_output(escaped).expect_err("expected a refusal");
+        assert!(
+            matches!(refused, Error::LimitExceeded { received, .. } if received == STRUCTURED_OUTPUT_MAX_BYTES / 3 * 6 + 2),
+            "expected the escaped size | received: {refused:?}"
+        );
+    }
+
+    /// An event read off the wire or built by hand never went through the constructor, so
+    /// normalising it applies the same bound.
+    #[test]
+    fn normalising_a_hand_built_structured_output_applies_the_bound() {
+        let fits = EventKind::StructuredOutput {
+            value: serde_json::json!({ "ok": true }),
+        };
+        assert_eq!(fits.clone().normalized().expect("expected it to fit"), fits);
+
+        let oversized = EventKind::StructuredOutput {
+            value: string_value_of_json_len(STRUCTURED_OUTPUT_MAX_BYTES + 1),
+        };
+        let refused = oversized.normalized().expect_err("expected a refusal");
+        assert!(
+            matches!(refused, Error::LimitExceeded { .. }),
+            "expected a limit error | received: {refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_structured_outputs_debug_output_names_none_of_the_value() {
+        let kind = EventKind::StructuredOutput {
+            value: serde_json::json!({ "answer-key": "answer-secret", "n": 424_242 }),
+        };
+        let rendered = format!("{kind:?}");
+        for secret in ["answer-key", "answer-secret", "424242"] {
+            assert!(
+                !rendered.contains(secret),
+                "expected no structured value in debug output | received: {rendered}"
+            );
+        }
+        assert_eq!(rendered, "StructuredOutput");
+    }
+
+    #[test]
+    fn a_structured_output_is_a_marker_and_not_a_terminal() {
+        let event = |kind| super::AgentEvent {
+            session_id: super::SessionId::new("session"),
+            turn_id: super::TurnId::new("turn"),
+            attempt: crate::operation::AttemptId::FIRST,
+            at: std::time::SystemTime::UNIX_EPOCH,
+            kind,
+        };
+        let output = EventKind::structured_output(serde_json::json!({})).expect("expected a value");
+        assert!(!event(output).is_terminal());
+        assert!(event(EventKind::Completed).is_terminal());
+    }
+
+    #[test]
+    fn a_structured_output_is_written_as_a_tagged_object_and_reads_back() {
+        let kind = EventKind::structured_output(serde_json::json!({ "verdict": "pass", "n": 2 }))
+            .expect("expected a value");
+        let wire = serde_json::to_value(&kind).expect("expected the event to serialise");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "type": "structured_output",
+                "value": { "verdict": "pass", "n": 2 }
+            })
+        );
+        let read: EventKind =
+            serde_json::from_value(wire).expect("expected the event to read back");
+        assert_eq!(read, kind);
     }
 }

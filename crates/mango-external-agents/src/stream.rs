@@ -289,7 +289,9 @@ impl EventSink {
     ///
     /// For example, a protocol callback can publish text while continuing to acknowledge RPCs.
     /// Overflow returns `LimitExceeded` and commits a reserved `stream-overflow` failure; the
-    /// driver must stop native work. Events after a terminal are refused.
+    /// driver must stop native work. Events after a terminal are refused. An event that does not
+    /// survive normalization, such as an oversized [`EventKind::StructuredOutput`], returns its
+    /// error before anything is queued and commits no failure: the turn stays open.
     pub async fn emit(&self, kind: EventKind) -> Result<()> {
         if matches!(kind, EventKind::Completed) {
             return self.complete().await;
@@ -957,6 +959,65 @@ mod tests {
             panic!("expected an error event");
         };
         assert_eq!(error.message, "the vendor exited mid-turn");
+    }
+
+    /// The structured answer is a marker ahead of the terminal: the stream delivers it in emit
+    /// order, it does not end the turn, and `Completed` still does.
+    #[tokio::test]
+    async fn a_structured_output_arrives_before_the_completion_and_is_not_a_terminal() {
+        let (sink, mut events) = sink(4);
+        let value = serde_json::json!({ "verdict": "pass" });
+        sink.emit(EventKind::structured_output(value.clone()).expect("expected a value that fits"))
+            .await
+            .expect("expected the answer to be queued");
+        sink.complete().await.expect("expected the turn to end");
+
+        let answer = events.recv().await.expect("expected the answer first");
+        assert_eq!(answer.kind, EventKind::StructuredOutput { value });
+        assert!(!answer.is_terminal(), "received {:?}", answer.kind);
+        let completed = events.recv().await.expect("expected a completion");
+        assert_eq!(completed.kind, EventKind::Completed);
+        assert!(completed.is_terminal());
+        assert!(events.recv().await.is_none());
+    }
+
+    /// An answer after the terminal has no turn to belong to, like any other event.
+    #[tokio::test]
+    async fn a_structured_output_after_the_completion_is_refused() {
+        let (sink, _events) = sink(4);
+        sink.complete().await.expect("expected the turn to end");
+        let late = EventKind::structured_output(serde_json::json!({}))
+            .expect("expected a value that fits");
+        let refused = sink.emit(late).await;
+        assert!(
+            refused.is_err(),
+            "expected a refusal after the terminal | received: {refused:?}"
+        );
+    }
+
+    /// An oversized answer is refused on its own: nothing is queued, and the turn stays open for
+    /// the harness to decide between failing it and completing it.
+    #[tokio::test]
+    async fn an_oversized_structured_output_is_refused_without_ending_the_turn() {
+        let (sink, mut events) = sink(4);
+        let oversized = EventKind::StructuredOutput {
+            value: serde_json::Value::String("x".repeat(crate::STRUCTURED_OUTPUT_MAX_BYTES)),
+        };
+        let refused = sink.emit(oversized).await;
+        assert!(
+            matches!(refused, Err(Error::LimitExceeded { .. })),
+            "expected a limit error | received: {refused:?}"
+        );
+
+        sink.complete()
+            .await
+            .expect("expected the turn to still end");
+        let next = events.recv().await.expect("expected the completion");
+        assert_eq!(
+            next.kind,
+            EventKind::Completed,
+            "expected no failure or answer queued before the completion"
+        );
     }
 
     #[tokio::test]

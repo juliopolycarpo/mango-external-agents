@@ -896,6 +896,11 @@ mod tests {
                 title: text.to_owned(),
                 description: None,
             },
+            // Text in a key and in a nested string, so the size counter meets JSON escaping inside a
+            // value as well as in the event's own fields.
+            EventKind::StructuredOutput {
+                value: serde_json::json!({ (text): [text, true, null, 7] }),
+            },
             EventKind::Cancelled {
                 reason: CancelReason::Requested,
             },
@@ -945,6 +950,7 @@ mod tests {
             EventKind::ThreadUsage { .. } => "ThreadUsage",
             EventKind::AccountLimits { .. } => "AccountLimits",
             EventKind::Notice { .. } => "Notice",
+            EventKind::StructuredOutput { .. } => "StructuredOutput",
             EventKind::Cancelled { .. } => "Cancelled",
             EventKind::Completed => "Completed",
             EventKind::Error { .. } => "Error",
@@ -954,7 +960,7 @@ mod tests {
     /// Every kind of event is in the corpus, so "one event of every kind" is a checked claim.
     #[test]
     fn the_corpus_holds_every_event_kind() {
-        const KINDS: usize = 19;
+        const KINDS: usize = 20;
         let names: std::collections::BTreeSet<&str> = corpus("text")
             .iter()
             .map(|event| kind_name(&event.kind))
