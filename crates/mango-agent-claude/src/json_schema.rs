@@ -24,11 +24,18 @@ use mango_external_agents::{Error, Result};
 /// The schema travels inline, because the flag takes a value rather than a path. Windows caps a
 /// whole command line at 32,767 UTF-16 code units, and Rust's `Command` writes an argument as
 /// [`windows_argument_units`] counts it: every `"` becomes `\"` and the backslashes before it are
-/// doubled. A compact schema dense in quotes therefore grows well past its byte length, so the
-/// bound is on the escaped length. Half the cap leaves the other half for the program path, the
+/// doubled, and a batch-file launcher also turns every `%` into 8 units. A compact schema dense in
+/// quotes or percent signs therefore grows well past its byte length, so the bound is on the
+/// escaped length. Half the cap leaves the other half for the program path, the
 /// other flags, the session id and the MCP path. A host with a larger schema needs a surface the
 /// vendor documents for it; none is documented for `--json-schema` today.
 pub const MAX_JSON_SCHEMA_ARGUMENT_UNITS: usize = 16 * 1024;
+
+/// What one `%` takes in a batch-file argument: `%%cd:~,` is written before the `%` itself.
+///
+/// Rust's `Command` runs a `.bat` or `.cmd` program through `cmd.exe` and rewrites each `%` this
+/// way so `%VAR%` in an argument is not expanded.
+const PERCENT_UNITS_IN_A_BATCH_ARGUMENT: usize = 8;
 
 /// What a refusal names as the accepted shape.
 const EXPECTED_SHAPE: &str = "a JSON object, no larger than 16384 UTF-16 code units once compacted and escaped as a Windows command-line argument, that is a JSON Schema for --json-schema";
@@ -87,10 +94,16 @@ pub fn compact(raw: &str) -> Result<String> {
 /// How many UTF-16 code units `argument` takes on a Windows command line, as Rust's `Command`
 /// writes it.
 ///
-/// The argument is counted as quoted, which is conservative: `Command` quotes only an argument
-/// holding a space or tab. Inside the quotes each `"` is written as `\"`, and each backslash
-/// directly before a quote (or before the closing quote) is written twice. Every other
-/// character takes its UTF-16 length.
+/// The count is an upper bound valid for both writers `Command` uses, because the host's launcher
+/// may run an `.exe` or a `.bat`/`.cmd` shim such as an npm `claude.cmd`:
+///
+/// - The argument is counted as quoted. An `.exe` argument is quoted only when it holds a space or
+///   tab, a batch argument when it holds a character cmd.exe treats as special.
+/// - Each `"` takes 2 units (`\"` for an `.exe`, `""` for a batch file), and each backslash
+///   directly before a quote, or before the closing quote, is written twice. Both writers agree.
+/// - Each `%` takes 8 units. An `.exe` writes it as is (1 unit), but a batch file writes it as
+///   `%%cd:~,%` so cmd.exe does not expand `%VAR%`, and the bound takes the larger.
+/// - Every other character takes its UTF-16 length.
 ///
 /// # Example
 ///
@@ -102,6 +115,8 @@ pub fn compact(raw: &str) -> Result<String> {
 /// assert_eq!(windows_argument_units("\""), 4);
 /// // A backslash before a quote is written twice: `\\\"`.
 /// assert_eq!(windows_argument_units("\\\""), 6);
+/// // A batch file writes `%` as `%%cd:~,%`.
+/// assert_eq!(windows_argument_units("%"), 10);
 /// ```
 pub fn windows_argument_units(argument: &str) -> usize {
     // The surrounding quotes.
@@ -117,6 +132,13 @@ pub fn windows_argument_units(argument: &str) -> usize {
             '"' => {
                 units += backslashes + 2;
                 backslashes = 0;
+            }
+            // `%%cd:~,%` is what a batch file's argument writer emits for each `%`. An `.exe`
+            // writes 1 unit; the larger figure holds for either, so a `claude.cmd` launcher never
+            // meets a limit the typed refusal at `with_json_schema` did not.
+            '%' => {
+                backslashes = 0;
+                units += PERCENT_UNITS_IN_A_BATCH_ARGUMENT;
             }
             other => {
                 backslashes = 0;
@@ -281,6 +303,48 @@ mod tests {
         refusal_received(&over);
     }
 
+    /// A `claude.cmd` launcher writes each `%` as `%%cd:~,%`, so 5,000 of them take 40,008 units
+    /// and CreateProcess would refuse the first turn.
+    #[test]
+    fn refuses_a_percent_dense_schema_that_a_batch_launcher_would_expand_past_the_cap() {
+        let percents = 5_000;
+        let raw = format!("{{\"d\":\"{}\"}}", "%".repeat(percents));
+        let received = refusal_received(&raw);
+        assert_eq!(
+            received,
+            format!(
+                "a schema of {} bytes that takes {} UTF-16 code units on a Windows command line",
+                8 + percents,
+                14 + 8 * percents
+            ),
+            "expected the batch-escaped length named | received {received:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_a_percent_dense_schema_exactly_at_the_cap_and_refuses_one_unit_over() {
+        // 14 units of structure, 8 per `%`, then two filler characters.
+        let at_cap = format!("{{\"d\":\"{}xx\"}}", "%".repeat(2_046));
+        let argument = compact(&at_cap).expect("expected the cap itself to pass");
+        assert_eq!(
+            windows_argument_units(&argument),
+            MAX_JSON_SCHEMA_ARGUMENT_UNITS
+        );
+        let one_over = format!("{{\"d\":\"{}xxx\"}}", "%".repeat(2_046));
+        let received = refusal_received(&one_over);
+        assert!(
+            received.contains("16385 UTF-16 code units"),
+            "received {received:?}"
+        );
+        // One more `%` is 8 units over, not 1.
+        let one_percent_over = format!("{{\"d\":\"{}\"}}", "%".repeat(2_047));
+        let received = refusal_received(&one_percent_over);
+        assert!(
+            received.contains("16390 UTF-16 code units"),
+            "received {received:?}"
+        );
+    }
+
     #[test]
     fn counts_a_windows_argument_as_rusts_command_writes_it() {
         for (argument, units) in [
@@ -294,6 +358,11 @@ mod tests {
             ("a\\b", 5),
             // A backslash run before the closing quote is doubled.
             ("\\\\", 6),
+            // A batch file writes `%` as `%%cd:~,%`.
+            ("%", 10),
+            ("a%b", 12),
+            // A `%` ends a backslash run, so the next quote doubles nothing.
+            ("\\%\"", 13),
             // A character outside the BMP takes two UTF-16 units.
             ("\u{1F600}", 4),
         ] {
