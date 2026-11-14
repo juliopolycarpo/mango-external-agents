@@ -920,6 +920,53 @@ the library does not invoke a package fetcher on its own initiative — "no down
 invariant, not a default. A profile test asserts no built-in argv names one. A host that wants the
 `npx` form supplies it through `AcpProfile::custom`.
 
+### Which vendor binary an adapter runs
+
+The profile argv launches the adapter. The adapter then starts a vendor binary of its own choosing,
+which the host never named, so the version probe (`<adapter> --version`) reads the adapter and not
+the CLI beneath it. Both READMEs were read on 2026-11-14.
+
+| Profile            | Install                      | Vendor binary the adapter runs           | Chosen by                                    |
+| ------------------ | ---------------------------- | ---------------------------------------- | -------------------------------------------- |
+| `claude-agent-acp` | standalone archive           | the `claude` shipped in the same archive | whoever installed the archive                |
+| `claude-agent-acp` | `CLAUDE_CODE_EXECUTABLE` set | the CLI that variable names              | whoever sets it in the adapter's environment |
+| `claude-agent-acp` | npm package                  | not stated                               | not stated                                   |
+| `codex-acp`        | npm package                  | the bundled `@openai/codex` dependency   | the adapter's package                        |
+| `codex-acp`        | `CODEX_PATH` set             | the executable that variable names       | whoever sets it in the adapter's environment |
+| `codex-acp`        | other than npm               | not stated                               | not stated                                   |
+
+What each README says:
+
+- [`claude-agent-acp`][p-claude]: "Each holds two files: `claude-agent-acp`, and the Claude CLI
+  (`claude`) it runs." and "Keep them in the same directory; a symlink to `claude-agent-acp`
+  elsewhere works." The only override it documents, in the archive section, is "To use a Claude CLI
+  you already have instead, set `CLAUDE_CODE_EXECUTABLE`." It does not say which CLI the npm package
+  uses, nor whether the override applies there.
+- [`codex-acp`][p-codex]: "The npm package includes a compatible `@openai/codex` dependency." and
+  "Set `CODEX_PATH` only when you want the adapter to run a different Codex binary". Its option list
+  repeats it: "`CODEX_PATH` - run a specific Codex executable instead of the bundled package
+  dependency." The README documents npm installs and a developer build (`npm run bundle:all`) and
+  does not say which Codex a standalone binary runs.
+
+So with a built-in profile and an archive or npm install, the vendor binary is the one the adapter
+ships with, not an installation the user made separately. The host's control is the adapter it
+launches: pass the adapter's resolved path as `ExecutablePath`, and for the archive the `claude`
+beside it comes with that choice. The library does not probe, version-gate or otherwise inspect the
+binary beneath the adapter, and neither profile has a floor or a pinned contract for it.
+
+**`CLAUDE_CODE_EXECUTABLE` and `CODEX_PATH` are not forwarded.** Every key on the allowlist is a
+home location or a sign-in switch, and each only changes where a CLI reads its state. These two
+change which program runs. Forwarding them by name would let whatever is in the host's ambient
+environment replace the binary under the adapter, with nothing in discovery or the version probe
+able to see it. Left unforwarded, the adapter runs its default binary regardless of the host's
+environment, and that default is the one the table above documents.
+
+A host that wants a specific binary says so explicitly: it takes the built-in profile, clones it and
+names the extra key, for example
+`(*builtin_profile("codex-acp")?).clone().with_vendor_environment_keys(&["NO_BROWSER", "CODEX_HOME", "CODEX_PATH"])`.
+Doing so makes the host responsible for the executable it names, the same as `ExecutablePath` does
+for a dedicated harness.
+
 ### No version floors
 
 No built-in profile pins a `minimum_version`. A floor nobody has checked would refuse a build that
@@ -971,8 +1018,10 @@ already forward. Neither adapter's README names it, so the documents are the und
 Without them the adapter reads the default-location account when the user relocated the home.
 
 Location variables a vendor documents or reads that are **not** forwarded, because they are not
-home locations or can carry a secret: Cursor's `CURSOR_DATA_DIR` (read in the bundle, undocumented),
-`CURSOR_API_KEY`, `CURSOR_AUTH_TOKEN`; Grok's `XAI_API_KEY`, `GROK_AUTH_PROVIDER_COMMAND` and
+home locations or can carry a secret: the adapters' `CLAUDE_CODE_EXECUTABLE` and `CODEX_PATH`, which
+select an executable rather than a location (see
+[Which vendor binary an adapter runs](#which-vendor-binary-an-adapter-runs)); Cursor's
+`CURSOR_DATA_DIR` (read in the bundle, undocumented), `CURSOR_API_KEY`, `CURSOR_AUTH_TOKEN`; Grok's `XAI_API_KEY`, `GROK_AUTH_PROVIDER_COMMAND` and
 `GROK_LOG_FILE`; OpenCode's `OPENCODE_CONFIG` and `OPENCODE_TUI_CONFIG` (single files),
 `OPENCODE_CONFIG_CONTENT` and `OPENCODE_SERVER_PASSWORD`; Gemini's `GEMINI_API_KEY`,
 `GOOGLE_APPLICATION_CREDENTIALS` and the `GEMINI_CLI_*_PATH` file overrides; Copilot's

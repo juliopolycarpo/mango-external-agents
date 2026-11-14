@@ -57,7 +57,8 @@ Both are adapters, not CLI modes:
 
 A Codex ACP profile is therefore the app-server dialect the dedicated harness already speaks, behind
 a second process and narrowed to ACP's vocabulary. Both adapters may also run a vendor binary the
-host did not name ([#433](https://github.com/juliopolycarpo/mango-external-agents/issues/433)).
+host did not name; see
+[Which vendor binary an adapter runs](harness-acp.md#which-vendor-binary-an-adapter-runs).
 
 ## What the dedicated harnesses give that a profile does not
 

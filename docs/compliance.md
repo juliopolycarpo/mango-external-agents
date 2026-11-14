@@ -686,8 +686,22 @@ Some profiles need a note beyond the link:
   subscriptions (press coverage, 2026-02); the posture cites that as reported, not as a licence
   term. The profile lets a host's `NO_BROWSER` through by name, the adapter's own documented switch
   against opening a sign-in page; the library sets nothing else about authentication.
-- **`claude-agent-acp` drives the user's own `claude`**, so the Claude Code section above applies
-  unchanged. The package moved twice and the older `@zed-industries/claude-code-acp` is orphaned.
+- **`claude-agent-acp` runs a `claude` the adapter selects, not necessarily the user's own.** Its
+  [README][claude-acp] says each standalone archive holds "`claude-agent-acp`, and the Claude CLI
+  (`claude`) it runs", and that "`CLAUDE_CODE_EXECUTABLE`" selects "a Claude CLI you already have
+  instead". It does not say which CLI the npm package runs. The library does not forward the
+  variable and never inspects the CLI the adapter starts. The Claude Code section above
+  applies to the Claude Code the adapter ends up running, so the host that supplies the adapter also
+  vouches that this binary is Anthropic's unmodified build and is under the user's own login. The
+  package moved twice and the older `@zed-industries/claude-code-acp` is orphaned.
+- **`codex-acp` runs a Codex the adapter selects too.** Its [README][codex-acp] says "The npm
+  package includes a compatible `@openai/codex` dependency" and "Set `CODEX_PATH` only when you want
+  the adapter to run a different Codex binary". The library does not forward `CODEX_PATH`. It says
+  nothing about which Codex a non-npm install runs. The same caveat applies: the adapter's bundled
+  Codex is what the library reaches, not the `codex` the user installed.
+
+`docs/harness-acp.md` lists every install path and who chooses the binary
+([Which vendor binary an adapter runs](harness-acp.md#which-vendor-binary-an-adapter-runs)).
 
 Only `cursor` and `grok` answer `AcpProfile::is_verified()`, and each carries two records: the live
 `tests/smoke.rs` run that earned it, and the `initialize` handshake captured beside it under
