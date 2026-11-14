@@ -359,6 +359,144 @@ test_vendor_acp_docs_watch() {
   export PATH="$original_path"
 }
 
+# Writes a reviewed allowlist from vendor, line and reason arguments, three per entry. The file
+# separates fields with a TAB because a Markdown table row, the likeliest accepted line, carries
+# `|` itself.
+write_acp_allowlist() {
+  local path="$1"
+  shift
+  printf '%s\n' '# test allowlist' '' > "$path"
+  while [ $# -gt 0 ]; do
+    printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$path"
+    shift 3
+  done
+}
+
+test_vendor_acp_allowlist_entries() {
+  local allowlist="$test_root/acp-allowlist.txt"
+  local error="$test_root/acp-allowlist.error"
+  local original="$ACP_DOCS_ALLOWLIST"
+  ACP_DOCS_ALLOWLIST="$allowlist"
+  write_acp_allowlist "$allowlist" \
+    claude '- [claude-agent-acp](https://example.test/adapter.md): adapter' 'third-party adapter index line' \
+    codex '| `codex acp` | Run as an ACP agent |' 'reviewed table row'
+  assert_eq "$(accepted_lines claude)" '- [claude-agent-acp](https://example.test/adapter.md): adapter' \
+    'Claude accepted line'
+  assert_eq "$(accepted_lines codex)" '| `codex acp` | Run as an ACP agent |' \
+    'Codex accepted line keeps its own pipes'
+  write_acp_allowlist "$allowlist"
+  assert_eq "$(accepted_lines claude)" '' 'an allowlist without entries accepts nothing'
+
+  printf 'claude\tan accepted line with no reason\n' >> "$allowlist"
+  expect_status 2 accepted_lines claude
+  accepted_lines claude > /dev/null 2> "$error" || true
+  assert_contains "$error" 'received: claude	an accepted line with no reason' 'a missing reason names the entry'
+  write_acp_allowlist "$allowlist"
+  printf 'gemini\tsome line\tsome reason\n' >> "$allowlist"
+  expect_status 2 accepted_lines claude
+  ACP_DOCS_ALLOWLIST="$test_root/acp-allowlist.missing"
+  expect_status 2 accepted_lines claude
+  ACP_DOCS_ALLOWLIST="$original"
+}
+
+test_vendor_acp_document_allowlist() {
+  local document="$test_root/vendor-acp-allowlisted.md"
+  local accepted="$test_root/vendor-acp-accepted.txt"
+  local seen="$test_root/vendor-acp-seen.txt"
+  local error="$test_root/vendor-acp-allowlisted.error"
+  local url='https://example.test/reference.md'
+  local reviewed='- [claude-agent-acp](https://example.test/adapter.md): adapter'
+  printf '%s\n' "$reviewed" > "$accepted"
+  : > "$seen"
+  printf '%s\n' '# Commands' 'codex exec runs a task.' "$reviewed" > "$document"
+  validate_document "$url" 'codex exec' "$document" "$accepted" "$seen" > /dev/null
+  assert_eq "$(cat "$seen")" "$reviewed" 'the accepted line is recorded as used'
+  # The reviewed line passes; the new one is the only one reported.
+  printf '%s\n' '# Commands' 'codex exec runs a task.' "$reviewed" 'New: run with --acp.' > "$document"
+  expect_status 1 validate_document "$url" 'codex exec' "$document" "$accepted" "$seen"
+  validate_document "$url" 'codex exec' "$document" "$accepted" "$seen" > /dev/null 2> "$error" || true
+  assert_contains "$error" '4:New: run with --acp.' 'the new mention is named'
+  assert_not_contains "$error" 'claude-agent-acp' 'the reviewed mention is not reported'
+  # A reworded line is not the reviewed line.
+  printf '%s\n' '# Commands' 'codex exec runs a task.' "$reviewed (updated)" > "$document"
+  expect_status 1 validate_document "$url" 'codex exec' "$document" "$accepted" "$seen"
+  # A partial match is not a match: the entry must equal the whole line.
+  printf '%s\n' '# Commands' 'codex exec runs a task.' "prefix $reviewed" > "$document"
+  expect_status 1 validate_document "$url" 'codex exec' "$document" "$accepted" "$seen"
+  # A page that ends its lines with CRLF still matches the reviewed text.
+  printf '%s\r\n' '# Commands' 'codex exec runs a task.' "$reviewed" > "$document"
+  validate_document "$url" 'codex exec' "$document" "$accepted" "$seen" > /dev/null
+}
+
+test_vendor_acp_docs_allowlist_watch() {
+  local docs="$test_root/vendor-acp-allowlist-docs"
+  local fake_bin="$test_root/fake-allowlist-doc-bin"
+  local allowlist="$test_root/acp-watch-allowlist.txt"
+  local error="$test_root/vendor-acp-allowlist.error"
+  local original_path="$PATH"
+  local original_allowlist="$ACP_DOCS_ALLOWLIST"
+  local claude_index='https://code.claude.com/docs/llms.txt'
+  local claude_reference='https://code.claude.com/docs/en/cli-reference.md'
+  local reviewed='- [claude-agent-acp](https://code.claude.com/docs/en/adapter.md): Third-party ACP adapter'
+  mkdir -p "$fake_bin"
+  ln -s "$repo_root/scripts/test-fixtures/fake-doc-curl.sh" "$fake_bin/curl"
+  export PATH="$fake_bin:$PATH"
+  export FAKE_DOC_ROOT="$docs"
+  ACP_DOCS_ALLOWLIST="$allowlist"
+  write_acp_allowlist "$allowlist" claude "$reviewed" 'third-party adapter, not a Claude Code ACP mode'
+
+  # The reviewed line passes.
+  write_clean_fake_docs "$docs"
+  write_fake_doc "$docs" "$claude_index" '# Claude Code Docs' "$reviewed"
+  check_vendor claude > /dev/null
+
+  # A new mention beside it fails and is the only line reported.
+  write_fake_doc "$docs" "$claude_index" '# Claude Code Docs' "$reviewed" '- [ACP](https://code.claude.com/docs/en/acp.md): Run as an ACP agent'
+  expect_status 1 check_vendor claude
+  check_vendor claude > /dev/null 2> "$error" || true
+  assert_contains "$error" '- [ACP](https://code.claude.com/docs/en/acp.md)' 'the new mention is reported'
+  assert_not_contains "$error" 'claude-agent-acp' 'the reviewed mention is not reported'
+
+  # The entry is scoped to its vendor: Codex pages are not excused by a Claude entry.
+  write_clean_fake_docs "$docs"
+  write_fake_doc "$docs" 'https://learn.chatgpt.com/llms.txt' '- [Codex CLI](https://learn.chatgpt.com/docs/codex/cli.md)' "$reviewed"
+  expect_status 1 check_vendor codex
+
+  # A reviewed line that no page carries any more is stale. It fails and is named.
+  write_clean_fake_docs "$docs"
+  expect_status 1 check_vendor claude
+  check_vendor claude > /dev/null 2> "$error" || true
+  assert_contains "$error" "expected every claude entry in $allowlist to match a line in a watched page" \
+    'a stale entry names the allowlist'
+  assert_contains "$error" "received no match for:" 'a stale entry states what was received'
+  assert_contains "$error" "$reviewed" 'a stale entry names its line'
+  check_vendor codex > /dev/null
+
+  # The entry matches on any watched page of its vendor, so the CLI reference can carry it too.
+  write_fake_doc "$docs" "$claude_reference" 'claude -p --print' "$reviewed"
+  check_vendor claude > /dev/null
+
+  # An unreadable page could still carry the line: report "could not verify", not a stale entry.
+  rm -f -- "$docs/$(printf '%s' "$claude_reference" | tr -c 'A-Za-z0-9' '_')"
+  expect_status 2 check_vendor claude
+  check_vendor claude > /dev/null 2> "$error" || true
+  assert_not_contains "$error" 'expected every claude entry' 'an unreadable page hides no stale verdict'
+
+  # A malformed allowlist refuses the run before any page is read.
+  write_clean_fake_docs "$docs"
+  printf 'claude\tno reason\n' >> "$allowlist"
+  expect_status 2 check_vendor claude
+
+  unset FAKE_DOC_ROOT
+  ACP_DOCS_ALLOWLIST="$original_allowlist"
+  export PATH="$original_path"
+}
+
+test_committed_acp_allowlist_is_well_formed() {
+  accepted_lines claude > /dev/null
+  accepted_lines codex > /dev/null
+}
+
 test_issue_deduplication() {
   local fake_bin="$test_root/fake-bin"
   local report="$test_root/issue.md"
@@ -415,6 +553,10 @@ test_drift_report
 test_claude_bare_reference
 test_vendor_acp_document
 test_vendor_acp_docs_watch
+test_vendor_acp_allowlist_entries
+test_vendor_acp_document_allowlist
+test_vendor_acp_docs_allowlist_watch
+test_committed_acp_allowlist_is_well_formed
 test_issue_deduplication
 python3 scripts/test-vendor-result.py
 python3 scripts/test-codex-schema-inventory.py
