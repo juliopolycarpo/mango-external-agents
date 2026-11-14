@@ -1142,9 +1142,18 @@ surface has no Windows equivalent.
 point `mea` at its socket from another:
 
 ```sh
-codex app-server --listen unix:///tmp/codex-app-server.sock
-cargo run -p mea -- turn --harness codex --transport unix-socket --socket /tmp/codex-app-server.sock "summarise this repository"
+dir="${XDG_RUNTIME_DIR:-$HOME/.cache}/codex-app-server"
+mkdir -p "$dir" && chmod 700 "$dir"
+codex app-server --listen "unix://$dir/app-server.sock"
+cargo run -p mea -- turn --harness codex --transport unix-socket --socket "$dir/app-server.sock" "summarise this repository"
 ```
+
+The server refuses a socket whose parent directory another user could write into: one that is not
+owned by the user or root, or that is group- or other-writable without the sticky bit (`0777`, for
+example). It exits with `socket parent must be owned by the user or root and prevent other users from
+replacing socket entries`. A `0755` or `0700` directory passes, and so does the sticky `/tmp`. Checked
+on Codex 0.167.2 by starting the server under each mode. The host sees the server's own refusal; the
+library does not repeat the check.
 
 `--socket` is required with `--transport unix-socket`, refused with any other transport, and must be
 an absolute path. `mea` passes it to the harness as typed and prints the harness's refusals as they
