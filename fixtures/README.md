@@ -77,8 +77,9 @@ Redacted whatever the value type:
   be an ARN with an AWS account id, a project path, or an inference-profile name the user chose.
   The rule is an allow-list: an alias (`opus`, `sonnet[1m]`), a `claude-…` id (`claude-sonnet-5`,
   `claude-opus-4-1@20250805`) or a Bedrock id with its optional region prefix
-  (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`) is kept, and anything else becomes
-  `[REDACTED]`. A family word or numeric segment the rule has not seen redacts the id until the
+  (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`) is kept, and so is the bare Vertex form
+  `publishers/anthropic/models/claude-opus-5`. A path with a `projects/…` or `locations/…`
+  segment, extra segments or another publisher, and anything else, becomes `[REDACTED]`. A family word or numeric segment the rule has not seen redacts the id until the
   rule is reviewed. Two redacted usage keys stay two entries (`[REDACTED]`, `[REDACTED]#2`).
 
 Retained on purpose:

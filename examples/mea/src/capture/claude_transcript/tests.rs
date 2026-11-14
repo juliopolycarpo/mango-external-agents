@@ -615,8 +615,61 @@ const PLAIN_VENDOR_MODEL_IDS: &[&str] = &[
     "claude-sonnet-4-5-20250929[1m]",
     "anthropic.claude-opus-5-v1:0",
     "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    // The publisher form `model_accepted` takes: it names no project and no location.
+    "publishers/anthropic/models/claude-opus-5",
+    "publishers/anthropic/models/claude-opus-4-1@20250805",
     "opus",
     "sonnet[1m]",
+];
+
+/// Publisher paths that are not exactly `publishers/anthropic/models/<plain id>`, each with the
+/// segment that makes it private or unreviewed.
+const PUBLISHER_PATHS_THAT_STAY_REDACTED: &[(&str, &str)] = &[
+    (
+        "a location segment",
+        "locations/us-east5/publishers/anthropic/models/claude-opus-5",
+    ),
+    (
+        "a project segment",
+        "projects/acme-payments-4821/publishers/anthropic/models/claude-opus-5",
+    ),
+    (
+        "a project and a location",
+        "projects/acme/locations/us-east5/publishers/anthropic/models/claude-opus-5",
+    ),
+    (
+        "a segment before the publisher",
+        "acme/publishers/anthropic/models/claude-opus-5",
+    ),
+    (
+        "an extra segment after the model",
+        "publishers/anthropic/models/claude-opus-5/versions/1",
+    ),
+    (
+        "a trailing slash",
+        "publishers/anthropic/models/claude-opus-5/",
+    ),
+    (
+        "a non-anthropic publisher",
+        "publishers/acme/models/claude-opus-5",
+    ),
+    (
+        "a non-claude model id",
+        "publishers/anthropic/models/acme-payments-claude-profile",
+    ),
+    (
+        "an alias in place of a model id",
+        "publishers/anthropic/models/opus",
+    ),
+    ("no model id", "publishers/anthropic/models/"),
+    (
+        "a doubled prefix",
+        "publishers/anthropic/models/publishers/anthropic/models/claude-opus-5",
+    ),
+    (
+        "an upper-case publisher",
+        "publishers/Anthropic/models/claude-opus-5",
+    ),
 ];
 
 #[test]
@@ -652,6 +705,30 @@ fn a_plain_vendor_model_id_is_kept_in_the_model_member_and_the_usage_keys() {
                 "expected {id:?} kept as a key of {member} | received: {line}"
             );
         }
+    }
+}
+
+#[test]
+fn a_publisher_path_with_more_than_the_plain_model_id_is_redacted_in_every_model_slot() {
+    for (shape, id) in PUBLISHER_PATHS_THAT_STAY_REDACTED {
+        assert!(
+            !is_plain_vendor_model_id(id),
+            "expected {id:?} with {shape} to be redacted | received: kept"
+        );
+        let line = redacted_record(&json!({"type": "result", "model": id,
+            "modelUsage": {*id: {"costUSD": 0.01}}}));
+        assert_eq!(
+            line["model"],
+            redact::PLACEHOLDER,
+            "expected `model` to become {} for {shape} | received: {line}",
+            redact::PLACEHOLDER
+        );
+        assert_eq!(
+            line["modelUsage"][redact::PLACEHOLDER]["costUSD"],
+            0.01,
+            "expected the usage key to become {} for {shape} | received: {line}",
+            redact::PLACEHOLDER
+        );
     }
 }
 

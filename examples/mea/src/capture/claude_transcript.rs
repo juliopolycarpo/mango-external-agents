@@ -570,6 +570,9 @@ const MODEL_ALIASES: &[&str] = &["best", "default", "haiku", "opus", "opusplan",
 /// The cross-region prefixes of a Bedrock model id, such as `us.anthropic.claude-…`.
 const BEDROCK_REGION_PREFIXES: &[&str] = &["apac", "au", "eu", "global", "jp", "us", "us-gov"];
 
+/// The only Vertex path kept: the publisher form with no project and no location before it.
+const VERTEX_PUBLISHER_PREFIX: &str = "publishers/anthropic/models/";
+
 /// The model family words of a vendor id. A word outside this list makes the id user-shaped, so a
 /// family a later Claude Code adds is redacted until it is reviewed here.
 const MODEL_FAMILIES: &[&str] = &["haiku", "instant", "opus", "sonnet"];
@@ -577,12 +580,18 @@ const MODEL_FAMILIES: &[&str] = &["haiku", "instant", "opus", "sonnet"];
 /// Whether `id` is a model name the vendor assigns, one that says nothing about who runs it.
 ///
 /// The shapes kept: an alias (`opus`, `sonnet[1m]`), a vendor id (`claude-sonnet-5`,
-/// `claude-haiku-4-5-20251001`, `claude-opus-4-1@20250805` on Vertex) and a Bedrock id, with or
-/// without its cross-region prefix (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`). Everything
-/// else is private: an ARN carries an AWS account id, a Vertex path carries a project, and an
-/// inference-profile name is whatever its owner typed. The check is an allow-list, so a shape this
+/// `claude-haiku-4-5-20251001`, `claude-opus-4-1@20250805` on Vertex), a Bedrock id, with or
+/// without its cross-region prefix (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`), and the bare
+/// Vertex publisher form `publishers/anthropic/models/<vendor id>`. Everything else is private: an
+/// ARN carries an AWS account id, a Vertex path with a `projects/…` or `locations/…` segment
+/// carries a project, and an inference-profile name is whatever its owner typed. The check is an allow-list, so a shape this
 /// function has not seen is redacted.
 fn is_plain_vendor_model_id(id: &str) -> bool {
+    // The publisher form is exactly the prefix plus one vendor id. The id check below accepts no
+    // `/`, so a longer path, a second prefix or another publisher fails it.
+    if let Some(model) = id.strip_prefix(VERTEX_PUBLISHER_PREFIX) {
+        return is_claude_vendor_id(model);
+    }
     // The context-window suffix (`[1m]`) selects a variant of the same model.
     let id = id.strip_suffix("[1m]").unwrap_or(id);
     if MODEL_ALIASES.contains(&id) {
@@ -596,6 +605,11 @@ fn is_plain_vendor_model_id(id: &str) -> bool {
                 .and_then(|rest| rest.strip_prefix(".anthropic."))
         })
         .unwrap_or(id);
+    is_claude_vendor_id(id)
+}
+
+/// Whether `id` is `claude-…` made only of reviewed family words, versions, dates and revisions.
+fn is_claude_vendor_id(id: &str) -> bool {
     // Vertex puts the release date after `@`; it reads as one more segment.
     let id = id.replacen('@', "-", 1);
     let Some(rest) = id.strip_prefix("claude") else {
