@@ -1090,9 +1090,12 @@ mod tests {
             .expect_err("expected an unusable vendor answer to be refused");
 
             let message = refused.to_string();
+            // The refusal quotes the program with `{:?}`, which doubles the backslashes of a
+            // Windows temp path, so the expected text is quoted the same way.
+            let quoted = format!("{vendor_cli:?}");
             assert!(
-                message.contains(&vendor_cli) && message.contains(expected),
-                "expected an error naming {vendor_cli:?} and {expected:?} | received {message}"
+                message.contains(&quoted) && message.contains(expected),
+                "expected an error naming {quoted} and {expected:?} | received {message}"
             );
             assert!(
                 !out.join("contract").exists(),
