@@ -174,19 +174,12 @@ with `# unqualified capture` and fails; a failed run, or a child whose stop coul
 writes `structured-output.partial.jsonl` with `# incomplete capture` and fails. Neither replaces a
 qualified file, and a later qualified run removes them.
 
-Redaction keeps wire structure and drops what a machine or a model wrote. Strings survive only under
-a short list of structural members (`type`, `subtype`, `role`, `id`, `tool_use_id`, `session_id`,
-`uuid`, `model`, `stop_reason`, `terminal_reason`, `permissionMode`, `claude_code_version`) and as the
-name of a tool call that is not an `mcp__` tool; every other string becomes `[REDACTED]`, including
-the `tools`, `mcp_servers` and `commands` entries that name the user's installation. `cwd` is always
-written as `/workspace`, and the capture's own directory, home directory and login are rewritten in
-every key and retained value. A member whose name is credential or account shaped
-(`credential_expires_at`, `*_token`, `email`, `organization*`, `account*`, and similar) is replaced
-whatever its value type, because `credential_expires_at` is a number and a rule about strings does
-not reach it. Everything under `input` and `structured_output` is treated as the model's answer, so
-the answer's strings are redacted and its shape stays. Lines that are not JSON objects are dropped.
-Numbers survive, including the usage counts, the cost and the `rate_limit_event` window utilisation
-and reset times, which describe the account's plan usage at capture time.
+Redaction keeps wire structure and drops what a machine, a model or an account wrote: strings
+outside a short structural list, credential, account and plan-usage members, the whole body of a
+`rate_limit_event` beyond its ids, and the capture's own paths. Per-turn usage, cost and timing
+survive, because they describe the turn and not the plan. The exact retained and redacted lists are
+in [the fixtures README](../fixtures/README.md#what-a-claude-transcript-retains-and-redacts) and are
+not repeated here.
 
 ## The surface driven
 
