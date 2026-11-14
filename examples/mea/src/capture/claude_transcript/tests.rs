@@ -627,6 +627,113 @@ fn a_tool_result_array_replaces_strings_under_structural_field_names() {
     assert_no_tool_author_value(&line, "inside an array under tool_use_result");
 }
 
+/// Numbers only a tool author would write: an account number and an amount over a customer's data.
+const TOOL_AUTHOR_ACCOUNT_NUMBER: u64 = 4_417_208_113;
+const TOOL_AUTHOR_AMOUNT: f64 = 1234.56;
+
+/// A tool author's parameters or result fields holding a number and a boolean at every place the
+/// walk meets one: a member, an array entry and a nested object, plus a null.
+fn tool_author_numbers_and_booleans() -> Value {
+    json!({
+        "customerNumber": TOOL_AUTHOR_ACCOUNT_NUMBER,
+        "amount": TOOL_AUTHOR_AMOUNT,
+        "overdrawn": true,
+        "balances": [TOOL_AUTHOR_ACCOUNT_NUMBER, TOOL_AUTHOR_AMOUNT, true],
+        "nested": {"retries": TOOL_AUTHOR_ACCOUNT_NUMBER, "approved": true, "absent": null},
+    })
+}
+
+/// `tool_author_numbers_and_booleans` as the walk writes it: the same shape and types, every
+/// number `0`, every boolean `false`, the null untouched.
+fn tool_author_numbers_and_booleans_replaced() -> Value {
+    json!({
+        "customerNumber": 0,
+        "amount": 0,
+        "overdrawn": false,
+        "balances": [0, 0, false],
+        "nested": {"retries": 0, "approved": false, "absent": null},
+    })
+}
+
+#[test]
+fn a_denied_tool_calls_input_replaces_numbers_and_booleans_keeping_their_type() {
+    let line = redacted_record(&json!({"type": "result", "permission_denials": [
+        {"tool_name": "mcp__ledger__lookup", "tool_use_id": "toolu_1",
+         "tool_input": tool_author_numbers_and_booleans()}]}));
+
+    assert_eq!(
+        line["permission_denials"][0]["tool_input"],
+        tool_author_numbers_and_booleans_replaced(),
+        "expected every number 0 and every boolean false under permission_denials[].tool_input | received: {line}"
+    );
+}
+
+#[test]
+fn a_tool_result_replaces_numbers_and_booleans_keeping_their_type() {
+    let line = redacted_record(
+        &json!({"type": "user", "tool_use_result": tool_author_numbers_and_booleans()}),
+    );
+
+    assert_eq!(
+        line["tool_use_result"],
+        tool_author_numbers_and_booleans_replaced(),
+        "expected every number 0 and every boolean false under tool_use_result | received: {line}"
+    );
+}
+
+#[test]
+fn a_tool_result_that_is_a_bare_number_or_boolean_is_replaced() {
+    let number =
+        redacted_record(&json!({"type": "user", "tool_use_result": TOOL_AUTHOR_ACCOUNT_NUMBER}));
+    let flag = redacted_record(&json!({"type": "user", "tool_use_result": true}));
+
+    assert_eq!(
+        (&number["tool_use_result"], &flag["tool_use_result"]),
+        (&json!(0), &json!(false)),
+        "expected a bare number replaced by 0 and a bare boolean by false | received: {number} and {flag}"
+    );
+}
+
+#[test]
+fn the_numbers_beside_a_tool_input_and_a_tool_result_are_still_kept() {
+    let line = redacted_record(&json!({"type": "result", "num_turns": 3, "is_error": false,
+        "usage": {"input_tokens": 11},
+        "tool_use_result": {"customerNumber": TOOL_AUTHOR_ACCOUNT_NUMBER},
+        "permission_denials": [{"tool_input": {"amount": TOOL_AUTHOR_AMOUNT}}]}));
+
+    assert!(
+        line["num_turns"] == 3 && line["is_error"] == false && line["usage"]["input_tokens"] == 11,
+        "expected the turn's own numbers kept beside the tool data | received: {line}"
+    );
+}
+
+#[test]
+fn a_number_inside_the_models_answer_stays_even_under_a_tool_data_name() {
+    let line = redacted_record(&json!({"type": "result", "structured_output": {
+        "tool_input": {"count": 1, "ready": true}}}));
+
+    assert_eq!(
+        line["structured_output"]["tool_input"],
+        json!({"count": 1, "ready": true}),
+        "expected the answer's numbers and booleans kept, as the README says | received: {line}"
+    );
+}
+
+#[test]
+fn a_replaced_tool_data_number_is_in_no_drift_set() {
+    let drift = drift_over(&lines_of(&[
+        json!({"type": "user", "tool_use_result": {"novelCounter": 3, "novelFlag": true}}),
+    ]));
+
+    assert!(
+        drift.retained.is_empty() && drift.unseen.is_empty() && drift.denied.is_empty(),
+        "expected no drift set to name a number or boolean the walk replaced | received retained: {:?} strings: {:?} denied: {:?}",
+        drift.retained,
+        drift.unseen,
+        drift.denied
+    );
+}
+
 #[test]
 fn a_structural_name_replaced_inside_tool_data_is_not_reported_as_a_new_member() {
     let drift = drift_over(&lines_of(&[
@@ -2944,7 +3051,7 @@ fn a_user_chosen_key_is_not_also_judged_as_a_member_name() {
 fn the_members_below_a_user_chosen_key_are_judged_by_name() {
     let drift = drift_over(&lines_of(&[
         json!({"type": "result", "permission_denials": [
-        {"tool_input": {"nested": {"deeperName": 3, "novelNote": "x"}}}]}),
+        {"tool_input": {"nested": {"deeperName": {"leaf": "x"}, "novelNote": "x"}}}]}),
     ]));
 
     assert_eq!(

@@ -74,11 +74,17 @@ Redacted whatever the value type:
   keyed by tool-use id), even under a name such as `type` or `id`.
 - Strings inside `tool_input` (the arguments of a denied call, repeated under `permission_denials`)
   and `tool_use_result` (the tool's output), under the same rule: a tool author names those
-  fields, so a parameter called `type`, `id` or `role` loses its value too. The names and numbers
-  stay, and a name no review lists is still reported as below; the structural names and `model` are
-  the exception, since the recorder already knows them. A `tool_use_result` recorded before this
-  rule keeps a vendor string such as `"type": "text"`; the committed transcripts are archival and
-  are not rewritten.
+  fields, so a parameter called `type`, `id` or `role` loses its value too. Numbers and booleans
+  there are replaced as well, by `0` and `false`: an account number, an amount or a flag over a
+  customer's data is the author's, and the replacement keeps the field's type where a `[REDACTED]`
+  string would not. A `null` stays. The names stay. A string or an object under a name no review
+  lists is still reported as below (the structural names and `model` are the exception, since the
+  recorder already knows them); a number or boolean under one is replaced and not reported. The
+  same call's arguments also sit under `input` and `wire_tool_inputs`, which keep their numbers
+  as the model's answer, so this rule removes them from `tool_input` only. A `tool_use_result` recorded before this rule keeps a vendor string such as
+  `"type": "text"` and its numbers (`numLines`, `totalLines`); the committed transcripts are
+  archival and are not rewritten. A `tool_input` or `tool_use_result` inside the model's answer is
+  the answer's own and keeps its numbers, as below.
 - A model id that is not a plain vendor name, in `model`, in the keys of `modelUsage` and
   `model_usage_since_last_result`, and on the `# model:` header line. On Bedrock or Vertex an id can
   be an ARN with an AWS account id, a project path, or an inference-profile name the user chose.
@@ -121,7 +127,8 @@ member that is redacted without anyone noticing. After it writes the transcript 
   and that `REVIEWED_REDACTED_STRING_MEMBERS` does not list.
 - `members not seen before, their numbers, booleans and objects kept`: members whose number,
   boolean or object the recorder kept and that `REVIEWED_RETAINED_MEMBERS` does not list. An array
-  is judged by the member that holds it. A key under `modelUsage` is a model id and is not a name.
+  is judged by the member that holds it. A number or boolean under `tool_input` or
+  `tool_use_result` is replaced, so it is never listed here; an object there still is. A key under `modelUsage` is a model id and is not a name.
   A `mea` test replays the committed `fixtures/claude/transcripts/` through the recorder and fails
   when any of the three lists is incomplete for them, so the lists stay in step with what the
   fixtures show.
