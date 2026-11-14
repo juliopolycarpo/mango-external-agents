@@ -21,6 +21,8 @@ struct Arguments {
     #[arg(long)]
     socket: Option<PathBuf>,
     #[arg(long)]
+    model: Option<String>,
+    #[arg(long)]
     cwd: Option<PathBuf>,
     #[arg(long)]
     json: bool,
@@ -67,6 +69,8 @@ pub(crate) struct Options {
     pub transport: Option<TransportKind>,
     /// The Unix socket of an app-server the host already runs, for `--transport unix-socket`.
     pub socket: Option<PathBuf>,
+    /// The Codex model id `mea turn` opens its thread with, instead of the user's configured one.
+    pub model: Option<String>,
     pub cwd: Option<PathBuf>,
     pub json: bool,
     /// How long after a turn starts `mea turn` asks its session to cancel it, when asked to.
@@ -86,6 +90,7 @@ impl Options {
             level: args.level.as_deref().map(level).transpose()?,
             transport: args.transport.as_deref().map(transport).transpose()?,
             socket: args.socket,
+            model: args.model,
             cwd: args.cwd,
             json: args.json,
             cancel_after: args.cancel_after.as_deref().map(cancel_after).transpose()?,
@@ -101,7 +106,33 @@ impl Options {
     pub fn parse_for(command: &str, arguments: &[String]) -> Result<Self, String> {
         let options = Self::parse(arguments)?;
         options.check_socket(command)?;
+        options.check_model(command)?;
         Ok(options)
+    }
+
+    /// The `--model` pairing: only `turn` opens a session, and only the Codex harness takes it.
+    ///
+    /// The id is the host's, sent as `thread/start`'s `model` member and never written to the
+    /// vendor's own configuration. Other harnesses are refused here rather than quietly run on
+    /// their configured model, which is the run the flag exists to avoid.
+    fn check_model(&self, command: &str) -> Result<(), String> {
+        let Some(model) = &self.model else {
+            return Ok(());
+        };
+        if command != "turn" {
+            return Err(format!(
+                "(mea {command}): expected no --model; {command} probes the local CLI and never opens a session | received --model {model:?}"
+            ));
+        }
+        model_id(command, model)?;
+        let kind = self.kind.clone().unwrap_or(HarnessChoice::Claude);
+        if kind == HarnessChoice::Codex {
+            Ok(())
+        } else {
+            Err(format!(
+                "(mea {command}): expected --model with --harness codex | received --model {model:?} with --harness {kind}"
+            ))
+        }
     }
 
     /// The `--socket` and `--transport` pairing: the path goes with `unix-socket` and with nothing
@@ -148,6 +179,23 @@ impl Options {
             (Some(_), true) => Ok(()),
         }
     }
+}
+
+/// The model id `--model` carries, or the refusal that names it.
+///
+/// The same shape the Codex harness accepts for a model id: nonempty, bounded, no surrounding
+/// spaces and no control characters. `mea capture` sends the id to the app-server itself, so the
+/// check cannot be left to the harness. Example: `--model gpt-5.2-codex`.
+pub(crate) fn model_id<'a>(command: &str, received: &'a str) -> Result<&'a str, String> {
+    if received.trim() != received
+        || received.chars().any(char::is_control)
+        || mango_external_agents::normalize::opaque_id(received, "model id").is_err()
+    {
+        return Err(format!(
+            "(mea {command}): expected --model as a nonempty, bounded model id without surrounding spaces or control characters | received {received:?}"
+        ));
+    }
+    Ok(received)
 }
 
 /// The permission level this name asks for. Example: `--level read-only`.
@@ -497,6 +545,100 @@ mod tests {
             "expected the refusal to list every accepted name"
         );
     }
+
+    #[test]
+    fn a_codex_turn_carries_the_model_id_as_typed() {
+        let options = Options::parse_for(
+            "turn",
+            &arguments(&["--harness", "codex", "--model", "gpt-5.2-codex", "hello"]),
+        )
+        .unwrap_or_else(|error| panic!("expected (mea turn) to accept it, received {error}"));
+        assert_eq!(options.model.as_deref(), Some("gpt-5.2-codex"));
+        assert_eq!(options.prompt, "hello");
+
+        let without = Options::parse_for("turn", &arguments(&["--harness", "codex", "hello"]))
+            .expect("expected a turn without --model");
+        assert_eq!(without.model, None);
+    }
+
+    #[test]
+    fn a_model_for_another_harness_is_refused_with_the_harness_it_received() {
+        for (flags, harness) in [
+            (vec!["--harness", "claude"], "claude"),
+            // No `--harness` runs Claude, the turn's default, which has no model flag here.
+            (vec![], "claude"),
+            (vec!["--harness", "acp:cursor"], "acp:cursor"),
+        ] {
+            let mut words = flags;
+            words.extend(["--model", "gpt-5.2-codex", "hello"]);
+            let refused = Options::parse_for("turn", &arguments(&words));
+            assert_eq!(
+                refused.err(),
+                Some(format!(
+                    "(mea turn): expected --model with --harness codex | received --model \"gpt-5.2-codex\" with --harness {harness}"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn discover_and_doctor_refuse_a_model_they_would_never_use() {
+        for command in ["discover", "doctor"] {
+            let refused = Options::parse_for(
+                command,
+                &arguments(&["--harness", "codex", "--model", "gpt-5.2-codex"]),
+            );
+            assert_eq!(
+                refused.err(),
+                Some(format!(
+                    "(mea {command}): expected no --model; {command} probes the local CLI and never opens a session | received --model \"gpt-5.2-codex\""
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn model_id_passes_a_plain_id_and_refuses_one_the_harness_would() {
+        assert_eq!(
+            model_id("turn", "gpt-5.2-codex"),
+            Ok("gpt-5.2-codex"),
+            "expected an ordinary model id to pass as typed"
+        );
+        for received in [
+            "",
+            " ",
+            " gpt-5.2-codex",
+            "gpt-5.2-codex ",
+            "gpt\n5",
+            "gpt\u{7f}",
+        ] {
+            assert_eq!(
+                model_id("turn", received),
+                Err(format!(
+                    "(mea turn): expected --model as a nonempty, bounded model id without surrounding spaces or control characters | received {received:?}"
+                ))
+            );
+        }
+        let overlong = "m".repeat(10_000);
+        assert!(
+            model_id("turn", &overlong).is_err(),
+            "expected an id past the vendor-id bound to be refused"
+        );
+    }
+
+    #[test]
+    fn a_malformed_model_stops_the_turn_parse_before_the_harness_check() {
+        let refused = Options::parse_for(
+            "turn",
+            &arguments(&["--harness", "claude", "--model", "", "hello"]),
+        );
+        assert_eq!(
+            refused.err(),
+            Some(String::from(
+                "(mea turn): expected --model as a nonempty, bounded model id without surrounding spaces or control characters | received \"\""
+            ))
+        );
+    }
 }
 
 /// Contract capture arguments. `capture codex` preserves the historical transcript command.
@@ -515,6 +657,9 @@ pub(crate) struct CaptureOptions {
     pub workspace: Option<PathBuf>,
     #[arg(long)]
     pub transcripts: bool,
+    /// The Codex model id every transcript conversation opens its thread with.
+    #[arg(long)]
+    pub model: Option<String>,
     #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(crate::capture::scenario_names()))]
     pub scenario: Option<String>,
 }
@@ -546,6 +691,21 @@ impl CaptureOptions {
             return Err(format!(
                 "expected a Codex transcript capture for --scenario, received {selected} without transcript selection"
             ));
+        }
+        if let Some(model) = &self.model {
+            model_id("capture", model)?;
+            let transcript =
+                selected == HarnessChoice::Codex && (self.legacy.is_some() || self.transcripts);
+            if !transcript {
+                let received = if selected == HarnessChoice::Codex {
+                    format!("--model {model:?} with --harness codex without --transcripts")
+                } else {
+                    format!("--model {model:?} with --harness {selected}")
+                };
+                return Err(format!(
+                    "(mea capture): expected --model with a Codex transcript capture (--harness codex --transcripts or `codex`) | received {received}"
+                ));
+            }
         }
         Ok(selected)
     }
@@ -606,6 +766,76 @@ mod capture_tests {
                 assert_eq!(options.scenario.as_deref(), Some(name));
             }
         }
+    }
+
+    fn capture_arguments(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_model_is_accepted_for_both_spellings_of_a_codex_transcript_capture() {
+        for words in [
+            vec![
+                "--harness",
+                "codex",
+                "--transcripts",
+                "--model",
+                "gpt-5.2-codex",
+            ],
+            vec!["codex", "--model", "gpt-5.2-codex"],
+        ] {
+            let options = CaptureOptions::parse(&capture_arguments(&words))
+                .expect("expected the capture arguments to parse");
+            assert_eq!(options.kind(), Ok(HarnessChoice::Codex));
+            assert_eq!(options.model.as_deref(), Some("gpt-5.2-codex"));
+        }
+        let without = CaptureOptions::parse(&capture_arguments(&["codex"]))
+            .expect("expected a capture without --model");
+        assert_eq!(without.model, None);
+    }
+
+    #[test]
+    fn a_model_is_refused_where_no_codex_transcript_would_use_it() {
+        for (words, received) in [
+            (
+                vec!["--harness", "codex", "--model", "gpt-5.2-codex"],
+                "--model \"gpt-5.2-codex\" with --harness codex without --transcripts",
+            ),
+            (
+                vec!["--model", "gpt-5.2-codex"],
+                "--model \"gpt-5.2-codex\" with --harness codex without --transcripts",
+            ),
+            (
+                vec!["--harness", "claude", "--model", "gpt-5.2-codex"],
+                "--model \"gpt-5.2-codex\" with --harness claude",
+            ),
+            (
+                vec!["--harness", "acp:cursor", "--model", "gpt-5.2-codex"],
+                "--model \"gpt-5.2-codex\" with --harness acp:cursor",
+            ),
+        ] {
+            let refused = CaptureOptions::parse(&capture_arguments(&words))
+                .and_then(|options| options.kind());
+            assert_eq!(
+                refused.err(),
+                Some(format!(
+                    "(mea capture): expected --model with a Codex transcript capture (--harness codex --transcripts or `codex`) | received {received}"
+                )),
+                "expected {words:?} to be refused with the value it received"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_capture_model_is_refused_with_the_value_it_received() {
+        let refused = CaptureOptions::parse(&capture_arguments(&["codex", "--model", ""]))
+            .and_then(|options| options.kind());
+        assert_eq!(
+            refused.err(),
+            Some(String::from(
+                "(mea capture): expected --model as a nonempty, bounded model id without surrounding spaces or control characters | received \"\""
+            ))
+        );
     }
 }
 

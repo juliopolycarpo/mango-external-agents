@@ -143,13 +143,13 @@ fn print_banner() {
         "usage: mea discover|doctor [--harness claude|codex|acp:<profile>] [--json] [--cwd DIR]"
     );
     println!(
-        "       mea turn [--harness claude|codex|acp:<profile>] [--profile ID] [--transport stdio|websocket|unix-socket|acp] [--socket PATH] [--cwd DIR] [--json] [--level read-only|default|full-access] [--cancel-after SECONDS] <prompt>"
+        "       mea turn [--harness claude|codex|acp:<profile>] [--profile ID] [--transport stdio|websocket|unix-socket|acp] [--socket PATH] [--model ID] [--cwd DIR] [--json] [--level read-only|default|full-access] [--cancel-after SECONDS] <prompt>"
     );
     println!(
-        "       mea capture --harness claude|codex|acp[:profile] [--profile ID] [--out DIR] [--workspace DIR] [--transcripts]"
+        "       mea capture --harness claude|codex|acp[:profile] [--profile ID] [--out DIR] [--workspace DIR] [--transcripts [--model ID]]"
     );
     println!(
-        "       mea capture codex [--scenario NAME] [--out DIR] [--workspace DIR] (archival transcripts)"
+        "       mea capture codex [--scenario NAME] [--model ID] [--out DIR] [--workspace DIR] (archival transcripts)"
     );
     println!(
         "       mea digests [--out DIR] [--check] (rewrite or verify capture manifest digests)"
@@ -363,22 +363,7 @@ async fn turn_with(
         Some(discovery)
     };
 
-    let mut request = OpenSession::new(format!("mea-{}", uuid_like()));
-    if let Some(level) = options.level {
-        request.configuration.level = ConfigurationChange::Set(level);
-        // The CLI only exposes the level axis. Its explicit form keeps the historic interactive
-        // routing; omission of `--level` leaves both axes to the vendor.
-        request.configuration.routing = ConfigurationChange::Set(ApprovalRouting::User);
-    }
-    if let Some(transport) = options.transport {
-        request = request.over_transport(transport);
-    }
-    if let Some(executable) = discovery
-        .as_ref()
-        .and_then(|found| found.executable.as_ref())
-    {
-        request = request.with_executable(ExecutablePath::resolved(executable.clone()));
-    }
+    let request = session_request(options, discovery.as_ref());
 
     // A gate refusal reaches an operator here rather than through `discovery.gate`: Codex names
     // its build in the app-server handshake, which happens inside `open_session`.
@@ -401,6 +386,33 @@ async fn turn_with(
     .map_err(|error| command_failure(&error))
 }
 
+/// The session `mea turn` asks the harness to open for these options.
+///
+/// `--model` becomes the configuration's `model`, which the Codex harness sends as the `model`
+/// member of `thread/start`. Nothing here writes the vendor's own configuration.
+fn session_request(
+    options: &Options,
+    discovery: Option<&mango_external_agents::Discovery>,
+) -> OpenSession {
+    let mut request = OpenSession::new(format!("mea-{}", uuid_like()));
+    if let Some(level) = options.level {
+        request.configuration.level = ConfigurationChange::Set(level);
+        // The CLI only exposes the level axis. Its explicit form keeps the historic interactive
+        // routing; omission of `--level` leaves both axes to the vendor.
+        request.configuration.routing = ConfigurationChange::Set(ApprovalRouting::User);
+    }
+    if let Some(model) = &options.model {
+        request.configuration.model = ConfigurationChange::Set(model.clone());
+    }
+    if let Some(transport) = options.transport {
+        request = request.over_transport(transport);
+    }
+    if let Some(executable) = discovery.and_then(|found| found.executable.as_ref()) {
+        request = request.with_executable(ExecutablePath::resolved(executable.clone()));
+    }
+    request
+}
+
 async fn capture(arguments: &[String]) -> Result<(), String> {
     let options = options::CaptureOptions::parse(arguments)?;
     let kind = options.kind()?;
@@ -410,7 +422,13 @@ async fn capture(arguments: &[String]) -> Result<(), String> {
     let workspace = workspace::CaptureWorkspace::new(options.workspace)?;
     let result = match &kind {
         HarnessChoice::Codex if options.legacy.is_some() || options.transcripts => {
-            capture::codex(&out, &workspace.path, options.scenario.as_deref()).await
+            capture::codex(
+                &out,
+                &workspace.path,
+                options.scenario.as_deref(),
+                options.model.as_deref(),
+            )
+            .await
         }
         HarnessChoice::Codex => capture::codex_contract(&out, &workspace.path).await,
         HarnessChoice::Claude => capture::claude(&out, &workspace.path).await,
@@ -537,7 +555,7 @@ mod tests {
 
     use super::{
         HarnessChoice, Options, acp_profile_ids, describe, discover_with, harness_lines, refusal,
-        registry, run, transport_report,
+        registry, run, session_request, transport_report,
     };
     use mango_external_agents::testing::FakeLauncher;
     use mango_external_agents::{
@@ -890,6 +908,51 @@ mod tests {
                 "expected {arguments:?} to be refused"
             );
         }
+    }
+
+    /// `--model` is the opened session's model, which the Codex harness sends as `thread/start`'s
+    /// `model` member (`opening_with_an_explicit_model_sends_it_as_the_thread_start_model_member`
+    /// in the Codex replay tests); without the flag the axis is left alone.
+    #[test]
+    fn a_turn_opens_its_session_on_the_model_the_flag_named() {
+        let named = Options::parse_for(
+            "turn",
+            &["--harness", "codex", "--model", "gpt-5.2-codex", "hi"].map(String::from),
+        )
+        .expect("expected valid codex turn arguments");
+        let request = session_request(&named, None);
+        assert_eq!(
+            request.configuration.model.set_value().map(String::as_str),
+            Some("gpt-5.2-codex"),
+            "expected the session to open on the named model"
+        );
+
+        let unnamed = Options::parse_for("turn", &["--harness", "codex", "hi"].map(String::from))
+            .expect("expected valid codex turn arguments");
+        let request = session_request(&unnamed, None);
+        assert_eq!(
+            request.configuration.model,
+            mango_external_agents::ConfigurationChange::Keep,
+            "expected the user's configured model to stay in force without the flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_refuses_a_model_for_another_harness_before_any_discovery() {
+        let args = [
+            "turn",
+            "--harness",
+            "claude",
+            "--model",
+            "gpt-5.2-codex",
+            "hi",
+        ]
+        .map(String::from);
+        let error = run(&args).await.expect_err("expected the model refused");
+        assert_eq!(
+            error,
+            "(mea turn): expected --model with --harness codex | received --model \"gpt-5.2-codex\" with --harness claude"
+        );
     }
 
     /// The three words the smoke test reads, plus the honest fourth: an agent that started and

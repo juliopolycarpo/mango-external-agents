@@ -716,6 +716,24 @@ response reports stays separately observed.
 An isolated 0.154.0 app-server probe returned `reasoningEffort: high` for a
 `config.model_reasoning_effort: high` thread start and wrote no `config.toml`.
 
+An explicit opening model is the `model` member of `thread/start` (and of `thread/resume`), which
+the [pinned protocol][thread-protocol] declares in `ThreadStartParams`. Without one the member is absent and the app-server uses
+the user's configured model. When that default is one the account rejects, the turn ends in
+`modelNotFound`, and the host picks another model for the session rather than editing the user's
+`config.toml`. `mea turn` exposes this as `--model ID`:
+
+```sh
+cargo run -p mea -- turn --harness codex --model gpt-5.2-codex "summarise this repository"
+```
+
+The flag is Codex only. With any other harness, including the Claude default of a turn without
+`--harness`, `mea turn` refuses with `(mea turn): expected --model with --harness codex | received
+--model "<id>" with --harness <harness>`, and `discover` and `doctor` refuse it as well because
+they never open a session. An empty id, one with surrounding spaces or control characters, or one
+past the vendor-id bound is refused with the value it received. `mea turn` does not check the id
+against `model/list`: a model the account cannot use surfaces as the vendor's own refusal, printed
+as it came.
+
 ## Approvals
 
 Two of the server's questions are approvals a person can answer:
@@ -1330,6 +1348,24 @@ This follows the official [app-server protocol](https://developers.openai.com/co
 and [subagent configuration](https://learn.chatgpt.com/docs/agent-configuration/subagents).
 Feature availability must be checked against the captured CLI version; enabling a process flag
 does not prove that the selected model emitted an attributed item.
+
+`--model ID` opens every conversation's thread on that model instead of the user's configured
+one, and works with `--harness codex --transcripts` and with `mea capture codex`:
+
+```sh
+cargo run -p mea -- capture --harness codex --transcripts --scenario subagent --model gpt-5.2-codex
+```
+
+Before any thread starts the capture walks `model/list` by cursor, the same picker-visible catalog
+the harness reads, and refuses an id the server did not list: `expected a --model id that
+model/list names, received "<id>"; listed ids: <id>, <id>`. The walk stops at 16 pages and at a
+repeated cursor. The sent `model/list` pages and their answers are part of the transcript, after
+`account/read`. A capture that chose a model also records it on a `# model: ID` line under the
+first header line, so a fixture states what it ran on; a capture without the flag has neither the
+line nor the check, and the committed fixtures are unchanged. The `user-defaults` scenario exists to
+record the user's own defaults, so under `--model` it records the user's defaults for everything
+except the model. Contract captures and the other harnesses refuse the flag with `(mea capture):
+expected --model with a Codex transcript capture ... | received ...`.
 
 The approval fixture records a **refusal**. A fixture that captured a grant would be a recording of
 this tool letting an agent out of its sandbox, checked into the repository.

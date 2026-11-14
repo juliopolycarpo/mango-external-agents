@@ -33,6 +33,13 @@ pub const SENT: &str = ">>";
 /// A line the vendor wrote.
 pub const RECEIVED: &str = "<<";
 
+/// The JSON-RPC id of the first `model/list` page a `--model` check asks for; later pages count up.
+///
+/// Above the ids the scenarios use (0 to 13 and 100), so the check never answers for one of them.
+const MODEL_LIST_FIRST_REQUEST_ID: usize = 200;
+/// How many `model/list` pages a `--model` check reads before it calls the catalog unbounded.
+const MODEL_LIST_PAGE_LIMIT: usize = 16;
+
 /// How long one scripted step waits for the vendor before moving on.
 const STEP_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -99,18 +106,26 @@ pub fn scenario_names() -> Vec<&'static str> {
 
 /// Records every Codex scenario, or only `selected`, into `out_dir`.
 ///
+/// A `model` opens every conversation's thread with that model id instead of the user's
+/// configured one, after `model/list` has named it; each transcript records it in its header.
+///
 /// # Errors
 ///
 /// Whatever the launcher or the vendor reported. A scenario that fails leaves the fixtures written
 /// so far in place: a partial capture is a diff to read, not a reason to lose the rest.
-pub async fn codex(out_dir: &Path, workspace: &Path, selected: Option<&str>) -> Result<()> {
+pub async fn codex(
+    out_dir: &Path,
+    workspace: &Path,
+    selected: Option<&str>,
+    model: Option<&str>,
+) -> Result<()> {
     let host = HostContext::builder()
         .launcher(Arc::new(TokioLauncher::new()))
         .cwd(workspace.to_path_buf())
         .client_info("mea", env!("CARGO_PKG_VERSION"))
         .environment(mango_external_agents::EnvSource::from_process())
         .build()?;
-    codex_with(&host, out_dir, workspace, selected).await
+    codex_with(&host, out_dir, workspace, selected, model).await
 }
 
 /// Refuses a `codex` older than the library's floor, before any app-server is started.
@@ -149,6 +164,7 @@ async fn codex_with(
     out_dir: &Path,
     workspace: &Path,
     selected: Option<&str>,
+    model: Option<&str>,
 ) -> Result<()> {
     let scenarios: Vec<_> = SCENARIOS
         .iter()
@@ -186,7 +202,7 @@ async fn codex_with(
         let partial = out_dir.join(format!("{}.partial.jsonl", scenario.name));
         let diagnostic =
             (scenario.name == "subagent").then_some((partial.as_path(), prefix.as_str()));
-        let conversation = record(host, scenario, workspace, diagnostic).await?;
+        let conversation = record(host, scenario, workspace, diagnostic, model).await?;
         let mut recorded = prefix + &conversation;
         let qualified = scenario.name != "subagent" || has_captured_subagent(&recorded);
         let unqualified = out_dir.join("subagent.unqualified.jsonl");
@@ -283,6 +299,7 @@ async fn record(
     scenario: &Scenario,
     workspace: &Path,
     diagnostic: Option<(&Path, &str)>,
+    model: Option<&str>,
 ) -> Result<String> {
     let spec = if scenario.name == "subagent" {
         StdioSpec::new(["codex", "--enable", "multi_agent_v2", "app-server"])
@@ -302,7 +319,8 @@ async fn record(
         cwd: workspace.to_string_lossy().into_owned(),
         home: home_directory(),
         user: account_name(),
-        lines: vec![format!("# codex/{}: {}", scenario.name, scenario.purpose)],
+        lines: header(scenario, model),
+        model: model.map(str::to_owned),
     };
 
     let outcome = recorder.run(scenario).await;
@@ -336,6 +354,8 @@ struct Recorder {
     home: String,
     user: String,
     lines: Vec<String>,
+    /// The model id every thread this recording starts is opened with, when the operator chose one.
+    model: Option<String>,
 }
 
 impl Recorder {
@@ -369,6 +389,12 @@ impl Recorder {
             .await?;
         self.read_until(|frame| frame.get("id") == Some(&json!(1)))
             .await?;
+
+        // Before any thread, so an id the server does not list stops the capture with nothing
+        // started on it, rather than as a `modelNotFound` that ends a turn.
+        if let Some(model) = self.model.clone() {
+            self.require_listed_model(&model).await?;
+        }
 
         match scenario.name {
             "handshake" => self.handshake().await,
@@ -568,13 +594,50 @@ impl Recorder {
             .await
     }
 
+    /// Walks `model/list` until it names `model`, and refuses with every id it listed otherwise.
+    ///
+    /// The ids are the ones the picker shows, the same catalog the harness reads, so a hidden
+    /// model is refused here as it would be in a host's own picker. The walk is bounded: a server
+    /// that never ends its pages is a protocol failure, not a long capture.
+    async fn require_listed_model(&mut self, model: &str) -> Result<()> {
+        let mut listed = Vec::new();
+        let mut cursor: Option<String> = None;
+        for page in 0..MODEL_LIST_PAGE_LIMIT {
+            let id = MODEL_LIST_FIRST_REQUEST_ID + page;
+            let params = cursor
+                .as_ref()
+                .map_or_else(|| json!({}), |next| json!({"cursor": next}));
+            self.send(json!({"id": id, "method": "model/list", "params": params}))
+                .await?;
+            let answer = self
+                .read_until(|frame| frame.get("id") == Some(&json!(id)))
+                .await?;
+            let (ids, next) = model_list_page(&answer).ok_or_else(|| Error::Protocol {
+                expected: String::from("a model/list result with a data array of model ids"),
+                received: redact::incoming_frame(answer.clone(), self.paths()).to_string(),
+            })?;
+            listed.extend(ids);
+            if listed.iter().any(|id| id == model) {
+                return Ok(());
+            }
+            match next {
+                Some(next) if cursor.as_ref() != Some(&next) => cursor = Some(next),
+                _ => return Err(unlisted_model(model, &listed)),
+            }
+        }
+        Err(Error::Protocol {
+            expected: format!("model/list to end within {MODEL_LIST_PAGE_LIMIT} pages"),
+            received: format!("a further page after {} listed ids", listed.len()),
+        })
+    }
+
     async fn start_thread_with(
         &mut self,
         sandbox: Option<&str>,
         approval_policy: Option<&str>,
     ) -> Result<String> {
         self.send(json!({"id": 5, "method": "thread/start", "params":
-            thread_start_params(&self.cwd, sandbox, approval_policy)
+            thread_start_params(&self.cwd, self.model.as_deref(), sandbox, approval_policy)
         }))
         .await?;
         let started = self
@@ -669,9 +732,65 @@ fn is_turn_completed(frame: &Value) -> bool {
     frame.get("method") == Some(&json!("turn/completed"))
 }
 
+/// The comment lines a transcript opens with.
+///
+/// The second line exists only for a capture that chose a model: the thread-start frame carries
+/// the member too, but a header is what a reader of the fixture and a re-run both look at first.
+/// A capture that chose none keeps the one line the committed fixtures have.
+fn header(scenario: &Scenario, model: Option<&str>) -> Vec<String> {
+    let mut lines = vec![format!("# codex/{}: {}", scenario.name, scenario.purpose)];
+    if let Some(model) = model {
+        lines.push(format!("# model: {model}"));
+    }
+    lines
+}
+
+/// The ids on one `model/list` answer and the cursor of the next page, if the answer has both
+/// members in the shape the schema declares.
+fn model_list_page(answer: &Value) -> Option<(Vec<String>, Option<String>)> {
+    let data = answer["result"]["data"].as_array()?;
+    // A model the picker hides is not listed, as in the harness's own catalog read.
+    let ids = data
+        .iter()
+        .filter(|model| model["hidden"] != json!(true))
+        .map(|model| model["id"].as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    // An empty cursor is no next page, as in the harness's `read_model_catalog`.
+    let next = answer["result"]["nextCursor"]
+        .as_str()
+        .filter(|cursor| !cursor.is_empty())
+        .map(str::to_owned);
+    Some((ids, next))
+}
+
+/// The refusal for a model id `model/list` never named, with what it did name.
+fn unlisted_model(model: &str, listed: &[String]) -> Error {
+    let listed = if listed.is_empty() {
+        String::from("none")
+    } else {
+        listed.join(", ")
+    };
+    Error::HostConfiguration {
+        expected: "a --model id that model/list names",
+        received: mango_external_agents::redact::bounded(
+            &format!("{model:?}; listed ids: {listed}"),
+            mango_external_agents::normalize::TextLimit::ErrorMessage,
+        )
+        .text,
+    }
+}
+
 /// Builds `thread/start` members without imposing a permission choice when one is absent.
-fn thread_start_params(cwd: &str, sandbox: Option<&str>, approval_policy: Option<&str>) -> Value {
+fn thread_start_params(
+    cwd: &str,
+    model: Option<&str>,
+    sandbox: Option<&str>,
+    approval_policy: Option<&str>,
+) -> Value {
     let mut params = Map::from_iter([(String::from("cwd"), json!(cwd))]);
+    if let Some(model) = model {
+        params.insert(String::from("model"), json!(model));
+    }
     if let Some(sandbox) = sandbox {
         params.insert(String::from("sandbox"), json!(sandbox));
     }
@@ -711,8 +830,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        SCENARIOS, Scenario, codex_with, record, review_target, thread_start_params,
-        unconfigured_turn_params,
+        SCENARIOS, Scenario, codex_with, header, model_list_page, record, review_target,
+        thread_start_params, unconfigured_turn_params, unlisted_model,
     };
     use mango_external_agents::process::{
         ByteSource, LaunchSpec, ManagedProcess, ProcessControl, ProcessLauncher,
@@ -772,6 +891,7 @@ mod tests {
                 &host(launcher.clone()),
                 &SCENARIOS[0],
                 &std::env::temp_dir(),
+                None,
                 None,
             )
             .await
@@ -1090,6 +1210,7 @@ mod tests {
             },
             &std::env::temp_dir(),
             None,
+            None,
         )
         .await;
         let control = launcher.control();
@@ -1136,7 +1257,7 @@ mod tests {
         );
         let result = tokio::time::timeout(
             Duration::from_millis(20),
-            record(&host, handshake(), &std::env::temp_dir(), None),
+            record(&host, handshake(), &std::env::temp_dir(), None, None),
         )
         .await;
         let control = launcher.control();
@@ -1170,6 +1291,7 @@ mod tests {
                     purpose: "synthetic stalled turn",
                 },
                 &std::env::temp_dir(),
+                None,
                 None,
             )
             .await
@@ -1215,6 +1337,7 @@ mod tests {
             handshake(),
             &workspace.path,
             Some((&diagnostic, "# UNQUALIFIED\n")),
+            None,
         )
         .await;
         launcher
@@ -1240,6 +1363,7 @@ mod tests {
             &host(launcher.clone()),
             handshake(),
             &std::env::temp_dir(),
+            None,
             None,
         )
         .await
@@ -1275,6 +1399,7 @@ mod tests {
             &out,
             &std::env::temp_dir(),
             Some("subagent"),
+            None,
         )
         .await;
         let recorded = std::fs::read_to_string(out.join("subagent.jsonl")).unwrap_or_default();
@@ -1340,6 +1465,7 @@ mod tests {
             &out,
             &std::env::temp_dir(),
             Some("subagent"),
+            None,
         )
         .await;
         let recorded =
@@ -1374,7 +1500,14 @@ mod tests {
             launcher.push(archival_app_server());
         }
         let out = std::env::temp_dir().join(format!("mea-default-archival-{}", std::process::id()));
-        let result = codex_with(&host(launcher.clone()), &out, &std::env::temp_dir(), None).await;
+        let result = codex_with(
+            &host(launcher.clone()),
+            &out,
+            &std::env::temp_dir(),
+            None,
+            None,
+        )
+        .await;
         let files = std::fs::read_dir(&out).expect("capture directory").count();
         std::fs::remove_dir_all(&out).expect("remove test captures");
         assert!(
@@ -1407,6 +1540,7 @@ mod tests {
             &out,
             &std::env::temp_dir(),
             Some("subagent"),
+            None,
         )
         .await;
         std::fs::remove_dir_all(&out).expect("remove test diagnostic");
@@ -1433,7 +1567,14 @@ mod tests {
         }));
         let out = std::env::temp_dir().join(format!("mea-stalled-subagent-{}", std::process::id()));
         let workspace = out.join("private-workspace-canary");
-        let result = codex_with(&host(launcher.clone()), &out, &workspace, Some("subagent")).await;
+        let result = codex_with(
+            &host(launcher.clone()),
+            &out,
+            &workspace,
+            Some("subagent"),
+            None,
+        )
+        .await;
         let partial = std::fs::read_to_string(out.join("subagent.partial.jsonl"))
             .expect("retained partial traffic");
         assert!(!out.join("subagent.jsonl").exists());
@@ -1471,6 +1612,7 @@ mod tests {
             scenario,
             &std::env::temp_dir(),
             None,
+            None,
         )
         .await;
         let Err(Error::Protocol { expected, received }) = &result else {
@@ -1490,6 +1632,7 @@ mod tests {
             &std::env::temp_dir(),
             &std::env::temp_dir(),
             Some("not-a-scenario"),
+            None,
         )
         .await;
         assert!(
@@ -1556,6 +1699,7 @@ mod tests {
             handshake(),
             &std::env::temp_dir(),
             None,
+            None,
         )
         .await;
 
@@ -1583,6 +1727,7 @@ mod tests {
             &host(unreapable(&launcher)),
             &scenario,
             &std::env::temp_dir(),
+            None,
             None,
         )
         .await;
@@ -1621,7 +1766,14 @@ mod tests {
         let out = std::env::temp_dir().join(format!("mea-capture-outdated-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&out);
 
-        let result = codex_with(&host(launcher.clone()), &out, &std::env::temp_dir(), None).await;
+        let result = codex_with(
+            &host(launcher.clone()),
+            &out,
+            &std::env::temp_dir(),
+            None,
+            None,
+        )
+        .await;
 
         let launches = launched(&launcher);
         let wrote_a_directory = out.exists();
@@ -1650,7 +1802,14 @@ mod tests {
         let out = std::env::temp_dir().join(format!("mea-capture-current-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&out);
 
-        let result = codex_with(&host(launcher.clone()), &out, &std::env::temp_dir(), None).await;
+        let result = codex_with(
+            &host(launcher.clone()),
+            &out,
+            &std::env::temp_dir(),
+            None,
+            None,
+        )
+        .await;
 
         let launches = launched(&launcher);
         let _ = std::fs::remove_dir_all(&out);
@@ -1673,7 +1832,14 @@ mod tests {
         let out = std::env::temp_dir().join(format!("mea-capture-unknown-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&out);
 
-        let result = codex_with(&host(launcher.clone()), &out, &std::env::temp_dir(), None).await;
+        let result = codex_with(
+            &host(launcher.clone()),
+            &out,
+            &std::env::temp_dir(),
+            None,
+            None,
+        )
+        .await;
 
         let launches = launched(&launcher);
         let _ = std::fs::remove_dir_all(&out);
@@ -1700,6 +1866,7 @@ mod tests {
             &host(unreapable(&launcher)),
             &out,
             &std::env::temp_dir(),
+            None,
             None,
         )
         .await;
@@ -1743,11 +1910,439 @@ mod tests {
 
     #[test]
     fn user_default_thread_start_omits_permission_members() {
-        let params = thread_start_params("/workspace", None, None);
+        let params = thread_start_params("/workspace", None, None, None);
 
         assert_eq!(params["cwd"], "/workspace");
         assert!(params.get("sandbox").is_none());
         assert!(params.get("approvalPolicy").is_none());
+        assert!(
+            params.get("model").is_none(),
+            "expected no model member without --model | received {params}"
+        );
+    }
+
+    #[test]
+    fn a_chosen_model_is_the_thread_start_model_member() {
+        let params = thread_start_params("/workspace", Some("gpt-5.2-codex"), None, None);
+
+        assert_eq!(
+            params["model"], "gpt-5.2-codex",
+            "expected thread/start to carry the chosen model | received {params}"
+        );
+        assert_eq!(params["cwd"], "/workspace");
+    }
+
+    #[test]
+    fn a_transcript_header_names_the_model_only_when_one_was_chosen() {
+        let plain = header(handshake(), None);
+        assert_eq!(
+            plain.len(),
+            1,
+            "expected one header line | received {plain:?}"
+        );
+        assert!(plain[0].starts_with("# codex/handshake: "));
+
+        let pinned = header(handshake(), Some("gpt-5.2-codex"));
+        assert_eq!(pinned[0], plain[0]);
+        assert_eq!(pinned[1], "# model: gpt-5.2-codex");
+        assert_eq!(pinned.len(), 2);
+    }
+
+    #[test]
+    fn a_model_list_page_yields_its_ids_and_the_next_cursor() {
+        let last = json!({"id": 1, "result": {"data": [{"id": "a"}, {"id": "b"}]}});
+        assert_eq!(
+            model_list_page(&last),
+            Some((vec![String::from("a"), String::from("b")], None))
+        );
+        let first = json!({"id": 1, "result": {"data": [{"id": "a"}], "nextCursor": "page-1"}});
+        assert_eq!(
+            model_list_page(&first),
+            Some((vec![String::from("a")], Some(String::from("page-1"))))
+        );
+        let empty = json!({"id": 1, "result": {"data": [], "nextCursor": null}});
+        assert_eq!(model_list_page(&empty), Some((Vec::new(), None)));
+    }
+
+    /// The harness's catalog read drops an empty cursor, so a server that spells "no next page" as
+    /// `""` ends that walk; this check has to end on it too.
+    #[test]
+    fn an_empty_next_cursor_is_no_next_page_like_a_null_one() {
+        let page = json!({"id": 1, "result": {"data": [{"id": "a"}], "nextCursor": ""}});
+        assert_eq!(
+            model_list_page(&page),
+            Some((vec![String::from("a")], None)),
+            "expected nextCursor \"\" to read as no next page"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_list_ending_on_an_empty_cursor_refuses_an_unlisted_id_without_a_second_request()
+     {
+        let launcher = Arc::new(FakeLauncher::new());
+        let mut server = ModelCatalogServer::paged(&[&["gpt-a"]]);
+        server.endless = true;
+        server.repeating_cursor = Some("");
+        launcher.push(server.process());
+
+        let error = record(
+            &host(launcher.clone()),
+            handshake(),
+            &std::env::temp_dir(),
+            None,
+            Some("gpt-z"),
+        )
+        .await
+        .expect_err("expected an unlisted id to be refused");
+
+        assert_eq!(
+            error.to_string(),
+            "expected a --model id that model/list names, received \"gpt-z\"; listed ids: gpt-a"
+        );
+        assert_eq!(
+            model_checks(&written_frames(&launcher)).len(),
+            1,
+            "expected the walk to stop after the page whose nextCursor was empty"
+        );
+    }
+
+    #[test]
+    fn a_model_the_picker_hides_is_not_a_listed_id() {
+        let page = json!({"id": 1, "result": {"data": [
+            {"id": "shown", "hidden": false},
+            {"id": "old-model", "hidden": true},
+            {"id": "unmarked"}
+        ]}});
+        assert_eq!(
+            model_list_page(&page),
+            Some((vec![String::from("shown"), String::from("unmarked")], None))
+        );
+    }
+
+    #[test]
+    fn a_model_list_answer_without_its_data_or_a_model_id_is_not_a_page() {
+        for answer in [
+            json!({"id": 1, "error": {"code": -32601, "message": "unsupported"}}),
+            json!({"id": 1, "result": {}}),
+            json!({"id": 1, "result": {"data": "a"}}),
+            json!({"id": 1, "result": {"data": [{"id": "a"}, {"displayName": "no id"}]}}),
+            json!({"id": 1, "result": {"data": [{"id": 7}]}}),
+        ] {
+            assert_eq!(
+                model_list_page(&answer),
+                None,
+                "expected no page from {answer}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unlisted_model_is_refused_with_the_received_id_and_every_listed_id() {
+        let listed = [String::from("gpt-a"), String::from("gpt-b")];
+        let error = unlisted_model("gpt-6.1-sol", &listed);
+        assert_eq!(
+            error.to_string(),
+            "expected a --model id that model/list names, received \"gpt-6.1-sol\"; listed ids: gpt-a, gpt-b"
+        );
+        assert_eq!(
+            unlisted_model("gpt-6.1-sol", &[]).to_string(),
+            "expected a --model id that model/list names, received \"gpt-6.1-sol\"; listed ids: none"
+        );
+    }
+
+    /// A Codex app-server stand-in whose `model/list` serves fixed pages by cursor.
+    ///
+    /// Everything else is mechanical, as in `app_server`: a thread for `thread/start`, an empty
+    /// result for the rest. A page's `nextCursor` is `page-N` for the page after it, and the
+    /// server hands out page 0 for no cursor.
+    struct ModelCatalogServer {
+        pages: Vec<Vec<&'static str>>,
+        /// Whether the last page still claims a next one, as a server that never ends would.
+        endless: bool,
+        /// A cursor to hand out in place of every page's own, as a server that loops would.
+        repeating_cursor: Option<&'static str>,
+    }
+
+    impl ModelCatalogServer {
+        fn paged(pages: &[&[&'static str]]) -> Self {
+            Self {
+                pages: pages.iter().map(|page| page.to_vec()).collect(),
+                endless: false,
+                repeating_cursor: None,
+            }
+        }
+
+        fn process(self) -> FakeProcess {
+            FakeProcess::responding(move |line| {
+                let Ok(frame) = serde_json::from_str::<Value>(line) else {
+                    return Vec::new();
+                };
+                let (Some(method), Some(id)) = (frame["method"].as_str(), frame.get("id")) else {
+                    return Vec::new();
+                };
+                let result = match method {
+                    "account/gatewayOAuth/read" => json!({"required": false, "status": null}),
+                    "thread/start" => json!({"thread": {"id": "thread-1"}}),
+                    "model/list" => {
+                        let index = frame["params"]["cursor"]
+                            .as_str()
+                            .and_then(|cursor| cursor.strip_prefix("page-"))
+                            .and_then(|number| number.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        let ids = self
+                            .pages
+                            .get(index)
+                            .cloned()
+                            .unwrap_or_else(|| vec!["endless"]);
+                        let more = self.endless || index + 1 < self.pages.len();
+                        let next = self
+                            .repeating_cursor
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("page-{}", index + 1));
+                        json!({
+                            "data": ids.iter().map(|id| json!({"id": id})).collect::<Vec<_>>(),
+                            "nextCursor": more.then_some(next),
+                        })
+                    }
+                    _ => json!({}),
+                };
+                vec![json!({"id": id, "result": result}).to_string()]
+            })
+        }
+    }
+
+    fn written_frames(launcher: &FakeLauncher) -> Vec<Value> {
+        launcher
+            .written()
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("expected a JSON capture frame"))
+            .collect()
+    }
+
+    /// The `model/list` pages the `--model` check asked for, apart from the handshake scenario's own
+    /// catalog read, which uses a lower id.
+    fn model_checks(frames: &[Value]) -> Vec<&Value> {
+        frames
+            .iter()
+            .filter(|frame| {
+                frame["method"] == "model/list"
+                    && frame["id"]
+                        .as_u64()
+                        .is_some_and(|id| id >= super::MODEL_LIST_FIRST_REQUEST_ID as u64)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_listed_model_opens_the_capture_thread_and_is_recorded_in_the_header() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(ModelCatalogServer::paged(&[&["gpt-a"], &["gpt-b", "gpt-c"]]).process());
+
+        let recorded = record(
+            &host(launcher.clone()),
+            handshake(),
+            &std::env::temp_dir(),
+            None,
+            Some("gpt-c"),
+        )
+        .await
+        .expect("expected a model on the second page to be accepted");
+
+        let frames = written_frames(&launcher);
+        let lists = model_checks(&frames);
+        assert_eq!(
+            lists.len(),
+            2,
+            "expected the check to follow the cursor to the second page | received {frames:?}"
+        );
+        assert_eq!(lists[1]["params"]["cursor"], "page-1");
+        let start = frames
+            .iter()
+            .find(|frame| frame["method"] == "thread/start")
+            .expect("expected a thread/start");
+        assert_eq!(start["params"]["model"], "gpt-c");
+        let lines: Vec<&str> = recorded.lines().collect();
+        assert_eq!(lines[1], "# model: gpt-c");
+        assert!(
+            recorded.lines().any(|line| line.starts_with(super::SENT)
+                && line.contains(r#""method":"thread/start""#)
+                && line.contains(r#""model":"gpt-c""#)),
+            "expected the sent thread/start in the transcript to carry the model | received {recorded}"
+        );
+        assert_eq!(launcher.live_children(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_model_stops_the_capture_before_any_thread_starts() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(ModelCatalogServer::paged(&[&["gpt-a"], &["gpt-b"]]).process());
+
+        let error = record(
+            &host(launcher.clone()),
+            handshake(),
+            &std::env::temp_dir(),
+            None,
+            Some("gpt-6.1-sol"),
+        )
+        .await
+        .expect_err("expected an id model/list never named to be refused");
+
+        assert_eq!(
+            error.to_string(),
+            "expected a --model id that model/list names, received \"gpt-6.1-sol\"; listed ids: gpt-a, gpt-b"
+        );
+        let methods: Vec<String> = written_frames(&launcher)
+            .iter()
+            .filter_map(|frame| frame["method"].as_str().map(str::to_owned))
+            .collect();
+        assert!(
+            !methods.iter().any(|method| method == "thread/start"),
+            "expected no thread to start on a refused model | received {methods:?}"
+        );
+        assert_eq!(launcher.live_children(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_model_list_that_loops_on_one_cursor_ends_the_check_with_what_it_listed() {
+        let launcher = Arc::new(FakeLauncher::new());
+        let mut server = ModelCatalogServer::paged(&[&["gpt-a"]]);
+        server.endless = true;
+        server.repeating_cursor = Some("same");
+        launcher.push(server.process());
+
+        let error = record(
+            &host(launcher.clone()),
+            handshake(),
+            &std::env::temp_dir(),
+            None,
+            Some("gpt-z"),
+        )
+        .await
+        .expect_err("expected a looping cursor to end the check");
+
+        assert_eq!(
+            error.to_string(),
+            "expected a --model id that model/list names, received \"gpt-z\"; listed ids: gpt-a, gpt-a"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_list_that_never_ends_fails_the_check_after_its_page_limit() {
+        let launcher = Arc::new(FakeLauncher::new());
+        let mut server = ModelCatalogServer::paged(&[&["gpt-a"]]);
+        server.endless = true;
+        launcher.push(server.process());
+
+        let error = record(
+            &host(launcher.clone()),
+            handshake(),
+            &std::env::temp_dir(),
+            None,
+            Some("gpt-z"),
+        )
+        .await
+        .expect_err("expected an endless catalog to fail the check");
+
+        assert!(
+            matches!(
+                &error,
+                Error::Protocol { expected, received }
+                    if expected == "model/list to end within 16 pages"
+                        && received == "a further page after 16 listed ids"
+            ),
+            "expected a page-limit failure | received {error:?}"
+        );
+        assert_eq!(launcher.live_children(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_model_list_answer_that_is_not_a_page_fails_the_check_with_the_frame() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(FakeProcess::responding(|line| {
+            let frame: Value = serde_json::from_str(line).expect("capture request");
+            let Some(id) = frame.get("id") else {
+                return Vec::new();
+            };
+            let result = match frame["method"].as_str() {
+                Some("account/gatewayOAuth/read") => json!({"required": false, "status": null}),
+                Some("model/list") => json!({"models": []}),
+                _ => json!({}),
+            };
+            vec![json!({"id": id, "result": result}).to_string()]
+        }));
+
+        let error = record(
+            &host(launcher.clone()),
+            handshake(),
+            &std::env::temp_dir(),
+            None,
+            Some("gpt-a"),
+        )
+        .await
+        .expect_err("expected an answer without data to fail the check");
+
+        assert!(
+            matches!(
+                &error,
+                Error::Protocol { expected, received }
+                    if expected == "a model/list result with a data array of model ids"
+                        && received.contains("models")
+            ),
+            "expected a protocol failure naming the shape | received {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_capture_without_a_model_never_lists_models_or_adds_a_header_line() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(ModelCatalogServer::paged(&[&["gpt-a"]]).process());
+
+        let recorded = record(
+            &host(launcher.clone()),
+            handshake(),
+            &std::env::temp_dir(),
+            None,
+            None,
+        )
+        .await
+        .expect("expected a capture on the configured model");
+
+        assert!(
+            model_checks(&written_frames(&launcher)).is_empty(),
+            "expected no model/list check on a capture that chose no model"
+        );
+        assert!(!recorded.contains("# model:"));
+        assert!(!recorded.contains(r#""model":"#));
+    }
+
+    #[tokio::test]
+    async fn a_model_capture_writes_the_header_into_the_transcript_file() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(version_line(mango_agent_codex::MINIMUM_CODEX_VERSION));
+        launcher.push(ModelCatalogServer::paged(&[&["gpt-a"]]).process());
+        let out = std::env::temp_dir().join(format!("mea-capture-model-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+
+        let result = codex_with(
+            &host(launcher.clone()),
+            &out,
+            &std::env::temp_dir(),
+            Some("handshake"),
+            Some("gpt-a"),
+        )
+        .await;
+        let written = std::fs::read_to_string(out.join("handshake.jsonl")).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&out);
+
+        assert!(
+            result.is_ok(),
+            "expected a model capture | received {result:?}"
+        );
+        assert_eq!(
+            written.lines().nth(1),
+            Some("# model: gpt-a"),
+            "expected the model on the second line of the file | received {written}"
+        );
     }
 
     #[test]
