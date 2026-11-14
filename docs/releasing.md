@@ -43,7 +43,7 @@ ordinary documentation PR.
    ```
 
 4. Watch the `Release` workflow. It verifies the tag signature and that the manifests match the tag, runs `scripts/check.sh`,
-   runs the isolated minimum-Rust feature check (`scripts/check-msrv-features.sh --locked`, on the
+   runs the isolated minimum-Rust feature check (`scripts/check-features.sh msrv --locked`, on the
    `rust-version` the script reads from `Cargo.toml`, one package at a time), publishes each crate
    that is not on crates.io yet, and creates the GitHub release with git-cliff notes. The checks
    run in the verify job, which the publish job needs, so a tag that fails the minimum-Rust check
@@ -60,7 +60,7 @@ ordinary documentation PR.
    pinned crates declare:
 
    ```sh
-   export RUSTUP_TOOLCHAIN=$(scripts/check-msrv-features.sh --print-toolchain)
+   export RUSTUP_TOOLCHAIN=$(scripts/check-features.sh --print-toolchain)
    cargo update --manifest-path tests/standalone-current/Cargo.toml \
      -p mango-external-agents -p mango-agent-acp -p mango-agent-claude -p mango-agent-codex
    scripts/check-standalone.sh --test-only current
@@ -86,9 +86,9 @@ ordinary documentation PR.
 ## Pre-publication requirements
 
 For every release, run `scripts/check.sh`, `scripts/check-publish.sh --list` and
-`scripts/check-msrv-features.sh --locked` on the intended release sources. Verify crate docs with
+`scripts/check-features.sh msrv --locked` on the intended release sources. Verify crate docs with
 `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked`.
-The isolated feature check needs the declared minimum Rust toolchain installed. `scripts/check.sh`
+The isolated feature check needs the declared minimum Rust toolchain and cargo-hack installed. `scripts/check.sh`
 also runs the extracted core package unit tests with an isolated prerelease version, using the
 checkout’s selected Rust toolchain.
 
@@ -155,14 +155,17 @@ release.
 
 ## Where each feature set is checked
 
-| Check                                                                           | Covers                                                                              | Runs                                                                    |
-| ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| `cargo hack clippy --feature-powerset --depth 2` (`scripts/check.sh`, `ci.yml`) | every feature pair of the core and of the Claude, Codex and ACP crates, all targets | stable toolchain, CI Linux, macOS and Windows lanes, `scripts/check.sh` |
-| `scripts/check-msrv-features.sh`                                                | each package alone, library targets only, on the declared minimum Rust              | release verify job, by hand                                             |
+| Lane                                 | Covers                                                                                                                                                   | Runs                                                                                                 |
+| ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `scripts/check-features.sh powerset` | Clippy over every feature pair (depth 2) of the core and of the Claude, Codex and ACP crates, all targets, on the development toolchain                  | CI `rust` job on Linux, macOS and Windows, `scripts/check.sh`, release verify job                    |
+| `scripts/check-features.sh msrv`     | each package alone on the declared minimum Rust: bare, each feature alone, core with all features, bare core with all targets; library targets otherwise | CI `msrv` job, fresh-dependencies lane, release verify job, `scripts/check-features.sh msrv` by hand |
 
-The powerset names all four library crates in the one command, so a feature added to a harness
-crate is linted in combination with the others without a script edit. `scripts/test-check-powerset.sh`
-fails when the command drops one of them.
+`scripts/check-features.sh` is the single driver. A lane fixes the toolchain and the target set; the
+four library crates are listed once, in the script, and cargo-hack reads each crate's features from
+its manifest. A new crate is one edit to that list and a new feature needs none. Both lanes need
+cargo-hack on `PATH`; only `scripts/check.sh` skips the powerset when it is missing.
+`scripts/test-check-powerset.sh` fails when either lane drops a library crate or a flag, and when
+`ci.yml` or `scripts/check.sh` runs cargo-hack without the driver.
 
 ## Pre-releases
 
