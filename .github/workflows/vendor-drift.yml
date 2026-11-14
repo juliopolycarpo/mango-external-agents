@@ -100,6 +100,11 @@ jobs:
         if: matrix.vendor == 'claude' && steps.install.outcome == 'success'
         continue-on-error: true
         run: scripts/check-claude-bare-reference.sh
+      - name: Watch the vendor documentation for an ACP mode
+        id: acp-docs
+        if: (matrix.vendor == 'claude' || matrix.vendor == 'codex') && steps.install.outcome == 'success'
+        continue-on-error: true
+        run: scripts/check-vendor-acp-docs.sh "${{ matrix.vendor }}"
       - name: Capture the latest public contract
         id: capture
         if: steps.install.outcome == 'success'
@@ -137,6 +142,12 @@ jobs:
             echo drift > "$state"
             exit 0
           fi
+          # The documentation watch does not return early: the contract comparison below still runs,
+          # so a drift issue about an ACP page carries the help diff when there is one.
+          docs_failed=false
+          if [ "$vendor" != 'acp-opencode' ] && [ "${{ steps.acp-docs.outcome }}" != 'success' ]; then
+            docs_failed=true
+          fi
           if [ "${{ steps.capture.outcome }}" != 'success' ]; then
             scripts/write-vendor-drift-report.sh --failure "$vendor" 'public contract capture' "$report"
             echo drift > "$state"
@@ -158,16 +169,28 @@ jobs:
               ;;
           esac
           if scripts/write-vendor-drift-report.sh "$vendor" "$committed" "$observed" "$report"; then
-            echo "no $vendor drift"
-            echo no-drift > "$state"
-            exit 0
+            status=0
           else
             status=$?
           fi
-          if [ "$status" -ne 1 ]; then
+          if [ "$status" -gt 1 ]; then
             echo "could not compare $vendor public contract" >&2
             echo error > "$state"
             exit "$status"
+          fi
+          if [ "$status" -eq 0 ]; then
+            if [ "$docs_failed" = false ]; then
+              echo "no $vendor drift"
+              echo no-drift > "$state"
+              exit 0
+            fi
+            scripts/write-vendor-drift-report.sh --failure "$vendor" 'documentation watch for an ACP page or command' "$report"
+          elif [ "$docs_failed" = true ]; then
+            {
+              echo
+              echo 'The documentation watch for an ACP page or command also failed in this run: a vendor'
+              echo 'document now mentions ACP, or could not be read. The workflow log names the page.'
+            } >> "$report"
           fi
           echo drift > "$state"
       - name: Bound the drift result
