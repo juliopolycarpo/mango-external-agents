@@ -2677,9 +2677,11 @@ mod tests {
     use mango_external_agents::{CancelReason, CancelToken, ExitStatus, Resumability};
     use std::sync::Arc;
 
-    /// A one-event sink and its receiver: the first payload fills it, so the next close is refused.
-    /// The receiver stays with the caller, because a dropped one closes the stream.
-    fn one_event_sink() -> (
+    /// A sink that queues `capacity` payload events, and the receiver they arrive on. The receiver
+    /// stays with the caller, because a dropped one closes the stream.
+    fn bounded_sink(
+        capacity: usize,
+    ) -> (
         mango_external_agents::EventSink,
         mango_external_agents::EventReceiver,
     ) {
@@ -2690,8 +2692,65 @@ mod tests {
             TurnId::new("turn"),
             AttemptId::FIRST,
             Arc::new(FrozenClock::default()),
-            1,
+            capacity,
         )
+    }
+
+    /// A one-event sink: the first payload fills it, so the next close is refused.
+    fn one_event_sink() -> (
+        mango_external_agents::EventSink,
+        mango_external_agents::EventReceiver,
+    ) {
+        bounded_sink(1)
+    }
+
+    fn filler_text() -> mango_external_agents::EventKind {
+        mango_external_agents::EventKind::TextDelta {
+            text: String::from("fills the queue"),
+        }
+    }
+
+    fn reported_usage() -> mango_external_agents::Usage {
+        mango_external_agents::Usage {
+            input_tokens: Some(3),
+            output_tokens: Some(5),
+            ..Default::default()
+        }
+    }
+
+    /// A one-event sink holding one text delta whose next close was refused, with the `room` flag
+    /// `emit_run_end` keeps after that refusal.
+    async fn sink_after_a_refused_close() -> (
+        mango_external_agents::EventSink,
+        mango_external_agents::EventReceiver,
+        bool,
+    ) {
+        use mango_external_agents::EventKind;
+        let (sink, events) = one_event_sink();
+        sink.emit(filler_text())
+            .await
+            .expect("expected the first payload to fit");
+        let mut room = true;
+        super::emit_run_end(&sink, EventKind::ReasoningEnded, &mut room)
+            .await
+            .expect("expected a refused close to be dropped quietly");
+        assert!(!room, "expected the refused close to be remembered");
+        (sink, events, room)
+    }
+
+    /// Everything the host reads until the stream ends. Takes the sink and drops it first, so a
+    /// test whose terminal went missing reads a short stream (or the sink's own overflow failure
+    /// after a refused close) and fails on the comparison, rather than hanging on a live sender.
+    async fn read_to_the_end(
+        sink: mango_external_agents::EventSink,
+        events: &mut mango_external_agents::EventReceiver,
+    ) -> Vec<mango_external_agents::EventKind> {
+        drop(sink);
+        let mut kinds = Vec::new();
+        while let Some(event) = events.recv().await {
+            kinds.push(event.kind);
+        }
+        kinds
     }
 
     /// A close the queue has no room for sets `room` to false, and the usage behind it is
@@ -2731,6 +2790,250 @@ mod tests {
             sent.is_err() && sink.is_terminal(),
             "expected the answer to be sent and to fail the turn as overflow, not vanish | received: {sent:?}, terminal: {}",
             sink.is_terminal()
+        );
+    }
+
+    /// The usage is dropped behind a refused close, the terminal still commits as itself, and the
+    /// host reads only what was queued before the refusal.
+    #[tokio::test]
+    async fn a_usage_behind_a_refused_close_is_dropped_and_the_completion_is_sent() {
+        use mango_external_agents::EventKind;
+        let (sink, mut events, mut room) = sink_after_a_refused_close().await;
+
+        let usage = super::emit_run_end(
+            &sink,
+            EventKind::Usage {
+                usage: reported_usage(),
+            },
+            &mut room,
+        )
+        .await;
+        assert!(
+            usage.is_ok() && !sink.is_terminal(),
+            "expected the usage to be dropped without a terminal | received: {usage:?}"
+        );
+        super::emit_run_end(&sink, EventKind::Completed, &mut room)
+            .await
+            .expect("expected the terminal to need no room");
+
+        let kinds = read_to_the_end(sink, &mut events).await;
+        assert_eq!(
+            kinds,
+            vec![filler_text(), EventKind::Completed],
+            "expected the queued text and the completion, with no usage and no close"
+        );
+    }
+
+    /// A terminal never waits for room, and a vendor failure is not rewritten into an overflow.
+    #[tokio::test]
+    async fn a_vendor_failure_behind_a_refused_close_is_sent_as_itself() {
+        use mango_external_agents::{ErrorCode, EventKind, VendorError};
+        let (sink, mut events, mut room) = sink_after_a_refused_close().await;
+
+        let failure = EventKind::Error {
+            error: VendorError::new(
+                ErrorCode::from_static("claude-no-result"),
+                "expected a result, received none",
+            ),
+        };
+        super::emit_run_end(&sink, failure, &mut room)
+            .await
+            .expect("expected the failure to need no room");
+
+        let kinds = read_to_the_end(sink, &mut events).await;
+        assert!(
+            matches!(
+                kinds.last(),
+                Some(EventKind::Error { error }) if error.code.as_str() == "claude-no-result"
+            ),
+            "expected the vendor's own failure as the terminal, not stream-overflow | received: {kinds:?}"
+        );
+    }
+
+    /// With room, the usage is ordinary payload: queued, in order, ahead of the terminal.
+    #[tokio::test]
+    async fn a_usage_is_sent_while_no_close_was_refused() {
+        use mango_external_agents::EventKind;
+        let (sink, mut events) = bounded_sink(4);
+        let mut room = true;
+
+        for event in [
+            EventKind::Usage {
+                usage: reported_usage(),
+            },
+            EventKind::Completed,
+        ] {
+            super::emit_run_end(&sink, event, &mut room)
+                .await
+                .expect("expected room for the usage and the terminal");
+        }
+
+        let kinds = read_to_the_end(sink, &mut events).await;
+        assert_eq!(
+            kinds,
+            vec![
+                EventKind::Usage {
+                    usage: reported_usage()
+                },
+                EventKind::Completed
+            ],
+            "expected the usage then the completion | received: {kinds:?}"
+        );
+        assert!(room, "expected no refusal to be remembered");
+    }
+
+    /// The usage is payload, so a queue that has no room for it fails the turn rather than losing
+    /// it quietly, and the failure names the cap and the count it passed.
+    #[tokio::test]
+    async fn a_usage_the_full_queue_cannot_hold_fails_the_turn_as_stream_overflow() {
+        use mango_external_agents::{Error, EventKind};
+        let (sink, mut events) = one_event_sink();
+        sink.emit(filler_text())
+            .await
+            .expect("expected the first payload to fit");
+        let mut room = true;
+
+        let sent = super::emit_run_end(
+            &sink,
+            EventKind::Usage {
+                usage: reported_usage(),
+            },
+            &mut room,
+        )
+        .await;
+        assert!(
+            matches!(sent, Err(Error::LimitExceeded { .. })) && sink.is_terminal(),
+            "expected LimitExceeded and a committed terminal | received: {sent:?}, terminal: {}",
+            sink.is_terminal()
+        );
+
+        let kinds = read_to_the_end(sink, &mut events).await;
+        let Some(EventKind::Error { error }) = kinds.last() else {
+            panic!("expected the turn to end as stream-overflow | received: {kinds:?}");
+        };
+        assert_eq!(
+            error.code.as_str(),
+            "stream-overflow",
+            "expected stream-overflow | received: {kinds:?}"
+        );
+        assert!(
+            error.message.starts_with("expected at most 1 ")
+                && error.message.contains("received 2"),
+            "expected the message to name the cap (1) and the count received (2) | received: {}",
+            error.message
+        );
+        assert!(
+            !kinds
+                .iter()
+                .any(|kind| matches!(kind, EventKind::Usage { .. })),
+            "expected the refused usage to stay off the stream | received: {kinds:?}"
+        );
+    }
+
+    /// What the host reads when the answer meets a real refused close: the queued text, then a
+    /// `stream-overflow` failure naming the cap and the count, and no answer. Production only
+    /// reaches this through a refusal the sink remembers; the code alone does not tell the sent
+    /// answer apart from a dropped one, because the sink's drop also ends the stream as
+    /// `stream-overflow`, so the message is asserted too.
+    #[tokio::test]
+    async fn a_structured_answer_behind_a_refused_close_ends_the_stream_as_a_named_overflow() {
+        use mango_external_agents::EventKind;
+        let (sink, mut events, mut room) = sink_after_a_refused_close().await;
+
+        let answer = EventKind::structured_output(serde_json::json!({"word": "ok"}))
+            .expect("expected a small answer");
+        let _ = super::emit_run_end(&sink, answer, &mut room).await;
+
+        let kinds = read_to_the_end(sink, &mut events).await;
+        let [first, EventKind::Error { error }] = kinds.as_slice() else {
+            panic!(
+                "expected the queued text then one stream-overflow failure | received: {kinds:?}"
+            );
+        };
+        assert_eq!(first, &filler_text(), "expected only the queued text first");
+        assert_eq!(
+            error.code.as_str(),
+            "stream-overflow",
+            "expected stream-overflow | received: {kinds:?}"
+        );
+        assert_eq!(
+            error.message,
+            "expected at most 1 queued turn events after a refused close, received 2",
+            "expected the overflow raised by the answer, not the sink's drop"
+        );
+    }
+
+    /// The answer's delivery does not depend on `room`. The flag is set by hand here, on a sink
+    /// that refused nothing, to isolate `emit_run_end`'s own decision: production reaches a false
+    /// `room` only behind a refusal the sink remembers, which the test above covers. With a queue
+    /// that has space, the answer is queued while the usage and a later close are dropped.
+    #[tokio::test]
+    async fn a_structured_answer_is_queued_whatever_room_remembers() {
+        use mango_external_agents::EventKind;
+        let (sink, mut events) = bounded_sink(4);
+        let mut room = false;
+
+        let answer = EventKind::structured_output(serde_json::json!({"word": "ok"}))
+            .expect("expected a small answer");
+        for event in [
+            EventKind::Usage {
+                usage: reported_usage(),
+            },
+            EventKind::ReasoningEnded,
+            answer.clone(),
+            EventKind::Completed,
+        ] {
+            super::emit_run_end(&sink, event, &mut room)
+                .await
+                .expect("expected only the dropped events to pass quietly");
+        }
+
+        let kinds = read_to_the_end(sink, &mut events).await;
+        assert_eq!(
+            kinds,
+            vec![answer, EventKind::Completed],
+            "expected the answer and the completion, with the usage and the close dropped"
+        );
+        assert!(!room, "expected the refusal to stay remembered");
+    }
+
+    /// With room, a close is queued as the close it is, ahead of the usage and the terminal.
+    #[tokio::test]
+    async fn the_closes_a_run_owes_are_queued_ahead_of_the_usage_and_the_terminal() {
+        use mango_external_agents::EventKind;
+        use mango_external_agents::event::{ActivityResult, ActivityStatus};
+        let (sink, mut events) = bounded_sink(8);
+        let mut room = true;
+        let activity_close = EventKind::ActivityCompleted {
+            call_id: String::from("call-1"),
+            result: ActivityResult::new(ActivityStatus::Cancelled),
+        };
+
+        for event in [
+            EventKind::ReasoningEnded,
+            activity_close.clone(),
+            EventKind::Usage {
+                usage: reported_usage(),
+            },
+            EventKind::Completed,
+        ] {
+            super::emit_run_end(&sink, event, &mut room)
+                .await
+                .expect("expected room for every event");
+        }
+
+        let kinds = read_to_the_end(sink, &mut events).await;
+        assert_eq!(
+            kinds,
+            vec![
+                EventKind::ReasoningEnded,
+                activity_close,
+                EventKind::Usage {
+                    usage: reported_usage()
+                },
+                EventKind::Completed
+            ],
+            "expected the closes, the usage and the completion in that order"
         );
     }
 
