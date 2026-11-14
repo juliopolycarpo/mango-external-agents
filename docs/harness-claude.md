@@ -895,6 +895,29 @@ empty one. An explicit model is an opaque vendor value: it is checked only for t
 value shape, never rejected merely because it is absent from a partial alias catalog. An invalid
 value is refused before a child starts rather than omitted or allowed to alter the CLI defaults.
 
+**Measured with `--model`.** One throwaway run on 2026-11-14 against `claude` **2.1.325**, signed in,
+in a temporary directory that was deleted afterwards; only record shapes were read and nothing from
+it is committed. It drove the turn argv above with `--session-id <uuid> --model haiku` and a prompt
+that needs no tool:
+
+- The argv was accepted: exit 0, empty stderr, a `system/init` first and a `result` with
+  `subtype: "success"` and `is_error: false`. `--model` after `--session-id` is fine, so the
+  harness's argv position works.
+- `haiku` is accepted although `--model`'s help on that build lists only `fable`, `opus` and
+  `sonnet`. The alias list is a sample, which is why an explicit model is never checked against the
+  catalog.
+- `system/init` reports `model: "claude-haiku-5-5"`: the full id the alias resolved to, not the
+  alias. The `assistant` record's `message.model` and the key of the `result`'s `modelUsage` carry
+  the same id. `init.session_id` echoed the `--session-id` value.
+
+So `Session::snapshot().configuration.accepted.model` stays `haiku` and `observed.model` becomes
+`claude-haiku-5-5`; a host that compares the two for equality will see a mismatch on every alias.
+For `mea capture --transcripts --model haiku` the `# model:` header line is the alias as passed and
+the body carries the resolved id. The fake does not resolve aliases: it replays the `model` its
+scripted `system/init` holds, whatever `--model` it was given. The fake-CLI test
+`keeps_a_model_alias_accepted_and_the_resolved_id_observed` pins the shape above. The measurement
+covers one alias on one build, and the resolved id follows the vendor's alias mapping.
+
 **Effort.** `--effort` is passed only for the exact level this build itself printed, and only when
 the host chose one. An explicit level that is unavailable after a downgrade is refused before a
 child starts, so the turn never silently falls back to another effort or replaces accepted defaults.
