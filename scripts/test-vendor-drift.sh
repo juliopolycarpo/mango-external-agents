@@ -423,11 +423,13 @@ EXPECTED
   # Both pages are reported in one report, and a reviewed line is left out of it.
   write_acp_allowlist "$allowlist" claude "$reviewed" 'third-party adapter'
   write_fake_doc "$docs" "$claude_index" '# Claude Code Docs' "$reviewed" '- [ACP](https://code.claude.com/docs/en/acp.md)'
+  # shellcheck disable=SC2016 # the backticks are literal Markdown in the fake page, not command substitution
   write_fake_doc "$docs" "$claude_reference" 'claude -p --print' '| `--acp` | Serve over ACP |'
   expect_status 1 check_vendor claude "$report"
   assert_contains "$report" '### https://code.claude.com/docs/llms.txt' 'the index page is reported'
   assert_contains "$report" '3:- [ACP](https://code.claude.com/docs/en/acp.md)' 'the index line is reported'
   assert_contains "$report" '### https://code.claude.com/docs/en/cli-reference.md' 'the CLI reference page is reported'
+  # shellcheck disable=SC2016 # the backticks are literal Markdown in the expected report line, not command substitution
   assert_contains "$report" '2:| `--acp` | Serve over ACP |' 'the CLI reference line is reported'
   assert_not_contains "$report" 'claude-agent-acp' 'a reviewed line is not reported'
 
@@ -451,6 +453,7 @@ EXPECTED
   write_fake_doc "$docs" "$claude_reference" 'Page not found'
   expect_status 2 check_vendor claude "$report"
   assert_contains "$report" "### $claude_reference" 'a moved page names the URL'
+  # shellcheck disable=SC2016 # the backticks are literal Markdown in the expected report line, not command substitution
   assert_contains "$report" 'The page no longer contains the text `--print`' 'a moved page names the lost anchor'
 
   # A stale allowlist entry is reported by its line, without the allowlist path; exit status 1.
@@ -481,6 +484,7 @@ test_docs_drift_report() {
   local expected="$test_root/docs-report-expected.md"
   local committed="$test_root/docs-report-committed"
   local observed="$test_root/docs-report-observed"
+  # shellcheck disable=SC2016 # the backticks are literal Markdown in the fake report, not command substitution
   printf '### https://example.test/reference.md\n\nLines naming ACP:\n\n```text\n3:Use --acp.\n```\n\n' > "$docs_report"
 
   # With no contract difference the docs result is the whole report, led by the managed marker.
