@@ -39,8 +39,44 @@ unqualified capture` in `structured-output.unqualified.jsonl` when the file lack
 `StructuredOutput` tool call or a final `result` with an object `structured_output`. The file is an
 archival transcript, like `codex/subagent.jsonl` under the historical sets below: no manifest, no
 `reproducible` flag, and nothing in CI can re-record it, since it belongs to one account and one CLI
-build. See [Transcript capture](../docs/harness-claude.md#transcript-capture) for the redaction
-rules.
+build. The next subsection lists what the file keeps and drops.
+
+### What a Claude transcript retains and redacts
+
+The recorder redacts each line before it is held in memory. A string survives only under a short
+list of structural members (`type`, `subtype`, `role`, `id`, `tool_use_id`, `parent_tool_use_id`,
+`session_id`, `uuid`, `model`, `stop_reason`, `terminal_reason`, `permissionMode`,
+`claude_code_version`) and as the name of a non-`mcp__` tool call. Every other string becomes
+`[REDACTED]`, so a field a later Claude Code adds is private until someone reviews it. `cwd` is
+written as `/workspace`, and the capture's directory, home directory and login are rewritten in
+every key and retained value. Lines that are not JSON objects are dropped.
+
+Redacted whatever the value type:
+
+- Members with a credential, account or plan shaped name: `*token` (not `*_tokens` counts),
+  `credential*`, `account*`, `email`, `organization*`, `oauth`, `secret`, `password`, `apikey`,
+  `authorization`, `cookie`, `userid`, and the plan-usage names `ratelimit*`, `resetsat`,
+  `overage*`, `utilization`, `quota`.
+- A `rate_limit_event`: it reports plan usage (utilisation, reset times, overage state, the names
+  of the account's windows). Only `type`, `uuid` and `session_id` are kept; every other member is
+  replaced whole, so an unknown member is denied by default. Nothing replays the record.
+- `subagent_stats.by_type`: its keys are subagent type names, which a user can define themselves.
+- Strings inside `input`, `structured_output` and `wire_tool_inputs` (the same tool input again,
+  keyed by tool-use id), even under a name such as `type` or `id`.
+
+Retained on purpose:
+
+- The key names and numbers of the model's answer. They come from the operator's `--json-schema`
+  and the scripted prompt, so the answer's shape stays for qualification.
+- `toolu_…` ids, as values and as the keys of `wire_tool_inputs`. They are opaque and random per
+  call, the same ids are already kept under `id` and `tool_use_id`, and a call has to pair with its
+  result.
+- Per-turn usage, cost and timing: token counts, `total_cost_usd`, `duration_ms`, `modelUsage`
+  (keyed by model id), `subagent_stats` counters and the boolean feature flags of `init`. They
+  describe this turn, not the plan.
+- `permissionMode`. The recorder passes `--permission-mode plan` itself, so the value is the
+  capture's request and not the operator's default.
+- `session_id`, `uuid`, `model` and `claude_code_version`, as before.
 
 ## Three classes of fixture
 

@@ -30,6 +30,50 @@ const SCHEMA: &str = r#"{"type":"object","properties":{"word":{"type":"string"}}
 const CANARY_TEXT: &str = "canary-credential-7731";
 /// The numeric spelling of the same fact: `credential_expires_at` is a timestamp, not text.
 const CANARY_NUMBER: u64 = 7_731_424_242;
+/// A plan reset time, a Unix timestamp. Distinct from [`CANARY_NUMBER`] and from the header's
+/// capture time, so a substring check on one cannot pass for another.
+const CANARY_RESET_AT: u64 = 1_913_572_949;
+/// A plan utilisation fraction, spelled with digits no other fixture number shares.
+const CANARY_UTILIZATION: f64 = 0.80362;
+/// A rate-limit window name, which is a key and not a value.
+const CANARY_WINDOW_KEY: &str = "canary_window_key_5521";
+/// A subagent type a user defined under their own agents directory.
+const CANARY_AGENT_TYPE: &str = "canary-agent-type-9917";
+/// The name of a member of a `rate_limit_event` this build never had, as a later Claude Code could
+/// add. The vendor names it, so the name stays; its value is what is denied.
+const FUTURE_MEMBER: &str = "futurePlanMember";
+/// A session id the harness reads back, so a transcript keeps it.
+const SESSION_ID: &str = "b01414e7-4b4b-43a2-9109-a33e21664340";
+
+/// A `rate_limit_event` as the pinned Claude Code writes it, with every plan fact canaried: the
+/// reset times, the utilisation, the overage flag, a window name and a member this build never had.
+fn rate_limit_event() -> Value {
+    json!({"type": "rate_limit_event",
+        "rate_limit_info": {
+            "status": CANARY_TEXT, "resetsAt": CANARY_RESET_AT, "rateLimitType": CANARY_TEXT,
+            "overageStatus": CANARY_TEXT, "overageResetsAt": CANARY_RESET_AT + 1,
+            "isUsingOverage": true,
+            "unifiedWindows": {
+                CANARY_WINDOW_KEY: {"utilization": CANARY_UTILIZATION,
+                    "resetsAt": CANARY_RESET_AT + 2, "status": CANARY_TEXT}}},
+        FUTURE_MEMBER: {"seats": CANARY_NUMBER + 1, "enabled": false},
+        "uuid": "9694c392-b913-4f35-ba6f-06d9aff222d1",
+        "session_id": SESSION_ID})
+}
+
+/// Every canary a plan fact or an account fact of [`rate_limit_event`] carries, as the text a
+/// substring check looks for.
+fn rate_limit_canaries() -> Vec<String> {
+    vec![
+        CANARY_TEXT.to_owned(),
+        (CANARY_NUMBER + 1).to_string(),
+        CANARY_RESET_AT.to_string(),
+        (CANARY_RESET_AT + 1).to_string(),
+        (CANARY_RESET_AT + 2).to_string(),
+        CANARY_UTILIZATION.to_string(),
+        CANARY_WINDOW_KEY.to_owned(),
+    ]
+}
 
 /// The three machine facts a test capture ran under, built from the platform's own temporary
 /// root so a Windows runner spells them as it spells its own paths.
@@ -78,6 +122,7 @@ fn answered_turn_lines(facts: &MachineFacts) -> Vec<String> {
         json!({"type": "user", "message": {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "toolu_answer",
              "content": "Structured output provided successfully"}]}}),
+        rate_limit_event(),
         json!({"type": "result", "subtype": "success", "is_error": false,
             "result": answer.to_string(), "structured_output": answer,
             "credential_expires_at": CANARY_NUMBER,
@@ -188,6 +233,13 @@ fn which_member_names_are_credential_shaped() {
         "account_uuid",
         "oauth",
         "client_secret",
+        "rate_limit_info",
+        "rateLimitType",
+        "resetsAt",
+        "overageResetsAt",
+        "isUsingOverage",
+        "utilization",
+        "usage_quota",
     ] {
         assert!(
             is_credential_member(name),
@@ -201,12 +253,133 @@ fn which_member_names_are_credential_shaped() {
         "structured_output",
         "session_id",
         "total_cost_usd",
+        "modelUsage",
+        "ttft_ms",
+        "subagent_stats",
+        "permissionMode",
     ] {
         assert!(
             !is_credential_member(name),
             "expected {name:?} to be ordinary"
         );
     }
+}
+
+fn redacted_record(record: &Value) -> Value {
+    let facts = MachineFacts::new();
+    let line = redact_line(&record.to_string(), facts.paths())
+        .unwrap_or_else(|| panic!("expected a JSON object to be kept | received: {record}"));
+    serde_json::from_str(&line).unwrap_or_else(|error| {
+        panic!("expected a redacted JSON line | received: {line} ({error})")
+    })
+}
+
+#[test]
+fn a_rate_limit_event_keeps_only_the_members_that_identify_the_record() {
+    let line = redacted_record(&rate_limit_event());
+    let written = line.to_string();
+
+    for canary in rate_limit_canaries() {
+        assert!(
+            !written.contains(&canary),
+            "expected no {canary:?} in a redacted rate_limit_event | received: {written}"
+        );
+    }
+    assert!(
+        !written.contains("true") && !written.contains("false"),
+        "expected the overage flag and the unknown flag to be gone | received: {written}"
+    );
+    assert_eq!(
+        line,
+        json!({"type": "rate_limit_event",
+            "rate_limit_info": redact::PLACEHOLDER,
+            FUTURE_MEMBER: redact::PLACEHOLDER,
+            "uuid": "9694c392-b913-4f35-ba6f-06d9aff222d1",
+            "session_id": SESSION_ID}),
+        "expected only type, uuid and session_id to be kept, every other member collapsed"
+    );
+}
+
+#[test]
+fn a_rate_limit_event_member_this_build_never_saw_is_denied_by_default() {
+    let line = redacted_record(&json!({"type": "rate_limit_event", "futureBlock": [
+        {"remaining": CANARY_NUMBER, "tier": CANARY_TEXT}], "futureFlag": true,
+        "futureNumber": CANARY_RESET_AT, "futureNull": null}));
+
+    assert_eq!(line["futureBlock"], redact::PLACEHOLDER);
+    assert_eq!(line["futureFlag"], redact::PLACEHOLDER);
+    assert_eq!(line["futureNumber"], redact::PLACEHOLDER);
+    assert!(
+        line["futureNull"].is_null(),
+        "expected null, which carries nothing, to stay null | received: {line}"
+    );
+}
+
+#[test]
+fn plan_usage_in_a_record_other_than_a_rate_limit_event_is_redacted_by_member_name() {
+    let line = redacted_record(&json!({"type": "result", "subtype": "success",
+        "rate_limit_info": {CANARY_WINDOW_KEY: {"utilization": CANARY_UTILIZATION}},
+        "overage": {"resetsAt": CANARY_RESET_AT},
+        "utilization": CANARY_UTILIZATION, "resetsAt": CANARY_RESET_AT,
+        "isUsingOverage": true, "num_turns": 1}));
+    let written = line.to_string();
+
+    for canary in rate_limit_canaries() {
+        assert!(
+            !written.contains(&canary),
+            "expected no {canary:?} outside a rate_limit_event | received: {written}"
+        );
+    }
+    assert_eq!(line["isUsingOverage"], redact::PLACEHOLDER);
+    assert_eq!(line["num_turns"], 1);
+}
+
+#[test]
+fn a_tool_input_map_is_the_models_answer_whatever_the_schema_names_its_properties() {
+    let line = redacted_record(&json!({"type": "assistant",
+        "wire_tool_inputs": {"toolu_synthetic_1": {
+            "type": CANARY_TEXT, "id": CANARY_TEXT, "model": CANARY_TEXT, "subtype": CANARY_TEXT}}}));
+
+    assert!(
+        !line.to_string().contains(CANARY_TEXT),
+        "expected a property named like a structural member to be redacted in the input map | received: {line}"
+    );
+    assert!(
+        line["wire_tool_inputs"]["toolu_synthetic_1"].is_object(),
+        "expected the tool-use id key and the answer's shape to survive | received: {line}"
+    );
+}
+
+#[test]
+fn subagent_type_names_are_redacted_and_the_counters_beside_them_survive() {
+    let line = redacted_record(&json!({"type": "result", "subagent_stats": {
+        "spawned": 3, "completed": 2, "by_type": {CANARY_AGENT_TYPE: 2, "general-purpose": 1}}}));
+
+    assert!(
+        !line.to_string().contains(CANARY_AGENT_TYPE),
+        "expected no user-defined agent type name | received: {line}"
+    );
+    assert_eq!(line["subagent_stats"]["by_type"], redact::PLACEHOLDER);
+    assert_eq!(line["subagent_stats"]["spawned"], 3);
+    assert_eq!(line["subagent_stats"]["completed"], 2);
+}
+
+#[test]
+fn turn_scoped_numbers_and_the_requested_permission_mode_are_kept() {
+    let line = redacted_record(&json!({"type": "system", "subtype": "init",
+        "permissionMode": "plan"}));
+    assert_eq!(line["permissionMode"], "plan");
+
+    let line = redacted_record(&json!({"type": "result", "total_cost_usd": 0.0123,
+        "duration_ms": 1234, "usage": {"input_tokens": 3, "output_tokens": 5},
+        "modelUsage": {"claude-sonnet-5": {"costUSD": 0.0123, "contextWindow": 200_000}}}));
+    assert_eq!(line["total_cost_usd"], 0.0123);
+    assert_eq!(line["duration_ms"], 1234);
+    assert_eq!(line["usage"]["output_tokens"], 5);
+    assert_eq!(
+        line["modelUsage"]["claude-sonnet-5"]["contextWindow"],
+        200_000
+    );
 }
 
 #[test]
@@ -233,6 +406,10 @@ fn a_line_keeps_its_protocol_structure_and_loses_what_the_machine_and_model_wrot
     assert_eq!(init["mcp_servers"][0]["name"], redact::PLACEHOLDER);
     assert_eq!(init["mcp_servers"][0]["status"], redact::PLACEHOLDER);
     assert_eq!(init["apiKeySource"], redact::PLACEHOLDER);
+    assert_eq!(
+        init["permissionMode"], "default",
+        "expected the permission mode, which the capture requests rather than inherits, to survive"
+    );
 
     let blocks = &redacted[2]["message"]["content"];
     assert_eq!(blocks[0]["type"], "text");
@@ -253,7 +430,7 @@ fn a_line_keeps_its_protocol_structure_and_loses_what_the_machine_and_model_wrot
         redact::PLACEHOLDER
     );
 
-    let result = &redacted[4];
+    let result = &redacted[5];
     assert_eq!(result["subtype"], "success");
     assert_eq!(result["is_error"], false);
     assert!(
@@ -639,19 +816,22 @@ async fn a_qualified_capture_writes_the_redacted_transcript_and_nothing_private(
         .collect();
     assert_eq!(
         body.len(),
-        5,
+        6,
         "expected every record the CLI streamed | received: {written}"
     );
     assert_eq!(body[2]["message"]["content"][1]["name"], "StructuredOutput");
-    assert!(body[4]["structured_output"].is_object());
+    assert_eq!(body[4]["type"], "rate_limit_event");
+    assert!(body[5]["structured_output"].is_object());
 
     for private in [
-        CANARY_TEXT.to_owned(),
         CANARY_NUMBER.to_string(),
         "someone@example.com".to_owned(),
         facts.cwd.clone(),
         facts.home.clone(),
-    ] {
+    ]
+    .into_iter()
+    .chain(rate_limit_canaries())
+    {
         let escaped = serde_json::to_string(&private).expect("expected an escaped value");
         assert!(
             !written.contains(escaped.trim_matches('"')),

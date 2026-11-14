@@ -408,11 +408,30 @@ const STRUCTURAL_STRING_MEMBERS: &[&str] = &[
 
 /// Members whose whole subtree is the model's answer or its input: every string inside is
 /// replaced, even one under a structural member name, because a schema can name a property `type`.
-const ANSWER_MEMBERS: &[&str] = &["input", "structured_output"];
+///
+/// `wire_tool_inputs` is the same answer a second time, keyed by tool-use id: Claude Code repeats
+/// each tool call's input there, so a schema that names a property `type` or `id` would survive it
+/// if it were not listed. The `toolu_…` keys stay. They are opaque and random, and the same ids
+/// are kept as the values of `id` and `tool_use_id` so a call still pairs with its result.
+const ANSWER_MEMBERS: &[&str] = &["input", "structured_output", "wire_tool_inputs"];
 
-/// Fragments that make a member name credential- or account-shaped, matched after the name is
-/// lowercased and stripped of `_` and `-`. Such a member is replaced whatever its value, a number
-/// included: a default of "redact strings" does not reach `credential_expires_at`.
+/// The members of a `rate_limit_event` that identify the record rather than describe the account.
+/// The record reports plan usage (utilisation, reset times, overage state, the names of the
+/// windows an account has), and every other member is replaced whole, so a member a later Claude
+/// Code adds is denied until it is reviewed here. Nothing replays the record: the reducer ignores
+/// it.
+const RATE_LIMIT_EVENT_STRUCTURE: &[&str] = &["type", "uuid", "session_id"];
+
+/// Members that hold a map keyed by a name the user chose, such as a subagent type from their own
+/// agents directory. The keys are the private part, and a map cannot keep its counts without them,
+/// so the whole value is replaced.
+const USER_KEYED_MEMBERS: &[&str] = &["by_type"];
+
+/// Fragments that make a member name credential-, account- or plan-shaped, matched after the name
+/// is lowercased and stripped of `_` and `-`. Such a member is replaced whatever its value, a
+/// number included: a default of "redact strings" does not reach `credential_expires_at` or a
+/// reset time. The plan fragments back up [`RATE_LIMIT_EVENT_STRUCTURE`] for plan usage that
+/// shows up in a record of another type.
 const CREDENTIAL_NAME_FRAGMENTS: &[&str] = &[
     "account",
     "apikey",
@@ -422,10 +441,15 @@ const CREDENTIAL_NAME_FRAGMENTS: &[&str] = &[
     "email",
     "oauth",
     "organization",
+    "overage",
     "passwd",
     "password",
+    "quota",
+    "ratelimit",
+    "resetsat",
     "secret",
     "userid",
+    "utilization",
 ];
 
 /// Whether a member name is credential- or account-shaped.
@@ -477,13 +501,20 @@ fn redact_value(
                 members.get("type").and_then(Value::as_str),
                 Some("tool_use" | "server_tool_use")
             );
+            let rate_limit_event =
+                members.get("type").and_then(Value::as_str) == Some("rate_limit_event");
             Value::Object(
                 members
                     .into_iter()
                     .map(|(name, value)| {
                         // Keys are rewritten too: a map keyed by a path would carry it.
                         let key = redact::rewrite_paths(&name, paths);
-                        if is_credential_member(&name) && !value.is_null() {
+                        let denied = is_credential_member(&name)
+                            || USER_KEYED_MEMBERS.contains(&name.as_str())
+                            || (rate_limit_event
+                                && !RATE_LIMIT_EVENT_STRUCTURE.contains(&name.as_str()));
+                        // A null carries nothing, so it stays null.
+                        if denied && !value.is_null() {
                             return (key, placeholder());
                         }
                         let inner = ValueContext {
