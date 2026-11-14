@@ -128,9 +128,17 @@ impl ClaudeHarness {
     /// Opening a session on a build whose `--help` does not declare `--json-schema` is refused
     /// rather than run without the schema.
     ///
-    /// This maps no structured answer onto events. What the stream-json `result` record carries
-    /// for this flag was not measured, so a host that needs the validated value cannot read it
-    /// through this library yet; see `docs/harness-claude.md`.
+    /// The validated answer arrives as [`EventKind::StructuredOutput`](mango_external_agents::EventKind::StructuredOutput) after `Usage` and before
+    /// `Completed`, read from the `result` record's `structured_output`
+    /// (<https://code.claude.com/docs/en/headless#get-structured-output>). A turn that ends without
+    /// one is a failed schema run, not an empty success: the vendor documents a run without valid
+    /// output as having no such field, and no event is invented for it, so a host that asked for a
+    /// schema must treat `Completed` with no `StructuredOutput` as a failure. Exhausted retries end
+    /// the turn as an `Error` coded `claude-error_max_structured_output_retries`. The value is
+    /// untrusted input and never model input. The `StructuredOutput` tool call that carries it
+    /// (<https://code.claude.com/docs/en/agent-sdk/structured-outputs>) opens no activity. The shape
+    /// was measured at Claude Code 2.1.325, not at the pinned 2.1.322; see
+    /// `docs/harness-claude.md`.
     ///
     /// # Errors
     ///
