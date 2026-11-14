@@ -22,8 +22,8 @@ use mango_agent_codex::{CodexHarness, MINIMUM_CODEX_VERSION};
 use mango_external_agents::event::EventKind;
 use mango_external_agents::testing::FakeLauncher;
 use mango_external_agents::{
-    CancelReason, CloseReason, Dispatch, Error, Harness, HostContext, OpenSession, TransportKind,
-    TurnRequest,
+    CancelReason, CloseReason, Dispatch, Error, Harness, HostContext, OpenSession, SessionStatus,
+    TransportKind, TurnRequest,
 };
 use serde_json::{Value, json};
 use support::{Transcript, workspace_path};
@@ -39,6 +39,13 @@ type Responder = Box<dyn FnMut(&str) -> Vec<String> + Send>;
 /// An answer line that makes the fake drop the connection, without a closing handshake, instead of
 /// being sent: the server process dying mid-conversation.
 const HANG_UP: &str = "<hang up>";
+
+/// An answer line that makes the fake stop reading for [`STALL_FOR`] instead of being sent: a
+/// server that is alive but not draining its socket.
+const STALL: &str = "<stop reading>";
+
+/// Longer than the teardown bounds the stalled-server test sets, shorter than the test's patience.
+const STALL_FOR: Duration = Duration::from_millis(2500);
 
 /// What the fake does with a `turn/interrupt`.
 #[derive(Clone, Copy)]
@@ -106,6 +113,21 @@ impl FakeAppServerSocket {
                         .map_or(0, |at| at + 1);
                     answers.truncate(answered);
                     answers.push(HANG_UP.to_owned());
+                }
+                answers
+            }),
+            None,
+        )
+    }
+
+    /// Replays `turn` through `thread/start`, then stops reading for [`STALL_FOR`].
+    fn stalling_after_thread_start() -> Self {
+        let mut recorded = Transcript::load("turn").responder();
+        Self::start(
+            Box::new(move |line| {
+                let mut answers = recorded(line);
+                if line.contains("\"thread/start\"") {
+                    answers.push(STALL.to_owned());
                 }
                 answers
             }),
@@ -198,6 +220,10 @@ impl FakeAppServerSocket {
                             for answer in respond(&frame) {
                                 if answer == HANG_UP {
                                     break 'connection;
+                                }
+                                if answer == STALL {
+                                    tokio::time::sleep(STALL_FOR).await;
+                                    continue;
                                 }
                                 if socket.send(Message::Text(answer.into())).await.is_err() {
                                     break;
@@ -695,5 +721,42 @@ async fn abandoning_an_open_session_ends_the_connection_without_a_kill() {
 
     server.until_method("initialize").await;
     opening.abort();
+    server.until_disconnections(1).await;
+}
+
+/// A server that is alive but has stopped reading leaves the session's writer blocked mid-message.
+/// The attachment is ended from this side: the session reaches `Closed`, the teardown owes the host
+/// no cleanup, and the server sees the connection end. The close may still report that the link's
+/// own shutdown timed out, as it does for a child whose pipe is blocked.
+#[tokio::test]
+async fn closing_while_the_server_has_stopped_reading_still_detaches() {
+    let server = FakeAppServerSocket::stalling_after_thread_start();
+    let (host, _) = host_with_limits(quick_teardown_limits());
+    let session = server
+        .harness()
+        .open_session(&host, over_socket("chat-1"))
+        .await
+        .expect("expected a session");
+
+    // A message far past a socket buffer, but within the line cap: the write blocks mid-frame.
+    let prompt = "x".repeat(900_000);
+    let starting = session.start_turn(TurnRequest::new("turn-1", prompt));
+    let closing = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        session.close(CloseReason::Shutdown).await
+    };
+    let (_, closed) = tokio::join!(starting, closing);
+
+    if let Err(error) = &closed {
+        assert!(
+            error.cleanup_control().is_none(),
+            "expected no cleanup owed to the host for an attachment, received {error:?}"
+        );
+    }
+    assert_eq!(
+        session.subscribe().current().status,
+        SessionStatus::Closed,
+        "expected the attachment to be ended, close returned {closed:?}"
+    );
     server.until_disconnections(1).await;
 }

@@ -1139,8 +1139,12 @@ surface has no Windows equivalent.
   used to skip a probe.
 - **Closing detaches.** `close` sends the native `turn/interrupt` when a turn is running, closes
   the connection, and leaves the server and any thread it holds running. The session's process
-  control is an `AttachedPeer`: no pid, no stderr, `kill` sends nothing, and `wait` resolves when
-  the connection ended, whether this side closed it or the server went away. A server that
+  control is an `AttachedPeer`: no pid, no stderr, and `kill` signals no process but shuts this
+  side's connection down, which fails a write blocked on a server that stopped reading. `wait`
+  resolves when the connection ended, whether this side closed or severed it or the server went
+  away, so a stalled server cannot leave the teardown with a control it can never resolve. In that
+  case `close` may still report that the link's own shutdown timed out, as it does for a child whose
+  pipe is blocked, but the session reaches `Closed` and the host owes no cleanup. A server that
   disappears mid-turn fails the turn with `connection-terminated`, as a dead child does, and the
   message reports an unknown exit code.
 - **A turn may outlive its session.** Over stdio, reaping the child guarantees a running turn

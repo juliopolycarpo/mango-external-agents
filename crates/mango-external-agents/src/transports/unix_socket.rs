@@ -8,6 +8,8 @@
 //! There is no credential on this path. A server that answers the upgrade with `401` or `403`
 //! wants a token, and the library refuses that as host configuration instead of presenting one.
 
+use std::net::Shutdown;
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -47,8 +49,8 @@ const UPGRADE_URL: &str = "ws://localhost/";
 pub struct UnixSocketTransport {
     /// Messages in and out, one WebSocket text frame each.
     pub link: Link,
-    /// The attachment, for waiting until it ends. Its `kill` signals nothing; closing the link is
-    /// what ends the attachment. See [`AttachedPeer`].
+    /// The attachment, for waiting until it ends and for severing it. Its `kill` signals no process
+    /// and shuts this side's connection down. See [`AttachedPeer`].
     pub control: Arc<dyn ProcessControl>,
 }
 
@@ -75,25 +77,34 @@ impl std::fmt::Debug for UnixSocketTransport {
 /// - [`Error::Link`] when nothing listens at the path or the upgrade failed otherwise.
 pub async fn open(spec: &UnixSocketSpec, limits: &Limits) -> Result<UnixSocketTransport> {
     check_path(&spec.path)?;
-    let upgraded = tokio::time::timeout(limits.request_timeout, upgrade(&spec.path, limits))
-        .await
-        .map_err(|_| Error::Timeout {
-            operation: String::from("Unix socket connect and upgrade"),
-            after: limits.request_timeout,
-        })??;
-    Ok(attach(upgraded, limits))
+    let (upgraded, severable) =
+        tokio::time::timeout(limits.request_timeout, upgrade(&spec.path, limits))
+            .await
+            .map_err(|_| Error::Timeout {
+                operation: String::from("Unix socket connect and upgrade"),
+                after: limits.request_timeout,
+            })??;
+    Ok(attach(upgraded, severable, limits))
 }
 
+/// Connects and upgrades, returning the WebSocket and a second handle on the same socket.
+///
+/// The second handle is what lets [`AttachedPeer::kill`] end the connection while the WebSocket's
+/// writer is blocked mid-message on a server that stopped reading: shutting a socket down wakes
+/// every reader and writer on it, and no one else holds a reference to call it on.
 async fn upgrade(
     path: &Path,
     limits: &Limits,
-) -> Result<tokio_tungstenite::WebSocketStream<UnixStream>> {
-    let stream = UnixStream::connect(path)
-        .await
-        .map_err(|error| Error::Link {
-            peer: String::from(PEER),
-            message: format!("a socket failure ({:?})", error.kind()),
-        })?;
+) -> Result<(
+    tokio_tungstenite::WebSocketStream<UnixStream>,
+    StdUnixStream,
+)> {
+    let stream = UnixStream::connect(path).await.map_err(io_failure)?;
+    // `try_clone` duplicates the descriptor, not the connection: both handles are one socket, and
+    // the non-blocking mode `into_std` keeps is shared, so the clone's `shutdown` never blocks.
+    let stream = stream.into_std().map_err(io_failure)?;
+    let severable = stream.try_clone().map_err(io_failure)?;
+    let stream = UnixStream::from_std(stream).map_err(io_failure)?;
     let request = UPGRADE_URL
         .into_client_request()
         .map_err(|error| refusal(&error))?;
@@ -105,7 +116,15 @@ async fn upgrade(
     let (socket, _) = client_async_with_config(request, stream, Some(config))
         .await
         .map_err(|error| refusal(&error))?;
-    Ok(socket)
+    Ok((socket, severable))
+}
+
+/// A socket call that failed, as its `io::ErrorKind` and no path.
+fn io_failure(error: std::io::Error) -> Error {
+    Error::Link {
+        peer: String::from(PEER),
+        message: format!("a socket failure ({:?})", error.kind()),
+    }
 }
 
 /// An upgrade that did not complete, as the host should read it.
@@ -148,10 +167,12 @@ fn check_path(path: &Path) -> Result<()> {
 /// Builds the link over the upgraded stream, tied to a signal that says when the attachment ended.
 fn attach(
     upgraded: tokio_tungstenite::WebSocketStream<UnixStream>,
+    severable: StdUnixStream,
     limits: &Limits,
 ) -> UnixSocketTransport {
     let (ended, observer) = watch::channel(false);
     let ended = Arc::new(ended);
+    let signal = Arc::clone(&ended);
     let (sender, receiver) = socket::from_socket(upgraded, PEER, limits.line).split();
     UnixSocketTransport {
         link: Link::new(
@@ -164,22 +185,31 @@ fn attach(
                 ended,
             }),
         ),
-        control: Arc::new(AttachedPeer { ended: observer }),
+        control: Arc::new(AttachedPeer {
+            ended: observer,
+            ending: signal,
+            socket: severable,
+        }),
     }
 }
 
 /// The control for a server this library attached to but does not own.
 ///
 /// It answers the questions the harness's teardown asks of a child, honestly for a peer that is not
-/// one: there is no process id, no stderr, and no signal is ever sent. [`kill`](Self::kill)
-/// does nothing, because ending the *attachment* is the link's close, which the harness has done
-/// by the time it asks. `wait` resolves when the link ended, whether this side closed
-/// it or the server went away, so a teardown reports the same fact it would for a reaped child.
+/// one: there is no process id, no stderr, and no signal is ever sent to the server.
+/// [`kill`](Self::kill) ends this side's *connection*: it shuts the socket down, which fails a
+/// write blocked on a server that stopped reading, ends the read, and resolves `wait`. A clean
+/// close does the same through the link. `wait` resolves when the connection ended, whether this
+/// side closed it, severed it or the server went away, so a teardown reports the same fact it
+/// would for a reaped child.
 ///
 /// The server keeps running afterwards, with whatever conversation state it held.
 #[derive(Debug)]
 pub struct AttachedPeer {
     ended: watch::Receiver<bool>,
+    ending: Arc<watch::Sender<bool>>,
+    /// A second handle on the connection's socket, kept only to shut it down.
+    socket: StdUnixStream,
 }
 
 #[async_trait::async_trait]
@@ -200,6 +230,10 @@ impl ProcessControl for AttachedPeer {
     }
 
     async fn kill(&self, _reason: CancelReason) -> Result<()> {
+        // A socket that is already closed answers `NotConnected`: the attachment is over, which is
+        // what this call is for.
+        let _ = self.socket.shutdown(Shutdown::Both);
+        self.ending.send_replace(true);
         Ok(())
     }
 }
@@ -269,6 +303,9 @@ mod tests {
         RefuseUpgrade(StatusCode),
         /// Accepts the connection and never answers the upgrade.
         Silent,
+        /// Upgrades, then reads nothing for two seconds, so a writer with more than a socket buffer
+        /// of data to send stays blocked, and then reads until the connection ends.
+        StopReadingAfterUpgrade,
     }
 
     /// What the upgrade request carried, as the server saw it.
@@ -347,6 +384,10 @@ mod tests {
                         }
                     }
                     Behaviour::HangUpAfterUpgrade => drop(socket),
+                    Behaviour::StopReadingAfterUpgrade => {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        while let Some(Ok(_)) = socket.next().await {}
+                    }
                     Behaviour::RefuseUpgrade(_) | Behaviour::Silent => {}
                 }
             });
@@ -460,28 +501,76 @@ mod tests {
             .expect("expected a status");
     }
 
+    /// `kill` signals no process, but it must still end this side's connection: a server that
+    /// stopped reading leaves the writer blocked, and nothing else can wake it.
     #[tokio::test]
-    async fn killing_an_attached_peer_signals_nothing_and_reports_no_failure() {
+    async fn killing_an_attached_peer_fails_a_blocked_writer_and_resolves_wait() {
+        let server = FakeUnixSocketServer::start(Behaviour::StopReadingAfterUpgrade);
+        let limits = Limits {
+            line: crate::process::LineLimits {
+                max_line_bytes: 8 * 1024 * 1024,
+                max_buffered_bytes: 16 * 1024 * 1024,
+            },
+            ..Limits::default()
+        };
+        let transport = open(&server.spec(), &limits)
+            .await
+            .expect("expected the dial to land");
+        let control = Arc::clone(&transport.control);
+        let (mut sender, _receiver) = transport.link.split();
+        // Far past any socket buffer, so the write cannot finish while nobody reads.
+        let writer = tokio::spawn(async move { sender.send("x".repeat(4 * 1024 * 1024)).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !writer.is_finished(),
+            "expected the write to be blocked on a server that does not read"
+        );
+
+        control
+            .kill(crate::CancelReason::Shutdown)
+            .await
+            .expect("expected kill to end the connection");
+
+        let sent = tokio::time::timeout(Duration::from_secs(1), writer)
+            .await
+            .expect("expected the blocked write to fail within 1s of kill")
+            .expect("expected the writer task to finish");
+        assert!(
+            matches!(sent, Err(Error::Link { .. })),
+            "expected a link failure from the severed connection, received {sent:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(1), control.wait())
+            .await
+            .expect("expected wait to resolve after kill")
+            .expect("expected a status");
+    }
+
+    /// Ending the attachment is not ending the server: it keeps listening for the next client.
+    #[tokio::test]
+    async fn killing_an_attached_peer_leaves_the_server_listening() {
         let server = FakeUnixSocketServer::start(Behaviour::Echo);
         let transport = open(&server.spec(), &Limits::default())
             .await
             .expect("expected the dial to land");
+        let (_sender, mut receiver) = transport.link.split();
 
         transport
             .control
             .kill(crate::CancelReason::Shutdown)
             .await
-            .expect("expected kill on an attached peer to succeed without effect");
-        let (mut sender, mut receiver) = transport.link.split();
-        sender
-            .send(String::from("still"))
+            .expect("expected kill to succeed");
+
+        let ended = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
             .await
-            .expect("expected send");
+            .expect("expected this side's read to end within 1s of kill");
         assert_eq!(
-            receiver.recv().await.expect("expected the echo"),
-            Some(String::from("echo:still")),
-            "expected the connection to survive a kill: the server is not this library's to end"
+            ended.expect("expected the end"),
+            None,
+            "expected the read to end once the connection was severed"
         );
+        tokio::net::UnixStream::connect(&server.path)
+            .await
+            .expect("expected the server to still accept connections");
     }
 
     #[tokio::test]
