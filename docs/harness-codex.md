@@ -1363,9 +1363,11 @@ child in a nonempty `agentThreadId`, the child thread running its own turn, a
 `subagent-completed-...`) before the parent's `turn/completed`.
 `tests/replay/subagent.rs` replays those bytes through `CodexHarness`: the child id becomes
 `Activity::subagent_id` on both subagent items; the parent turn stays the host's and ends once,
-since the child thread's own `turn/completed` does not end it; the `[REDACTED]` `agentPath`,
-`senderThreadId` and `tool` parse without being carried; and no approval, question, broker call,
-or response frame follows. A second test reads the fixture's header and server frames, so a
+since the child thread's own `turn/completed` does not end it; and no approval, question, broker
+call, or response frame follows. `ThreadItem::SubAgentActivity` models only `id`, `agentThreadId`
+and `kind`, and the `collabAgentToolCall` is a `ThreadItem::Other` that keeps only `type`, `id`
+and `status`. The rest, including the `[REDACTED]` `agentPath`, `senderThreadId` and `tool`, is
+unmodelled JSON that deserialisation drops, so none of it is carried or interpreted. A second test reads the fixture's header and server frames, so a
 synthetic file in its place fails by name. These tests are separate from the schema-shaped
 attribution tests that predate the capture.
 
