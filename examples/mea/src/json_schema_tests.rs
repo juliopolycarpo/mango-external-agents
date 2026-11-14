@@ -54,8 +54,7 @@ async fn a_turn_passes_the_schema_file_to_the_vendor_command_line() {
     let cli = Arc::new(
         FakeClaudeCli::new()
             .with_help(HELP_WITH_JSON_SCHEMA)
-            .with_turn(Run::answering_schema(&serde_json::json!({"word": "ok"})))
-            .refusing_unscripted_turns(),
+            .with_turn(Run::answering_schema(&serde_json::json!({"word": "ok"}))),
     );
 
     turn_with(
@@ -107,8 +106,7 @@ async fn a_turn_without_the_flag_puts_no_schema_on_the_command_line() {
     let cli = Arc::new(
         FakeClaudeCli::new()
             .with_help(HELP_WITH_JSON_SCHEMA)
-            .with_turn(Run::answering_schema(&serde_json::json!({"word": "ok"})))
-            .refusing_unscripted_turns(),
+            .with_turn(Run::answering_schema(&serde_json::json!({"word": "ok"}))),
     );
 
     turn_with(
@@ -140,11 +138,7 @@ async fn a_build_without_the_flag_is_refused_by_the_harness_in_its_own_words() {
     let path = schema_file(&directory, r#"{"type":"object"}"#);
     let options = turn_options(&path);
     // No turn is scripted: a launch past the help check is a refusal that names its argv.
-    let cli = Arc::new(
-        FakeClaudeCli::new()
-            .with_help(HELP_WITHOUT_JSON_SCHEMA)
-            .refusing_unscripted_turns(),
-    );
+    let cli = Arc::new(FakeClaudeCli::new().with_help(HELP_WITHOUT_JSON_SCHEMA));
 
     let error = turn_with(
         &turn_registry(&options).expect("expected a registry with the schema"),
@@ -239,8 +233,7 @@ async fn a_schema_turn_without_an_answer_fails_with_the_harness_code_and_message
             .with_help(HELP_WITH_JSON_SCHEMA)
             .with_turn(Run::leaving_schema_unanswered(
                 "I could not satisfy the schema.",
-            ))
-            .refusing_unscripted_turns(),
+            )),
     );
 
     let error = turn_with(

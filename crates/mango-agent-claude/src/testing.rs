@@ -223,6 +223,22 @@ impl Run {
         ]))
     }
 
+    /// A child that ends its turn with an empty successful `result` and nothing else.
+    ///
+    /// For a test that needs a turn to launch and finish but does not read what it said.
+    ///
+    /// ```
+    /// use mango_agent_claude::testing::Run;
+    ///
+    /// let Run::Transcript { lines, .. } = Run::completing() else {
+    ///     panic!("expected a transcript run");
+    /// };
+    /// assert_eq!(lines, [r#"{"type":"result","is_error":false}"#]);
+    /// ```
+    pub fn completing() -> Self {
+        Self::replaying(r#"{"type":"result","is_error":false}"#)
+    }
+
     /// A child that writes `transcript`'s non-blank lines and exits cleanly.
     pub fn replaying(transcript: &str) -> Self {
         Self::Transcript {
@@ -265,9 +281,9 @@ impl Run {
 ///
 /// A launch whose argv has `--version` or `--help` anywhere, or `auth status` as its first two
 /// arguments, is a probe and is answered from the build's own text. Any other launch is a turn and
-/// plays the next [`Run`] queued with [`with_turn`](Self::with_turn). With nothing queued a turn
-/// completes with an empty `result`, unless [`refusing_unscripted_turns`](Self::refusing_unscripted_turns)
-/// asks for a refusal.
+/// plays the next [`Run`] queued with [`with_turn`](Self::with_turn). With nothing queued a turn is
+/// refused with a launch error, so a test never passes over a launch it did not script; queue
+/// [`Run::completing`] for a turn whose output does not matter.
 ///
 /// # Example
 ///
@@ -276,8 +292,7 @@ impl Run {
 ///
 /// let cli = FakeClaudeCli::new()
 ///     .with_auth(SIGNED_OUT)
-///     .with_turn(Run::exiting(1))
-///     .refusing_unscripted_turns();
+///     .with_turn(Run::exiting(1));
 /// assert!(cli.launches().is_empty(), "nothing has launched yet");
 /// ```
 pub struct FakeClaudeCli {
@@ -311,8 +326,6 @@ pub struct FakeClaudeCli {
     input_closed: Arc<Notify>,
     /// Whether a turn child's stdout needs one more pass of the runtime before a line is ready.
     output_needs_a_pass: bool,
-    /// Whether a turn launched with no [`Run`] queued is refused instead of answered.
-    refuses_unscripted_turns: bool,
 }
 
 impl Default for FakeClaudeCli {
@@ -322,7 +335,7 @@ impl Default for FakeClaudeCli {
 }
 
 impl FakeClaudeCli {
-    /// A build that answers every probe and completes every turn without saying anything.
+    /// A build that answers every probe and plays only the turns a test queued.
     pub fn new() -> Self {
         Self {
             version: Mutex::new(String::from(DEFAULT_VERSION)),
@@ -346,19 +359,7 @@ impl FakeClaudeCli {
             spawned: Notify::new(),
             input_closed: Arc::new(Notify::new()),
             output_needs_a_pass: false,
-            refuses_unscripted_turns: false,
         }
-    }
-
-    /// Refuses a turn launched while no [`Run`] is queued, with a launch error naming its argv.
-    ///
-    /// Without this a turn nobody scripted completes with an empty `result`, which lets a test
-    /// pass over a launch it never meant to allow. A refused launch is not recorded in
-    /// [`launches`](Self::launches).
-    #[must_use]
-    pub fn refusing_unscripted_turns(mut self) -> Self {
-        self.refuses_unscripted_turns = true;
-        self
     }
 
     /// Prints this instead of the default `--version` banner.
@@ -674,13 +675,12 @@ impl FakeClaudeCli {
         let queued = lock(&self.turns).pop_front();
         let run = match queued {
             Some(run) => run,
-            None if self.refuses_unscripted_turns => {
+            None => {
                 return Err(refused_launch(
                     argv,
                     "a turn with no Run queued through with_turn",
                 ));
             }
-            None => Run::replaying(r#"{"type":"result","is_error":false}"#),
         };
         Ok((run, lock(&self.stderr).clone()))
     }

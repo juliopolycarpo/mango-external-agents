@@ -1209,9 +1209,10 @@ unless `with_auth(SIGNED_OUT)`). Every other launch is a turn and plays the next
 frames are inline, not captured fixtures; `mea capture --transcripts` records the real thing.
 
 It records every launch (`launches`, `turn_argvs`) and every line written to a child's stdin
-(`written`). `refusing_unscripted_turns` turns a turn nobody scripted into a launch error that
-names the received argv, and any `auth` subcommand other than `status` is always refused: the
-library never logs in, so the fake never pretends to.
+(`written`). A turn nobody scripted is a launch error, so a test never passes over a launch it
+did not queue; `Run::completing` scripts a turn whose output does not matter. Any `auth`
+subcommand other than `status` is always refused: the library never logs in, so the fake never
+pretends to.
 
 A host turns it on in its own `[dev-dependencies]` with `features = ["testing"]` on
 `mango-agent-claude`, so the fake never reaches a release build.

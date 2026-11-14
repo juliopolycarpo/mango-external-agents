@@ -20,8 +20,7 @@ fn scripted_cli(turn_lines: Vec<String>) -> Arc<FakeClaudeCli> {
     Arc::new(
         FakeClaudeCli::new()
             .with_help(HELP_WITH_JSON_SCHEMA)
-            .with_turn(Run::replaying(&turn_lines.join("\n")))
-            .refusing_unscripted_turns(),
+            .with_turn(Run::replaying(&turn_lines.join("\n"))),
     )
 }
 
@@ -776,8 +775,7 @@ async fn a_signed_out_cli_is_refused_without_signing_in_or_starting_a_turn() {
         FakeClaudeCli::new()
             .with_help(HELP_WITH_JSON_SCHEMA)
             .with_auth(SIGNED_OUT)
-            .with_turn(Run::replaying(&answered_turn_lines(&facts).join("\n")))
-            .refusing_unscripted_turns(),
+            .with_turn(Run::replaying(&answered_turn_lines(&facts).join("\n"))),
     );
 
     let error = capture_over(cli.clone(), out.path(), &facts, Some(SCHEMA))
