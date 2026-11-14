@@ -4793,6 +4793,25 @@ mod json_schema_passthrough {
         assert!(launcher.turn_argvs().is_empty(), "expected no turn launch");
     }
 
+    /// Beside the real fixed flags an 8,000-character schema can never fit the line a
+    /// `claude.cmd` launch gives cmd.exe, so the host hears it at configuration, not at turn one.
+    #[test]
+    fn refuses_a_schema_the_fixed_flags_leave_no_room_for_at_configuration() {
+        let schema = format!("{{\"d\":\"{}\"}}", "x".repeat(8_000));
+        let error = ClaudeHarness::new()
+            .with_json_schema(&schema)
+            .map(drop)
+            .expect_err("expected an 8,000-character schema to be refused");
+        let Error::HostConfiguration { expected, received } = error else {
+            panic!("expected a host-configuration refusal | received {error:?}");
+        };
+        assert!(expected.contains("6861"), "received {expected:?}");
+        assert!(
+            received.contains("8014 UTF-16 code units"),
+            "received {received:?}"
+        );
+    }
+
     #[test]
     fn refuses_an_unusable_schema_before_a_harness_exists_to_spawn_anything() {
         for schema in ["{broken", "-1", "[]", ""] {

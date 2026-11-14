@@ -906,10 +906,20 @@ What the harness checks, all before anything is spawned:
   turns every `"` into `\"` and doubles the backslashes before it, so a quote-dense schema
   grows. When the launcher runs a `.bat` or `.cmd` shim (an npm `claude.cmd`), Rust also writes
   each `%` as `%%cd:~,%`, 8 units for 1. The count takes the larger figure for both, so it is an
-  upper bound whichever program the host launches. The escaped argument may take at most 16,384
-  UTF-16 code units, half of Windows' 32,767-unit cap on a whole command line, which leaves the
-  other half for the program path, the other flags, the session id and the MCP path (a batch
-  launch also prefixes `cmd.exe /e:ON /v:OFF /d /c`).
+  upper bound whichever program the host launches.
+- The bound is a conservative worst case for a batch-shim launch. A `.cmd` launch runs through
+  `cmd.exe /e:ON /v:OFF /d /c "…"`, and `cmd.exe` rejects a line past 8,191 characters, well
+  under the 32,767 units CreateProcess takes. The whole turn line is therefore counted against
+  8,191: the 28-unit prefix and closing quote, 1,024 units reserved for the launcher path the
+  library does not see, and every argument quoted and escaped as above. The schema cap
+  (`MAX_JSON_SCHEMA_ARGUMENT_UNITS`, 6,861 units) is what remains once the flags every turn
+  passes and the longest conditional ones are subtracted, derived from the flag lists rather
+  than chosen, so `with_json_schema` already refuses a schema that can never fit. The model,
+  effort and MCP path vary per turn, so `TurnArgv::build` counts the whole line again whenever
+  a schema is present and refuses with `Error::HostConfiguration` naming the units and the cap,
+  never the schema or a path. A turn without a schema is never refused on length.
+- A host that launches the native binary has more room than this, but gets the same refusal,
+  because the library cannot tell which launcher the host runs. Avoid large schemas on Windows.
 - The build's `--help` declares `--json-schema` (fail closed, like `--mcp-config`). Opening a
   session on a build that does not is refused instead of running without the schema.
 

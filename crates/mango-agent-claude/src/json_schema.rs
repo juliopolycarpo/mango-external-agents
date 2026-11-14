@@ -19,17 +19,60 @@
 
 use mango_external_agents::{Error, Result};
 
+/// The longest command line `cmd.exe` accepts, in characters.
+///
+/// CreateProcess takes 32,767 UTF-16 code units, but Rust's `Command` runs a `.bat` or `.cmd`
+/// program, such as an npm `claude.cmd` shim, through `cmd.exe`, which rejects a line past this.
+/// The bound is the tighter one, so a host that launches the native binary has more room and
+/// gets the same refusal.
+pub(crate) const BATCH_COMMAND_LINE_LIMIT_UNITS: usize = 8_191;
+
+/// What `Command` writes before the program for a batch launch.
+const BATCH_LAUNCH_PREFIX: &str = "cmd.exe /e:ON /v:OFF /d /c \"";
+
+/// Units set aside for the resolved launcher path and its quotes, which the library does not see.
+///
+/// The host's [`ExecutablePath`](mango_external_agents::ExecutablePath) replaces the program name
+/// at spawn time. 1,024 is four times the legacy `MAX_PATH` of 260.
+pub(crate) const LAUNCHER_PATH_RESERVE_UNITS: usize = 1_024;
+
+/// The units a fixed overhead takes in a batch launch: the prefix, the launcher reserve and the
+/// quote that closes the whole line.
+const BATCH_OVERHEAD_UNITS: usize = BATCH_LAUNCH_PREFIX.len() + LAUNCHER_PATH_RESERVE_UNITS + 1;
+
+/// What each of these ASCII arguments takes on the line: a separator and two quotes around it.
+///
+/// None of them holds a `"`, a backslash or a `%`, which a test pins, so the length is the count.
+const fn plain_argument_units(arguments: &[&str]) -> usize {
+    let mut units = 0;
+    let mut index = 0;
+    while index < arguments.len() {
+        units += 1 + arguments[index].len() + 2;
+        index += 1;
+    }
+    units
+}
+
 /// The most UTF-16 code units the schema argument may occupy on a Windows command line.
 ///
-/// The schema travels inline, because the flag takes a value rather than a path. Windows caps a
-/// whole command line at 32,767 UTF-16 code units, and Rust's `Command` writes an argument as
-/// [`windows_argument_units`] counts it: every `"` becomes `\"` and the backslashes before it are
+/// The schema travels inline, because the flag takes a value rather than a path. It is derived,
+/// not chosen: the 8,191 characters `cmd.exe` accepts for a batch launch, less the launch prefix,
+/// the launcher-path reserve, every fixed flag, the longest conditional flags and the schema's
+/// own separator. A schema over this can never fit beside the flags every turn passes, so
+/// `with_json_schema` refuses it before anything runs. The model, effort and MCP path vary per
+/// turn, so `TurnArgv::build` counts the whole line again when a turn is built.
+///
+/// The count is [`windows_argument_units`]: every `"` becomes `\"` and the backslashes before it are
 /// doubled, and a batch-file launcher also turns every `%` into 8 units. A compact schema dense in
 /// quotes or percent signs therefore grows well past its byte length, so the bound is on the
-/// escaped length. Half the cap leaves the other half for the program path, the
-/// other flags, the session id and the MCP path. A host with a larger schema needs a surface the
-/// vendor documents for it; none is documented for `--json-schema` today.
-pub const MAX_JSON_SCHEMA_ARGUMENT_UNITS: usize = 16 * 1024;
+/// escaped length. A host with a larger schema needs a surface the vendor documents for it; none
+/// is documented for `--json-schema` today.
+pub const MAX_JSON_SCHEMA_ARGUMENT_UNITS: usize = BATCH_COMMAND_LINE_LIMIT_UNITS
+    - BATCH_OVERHEAD_UNITS
+    - plain_argument_units(&crate::argv::FIXED_FLAGS)
+    - plain_argument_units(&crate::argv::WORST_CASE_CONDITIONAL_FLAGS)
+    // The separator before the schema itself; its own quotes are in its count.
+    - 1;
 
 /// What one `%` takes in a batch-file argument: `%%cd:~,` is written before the `%` itself.
 ///
@@ -38,7 +81,10 @@ pub const MAX_JSON_SCHEMA_ARGUMENT_UNITS: usize = 16 * 1024;
 const PERCENT_UNITS_IN_A_BATCH_ARGUMENT: usize = 8;
 
 /// What a refusal names as the accepted shape.
-const EXPECTED_SHAPE: &str = "a JSON object, no larger than 16384 UTF-16 code units once compacted and escaped as a Windows command-line argument, that is a JSON Schema for --json-schema";
+const EXPECTED_SHAPE: &str = "a JSON object, no larger than 6861 UTF-16 code units once compacted and escaped as a Windows batch-launch command-line argument, that is a JSON Schema for --json-schema";
+
+/// What a refusal of a whole turn command line names as the accepted shape.
+const EXPECTED_COMMAND_LINE: &str = "a turn command line of at most 8191 UTF-16 code units as a cmd.exe batch launch writes it, counting the launch prefix, every quoted argument and 1024 units for the launcher path";
 
 /// Checks a host's schema text and returns the compact form that goes on argv.
 ///
@@ -148,6 +194,37 @@ pub fn windows_argument_units(argument: &str) -> usize {
     }
     // Backslashes before the closing quote are doubled too.
     units + backslashes
+}
+
+/// The units a whole turn command line takes when launched through a `.bat` or `.cmd` shim.
+///
+/// The worst case for either launcher: the batch prefix and closing quote, the reserve for the
+/// launcher path in place of `argv[0]`, and each other argument counted by
+/// [`windows_argument_units`] with its separator.
+pub(crate) fn turn_command_line_units(argv: &[String]) -> usize {
+    BATCH_OVERHEAD_UNITS
+        + argv
+            .iter()
+            .skip(1)
+            .map(|argument| 1 + windows_argument_units(argument))
+            .sum::<usize>()
+}
+
+/// Refuses a turn command line that could not run when launched through a batch shim.
+///
+/// # Errors
+///
+/// [`Error::HostConfiguration`] naming the units the line takes and the cap, never an argument's
+/// content: the line holds the schema and the MCP path.
+pub(crate) fn check_turn_command_line(argv: &[String]) -> Result<()> {
+    let units = turn_command_line_units(argv);
+    if units > BATCH_COMMAND_LINE_LIMIT_UNITS {
+        return Err(Error::HostConfiguration {
+            expected: EXPECTED_COMMAND_LINE,
+            received: format!("a command line of {units} UTF-16 code units"),
+        });
+    }
+    Ok(())
 }
 
 fn refusal(received: String) -> Error {
@@ -263,16 +340,136 @@ mod tests {
         );
         let received = refusal_received(&filler(MAX_JSON_SCHEMA_ARGUMENT_UNITS - 13));
         assert!(
-            received.contains("16385 UTF-16 code units"),
+            received.contains(&format!(
+                "{} UTF-16 code units",
+                MAX_JSON_SCHEMA_ARGUMENT_UNITS + 1
+            )),
             "received {received:?}"
         );
+    }
+
+    /// The regression for an 8,000-character schema: under the earlier 16 KiB cap it was
+    /// accepted, and a `claude.cmd` launch then died inside cmd.exe, which takes 8,191 characters
+    /// for the whole line.
+    #[test]
+    fn refuses_an_eight_thousand_character_schema_the_fixed_flags_leave_no_room_for() {
+        let raw = format!("{{\"d\":\"{}\"}}", "x".repeat(8_000));
+        let received = refusal_received(&raw);
+        assert_eq!(
+            received,
+            "a schema of 8008 bytes that takes 8014 UTF-16 code units on a Windows command line",
+            "expected the escaped length named | received {received:?}"
+        );
+    }
+
+    /// The cap is derived from the flags every turn passes, so it moves when they do. This pins
+    /// the number, and the inputs it is derived from, so a change shows in review.
+    #[test]
+    fn the_schema_cap_is_derived_from_the_fixed_flags_and_the_batch_limit() {
+        use super::{
+            BATCH_COMMAND_LINE_LIMIT_UNITS, BATCH_LAUNCH_PREFIX, LAUNCHER_PATH_RESERVE_UNITS,
+        };
+        use crate::argv::{FIXED_FLAGS, WORST_CASE_CONDITIONAL_FLAGS};
+
+        assert_eq!(BATCH_LAUNCH_PREFIX.len(), 28);
+        // Each plain flag counts as its length, a separator and two quotes only while no flag
+        // holds a character the writers escape.
+        for flag in FIXED_FLAGS.iter().chain(&WORST_CASE_CONDITIONAL_FLAGS) {
+            assert!(
+                flag.is_ascii() && !flag.contains(['"', '\\', '%']),
+                "expected a plain ASCII flag | received {flag:?}"
+            );
+            assert_eq!(windows_argument_units(flag), flag.len() + 2);
+        }
+        // 8191 - (28 + 1024 + 1) - 140 - 136 - 1
+        assert_eq!(MAX_JSON_SCHEMA_ARGUMENT_UNITS, 6_861);
+        assert_eq!(BATCH_COMMAND_LINE_LIMIT_UNITS, 8_191);
+        assert_eq!(LAUNCHER_PATH_RESERVE_UNITS, 1_024);
+    }
+
+    #[test]
+    fn the_refusal_texts_name_the_caps_the_code_enforces() {
+        use super::{EXPECTED_COMMAND_LINE, EXPECTED_SHAPE};
+
+        assert!(
+            EXPECTED_SHAPE.contains(&MAX_JSON_SCHEMA_ARGUMENT_UNITS.to_string()),
+            "expected the schema cap in the shape | received {EXPECTED_SHAPE:?}"
+        );
+        for number in [
+            super::BATCH_COMMAND_LINE_LIMIT_UNITS,
+            super::LAUNCHER_PATH_RESERVE_UNITS,
+        ] {
+            assert!(
+                EXPECTED_COMMAND_LINE.contains(&number.to_string()),
+                "expected {number} in the command-line shape | received {EXPECTED_COMMAND_LINE:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn counts_a_turn_command_line_as_a_batch_launch_writes_it() {
+        use super::turn_command_line_units;
+
+        // 28 for the prefix, 1024 for the launcher, 1 for the closing quote, then for each
+        // argument after the program a separator and its quoted count.
+        let argv = |arguments: &[&str]| -> Vec<String> {
+            arguments
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect()
+        };
+        assert_eq!(turn_command_line_units(&argv(&["claude"])), 1_053);
+        assert_eq!(turn_command_line_units(&argv(&["claude", "a"])), 1_057);
+        // The program name is the reserve, whatever it is.
+        assert_eq!(
+            turn_command_line_units(&argv(&["C:\\very\\long\\claude.cmd", "a"])),
+            1_057
+        );
+        assert_eq!(
+            turn_command_line_units(&argv(&["claude", "%", "\""])),
+            1_053 + 11 + 5
+        );
+    }
+
+    #[test]
+    fn refuses_a_command_line_over_the_batch_limit_naming_units_and_never_its_content() {
+        use super::{
+            BATCH_COMMAND_LINE_LIMIT_UNITS, check_turn_command_line, turn_command_line_units,
+        };
+
+        // One argument takes 1 + 2 + length units on top of the 1,053 fixed ones.
+        let at_limit = vec![
+            String::from("claude"),
+            "s".repeat(BATCH_COMMAND_LINE_LIMIT_UNITS - 1_053 - 3),
+        ];
+        assert_eq!(
+            turn_command_line_units(&at_limit),
+            BATCH_COMMAND_LINE_LIMIT_UNITS
+        );
+        assert!(check_turn_command_line(&at_limit).is_ok());
+
+        let mut over = at_limit;
+        over[1].push_str("secret-canary");
+        let Err(Error::HostConfiguration { expected, received }) = check_turn_command_line(&over)
+        else {
+            panic!("expected a host-configuration refusal for a command line over the batch limit");
+        };
+        assert!(expected.contains("8191"), "received {expected:?}");
+        assert_eq!(
+            received,
+            format!(
+                "a command line of {} UTF-16 code units",
+                BATCH_COMMAND_LINE_LIMIT_UNITS + 13
+            )
+        );
+        assert!(!received.contains("secret-canary"), "received {received:?}");
     }
 
     /// Each `"` in a schema string is `\"` in JSON and `\\\"` on a Windows command line, so a
     /// schema well under the cap in bytes can overflow it once escaped.
     #[test]
     fn refuses_a_quote_dense_schema_that_fits_in_bytes_but_not_once_escaped() {
-        let quotes = 5_000;
+        let quotes = 2_000;
         let raw = format!("{{\"d\":\"{}\"}}", "\\\"".repeat(quotes));
         let compact_bytes = 8 + 2 * quotes;
         assert!(
@@ -292,14 +489,24 @@ mod tests {
 
     #[test]
     fn accepts_a_quote_dense_schema_exactly_at_the_escaped_cap() {
-        // 14 units of structure, 4 per escaped quote, then two filler characters.
-        let raw = format!("{{\"d\":\"{}xx\"}}", "\\\"".repeat(4_092));
+        // 14 units of structure, 4 per escaped quote, then filler characters for the remainder.
+        let room = MAX_JSON_SCHEMA_ARGUMENT_UNITS - 14;
+        let (quotes, filler) = (room / 4, room % 4);
+        let raw = format!(
+            "{{\"d\":\"{}{}\"}}",
+            "\\\"".repeat(quotes),
+            "x".repeat(filler)
+        );
         let argument = compact(&raw).expect("expected the escaped cap itself to pass");
         assert_eq!(
             windows_argument_units(&argument),
             MAX_JSON_SCHEMA_ARGUMENT_UNITS
         );
-        let over = format!("{{\"d\":\"{}xxx\"}}", "\\\"".repeat(4_092));
+        let over = format!(
+            "{{\"d\":\"{}{}\"}}",
+            "\\\"".repeat(quotes),
+            "x".repeat(filler + 1)
+        );
         refusal_received(&over);
     }
 
@@ -323,24 +530,36 @@ mod tests {
 
     #[test]
     fn accepts_a_percent_dense_schema_exactly_at_the_cap_and_refuses_one_unit_over() {
-        // 14 units of structure, 8 per `%`, then two filler characters.
-        let at_cap = format!("{{\"d\":\"{}xx\"}}", "%".repeat(2_046));
-        let argument = compact(&at_cap).expect("expected the cap itself to pass");
+        // 14 units of structure, 8 per `%`, then filler characters for the remainder.
+        let room = MAX_JSON_SCHEMA_ARGUMENT_UNITS - 14;
+        let (percents, filler) = (room / 8, room % 8);
+        let schema = |percents: usize, filler: usize| {
+            format!(
+                "{{\"d\":\"{}{}\"}}",
+                "%".repeat(percents),
+                "x".repeat(filler)
+            )
+        };
+        let argument = compact(&schema(percents, filler)).expect("expected the cap itself to pass");
         assert_eq!(
             windows_argument_units(&argument),
             MAX_JSON_SCHEMA_ARGUMENT_UNITS
         );
-        let one_over = format!("{{\"d\":\"{}xxx\"}}", "%".repeat(2_046));
-        let received = refusal_received(&one_over);
+        let received = refusal_received(&schema(percents, filler + 1));
         assert!(
-            received.contains("16385 UTF-16 code units"),
+            received.contains(&format!(
+                "{} UTF-16 code units",
+                MAX_JSON_SCHEMA_ARGUMENT_UNITS + 1
+            )),
             "received {received:?}"
         );
         // One more `%` is 8 units over, not 1.
-        let one_percent_over = format!("{{\"d\":\"{}\"}}", "%".repeat(2_047));
-        let received = refusal_received(&one_percent_over);
+        let received = refusal_received(&schema(percents + 1, filler));
         assert!(
-            received.contains("16390 UTF-16 code units"),
+            received.contains(&format!(
+                "{} UTF-16 code units",
+                MAX_JSON_SCHEMA_ARGUMENT_UNITS + 8
+            )),
             "received {received:?}"
         );
     }
