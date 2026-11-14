@@ -21,7 +21,7 @@ use failure::describe as command_failure;
 use mango_external_agents::launcher::TokioLauncher;
 use mango_external_agents::{
     ApprovalRouting, AuthState, ConfigurationChange, EnvSource, ExecutablePath, HarnessId,
-    HarnessRegistry, HostContext, OpenSession, TransportSelection, TurnRequest,
+    HarnessRegistry, HostContext, OpenSession, TransportKind, TransportSelection, TurnRequest,
 };
 use options::HarnessChoice;
 
@@ -45,10 +45,20 @@ fn harness_lines() -> [String; 3] {
 ///
 /// Claude, Codex and every built-in ACP profile implement the shared `Harness` contract.
 fn registry() -> HarnessRegistry {
-    let mut harnesses = vec![
-        mango_agent_claude::harness(),
-        Arc::new(mango_agent_codex::CodexHarness::new()),
-    ];
+    registry_attaching_to(None)
+}
+
+/// [`registry`], with Codex pointed at the Unix socket of an app-server the host already runs.
+///
+/// The path is handed to the harness as typed: its own checks (fits a socket address, served by
+/// this user) answer for it. `mea` starts no server; running `codex app-server --listen
+/// unix://PATH` is the operator's job.
+fn registry_attaching_to(socket: Option<&std::path::Path>) -> HarnessRegistry {
+    let codex = match socket {
+        Some(path) => mango_agent_codex::CodexHarness::new().with_unix_socket(path),
+        None => mango_agent_codex::CodexHarness::new(),
+    };
+    let mut harnesses = vec![mango_agent_claude::harness(), Arc::new(codex)];
     harnesses.extend(mango_agent_acp::AcpHarness::builtins());
     HarnessRegistry::new(harnesses).expect("expected one harness per kind")
 }
@@ -105,9 +115,9 @@ async fn run(arguments: &[String]) -> Result<(), String> {
         return Ok(());
     }
     match command.as_str() {
-        "discover" => discover(&Options::parse(rest)?).await,
-        "doctor" => doctor(&Options::parse(rest)?).await,
-        "turn" => turn(&Options::parse(rest)?).await,
+        "discover" => discover(&Options::parse_for(command, rest)?).await,
+        "doctor" => doctor(&Options::parse_for(command, rest)?).await,
+        "turn" => turn(&Options::parse_for(command, rest)?).await,
         "capture" => capture(rest).await,
         "digests" => digests(rest),
         "help" | "--help" | "-h" => {
@@ -133,7 +143,10 @@ fn print_banner() {
         "usage: mea discover|doctor [--harness claude|codex|acp:<profile>] [--json] [--cwd DIR]"
     );
     println!(
-        "       mea turn [--harness claude|codex|acp:<profile>] [--profile ID] [--transport stdio|websocket|unix-socket|acp] [--cwd DIR] [--json] [--level read-only|default|full-access] [--cancel-after SECONDS] <prompt>"
+        "       mea doctor --harness codex --transport unix-socket --socket PATH [--json] [--cwd DIR] (also attaches)"
+    );
+    println!(
+        "       mea turn [--harness claude|codex|acp:<profile>] [--profile ID] [--transport stdio|websocket|unix-socket|acp] [--socket PATH] [--cwd DIR] [--json] [--level read-only|default|full-access] [--cancel-after SECONDS] <prompt>"
     );
     println!(
         "       mea capture --harness claude|codex|acp[:profile] [--profile ID] [--out DIR] [--workspace DIR] [--transcripts]"
@@ -298,28 +311,91 @@ async fn discover(options: &Options) -> Result<(), String> {
 }
 
 async fn doctor(options: &Options) -> Result<(), String> {
-    let reports = discover_with(
-        &registry(),
+    doctor_with(
+        &registry_attaching_to(options.socket.as_deref()),
         &host(options.cwd.as_deref())?,
-        options.kind.as_ref().map(HarnessChoice::id),
+        options,
     )
-    .await?;
+    .await
+}
+
+/// The probes of every selected harness, plus one attach when the options name a Unix socket.
+///
+/// The probe never touches the socket: it runs the local `codex`. Attaching is the only way to
+/// learn what the server says to this host, so `doctor` opens one session over the socket, reports
+/// the thread it got or the refusal as the harness worded it, and closes. The refusal is a row of
+/// the report, not a failed command, as a probe failure is.
+async fn doctor_with(
+    registry: &HarnessRegistry,
+    host: &HostContext,
+    options: &Options,
+) -> Result<(), String> {
+    let reports =
+        discover_with(registry, host, options.kind.as_ref().map(HarnessChoice::id)).await?;
+    let attach = if options.transport == Some(TransportKind::UnixSocket) {
+        let id = HarnessChoice::Codex.id();
+        let harness = registry.require(&id).map_err(|error| error.to_string())?;
+        Some(doctor::AttachReport {
+            kind: id,
+            result: attach_over_socket(harness.as_ref(), host).await,
+        })
+    } else {
+        None
+    };
     if options.json {
-        println!("{}", doctor::json(&reports));
+        println!("{}", doctor::json_with_attach(&reports, attach.as_ref()));
     } else {
         for report in &reports {
             println!("{}", doctor::text(report));
         }
+        if let Some(attach) = &attach {
+            println!("{}", doctor::attach_text(attach));
+        }
     }
     Ok(())
+}
+
+/// Opens one session over the Unix socket and closes it, returning the thread the server started.
+///
+/// Opening starts a thread on the server, so the server keeps one empty thread after the close: the
+/// price of asking it anything. Example: a server owned by another user answers with the harness's
+/// own `expected a Unix socket served by this process's own user, received ...` refusal.
+async fn attach_over_socket(
+    harness: &dyn mango_external_agents::Harness,
+    host: &HostContext,
+) -> Result<String, String> {
+    let request = OpenSession::new(format!("mea-doctor-{}", uuid_like()))
+        .over_transport(TransportKind::UnixSocket);
+    let session = harness
+        .open_session(host, request)
+        .await
+        .map_err(|error| refusal(&error))?;
+    let thread = session.ids().native_session_id.to_string();
+    session
+        .close(mango_external_agents::CloseReason::Requested)
+        .await
+        .map_err(|error| refusal(&error))?;
+    Ok(thread)
 }
 
 async fn turn(options: &Options) -> Result<(), String> {
     if options.prompt.trim().is_empty() {
         return Err(String::from("expected a prompt, received none"));
     }
-    let host = host(options.cwd.as_deref())?;
-    let registry = registry();
+    turn_with(
+        &registry_attaching_to(options.socket.as_deref()),
+        &host(options.cwd.as_deref())?,
+        options,
+    )
+    .await
+}
+
+/// One turn through the harness the options select, in the host and registry it is given.
+async fn turn_with(
+    registry: &HarnessRegistry,
+    host: &HostContext,
+    options: &Options,
+) -> Result<(), String> {
     let kind = options.kind.clone().unwrap_or(HarnessChoice::Claude);
     let harness = registry.require(&kind.id()).map_err(|e| e.to_string())?;
     if let Some(transport) = options.transport {
@@ -329,10 +405,17 @@ async fn turn(options: &Options) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
     }
 
-    let discovery = harness.discover(&host).await.map_err(|e| refusal(&e))?;
-    if let AuthState::LoggedOut { login_hint } = &discovery.auth {
-        return Err(format!("not signed in; run `{login_hint}`"));
-    }
+    // An attach spawns nothing, so the local `codex` has nothing to gate: the server's own
+    // `initialize` answer carries its version, and its account read refuses a signed-out server.
+    let discovery = if options.transport == Some(TransportKind::UnixSocket) {
+        None
+    } else {
+        let discovery = harness.discover(host).await.map_err(|e| refusal(&e))?;
+        if let AuthState::LoggedOut { login_hint } = &discovery.auth {
+            return Err(format!("not signed in; run `{login_hint}`"));
+        }
+        Some(discovery)
+    };
 
     let mut request = OpenSession::new(format!("mea-{}", uuid_like()));
     if let Some(level) = options.level {
@@ -344,14 +427,17 @@ async fn turn(options: &Options) -> Result<(), String> {
     if let Some(transport) = options.transport {
         request = request.over_transport(transport);
     }
-    if let Some(executable) = &discovery.executable {
+    if let Some(executable) = discovery
+        .as_ref()
+        .and_then(|found| found.executable.as_ref())
+    {
         request = request.with_executable(ExecutablePath::resolved(executable.clone()));
     }
 
     // A gate refusal reaches an operator here rather than through `discovery.gate`: Codex names
     // its build in the app-server handshake, which happens inside `open_session`.
     let session = harness
-        .open_session(&host, request)
+        .open_session(host, request)
         .await
         .map_err(|e| refusal(&e))?;
     eprintln!("session: {}", session.ids().native_session_id);
@@ -889,6 +975,216 @@ mod tests {
         assert_eq!(
             describe(&discovery),
             "gated      expected a required launch flag; received the flag was absent from help"
+        );
+    }
+}
+
+/// `mea turn` and `mea doctor` over a Unix socket, against a named stand-in for the server.
+///
+/// The stand-in refuses the WebSocket upgrade, so a run crosses a real socket and the harness's
+/// real connect and upgrade, and ends in a refusal whose words the test can name. A full replayed
+/// turn lives in `crates/mango-agent-codex/tests/unix_socket.rs`, which owns the recorded
+/// conversation and the WebSocket server that speaks it.
+#[cfg(all(test, unix))]
+mod unix_socket_tests {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::thread::JoinHandle;
+    use std::time::Duration;
+
+    use mango_external_agents::testing::FakeLauncher;
+    use mango_external_agents::{EnvSource, HostContext};
+
+    use super::{Options, attach_over_socket, registry_attaching_to, run, turn_with};
+
+    /// An app-server stand-in on a Unix socket that answers every upgrade with `403 Forbidden`.
+    struct UpgradeRefusingSocketServer {
+        /// Held so the socket's directory outlives the test.
+        _directory: tempfile::TempDir,
+        path: PathBuf,
+        connections: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        accepting: Option<JoinHandle<()>>,
+    }
+
+    impl UpgradeRefusingSocketServer {
+        fn start() -> Self {
+            let directory = tempfile::tempdir().expect("expected a socket directory");
+            let path = directory.path().join("app-server.sock");
+            let listener = UnixListener::bind(&path).expect("expected the socket to bind");
+            listener
+                .set_nonblocking(true)
+                .expect("expected a non-blocking listener");
+            let connections = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let accepting = {
+                let (connections, stop) = (Arc::clone(&connections), Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Acquire) {
+                        let Ok((mut stream, _)) = listener.accept() else {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        };
+                        connections.fetch_add(1, Ordering::AcqRel);
+                        stream
+                            .set_nonblocking(false)
+                            .expect("expected a blocking connection");
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .expect("expected a read timeout");
+                        // The upgrade request ends at the blank line.
+                        let mut request = Vec::new();
+                        let mut byte = [0_u8; 1];
+                        while !request.ends_with(b"\r\n\r\n")
+                            && stream.read(&mut byte).is_ok_and(|read| read == 1)
+                        {
+                            request.push(byte[0]);
+                        }
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        );
+                    }
+                })
+            };
+            Self {
+                _directory: directory,
+                path,
+                connections,
+                stop,
+                accepting: Some(accepting),
+            }
+        }
+
+        fn connections(&self) -> usize {
+            self.connections.load(Ordering::Acquire)
+        }
+    }
+
+    impl Drop for UpgradeRefusingSocketServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(accepting) = self.accepting.take() {
+                let _ = accepting.join();
+            }
+        }
+    }
+
+    /// A host whose launcher holds no process, so a spawn of the local `codex` is visible.
+    fn host_without_processes() -> (HostContext, Arc<FakeLauncher>) {
+        let launcher = Arc::new(FakeLauncher::new());
+        let host = HostContext::builder()
+            .launcher(launcher.clone())
+            .cwd(std::env::temp_dir())
+            .environment(EnvSource::from_pairs([("PATH", "/fake/bin")]))
+            .client_info("mea-test", "0.0.0")
+            .build()
+            .expect("expected a fake host context");
+        (host, launcher)
+    }
+
+    fn options_for(command: &str, socket: &Path, rest: &[&str]) -> Options {
+        let mut arguments: Vec<String> = [
+            "--harness",
+            "codex",
+            "--transport",
+            "unix-socket",
+            "--socket",
+        ]
+        .map(String::from)
+        .to_vec();
+        arguments.push(socket.display().to_string());
+        arguments.extend(rest.iter().map(|word| (*word).to_owned()));
+        Options::parse_for(command, &arguments)
+            .unwrap_or_else(|error| panic!("expected valid {command} arguments, received {error}"))
+    }
+
+    #[tokio::test]
+    async fn a_turn_dials_the_named_socket_and_prints_the_harness_refusal_as_it_is() {
+        let server = UpgradeRefusingSocketServer::start();
+        let options = options_for("turn", &server.path, &["hello"]);
+        let (host, launcher) = host_without_processes();
+
+        let error = turn_with(
+            &registry_attaching_to(options.socket.as_deref()),
+            &host,
+            &options,
+        )
+        .await
+        .expect_err("expected the server's 403 to refuse the turn");
+
+        assert!(
+            error.contains("HTTP 403 Forbidden from the upgrade"),
+            "expected the harness's own refusal (HTTP 403 Forbidden from the upgrade) | received: {error}"
+        );
+        assert_eq!(
+            server.connections(),
+            1,
+            "expected one connection to the named socket"
+        );
+        assert_eq!(
+            launcher.launches().len(),
+            0,
+            "expected an attach to spawn no local codex | received launches {:?}",
+            launcher.launches()
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_attaches_through_the_same_socket_and_reports_the_refusal() {
+        let server = UpgradeRefusingSocketServer::start();
+        let registry = registry_attaching_to(Some(&server.path));
+        let harness = registry
+            .require(&super::HarnessChoice::Codex.id())
+            .expect("expected the codex harness");
+        let (host, _launcher) = host_without_processes();
+
+        let outcome = attach_over_socket(harness.as_ref(), &host).await;
+
+        let error = outcome.expect_err("expected the server's 403 to refuse the attach");
+        assert!(
+            error.contains("HTTP 403 Forbidden from the upgrade"),
+            "expected the harness's own refusal (HTTP 403 Forbidden from the upgrade) | received: {error}"
+        );
+        assert_eq!(server.connections(), 1);
+    }
+
+    /// The path goes to the harness as typed: its refusal of a relative path is what comes out.
+    #[tokio::test]
+    async fn a_path_the_parser_never_saw_reaches_the_harness_unchanged() {
+        let registry = registry_attaching_to(Some(Path::new("relative/app-server.sock")));
+        let harness = registry
+            .require(&super::HarnessChoice::Codex.id())
+            .expect("expected the codex harness");
+        let (host, _launcher) = host_without_processes();
+
+        let error = attach_over_socket(harness.as_ref(), &host)
+            .await
+            .expect_err("expected the harness to refuse a relative path");
+
+        assert!(
+            error.contains("expected an absolute Unix socket path"),
+            "expected the harness's own words about the relative path | received: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_refuses_a_socket_without_its_transport_before_any_discovery() {
+        let args = [
+            "turn",
+            "--harness",
+            "codex",
+            "--socket",
+            "/run/codex.sock",
+            "hi",
+        ]
+        .map(String::from);
+        let error = run(&args).await.expect_err("expected the pairing refused");
+        assert_eq!(
+            error,
+            "(mea turn): expected --socket with --transport unix-socket | received --socket without it"
         );
     }
 }

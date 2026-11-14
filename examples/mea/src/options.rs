@@ -19,6 +19,8 @@ struct Arguments {
     #[arg(long)]
     transport: Option<String>,
     #[arg(long)]
+    socket: Option<PathBuf>,
+    #[arg(long)]
     cwd: Option<PathBuf>,
     #[arg(long)]
     json: bool,
@@ -63,6 +65,8 @@ pub(crate) struct Options {
     pub kind: Option<HarnessChoice>,
     pub level: Option<PermissionLevel>,
     pub transport: Option<TransportKind>,
+    /// The Unix socket of an app-server the host already runs, for `--transport unix-socket`.
+    pub socket: Option<PathBuf>,
     pub cwd: Option<PathBuf>,
     pub json: bool,
     /// How long after a turn starts `mea turn` asks its session to cancel it, when asked to.
@@ -81,11 +85,69 @@ impl Options {
             kind: kind(args.harness.as_deref(), args.profile.as_deref())?,
             level: args.level.as_deref().map(level).transpose()?,
             transport: args.transport.as_deref().map(transport).transpose()?,
+            socket: args.socket,
             cwd: args.cwd,
             json: args.json,
             cancel_after: args.cancel_after.as_deref().map(cancel_after).transpose()?,
             prompt: args.prompt.join(" "),
         })
+    }
+
+    /// Parses the arguments of one command and checks what only that command can judge.
+    ///
+    /// Example: `Options::parse_for("turn", &["--transport", "unix-socket", "--socket", "/run/codex.sock"])`.
+    /// The refusals name the command, `(mea turn)`, because this parser is shared by `discover`,
+    /// `doctor` and `turn` and an operator reads one of them.
+    pub fn parse_for(command: &str, arguments: &[String]) -> Result<Self, String> {
+        let options = Self::parse(arguments)?;
+        options.check_socket(command)?;
+        Ok(options)
+    }
+
+    /// The `--socket` and `--transport` pairing: the path goes with `unix-socket` and with nothing
+    /// else, and it is the host's, so it is passed on as typed.
+    ///
+    /// Only the shape is judged here (present, absolute). The harness still refuses a path that is
+    /// too long for a socket address or a server owned by another user, and `mea` prints its words.
+    fn check_socket(&self, command: &str) -> Result<(), String> {
+        // `discover` probes the installed CLI and never attaches, so there is no socket to name.
+        if command == "discover" {
+            return match &self.socket {
+                None => Ok(()),
+                Some(_) => Err(format!(
+                    "(mea {command}): expected --socket on turn or doctor | received --socket"
+                )),
+            };
+        }
+        let attaches = self.transport == Some(TransportKind::UnixSocket);
+        match (&self.socket, attaches) {
+            (None, false) => Ok(()),
+            (None, true) => Err(format!(
+                "(mea {command}): expected --socket PATH with --transport unix-socket | received --transport unix-socket without --socket"
+            )),
+            (Some(_), false) => Err(format!(
+                "(mea {command}): expected --socket with --transport unix-socket | received --socket {}",
+                self.transport.map_or_else(
+                    || String::from("without it"),
+                    |other| format!("with --transport {other}")
+                )
+            )),
+            (Some(path), true) if !path.is_absolute() => Err(format!(
+                "(mea {command}): expected --socket as an absolute path | received {path:?}"
+            )),
+            // `doctor` does not open a session on its own, so unlike `turn` it never reaches the
+            // descriptor's transport check: the attach it adds is Codex's alone.
+            (Some(_), true) if command == "doctor" && self.kind != Some(HarnessChoice::Codex) => {
+                Err(format!(
+                    "(mea {command}): expected --harness codex with --transport unix-socket | received {}",
+                    self.kind.as_ref().map_or_else(
+                        || String::from("no --harness"),
+                        |kind| format!("--harness {kind}")
+                    )
+                ))
+            }
+            (Some(_), true) => Ok(()),
+        }
     }
 }
 
@@ -263,6 +325,128 @@ mod tests {
         }
         assert!(kind(Some("acp"), None).is_err());
         assert!(acp("cursor").is_ok());
+    }
+
+    fn arguments(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_socket_path_goes_with_the_unix_socket_transport_as_typed() {
+        for command in ["turn", "doctor"] {
+            let options = Options::parse_for(
+                command,
+                &arguments(&[
+                    "--harness",
+                    "codex",
+                    "--transport",
+                    "unix-socket",
+                    "--socket",
+                    "/run/user/1000/codex/app-server.sock",
+                    "hello",
+                ]),
+            )
+            .unwrap_or_else(|error| {
+                panic!("expected (mea {command}) to accept it, received {error}")
+            });
+            assert_eq!(options.transport, Some(TransportKind::UnixSocket));
+            assert_eq!(
+                options.socket,
+                Some(PathBuf::from("/run/user/1000/codex/app-server.sock"))
+            );
+        }
+    }
+
+    #[test]
+    fn a_socket_path_without_the_unix_socket_transport_is_refused() {
+        let without =
+            Options::parse_for("turn", &arguments(&["--socket", "/run/codex.sock", "hi"]));
+        assert_eq!(
+            without.err().as_deref(),
+            Some(
+                "(mea turn): expected --socket with --transport unix-socket | received --socket without it"
+            )
+        );
+        for other in ["stdio", "websocket", "acp"] {
+            let refused = Options::parse_for(
+                "doctor",
+                &arguments(&["--transport", other, "--socket", "/run/codex.sock"]),
+            );
+            assert_eq!(
+                refused.err(),
+                Some(format!(
+                    "(mea doctor): expected --socket with --transport unix-socket | received --socket with --transport {other}"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn the_unix_socket_transport_without_a_socket_path_is_refused() {
+        for command in ["turn", "doctor"] {
+            let refused = Options::parse_for(
+                command,
+                &arguments(&["--harness", "codex", "--transport", "unix-socket"]),
+            );
+            assert_eq!(
+                refused.err(),
+                Some(format!(
+                    "(mea {command}): expected --socket PATH with --transport unix-socket | received --transport unix-socket without --socket"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn a_relative_socket_path_is_refused_with_the_path_it_received() {
+        let refused = Options::parse_for(
+            "turn",
+            &arguments(&[
+                "--transport",
+                "unix-socket",
+                "--socket",
+                "run/codex.sock",
+                "hi",
+            ]),
+        );
+        assert_eq!(
+            refused.err(),
+            Some(String::from(
+                "(mea turn): expected --socket as an absolute path | received \"run/codex.sock\""
+            ))
+        );
+    }
+
+    #[test]
+    fn discover_takes_no_socket_path() {
+        let refused = Options::parse_for("discover", &arguments(&["--socket", "/run/codex.sock"]));
+        assert_eq!(
+            refused.err(),
+            Some(String::from(
+                "(mea discover): expected --socket on turn or doctor | received --socket"
+            ))
+        );
+        Options::parse_for("discover", &arguments(&["--harness", "codex"]))
+            .unwrap_or_else(|error| panic!("expected a plain discover to parse, received {error}"));
+    }
+
+    #[test]
+    fn doctor_attaches_only_to_codex() {
+        for harness in [&["--harness", "claude"][..], &[][..]] {
+            let mut words = harness.to_vec();
+            words.extend(["--transport", "unix-socket", "--socket", "/run/codex.sock"]);
+            let refused = Options::parse_for("doctor", &arguments(&words));
+            let received = harness.last().map_or_else(
+                || String::from("no --harness"),
+                |name| format!("--harness {name}"),
+            );
+            assert_eq!(
+                refused.err(),
+                Some(format!(
+                    "(mea doctor): expected --harness codex with --transport unix-socket | received {received}"
+                ))
+            );
+        }
     }
 
     #[test]
