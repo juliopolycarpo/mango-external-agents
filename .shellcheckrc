@@ -1,0 +1,4 @@
+# Read by shellcheck for scripts/check-shellcheck.sh and by a bare `shellcheck` in an editor.
+# Follow `# shellcheck source=` directives, resolved against the sourcing script's directory.
+external-sources=true
+source-path=SCRIPTDIR
