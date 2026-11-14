@@ -930,20 +930,68 @@ the CLI does, and exits at startup with `Error: --json-schema is not a valid JSO
 The schema is inline, because the flag takes a value, not a path. It is visible in a process
 listing, unlike the prompt. Keep secrets out of it.
 
-**Unmeasured: the result mapping.** This harness does not surface the structured answer. The
-vendor documents `structured_output` for `--output-format json` and on the Agent SDK's result
-message. No document read for this change states the field for the CLI's `stream-json` `result`
-record, and the pinned CLI (2.1.322) was not run against an authenticated turn, so the shape was
-not observed. The reducer therefore ignores the field, and a host cannot read the validated value
-through this library yet. Mapping it needs that capture, and a core event to carry it. Two further
-effects of the flag are documented for the SDK stream and unobserved here:
+### The answer
 
-- A `StructuredOutput` tool call the host never defined appears as a `tool_use` and `tool_result`
-  pair, and the reducer reports it as an activity like any other tool call.
-- A run that produces no valid output ends with `error_max_structured_output_retries`. The reducer
-  already names that subtype as `claude-error_max_structured_output_retries`.
+With a schema, the turn's `result` record carries the validated value. The reducer maps it onto
+`EventKind::StructuredOutput`, built with `EventKind::structured_output`, and the host reads it
+from the event stream:
 
-What was measured: the pinned contract's `--help` (`fixtures/claude/contract/help.txt`) lists
+```text
+TurnStarted … Usage, StructuredOutput { value }, Completed
+```
+
+**Measured at Claude Code 2.1.325, not at the pin.** The pinned contract is 2.1.322 and the
+run that showed this shape used 2.1.325, with the harness's own argv plus
+`--json-schema`, with and without `--permission-mode default --permission-prompts none`, a schema
+of `{word: string}` and the prompt "Reply with the word ok." The records came in this order:
+`system` (init, status, commands_changed), `stream_event`s, an `assistant` message with a
+`tool_use` named `StructuredOutput` whose input was the value, a `user` message with its
+`tool_result` ("Structured output provided successfully"), `rate_limit_event`, then the `result`
+(`subtype: success`). The `result` carried the value as `structured_output`, an object, and again as
+`result`, a string. It also carried `credential_expires_at`. No permission or control request was
+raised for the `StructuredOutput` call, so there is nothing for a host to broker. The pin was not
+re-run, and the tests replay inline frames reduced from that run (`mea capture` has no Claude
+transcript recorder), not a fixture.
+
+Vendor documents followed: [headless: get structured output](https://code.claude.com/docs/en/headless#get-structured-output), which names
+`structured_output` and says a run without valid output has no such field, and [Agent SDK: structured outputs](https://code.claude.com/docs/en/agent-sdk/structured-outputs), which documents
+the `StructuredOutput` tool call, a `tool_result` with `is_error: true` on a mismatch followed by a
+retry, and the `error_max_structured_output_retries` result subtype. The retry and failure shapes
+below come from those documents; they were not observed.
+
+What the reducer does with it:
+
+- **The value.** A `result` that is not `is_error` and carries a `structured_output` that is a JSON
+  object emits `StructuredOutput` after `Usage` and before `Completed`. The value is passed through
+  as the vendor wrote it, bounded to `STRUCTURED_OUTPUT_MAX_BYTES`. One over the bound ends the turn
+  as a single `claude-structured-output-too-large` error in place of `Completed`, naming the bound
+  and the size received and never the value. The value stays out of the error message.
+- **Delivered once.** The `result` string repeats the value and is never emitted as assistant text.
+- **No answer.** A success `result` with no `structured_output`, or one that is not an object, emits
+  nothing extra and no error: the vendor documents that as a run without valid output, so a host
+  that asked for a schema must treat a `Completed` with no `StructuredOutput` as a failed run.
+- **The tool call is hidden.** `StructuredOutput` is the mechanism that carries the answer, not a
+  step the agent chose, so the exact tool name opens no activity. Its `tool_use`, its `tool_result`,
+  a retried call and an `is_error: true` result are all skipped. Another tool, including
+  `mcp__x__StructuredOutput`, is an ordinary activity.
+- **Retries exhausted.** A `result` with `is_error: true` and subtype
+  `error_max_structured_output_retries` ends the turn as an `Error` with code
+  `claude-error_max_structured_output_retries`. Its message is the vendor's own `errors` text, or
+  `Claude Code ended the turn with "error_max_structured_output_retries".` when there is none. Whether
+  the vendor sets `is_error` for that subtype was not observed, and the reducer keys on `is_error`
+  alone.
+- **A full queue fails the turn.** At the end of a run, the usage is dropped behind a close the
+  queue had no room for. The answer is not: it is sent anyway and, with no space, the turn fails as
+  `stream-overflow` rather than completing without it.
+- **`credential_expires_at` is dropped.** The field is never read, so it reaches no event, error or
+  log. See [`vendor-fields.md`](vendor-fields.md).
+
+The value is untrusted input. It is data the vendor's model wrote, checked by the CLI against the
+host's schema and by nothing else. Parse it as data, validate it again where a wrong shape would
+matter, and never put it in the host's own model context as an instruction; see
+[compliance.md](compliance.md).
+
+What else was measured: the pinned contract's `--help` (`fixtures/claude/contract/help.txt`) lists
 `--json-schema <schema>` ("JSON Schema for structured output validation (only works with
 --print)"), and the argv is pinned by a fake-CLI test.
 

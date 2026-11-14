@@ -664,6 +664,11 @@ impl TurnReducer {
     fn start_activity(&mut self, block: &ContentBlock<'_>) -> Option<EventKind> {
         let call_id = block.id()?;
         let name = block.name()?;
+        // Never opened, so its `tool_result` finds no open call in `reduce_user` and is skipped
+        // too, whether it succeeded or carried `is_error: true` for a retry.
+        if name == STRUCTURED_OUTPUT_TOOL {
+            return None;
+        }
         if self.is_open(call_id) {
             return None;
         }
@@ -747,7 +752,14 @@ impl TurnReducer {
         }
         match result_error(record) {
             Some(error) => events.push(EventKind::Error { error }),
-            None => events.push(EventKind::Completed),
+            None => match structured_answer(record) {
+                Ok(answer) => {
+                    // After `Usage` and ahead of the terminal, where the core documents it.
+                    events.extend(answer);
+                    events.push(EventKind::Completed);
+                }
+                Err(error) => events.push(EventKind::Error { error }),
+            },
         }
         events
     }
@@ -960,6 +972,41 @@ fn file_change_content(name: &str, input: Option<&Value>) -> Option<ActivityCont
 fn detail_for(detail: &str) -> Option<String> {
     let bounded = head(detail, DETAIL_CARRY_MAX_CHARS);
     (!bounded.is_empty()).then(|| bounded.to_owned())
+}
+
+/// The tool Claude Code gives a `--json-schema` run to deliver its answer through.
+///
+/// The Agent SDK documents it as the mechanism: the CLI adds a `StructuredOutput` tool, the model
+/// calls it with the value, and a value that does not match the schema comes back as a
+/// `tool_result` with `is_error: true` and a retry. The call is not a step the agent chose, and
+/// the answer reaches the host through [`EventKind::StructuredOutput`] on the `result`, so the
+/// reducer opens no activity for it. Only this exact name: a host's own tool called
+/// `structured_output`, or an MCP tool `mcp__x__StructuredOutput`, is an ordinary call.
+///
+/// <https://code.claude.com/docs/en/agent-sdk/structured-outputs>
+const STRUCTURED_OUTPUT_TOOL: &str = "StructuredOutput";
+
+/// The `--json-schema` answer a successful `result` carries, as the event that delivers it.
+///
+/// `Ok(None)` when the record has no object-shaped `structured_output`: the run produced no valid
+/// output, and the vendor documents that case as an absent field, so nothing is invented and a
+/// host reads the missing event as a failed schema run. An answer over the core's bound is
+/// refused whole, never cut, and ends the turn as an error naming the size received and the bound;
+/// the value stays out of the message.
+///
+/// <https://code.claude.com/docs/en/headless#get-structured-output>
+fn structured_answer(record: &StreamRecord) -> Result<Option<EventKind>, VendorError> {
+    let Some(value) = record.result().structured_output() else {
+        return Ok(None);
+    };
+    EventKind::structured_output(value.clone())
+        .map(Some)
+        .map_err(|refusal| {
+            VendorError::new(
+                ErrorCode::from_static("claude-structured-output-too-large"),
+                format!("Claude Code's structured output was refused: {refusal}."),
+            )
+        })
 }
 
 /// Whether a `result` record is a failure, and what to call it.
@@ -2173,5 +2220,409 @@ mod tests {
             Some("fresh"),
             "expected a closed call's full buffer not to carry into a new call of the same id"
         );
+    }
+
+    /// A `--json-schema` turn as Claude Code 2.1.325 streamed it, reduced to the members the
+    /// reducer reads. Measured on a live run (#362) and replayed here as inline frames, not a
+    /// fixture: `mea capture` has no Claude transcript recorder. `credential_expiry` stands in for
+    /// the `credential_expires_at` value, which is the vendor's and is never forwarded.
+    fn structured_answer_turn(credential_expiry: &str) -> Vec<String> {
+        let answer = json!({"word": "ok"});
+        vec![
+            json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_answer", "name": "StructuredOutput",
+                 "input": answer}]}})
+            .to_string(),
+            json!({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_answer",
+                 "content": "Structured output provided successfully"}]}})
+            .to_string(),
+            json!({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed"}})
+                .to_string(),
+            json!({"type": "result", "subtype": "success", "is_error": false,
+                   "result": answer.to_string(), "structured_output": answer,
+                   "credential_expires_at": credential_expiry,
+                   "usage": {"input_tokens": 3, "output_tokens": 5}})
+            .to_string(),
+        ]
+    }
+
+    /// Every event of `lines`, in order.
+    fn reduce_all(lines: &[String]) -> Vec<EventKind> {
+        let mut reducer = TurnReducer::new();
+        lines
+            .iter()
+            .flat_map(|line| reduce(&mut reducer, line))
+            .collect()
+    }
+
+    /// `EventKind`'s `Debug` prints metadata only, so a leak test has to read what a host reads:
+    /// the serialised event.
+    fn written(events: &[EventKind]) -> String {
+        serde_json::to_string(events).expect("expected the events to serialise")
+    }
+
+    /// Both result arms: the success one the answer rides on, and the failure one whose message,
+    /// code and vendor code are the fields a stray value could most plausibly be copied into.
+    #[test]
+    fn a_result_forwards_no_credential_expiry_on_success_or_failure() {
+        let canary = "CANARY-credential-expiry";
+        let succeeded = reduce_all(&structured_answer_turn(canary));
+        let failed = reduce_all(&[
+            json!({"type": "result", "subtype": "error_during_execution",
+                            "is_error": true, "api_error_status": 529,
+                            "errors": ["The run failed."],
+                            "terminal_reason": "aborted_streaming",
+                            "credential_expires_at": canary})
+            .to_string(),
+        ]);
+        for (arm, events, terminal) in [
+            ("success", &succeeded, EventKind::Completed),
+            (
+                "failure",
+                &failed,
+                EventKind::Error {
+                    error: VendorError::new(
+                        ErrorCode::from_static("claude-error_during_execution"),
+                        "The run failed.",
+                    )
+                    .with_vendor_code("529", true),
+                },
+            ),
+        ] {
+            let received = written(events);
+            assert!(
+                !received.contains(canary),
+                "expected the {arm} arm to forward no credential_expires_at | received: {received}"
+            );
+            assert_eq!(
+                events.last(),
+                Some(&terminal),
+                "expected the {arm} arm to end as before | received: {events:?}"
+            );
+        }
+    }
+
+    /// The same value arrives as `structured_output` and again as `result`, a string. Neither is
+    /// assistant text, so no `TextDelta` may carry the answer.
+    #[test]
+    fn the_result_text_of_a_structured_answer_is_not_delivered_as_assistant_text() {
+        let events = reduce_all(&structured_answer_turn("CANARY-credential-expiry"));
+        let received = text_of(&events);
+        assert_eq!(
+            received, "",
+            "expected no assistant text from the result record | received: {received:?}"
+        );
+    }
+
+    fn tool_use_line(id: &str, name: &str, input: &serde_json::Value) -> String {
+        json!({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": id, "name": name, "input": input}]}})
+        .to_string()
+    }
+
+    fn tool_result_line(id: &str, is_error: bool, body: &str) -> String {
+        json!({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": id, "is_error": is_error, "content": body}]}})
+        .to_string()
+    }
+
+    /// A success `result` with `extra` members merged into the measured ones.
+    fn success_result_with(extra: serde_json::Value) -> String {
+        let mut record = json!({"type": "result", "subtype": "success", "is_error": false,
+                                "usage": {"input_tokens": 3, "output_tokens": 5}});
+        record
+            .as_object_mut()
+            .expect("expected an object")
+            .extend(extra.as_object().expect("expected an object").clone());
+        record.to_string()
+    }
+
+    fn kinds_of_activity(events: &[EventKind]) -> Vec<&EventKind> {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    EventKind::ActivityStarted { .. }
+                        | EventKind::ActivityUpdated { .. }
+                        | EventKind::ActivityCompleted { .. }
+                )
+            })
+            .collect()
+    }
+
+    /// The measured turn: the call and its result are hidden, and the `result` ends the turn with
+    /// usage, then the answer, then the terminal.
+    #[test]
+    fn a_structured_answer_follows_usage_and_precedes_completed() {
+        let events = reduce_all(&structured_answer_turn("CANARY-credential-expiry"));
+        let usage = mango_external_agents::Usage {
+            input_tokens: Some(3),
+            output_tokens: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(
+            events,
+            vec![
+                EventKind::Usage { usage },
+                EventKind::StructuredOutput {
+                    value: json!({"word": "ok"})
+                },
+                EventKind::Completed,
+            ],
+            "expected usage, the answer and the terminal, with no activity for the call"
+        );
+    }
+
+    /// The closes of calls the run left open come first, then usage, as before the answer existed.
+    #[test]
+    fn a_structured_answer_comes_after_the_closes_of_calls_the_run_left_open() {
+        let mut reducer = TurnReducer::new();
+        reduce(
+            &mut reducer,
+            &tool_use_line("toolu_open", "Bash", &json!({"command": "sleep 1"})),
+        );
+        let events = reduce(
+            &mut reducer,
+            &success_result_with(json!({"structured_output": {"word": "ok"}})),
+        );
+        let order: Vec<&str> = events
+            .iter()
+            .map(|event| match event {
+                EventKind::ActivityCompleted { .. } => "close",
+                EventKind::Usage { .. } => "usage",
+                EventKind::StructuredOutput { .. } => "answer",
+                EventKind::Completed => "completed",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(order, ["close", "usage", "answer", "completed"]);
+    }
+
+    #[test]
+    fn a_structured_output_call_and_its_stream_events_open_no_activity() {
+        let mut reducer = TurnReducer::new();
+        let mut events = reduce(
+            &mut reducer,
+            &json!({"type": "stream_event", "event": {"type": "content_block_start", "index": 0,
+                    "content_block": {"type": "tool_use", "id": "toolu_answer",
+                                      "name": "StructuredOutput", "input": {}}}})
+            .to_string(),
+        );
+        events.extend(reduce(
+            &mut reducer,
+            &json!({"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                    "delta": {"type": "input_json_delta", "partial_json": "{\"word\":"}}})
+            .to_string(),
+        ));
+        // The assistant call, its result and the rate-limit record; the `result` is left out.
+        for line in structured_answer_turn("expiry").iter().take(3) {
+            events.extend(reduce(&mut reducer, line));
+        }
+        assert!(
+            events.is_empty(),
+            "expected the call, its partial input and its result to emit nothing | received: {events:?}"
+        );
+    }
+
+    /// The SDK documents a mismatch as a `tool_result` with `is_error: true`, then a retry.
+    #[test]
+    fn a_retried_structured_output_call_and_its_failed_result_open_no_activity() {
+        let mut reducer = TurnReducer::new();
+        let mut events = Vec::new();
+        for line in [
+            tool_use_line("toolu_first", "StructuredOutput", &json!({"word": 7})),
+            tool_result_line(
+                "toolu_first",
+                true,
+                "Output does not match required schema: word must be a string",
+            ),
+            tool_use_line("toolu_retry", "StructuredOutput", &json!({"word": "ok"})),
+            tool_result_line(
+                "toolu_retry",
+                false,
+                "Structured output provided successfully",
+            ),
+        ] {
+            events.extend(reduce(&mut reducer, &line));
+        }
+        assert!(
+            kinds_of_activity(&events).is_empty() && events.is_empty(),
+            "expected neither call nor either result to surface | received: {events:?}"
+        );
+        let end = reduce(
+            &mut reducer,
+            &success_result_with(json!({"structured_output": {"word": "ok"}})),
+        );
+        assert!(
+            matches!(
+                end.as_slice(),
+                [
+                    EventKind::Usage { .. },
+                    EventKind::StructuredOutput { .. },
+                    EventKind::Completed
+                ]
+            ),
+            "expected the retried answer to be delivered once | received: {end:?}"
+        );
+    }
+
+    /// Only the exact tool name is the mechanism: a look-alike is a host's or an MCP server's own
+    /// tool, and hiding it would hide work the user should see.
+    #[test]
+    fn other_tools_keep_their_activity_beside_a_structured_output_call() {
+        let mut reducer = TurnReducer::new();
+        let mut events = Vec::new();
+        for (id, name) in [
+            ("toolu_bash", "Bash"),
+            ("toolu_mcp", "mcp__notes__StructuredOutput"),
+            ("toolu_case", "structuredoutput"),
+            ("toolu_suffix", "StructuredOutput2"),
+            ("toolu_answer", "StructuredOutput"),
+        ] {
+            events.extend(reduce(
+                &mut reducer,
+                &tool_use_line(id, name, &json!({"command": "ls"})),
+            ));
+            events.extend(reduce(&mut reducer, &tool_result_line(id, false, "done")));
+        }
+        let started: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                EventKind::ActivityStarted { activity, .. } => Some(activity.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            started,
+            [
+                "Bash",
+                "mcp__notes__StructuredOutput",
+                "structuredoutput",
+                "StructuredOutput2"
+            ]
+        );
+        let closed = events
+            .iter()
+            .filter(|event| matches!(event, EventKind::ActivityCompleted { .. }))
+            .count();
+        assert_eq!(
+            closed, 4,
+            "expected every other call to close | received: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_success_without_an_object_answer_adds_no_event() {
+        for extra in [
+            json!({}),
+            json!({"structured_output": null}),
+            json!({"structured_output": "{\"word\":\"ok\"}"}),
+            json!({"structured_output": [1, 2]}),
+            json!({"result": "{\"word\":\"ok\"}"}),
+        ] {
+            let events = reduce_all(&[success_result_with(extra.clone())]);
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [EventKind::Usage { .. }, EventKind::Completed]
+                ),
+                "expected usage and completion only for {extra} | received: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_answer_on_a_failed_result_is_not_delivered() {
+        let failed = json!({"type": "result", "subtype": "error_during_execution",
+                            "is_error": true, "errors": ["The run failed."],
+                            "structured_output": {"word": "ok"}})
+        .to_string();
+        let events = reduce_all(&[failed]);
+        assert!(
+            matches!(events.as_slice(), [EventKind::Error { .. }]),
+            "expected the failure alone | received: {events:?}"
+        );
+    }
+
+    #[test]
+    fn an_answer_over_the_bound_ends_the_turn_as_one_error_without_the_value() {
+        let bound = mango_external_agents::STRUCTURED_OUTPUT_MAX_BYTES;
+        let value = json!({"word": "CANARY-oversized-".repeat(bound / 16)});
+        let received_bytes = serde_json::to_string(&value)
+            .expect("expected the value to serialise")
+            .len();
+        assert!(received_bytes > bound, "expected a value past the bound");
+        let events = reduce_all(&[success_result_with(json!({"structured_output": value}))]);
+        let [EventKind::Usage { .. }, EventKind::Error { error }] = events.as_slice() else {
+            panic!("expected usage then one error and no completion | received: {events:?}");
+        };
+        assert_eq!(error.code.as_str(), "claude-structured-output-too-large");
+        assert!(
+            error.message.contains(&format!("at most {bound} bytes")),
+            "expected the message to name the bound {bound} | received: {}",
+            error.message
+        );
+        assert!(
+            error
+                .message
+                .contains(&format!("received {received_bytes}")),
+            "expected the message to name the size received | received: {}",
+            error.message
+        );
+        assert!(
+            !error.message.contains("CANARY-oversized"),
+            "expected the value to stay out of the message | received: {}",
+            error.message
+        );
+        assert!(!error.retryable);
+    }
+
+    /// The SDK's documented failure: retries exhausted, with the failed calls hidden before it.
+    #[test]
+    fn exhausted_structured_output_retries_end_the_turn_as_a_named_error() {
+        let mut reducer = TurnReducer::new();
+        let mut events = Vec::new();
+        for line in [
+            tool_use_line("toolu_first", "StructuredOutput", &json!({"word": 7})),
+            tool_result_line("toolu_first", true, "Output does not match required schema"),
+        ] {
+            events.extend(reduce(&mut reducer, &line));
+        }
+        assert!(
+            events.is_empty(),
+            "expected the failed call to stay hidden | received: {events:?}"
+        );
+
+        let silent = json!({"type": "result", "subtype": "error_max_structured_output_retries",
+                            "is_error": true})
+        .to_string();
+        let explained = json!({"type": "result", "subtype": "error_max_structured_output_retries",
+                               "is_error": true, "errors": ["Failed after 5 attempts."]})
+        .to_string();
+        for (label, line, message) in [
+            (
+                "without an explanation",
+                silent,
+                "Claude Code ended the turn with \"error_max_structured_output_retries\".",
+            ),
+            (
+                "with the vendor's own",
+                explained,
+                "Failed after 5 attempts.",
+            ),
+        ] {
+            let received = reduce_all(&[line]);
+            let [EventKind::Error { error }] = received.as_slice() else {
+                panic!("expected one error {label} | received: {received:?}");
+            };
+            assert_eq!(
+                error.code.as_str(),
+                "claude-error_max_structured_output_retries",
+                "expected the subtype in the code {label}"
+            );
+            assert_eq!(error.message, message, "expected the message {label}");
+        }
     }
 }
