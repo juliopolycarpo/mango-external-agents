@@ -272,7 +272,7 @@ async fn a_flag_shaped_value_after_a_known_flag_is_counted_and_never_named() {
     let shapes = cli.refused_launch_shapes();
     assert_eq!(
         shapes,
-        vec!["claude with 4 arguments: flags --model, --session-id; 1 values redacted".to_owned()],
+        vec!["claude with 4 arguments: flags --model, --session-id; 1 value redacted".to_owned()],
         "expected a flag-shaped value to be counted, not named | received: {shapes:?}"
     );
 }
@@ -318,6 +318,40 @@ async fn a_known_flag_name_after_a_valueless_flag_or_an_equals_value_is_named() 
                 .to_owned()
         ],
         "expected no word skipped after a valueless flag, an = value or a trailing flag | received: {shapes:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_single_left_out_value_reads_in_the_singular() {
+    let cli = FakeClaudeCli::new();
+    let words = ["claude", "--model", "sk-ant-canary-argument"];
+
+    refusal(cli.spawn(launch(&words)).await, &words);
+
+    let shapes = cli.refused_launch_shapes();
+    assert_eq!(
+        shapes,
+        vec!["claude with 3 arguments: flags --model; 1 value redacted".to_owned()],
+        "expected the singular `1 value redacted` for one left-out argument | received: {shapes:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_program_with_no_arguments_reads_in_the_singular() {
+    let cli = FakeClaudeCli::new();
+    let words = ["claude"];
+
+    let message = refusal(cli.spawn(launch(&words)).await, &words);
+
+    let shapes = cli.refused_launch_shapes();
+    assert_eq!(
+        shapes,
+        vec!["claude with 1 argument: no flags; 0 values redacted".to_owned()],
+        "expected the singular `1 argument` for a bare program | received: {shapes:?}"
+    );
+    assert!(
+        message.contains("(1 argument);"),
+        "expected the refusal error to count `(1 argument)` | received: {message}"
     );
 }
 
