@@ -77,9 +77,9 @@ Redacted whatever the value type:
   fields, so a parameter called `type`, `id` or `role` loses its value too. Numbers and booleans
   there are replaced as well, by `0` and `false`: an account number, an amount or a flag over a
   customer's data is the author's, and the replacement keeps the field's type where a `[REDACTED]`
-  string would not. A `null` stays. The names stay. A string or an object under a name no review
-  lists is still reported as below, unless it is a direct key of the map, which the key line below lists (the structural names and `model` are the
-  exception, since the recorder already knows them); a number or boolean under one is replaced and not reported. The
+  string would not. A `null` stays. The names stay. A string, number, boolean or object under a name no review
+  lists is reported as below, unless it is a direct key of the map, which the key line below lists
+  (the structural names and `model` are the exception, since the recorder already knows them). The
   same call's arguments also sit under `input` and `wire_tool_inputs`, which keep their numbers
   as the model's answer, so this rule removes them from `tool_input` only. A `tool_use_result` recorded before this rule keeps a vendor string such as
   `"type": "text"` and its numbers (`numLines`, `totalLines`); the committed transcripts are
@@ -118,7 +118,7 @@ Retained on purpose:
 
 The by-name rules only know the shapes seen at the pinned Claude Code, so a later release can add a
 member that is redacted without anyone noticing. After it writes the transcript (qualified,
-`.unqualified` or `.partial`), `mea capture` prints up to four lines to stderr:
+`.unqualified` or `.partial`), `mea capture` prints up to five lines to stderr:
 
 - `members replaced by the deny-by-default rule`: members of a `system/init` or `rate_limit_event`
   record outside its allow-list, and `by_type`, that the committed transcripts do not already show.
@@ -128,10 +128,20 @@ member that is redacted without anyone noticing. After it writes the transcript 
 - `members not seen before, their numbers, booleans and objects kept`: members whose number,
   boolean or object the recorder kept and that `REVIEWED_RETAINED_MEMBERS` does not list. An array
   is judged by the member that holds it. A number or boolean under `tool_input` or
-  `tool_use_result` is replaced, so it is never listed here; an object below the direct keys still is. A key under `modelUsage` is a model id and is not a name.
+  `tool_use_result` is replaced, so it is never listed here and has its own line below; an object
+  below the direct keys still is listed here. A key under `modelUsage` is a model id and is not a
+  name.
   A `mea` test replays the committed `fixtures/claude/transcripts/` through the recorder and fails
-  when any of the three lists is incomplete for them, so the lists stay in step with what the
+  when any of the three lists, or the replaced-numbers line, names a member for them, so the lists stay in step with what the
   fixtures show.
+- `members not seen before, their numbers and booleans replaced`: members whose number or boolean
+  the recorder replaced by `0` or `false` inside `tool_input` or `tool_use_result`, below the
+  direct keys, and that `REVIEWED_RETAINED_MEMBERS` does not list (its `Leaf` names, such as
+  `numLines`, are the vendor's number members). Only the name is printed, never the value, so a
+  numeric field a later Claude Code adds to a built-in result is named even though its figure is
+  gone. An answer's own `tool_input` property keeps its numbers and is not reported. A direct key
+  is on the key line below, whatever its value, and a key under `modelUsage` is a model id and is
+  not a name.
 - `keys inside user-chosen maps, written to the transcript as given`: the direct keys of a member
   that `REVIEWED_RETAINED_MEMBERS` declares `UserChosen`, today `tool_input` (the parameters of a
   tool call that a tool author named) and `tool_use_result` (the tool's output). A key there is
