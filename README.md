@@ -67,6 +67,7 @@ host can log or route one without matching on what happened first.
 - [`docs/contracts.md`](docs/contracts.md): public API shapes, identities and compatibility
 - [`docs/vendor-fields.md`](docs/vendor-fields.md): vendor field mappings and their test evidence
 - [`docs/vendor-drift.md`](docs/vendor-drift.md): detecting and qualifying vendor changes
+- [`docs/acp-convergence.md`](docs/acp-convergence.md): where Claude Code and Codex stand against ACP, and when to converge
 - [`docs/benchmarks.md`](docs/benchmarks.md): benchmark commands and dated measurement receipts
 - [`docs/releasing.md`](docs/releasing.md): library publication and consumer-pin updates
 
