@@ -16,7 +16,9 @@ SELECTIONS = {
     "acp": ["cursor/contract", "grok/contract", "opencode/contract"],
 }
 # The recorders write these beside a replay fixture: an incomplete run and a completed run that
-# failed qualification. They are diagnostics, so a stray one must never reach a published crate.
+# failed qualification. They are diagnostics, so a stray one must never reach a published crate. `mea`'s
+# `claude_transcript::packaging` test reads this tuple and the `transcripts/*.jsonl` glob above and
+# pins them to the names the Claude recorder writes.
 DIAGNOSTIC_SUFFIXES = (".partial.jsonl", ".unqualified.jsonl")
 
 

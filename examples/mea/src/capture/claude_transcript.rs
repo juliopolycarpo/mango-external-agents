@@ -33,6 +33,27 @@ use crate::redact::{self, Paths};
 /// The scenario that asks Claude Code for an answer under a host-supplied JSON Schema.
 pub const STRUCTURED_OUTPUT: &str = "structured-output";
 
+/// The directory under the capture root a recording is written to.
+const TRANSCRIPTS_DIRECTORY: &str = "transcripts";
+
+/// What follows the scenario name in a qualified recording, the replay fixture.
+const QUALIFIED_SUFFIX: &str = ".jsonl";
+
+/// What follows the scenario name in the diagnostic a failed conversation leaves.
+const PARTIAL_SUFFIX: &str = ".partial.jsonl";
+
+/// What follows the scenario name in the diagnostic a conversation without the scenario's
+/// evidence leaves.
+const UNQUALIFIED_SUFFIX: &str = ".unqualified.jsonl";
+
+/// The file a scenario's recording lands in for `suffix`, beside its siblings.
+///
+/// `scripts/package-fixtures.py` selects `transcripts/*.jsonl` for the published crate and skips the
+/// two diagnostic suffixes; `claude_transcript::packaging` pins these names against that script.
+fn output_name(scenario: &str, suffix: &str) -> String {
+    format!("{scenario}{suffix}")
+}
+
 /// One scripted Claude conversation.
 struct Scenario {
     /// The file stem it is written to, under `transcripts/`.
@@ -168,7 +189,7 @@ async fn claude_with(
     if let Some(model) = model {
         mango_agent_claude::models::validate_model(model)?;
     }
-    let directory = out_dir.join("transcripts");
+    let directory = out_dir.join(TRANSCRIPTS_DIRECTORY);
     std::fs::create_dir_all(&directory).map_err(|error| Error::HostConfiguration {
         expected: "a writable fixture directory",
         received: error.to_string(),
@@ -224,9 +245,9 @@ async fn claude_with(
         notices.notice(&primary_failure_line(scenario.name, primary));
     });
 
-    let partial = directory.join(format!("{}.partial.jsonl", scenario.name));
-    let unqualified = directory.join(format!("{}.unqualified.jsonl", scenario.name));
-    let qualified = directory.join(format!("{}.jsonl", scenario.name));
+    let partial = directory.join(output_name(scenario.name, PARTIAL_SUFFIX));
+    let unqualified = directory.join(output_name(scenario.name, UNQUALIFIED_SUFFIX));
+    let qualified = directory.join(output_name(scenario.name, QUALIFIED_SUFFIX));
     let terminal = match outcome {
         Ok(terminal) => terminal,
         Err(error) => {
@@ -1147,5 +1168,7 @@ impl ByteSource for EndedStdout {
     }
 }
 
+#[cfg(test)]
+mod packaging;
 #[cfg(test)]
 mod tests;
