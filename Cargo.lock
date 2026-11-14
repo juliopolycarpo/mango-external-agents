@@ -756,11 +756,14 @@ name = "mango-agent-codex"
 version = "0.8.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "mango-external-agents",
  "ring",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

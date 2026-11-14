@@ -1077,13 +1077,89 @@ reported only by a full read, so a sparse update leaves the last read's in place
 
 ## Transports
 
-`stdio` only. The app-server also offers `--listen ws://IP:PORT` and a unix socket. OpenAI's
-[app-server documentation][app-server] (read 2026-09-30) lists the first as "websocket (--listen
-ws://IP:PORT, experimental and unsupported)" and says: "The app-server command and WebSocket
-transport are experimental and aren’t supported for production workloads." Declaring it would
-invite hosts to build on a surface the vendor does not support for production. The unix socket is
-the later opportunity; an undeclared transport is refused as `Error::UnsupportedTransport` before
-anything is spawned.
+`stdio` is the default and the only transport that spawns a process. The harness also declares
+`unix-socket`: it attaches to an app-server the host already runs, over that server's Unix socket.
+`ws://` stays undeclared. Any other pair is refused as `Error::UnsupportedTransport` before
+anything is spawned or dialled.
+
+OpenAI's [app-server documentation][app-server] (read 2026-11-13; `developers.openai.com/codex/app-server`
+redirects there) lists three local transports:
+
+> - `stdio` (`--listen stdio://`, default): newline-delimited JSON (JSONL).
+> - `websocket` (`--listen ws://IP:PORT`, experimental and unsupported): one JSON-RPC message per
+>   WebSocket text frame.
+> - Unix socket (`--listen unix://` or `--listen unix://PATH`): WebSocket connections over Codex’s
+>   default app-server control socket or a custom Unix socket path, using the standard HTTP Upgrade
+>   handshake.
+
+The page labels only the `ws://` listener ("WebSocket transport is experimental and unsupported"),
+and the Unix socket line carries no such label, which is why one is declared and the other is not.
+The sentence the 2026-09-30 read quoted, "The app-server command and WebSocket transport are
+experimental and aren’t supported for production workloads", is no longer on the page. The
+0.167.2 `codex app-server --help` still describes the command as "[experimental]", so this
+transport follows a documented surface of a command OpenAI has not declared stable.
+
+### Attaching over the Unix socket
+
+```rust,no_run
+# async fn example(host: &mango_external_agents::HostContext) -> mango_external_agents::Result<()> {
+use mango_agent_codex::CodexHarness;
+use mango_external_agents::{Harness, OpenSession, TransportKind};
+
+let harness = CodexHarness::new().with_unix_socket("/run/user/1000/codex/app-server.sock");
+let request = OpenSession::new("chat-1").over_transport(TransportKind::UnixSocket);
+let session = harness.open_session(host, request).await?;
+# let _ = session;
+# Ok(())
+# }
+```
+
+The transport needs Unix and this crate's `unix-socket` feature, which forwards the core's feature
+of the same name and pulls the WebSocket handshake without a TLS stack. Elsewhere `TRANSPORTS`
+holds `stdio` alone, so the request above is refused as `UnsupportedTransport`. The documented
+surface has no Windows equivalent.
+
+- **The host owns the server and the path.** The library never starts `codex app-server`, its
+  `daemon` subcommand or its `proxy`, and takes no default control-socket path: the host passes the
+  socket it started or discovered. The path must be absolute and fit `sockaddr_un` (107 bytes on
+  Linux, 103 elsewhere); a symlink works, and its own path is the one measured. No error or `Debug`
+  line carries the path.
+- **The upgrade.** The harness connects, sends `GET / HTTP/1.1` with `Host: localhost` and the
+  standard WebSocket upgrade headers, and speaks the same JSON-RPC dialect as stdio, one message per
+  text frame. A 0.167.2 server accepted that request with `101 Switching Protocols`, and answered
+  the same for other targets and hosts, so the fixed values are not load-bearing there.
+- **No token.** The harness presents no credential. A `401` or `403` on the upgrade is refused as
+  `Error::HostConfiguration`, the same as a missing path. The documented `--ws-auth` flags belong
+  to the `ws://` listener and are not driven. Login state still comes from `account/read` during
+  the handshake: a signed-out server is `Error::AuthRequired`, as over stdio.
+- **No spawn, no local gate.** Nothing is launched, so `refuse_outdated_before_spawn` does not run
+  and the local `codex` binary says nothing about the server. The version floor applies to the
+  `userAgent` in the server's own `initialize` answer, as the second line of defence does over
+  stdio. A receipt in `OpenSession::discovery` is checked against the effective transport and not
+  used to skip a probe.
+- **Closing detaches.** `close` sends the native `turn/interrupt` when a turn is running, closes
+  the connection, and leaves the server and any thread it holds running. The session's process
+  control is an `AttachedPeer`: no pid, no stderr, `kill` sends nothing, and `wait` resolves when
+  the connection ended, whether this side closed it or the server went away. A server that
+  disappears mid-turn fails the turn with `connection-terminated`, as a dead child does, and the
+  message reports an unknown exit code.
+- **A turn may outlive its session.** Over stdio, reaping the child guarantees a running turn
+  stops. Here the only lever is the native `turn/interrupt`, sent before the disconnect and bounded
+  by `kill_grace`. When the server does not acknowledge it in that bound, or a `cancel` escalates
+  past `cancel_settle_timeout` because the turn never ended, the session still disconnects, and the
+  host's server may keep running that turn. The turn's stream reports `Cancelled` with the reason
+  either way; it records what this side did, not what the server did next.
+- **Limits.** Connect plus upgrade is bounded by `Limits::request_timeout`; a server that accepts
+  and never answers is `Error::Timeout`. Messages are capped at `Limits::line.max_line_bytes`
+  after decoding, so the reducer's three-times bound is never the one that binds on this transport.
+- **Refusal shapes.** A missing path, a path that is relative or too long, and a `401` or `403` are
+  `Error::HostConfiguration`. A socket nobody listens on is `Error::Link` naming the
+  `io::ErrorKind`. Each is raised before `thread/start`, so each carries `Dispatch::NotSubmitted`.
+- **Scope.** Only `open_session` attaches. `probe`, `discover` and `list_native_sessions` still run
+  the `codex` executable over stdio and need it installed.
+
+Not driven: `ws://`, `--listen off`, the vendor's default control-socket path resolution, and
+`--remote` (a client option of the `codex` CLI, not of the app-server).
 
 ## MCP
 
@@ -1291,7 +1367,8 @@ The [crate README](../crates/mango-agent-codex/README.md#host-tests) describes t
 
 ## Known gaps
 
-- No websocket or unix-socket transport (see above).
+- No `ws://` transport, which the vendor labels experimental and unsupported, and the Unix socket
+  attaches sessions only: `probe`, `discover` and `list_native_sessions` stay on stdio (see above).
 - Subagent attribution has pinned schema evidence but no authenticated replay capture yet.
 - Claude-style plan structure has no counterpart; `plan` is freeform text at this pin.
 - `PermissionLevel` sends `AskForApproval::Never` (`never`) for read-only/full access and

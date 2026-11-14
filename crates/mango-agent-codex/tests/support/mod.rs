@@ -186,6 +186,19 @@ impl Transcript {
         }
     }
 
+    /// The replay as a function: one frame the library wrote in, the lines the server answers with
+    /// out.
+    ///
+    /// The same matching [`Self::as_process`] uses, for a peer that is not a child process, such
+    /// as a fake app-server listening on a socket. The greeting is not part of it: the caller
+    /// sends [`Self::greeting`] when its transport has a moment to.
+    pub fn responder(&self) -> impl FnMut(&str) -> Vec<String> + Send + 'static {
+        let mut replay = Replay {
+            remaining: self.steps.iter().cloned().collect(),
+        };
+        move |line| replay.answer(line)
+    }
+
     /// A fake child that replays this transcript.
     ///
     /// Matched by method rather than by position, so a harness that asks the same questions in a
@@ -209,19 +222,14 @@ impl Transcript {
         &self,
         intercept: impl Fn(&Value) -> Option<Vec<String>> + Send + Sync + 'static,
     ) -> FakeProcess {
-        let script = Arc::new(Mutex::new(Replay {
-            remaining: self.steps.iter().cloned().collect(),
-        }));
+        let script = Arc::new(Mutex::new(self.responder()));
         FakeProcess::responding(move |line| {
             if let Ok(frame) = serde_json::from_str::<Value>(line)
                 && let Some(answers) = intercept(&frame)
             {
                 return answers;
             }
-            script
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .answer(line)
+            (script.lock().unwrap_or_else(PoisonError::into_inner))(line)
         })
         .with_greeting(self.greeting.iter().map(Value::to_string))
     }
@@ -416,6 +424,30 @@ mod tests {
             received: Vec::new(),
         };
         assert_eq!(step.method(), Some("thread/start"));
+    }
+
+    /// The responder matches by method, answers under the id the call arrived with, and has
+    /// nothing for a method the recording does not contain.
+    #[test]
+    fn the_responder_answers_by_method_under_the_callers_id() {
+        let transcript = Transcript {
+            steps: vec![Step {
+                sent: json!({"id": 0, "method": "thread/start", "params": {}}),
+                received: vec![json!({"id": 0, "result": {"thread": {"id": "t"}}})],
+            }],
+            greeting: Vec::new(),
+        };
+        let mut respond = transcript.responder();
+
+        assert!(
+            respond(r#"{"id":4,"method":"turn/start","params":{}}"#).is_empty(),
+            "expected nothing for a method the recording does not hold"
+        );
+        let answers = respond(r#"{"id":9,"method":"thread/start","params":{}}"#);
+        assert_eq!(
+            answers,
+            vec![json!({"id": 9, "result": {"thread": {"id": "t"}}}).to_string()]
+        );
     }
 
     #[test]
