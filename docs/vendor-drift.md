@@ -43,6 +43,13 @@ compares both its `fixtures/codex/contract/` public app-server capture and the g
 inventory; the version pin by itself is not a schema drift report. Pull-request jobs do not create,
 edit, or close issues.
 
+Each public contract records the CLI's own `--help` text next to its version, so a vendor surface
+change reads as a diff. Claude records `claude --help` (`help.txt` plus the parsed `cli-surface.json`).
+Codex records `codex --help` and `codex app-server --help` (`help.txt`, `app-server-help.txt`),
+verbatim and unparsed. A new subcommand, a native ACP mode, or a changed `--listen` transport list
+fails the Codex latest-contract job and opens the managed `drift(codex)` issue. The probes are
+read-only, need no login and spawn only the CLI the host supplies.
+
 The Claude scheduled lane also checks Anthropic's [headless CLI reference](https://code.claude.com/docs/en/headless)
 for its documented statement that `--bare` is opt-in. A changed or missing statement opens the same
 managed Claude drift issue, because a default flip would change which local configuration a scripted
