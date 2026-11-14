@@ -449,6 +449,32 @@ const ANSWER_MEMBERS: &[&str] = &["input", "structured_output", "wire_tool_input
 /// it.
 const RATE_LIMIT_EVENT_STRUCTURE: &[&str] = &["type", "uuid", "session_id"];
 
+/// The members of a `system/init` record that identify the run or that the reducer reads. The
+/// record carries the user's configuration (`analytics_disabled`, `product_feedback_disabled`, the
+/// output style, the loaded agents, memory and socket paths, fast-mode state) and any account-shaped
+/// member a later Claude Code adds, so every other member is replaced whole and a new one is denied
+/// until it is reviewed here.
+///
+/// What the reducer reads is `session_id`, `model`, `permissionMode`, `capabilities`,
+/// `slash_commands`, `terminal_slash_commands`, `skills` and `plugins`. The string entries inside
+/// those lists still become [`redact::PLACEHOLDER`], so a replay keeps each list's length and not
+/// its names. `cwd` is rewritten to [`redact::FIXTURE_CWD`].
+const INIT_STRUCTURE: &[&str] = &[
+    "type",
+    "subtype",
+    "uuid",
+    "session_id",
+    "cwd",
+    "claude_code_version",
+    "model",
+    "permissionMode",
+    "capabilities",
+    "slash_commands",
+    "terminal_slash_commands",
+    "skills",
+    "plugins",
+];
+
 /// Members that hold a map keyed by a name the user chose, such as a subagent type from their own
 /// agents directory. The keys are the private part, and a map cannot keep its counts without them,
 /// so the whole value is replaced.
@@ -617,6 +643,10 @@ fn redact_value(
             );
             let rate_limit_event =
                 members.get("type").and_then(Value::as_str) == Some("rate_limit_event");
+            // Only the record itself: an object in the model's answer can read `system/init` too.
+            let init_record = member.is_none()
+                && members.get("type").and_then(Value::as_str) == Some("system")
+                && members.get("subtype").and_then(Value::as_str) == Some("init");
             // The keys of a per-model usage map are model ids, which can name an account. Inside
             // the model's answer the keys are the schema's own and stay.
             let model_keyed = !context.answer
@@ -632,7 +662,8 @@ fn redact_value(
                 let key = unused_key(&redacted, key);
                 let denied = is_credential_member(&name)
                     || USER_KEYED_MEMBERS.contains(&name.as_str())
-                    || (rate_limit_event && !RATE_LIMIT_EVENT_STRUCTURE.contains(&name.as_str()));
+                    || (rate_limit_event && !RATE_LIMIT_EVENT_STRUCTURE.contains(&name.as_str()))
+                    || (init_record && !INIT_STRUCTURE.contains(&name.as_str()));
                 // A null carries nothing, so it stays null.
                 let kept = if denied && !value.is_null() {
                     placeholder()

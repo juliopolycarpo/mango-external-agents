@@ -363,6 +363,107 @@ fn a_rate_limit_event_member_this_build_never_saw_is_denied_by_default() {
     );
 }
 
+/// A user-configuration boolean of `system/init` that no member-name rule matches, as Claude Code
+/// 2.1.325 writes it.
+const INIT_CONFIGURATION_FLAGS: [&str; 2] = ["analytics_disabled", "product_feedback_disabled"];
+/// A member of `system/init` this build never had, as a later Claude Code could add.
+const FUTURE_INIT_MEMBER: &str = "futureAccountMember";
+
+/// The error a canary test raises when an init member outside [`INIT_STRUCTURE`] survives: the
+/// received member and value, and the allow-list it should have been inside.
+fn init_member_leak(member: &str, line: &Value) -> String {
+    format!(
+        "expected member {member:?} outside the init allow-list {INIT_STRUCTURE:?} to be \
+         {placeholder:?} | received: {kept}",
+        placeholder = redact::PLACEHOLDER,
+        kept = line[member],
+    )
+}
+
+#[test]
+fn an_init_record_denies_the_user_configuration_booleans() {
+    for member in INIT_CONFIGURATION_FLAGS {
+        // The booleans carry a choice the user made, so a `true` and a `false` are both private.
+        for flag in [true, false] {
+            let line = redacted_record(&json!({"type": "system", "subtype": "init",
+                "session_id": SESSION_ID, member: flag}));
+            assert_eq!(
+                line[member],
+                redact::PLACEHOLDER,
+                "{}",
+                init_member_leak(member, &line)
+            );
+        }
+    }
+}
+
+#[test]
+fn an_init_member_this_build_never_saw_is_denied_by_default() {
+    for value in [
+        json!(true),
+        json!(CANARY_NUMBER),
+        json!(CANARY_TEXT),
+        json!({"seats": 4}),
+    ] {
+        let line = redacted_record(&json!({"type": "system", "subtype": "init",
+            "session_id": SESSION_ID, FUTURE_INIT_MEMBER: value}));
+        assert_eq!(
+            line[FUTURE_INIT_MEMBER],
+            redact::PLACEHOLDER,
+            "{}",
+            init_member_leak(FUTURE_INIT_MEMBER, &line)
+        );
+    }
+    let line = redacted_record(&json!({"type": "system", "subtype": "init",
+        FUTURE_INIT_MEMBER: null}));
+    assert!(
+        line[FUTURE_INIT_MEMBER].is_null(),
+        "expected null, which carries nothing, to stay null | received: {line}"
+    );
+}
+
+#[test]
+fn an_init_record_keeps_the_members_the_reducer_reads() {
+    let line = redacted_record(&json!({"type": "system", "subtype": "init",
+        "uuid": "58aa4f96-663d-4513-8b37-2ba65beb3743", "session_id": SESSION_ID,
+        "cwd": "/somewhere/else", "model": "claude-sonnet-5", "permissionMode": "plan", "claude_code_version": "2.1.325",
+        "slash_commands": ["review", "compact"], "skills": ["review"],
+        "terminal_slash_commands": ["compact"], "capabilities": ["msg_lifecycle_v1"],
+        "plugins": [{"name": "code-review"}],
+        "analytics_disabled": false, "output_style": "default", "tools": ["Bash"]}));
+
+    for member in INIT_STRUCTURE {
+        assert!(
+            !line[member].is_null(),
+            "expected allow-listed member {member:?} to be kept | received: {line}"
+        );
+    }
+    assert_eq!(line["session_id"], SESSION_ID);
+    assert_eq!(line["model"], "claude-sonnet-5");
+    assert_eq!(line["permissionMode"], "plan");
+    assert_eq!(
+        line["slash_commands"],
+        json!([redact::PLACEHOLDER, redact::PLACEHOLDER]),
+        "expected the command catalog to keep its length, which the reducer counts"
+    );
+    for member in ["analytics_disabled", "output_style", "tools"] {
+        assert_eq!(
+            line[member],
+            redact::PLACEHOLDER,
+            "{}",
+            init_member_leak(member, &line)
+        );
+    }
+}
+
+#[test]
+fn an_init_member_name_outside_a_system_init_record_is_not_denied_by_the_allow_list() {
+    let line = redacted_record(&json!({"type": "system", "subtype": "status",
+        "analytics_disabled": false, "num_turns": 1}));
+    assert_eq!(line["analytics_disabled"], false);
+    assert_eq!(line["num_turns"], 1);
+}
+
 #[test]
 fn plan_usage_in_a_record_other_than_a_rate_limit_event_is_redacted_by_member_name() {
     let line = redacted_record(&json!({"type": "result", "subtype": "success",
@@ -619,11 +720,10 @@ fn a_line_keeps_its_protocol_structure_and_loses_what_the_machine_and_model_wrot
     assert_eq!(init["cwd"], redact::FIXTURE_CWD);
     assert_eq!(
         init["tools"],
-        json!([redact::PLACEHOLDER, redact::PLACEHOLDER]),
-        "expected the tool list, which names the user's servers, to lose its entries"
+        redact::PLACEHOLDER,
+        "expected the tool list, which names the user's servers, to be replaced whole"
     );
-    assert_eq!(init["mcp_servers"][0]["name"], redact::PLACEHOLDER);
-    assert_eq!(init["mcp_servers"][0]["status"], redact::PLACEHOLDER);
+    assert_eq!(init["mcp_servers"], redact::PLACEHOLDER);
     assert_eq!(init["apiKeySource"], redact::PLACEHOLDER);
     assert_eq!(
         init["permissionMode"], "default",
@@ -666,8 +766,10 @@ fn an_absolute_local_path_never_reaches_a_redacted_line() {
         .join("symlink-resolved-workspace")
         .display()
         .to_string();
+    // Not an init record: that one replaces `paths` and `memory_paths` whole, and this test is
+    // about the rewrite of the members a record keeps.
     let line = json!({
-        "type": "system", "subtype": "init",
+        "type": "system", "subtype": "status",
         // Not the workspace string the recorder was given, as a symlinked workspace reads.
         "cwd": spelling_the_cli_resolved,
         "session_id": "b01414e7-4b4b-43a2-9109-a33e21664340",

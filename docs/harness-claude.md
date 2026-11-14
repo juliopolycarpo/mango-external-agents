@@ -186,9 +186,10 @@ qualified file, and a later qualified run removes them.
 
 Redaction keeps wire structure and drops what a machine, a model or an account wrote: strings
 outside a short structural list, credential, account and plan-usage members, the whole body of a
-`rate_limit_event` beyond its ids, and the capture's own paths. Per-turn usage, cost and timing
-survive, because they describe the turn and not the plan. The exact retained and redacted lists are
-in [the fixtures README](../fixtures/README.md#what-a-claude-transcript-retains-and-redacts) and are
+`rate_limit_event` beyond its ids, every `system/init` member the reducer does not read, and the
+capture's own paths. Per-turn usage, cost and timing survive, because they describe the turn and
+not the plan. The exact retained and redacted lists are in
+[the fixtures README](../fixtures/README.md#what-a-claude-transcript-retains-and-redacts) and are
 not repeated here.
 
 ## The surface driven
