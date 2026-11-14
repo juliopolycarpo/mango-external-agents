@@ -63,7 +63,7 @@ fn sha256(bytes: &[u8]) -> String {
 ///
 /// # Examples
 ///
-/// `manifests(Path::new("fixtures"))` returns the four committed capture manifests.
+/// `manifests(Path::new("fixtures"))` returns every committed capture manifest.
 ///
 /// # Errors
 ///
@@ -431,7 +431,7 @@ mod tests {
         );
     }
 
-    /// The tree check. It names the four committed manifests rather than whatever a walk happens
+    /// The tree check. It names the committed manifests rather than whatever a walk happens
     /// to find: a walk that finds nothing would otherwise pass while proving nothing.
     #[test]
     fn every_committed_capture_declares_the_digest_of_every_file_beside_it() {
@@ -449,6 +449,8 @@ mod tests {
             .collect();
 
         for known in [
+            "acp/claude-agent-acp/contract/manifest.json",
+            "acp/codex-acp/contract/manifest.json",
             "acp/opencode/contract/manifest.json",
             "claude/contract/manifest.json",
             "claude/historical/contract/manifest.json",

@@ -1,0 +1,40 @@
+{
+  "protocolVersion": 1,
+  "agentCapabilities": {
+    "promptCapabilities": {
+      "image": true,
+      "embeddedContext": true
+    },
+    "mcpCapabilities": {
+      "http": true,
+      "sse": true
+    },
+    "auth": {
+      "logout": {},
+      "status": {}
+    },
+    "providers": {},
+    "loadSession": true,
+    "sessionCapabilities": {
+      "additionalDirectories": {},
+      "close": {},
+      "delete": {},
+      "fork": {},
+      "list": {},
+      "options": {},
+      "resume": {},
+      "status": {},
+      "systemPrompt": {
+        "mode": {
+          "override": {}
+        }
+      },
+      "title": {}
+    }
+  },
+  "authMethods": [],
+  "agentInfo": {
+    "name": "@agentclientprotocol/claude-agent-acp",
+    "version": "0.107.0"
+  }
+}
