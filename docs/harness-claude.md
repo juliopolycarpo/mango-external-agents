@@ -956,8 +956,10 @@ transcript recorder), not a fixture.
 Vendor documents followed: [headless: get structured output](https://code.claude.com/docs/en/headless#get-structured-output), which names
 `structured_output` and says a run without valid output has no such field, and [Agent SDK: structured outputs](https://code.claude.com/docs/en/agent-sdk/structured-outputs), which documents
 the `StructuredOutput` tool call, a `tool_result` with `is_error: true` on a mismatch followed by a
-retry, and the `error_max_structured_output_retries` result subtype. The retry and failure shapes
-below come from those documents; they were not observed.
+retry, and the `error_max_structured_output_retries` result subtype. A later run at 2.1.325 with an
+unsatisfiable schema observed the `is_error: true` mismatch and a `success` `result` with no
+`structured_output` (see "No answer" below). The retried success and the
+`error_max_structured_output_retries` subtype come from those documents and were not observed.
 
 What the reducer does with it:
 
@@ -967,19 +969,27 @@ What the reducer does with it:
   as a single `claude-structured-output-too-large` error in place of `Completed`, naming the bound
   and the size received and never the value. The value stays out of the error message.
 - **Delivered once.** The `result` string repeats the value and is never emitted as assistant text.
-- **No answer.** A success `result` with no `structured_output`, or one that is not an object, emits
-  nothing extra and no error: the vendor documents that as a run without valid output, so a host
-  that asked for a schema must treat a `Completed` with no `StructuredOutput` as a failed run.
+- **No answer.** On a harness built with `with_json_schema`, a `result` that is not `is_error` and
+  carries no `structured_output` that is a JSON object ends the turn as an `Error` coded
+  `claude-structured-output-missing` in place of `Completed`. The Agent SDK's "Error handling"
+  section treats a success subtype without `structured_output` as a failure. Measured at 2.1.325
+  with the harness argv and an unsatisfiable schema (`n` with `minimum: 10`, `maximum: 5`): two
+  `StructuredOutput` calls came back `is_error: true`, the model answered in prose, and the
+  `result` was `subtype: success`, `is_error: false`, `terminal_reason: completed`, with the prose
+  in `result` and no `structured_output`. The message names the subtype received (a documented
+  one, else a fixed label), what `structured_output` was (`absent`, `null`, `a boolean`, `a number`,
+  `a string` or `an array`) and the shape expected, a JSON object. It never carries the `result`
+  prose or any value. A harness without a schema is unchanged: the same record completes.
 - **The tool call is hidden.** `StructuredOutput` is the mechanism that carries the answer, not a
   step the agent chose, so the exact tool name opens no activity. Its `tool_use`, its `tool_result`,
   a retried call and an `is_error: true` result are all skipped. Another tool, including
   `mcp__x__StructuredOutput`, is an ordinary activity.
-- **Retries exhausted.** A `result` with `is_error: true` and subtype
-  `error_max_structured_output_retries` ends the turn as an `Error` with code
-  `claude-error_max_structured_output_retries`. Its message is the vendor's own `errors` text, or
-  `Claude Code ended the turn with "error_max_structured_output_retries".` when there is none. Whether
-  the vendor sets `is_error` for that subtype was not observed, and the reducer keys on `is_error`
-  alone.
+- **Retries exhausted.** A `result` with subtype `error_max_structured_output_retries` ends the
+  turn as an `Error` with code `claude-error_max_structured_output_retries`, with `is_error` true
+  or false and with or without a schema on the harness. Its message is the vendor's own `errors`
+  text, or `Claude Code ended the turn with "error_max_structured_output_retries".` when there is
+  none. Whether the vendor sets `is_error` for that subtype was not observed, so the reducer does
+  not depend on it.
 - **A full queue fails the turn.** At the end of a run, the usage is dropped behind a close the
   queue had no room for. The answer is not: it is sent anyway and, with no space, the turn fails as
   `stream-overflow` rather than completing without it.

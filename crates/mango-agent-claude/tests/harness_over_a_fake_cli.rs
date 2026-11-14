@@ -2327,6 +2327,101 @@ mod a_turn {
         );
     }
 
+    /// A `--json-schema` turn on Claude Code 2.1.325 with an unsatisfiable schema (`n` with
+    /// `minimum: 10`, `maximum: 5`) as it streamed (#382), reduced to the members the harness reads
+    /// and replayed as inline lines. Two `StructuredOutput` calls come back `is_error: true`, the
+    /// model gives up in prose, and the `result` is `success` with no `structured_output`.
+    fn unsatisfiable_schema_turn_lines(prose: &str) -> Vec<String> {
+        [
+            serde_json::json!({"type": "system", "subtype": "init",
+                "session_id": "b01414e7-4b4b-43a2-9109-a33e21664340", "model": "claude-sonnet-5"}),
+            serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_first", "name": "StructuredOutput",
+                 "input": {"n": 7}}]}}),
+            serde_json::json!({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_first", "is_error": true,
+                 "content": "Output does not match required schema: /n: must be <= 5"}]}}),
+            serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_second", "name": "StructuredOutput",
+                 "input": {"n": 7}}]}}),
+            serde_json::json!({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_second", "is_error": true,
+                 "content": "Output does not match required schema: /n: must be >= 10"}]}}),
+            serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": prose}]}}),
+            serde_json::json!({"type": "result", "subtype": "success", "is_error": false,
+                "terminal_reason": "completed", "result": prose,
+                "usage": {"input_tokens": 3, "output_tokens": 5}}),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+    }
+
+    /// A schema turn that ends with no answer is a failed turn, not a completed one, and the
+    /// error carries neither the model's prose nor any value.
+    #[tokio::test]
+    async fn a_schema_turn_without_an_answer_ends_as_an_error_not_completed() {
+        let schema =
+            r#"{"properties":{"n":{"maximum":5,"minimum":10,"type":"integer"}},"type":"object"}"#;
+        let prose = "CANARY-model-prose the schema cannot be satisfied";
+        let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270).with_turn(
+            Run::replaying(&unsatisfiable_schema_turn_lines(prose).join("\n")),
+        ));
+        let session = ClaudeHarness::new()
+            .with_json_schema(schema)
+            .expect("expected a usable schema")
+            .open_session(&host(Arc::clone(&launcher)), OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session");
+
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "Reply with n."))
+            .await
+            .expect("expected a turn");
+        let events = drain(&mut turn).await;
+
+        assert!(
+            !events.contains(&EventKind::Completed),
+            "expected no Completed for a schema turn without an answer | received: {events:?}"
+        );
+        let Some(EventKind::Error { error }) = events.last() else {
+            panic!("expected the turn to end as an Error | received: {events:?}");
+        };
+        assert_eq!(error.code.as_str(), "claude-structured-output-missing");
+        assert!(
+            error
+                .message
+                .contains("received subtype success with structured_output absent"),
+            "expected the message to name the subtype and shape received | received: {}",
+            error.message
+        );
+        assert!(
+            !error.message.contains("CANARY-model-prose"),
+            "expected the result prose to stay out of the message | received: {}",
+            error.message
+        );
+    }
+
+    /// Without a schema the same frames complete: nothing asked for an answer.
+    #[tokio::test]
+    async fn the_same_turn_without_a_schema_completes() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::replaying(
+            &unsatisfiable_schema_turn_lines("plain prose").join("\n"),
+        )));
+        let session = open(&launcher).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "Reply with n."))
+            .await
+            .expect("expected a turn");
+        let events = drain(&mut turn).await;
+        assert_eq!(
+            events.last(),
+            Some(&EventKind::Completed),
+            "expected Completed without a schema | received: {events:?}"
+        );
+    }
+
     /// The catalog the reducer read off `system/init` has to actually reach
     /// [`SessionState`](mango_external_agents::SessionState), not just the `RunInit` the reducer's
     /// own unit tests inspect — this is the wiring `apply_init` is for.

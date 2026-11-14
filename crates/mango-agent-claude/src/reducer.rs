@@ -174,6 +174,9 @@ pub struct TurnReducer {
     open_reasoning_blocks: BTreeSet<u64>,
     /// The most delivered text kept for one block; `None` keeps all of it.
     max_message_bytes: Option<usize>,
+    /// Whether this run was launched with `--json-schema`, so a `result` with no answer is a
+    /// failure and not an ordinary completion.
+    expects_structured_output: bool,
 }
 
 impl fmt::Debug for TurnReducer {
@@ -206,6 +209,7 @@ impl fmt::Debug for TurnReducer {
             )
             .field("open_reasoning_blocks", &self.open_reasoning_blocks.len())
             .field("max_message_bytes", &self.max_message_bytes)
+            .field("expects_structured_output", &self.expects_structured_output)
             .finish()
     }
 }
@@ -226,6 +230,7 @@ impl fmt::Debug for TurnReducer {
 #[must_use]
 pub struct TurnReducerBuilder {
     max_message_bytes: Option<usize>,
+    expects_structured_output: bool,
 }
 
 impl TurnReducerBuilder {
@@ -247,11 +252,24 @@ impl TurnReducerBuilder {
         self
     }
 
+    /// Marks the run as launched with `--json-schema`.
+    ///
+    /// A `result` that is not an error and carries no JSON-object `structured_output` then ends
+    /// the turn as an `Error` coded `claude-structured-output-missing`, where the same record
+    /// completes a run without a schema. The vendor documents a success subtype without
+    /// `structured_output` as a failure of the schema run
+    /// (<https://code.claude.com/docs/en/agent-sdk/structured-outputs>, "Error handling").
+    pub fn expects_structured_output(mut self, expects: bool) -> Self {
+        self.expects_structured_output = expects;
+        self
+    }
+
     /// A reducer for one run.
     #[must_use]
     pub fn build(self) -> TurnReducer {
         TurnReducer {
             max_message_bytes: self.max_message_bytes,
+            expects_structured_output: self.expects_structured_output,
             ..TurnReducer::new()
         }
     }
@@ -286,6 +304,7 @@ impl TurnReducer {
             delivered_by_block: BTreeMap::new(),
             open_reasoning_blocks: BTreeSet::new(),
             max_message_bytes: None,
+            expects_structured_output: false,
         }
     }
 
@@ -304,9 +323,15 @@ impl TurnReducer {
     /// a websocket the limit applies to the decoded message against `max_line_bytes` alone (see
     /// `SocketReceiver::bounded` in the websocket transport), so a websocket transport would need
     /// its own bound rather than this one.
-    pub(crate) fn for_limits(limits: &mango_external_agents::Limits) -> Self {
+    ///
+    /// `expects_structured_output` is whether the session's harness passed `--json-schema`.
+    pub(crate) fn for_limits(
+        limits: &mango_external_agents::Limits,
+        expects_structured_output: bool,
+    ) -> Self {
         let line = &limits.line;
         Self::builder()
+            .expects_structured_output(expects_structured_output)
             .max_message_bytes(
                 line.max_line_bytes
                     .saturating_mul(3)
@@ -753,11 +778,15 @@ impl TurnReducer {
         match result_error(record) {
             Some(error) => events.push(EventKind::Error { error }),
             None => match structured_answer(record) {
-                Ok(answer) => {
+                Ok(Some(answer)) => {
                     // After `Usage` and ahead of the terminal, where the core documents it.
-                    events.extend(answer);
+                    events.push(answer);
                     events.push(EventKind::Completed);
                 }
+                Ok(None) if self.expects_structured_output => events.push(EventKind::Error {
+                    error: structured_answer_missing(record),
+                }),
+                Ok(None) => events.push(EventKind::Completed),
                 Err(error) => events.push(EventKind::Error { error }),
             },
         }
@@ -989,8 +1018,9 @@ const STRUCTURED_OUTPUT_TOOL: &str = "StructuredOutput";
 /// The `--json-schema` answer a successful `result` carries, as the event that delivers it.
 ///
 /// `Ok(None)` when the record has no object-shaped `structured_output`: the run produced no valid
-/// output, and the vendor documents that case as an absent field, so nothing is invented and a
-/// host reads the missing event as a failed schema run. An answer over the core's bound is
+/// output, and the vendor documents that case as an absent field, so nothing is invented. The
+/// caller decides what that means: a failure on a schema run, an ordinary completion otherwise.
+/// An answer over the core's bound is
 /// refused whole, never cut, and ends the turn as an error naming the size received and the bound;
 /// the value stays out of the message.
 ///
@@ -1009,6 +1039,34 @@ fn structured_answer(record: &StreamRecord) -> Result<Option<EventKind>, VendorE
         })
 }
 
+/// The error for a `--json-schema` run whose `result` carries no JSON-object `structured_output`.
+///
+/// The Agent SDK documents a success subtype without `structured_output` as a failure of the
+/// schema run, though the turn itself finished, so it is an `Error` and not a marker. Measured at
+/// Claude Code 2.1.325 with an unsatisfiable schema: two rejected `StructuredOutput` calls, then
+/// `subtype: success`, `is_error: false`, free text in `result` and no `structured_output`. The
+/// message names the subtype and the shape received, from fixed labels, and the shape expected.
+/// Neither the `result` prose nor any value of the record reaches it.
+///
+/// <https://code.claude.com/docs/en/agent-sdk/structured-outputs> ("Error handling")
+fn structured_answer_missing(record: &StreamRecord) -> VendorError {
+    let subtype = match record.subtype() {
+        Some("success") => "success",
+        Some(named) if NAMED_RESULT_SUBTYPES.contains(&named) => named,
+        // The vendor's own string stays out of the text a host shows, as in `result_error`.
+        Some(_) => "an undocumented subtype",
+        None => "no subtype",
+    };
+    VendorError::new(
+        ErrorCode::from_static("claude-structured-output-missing"),
+        format!(
+            "Claude Code ended a --json-schema turn without an answer: expected structured_output \
+             as a JSON object | received subtype {subtype} with structured_output {}.",
+            record.result().structured_output_shape()
+        ),
+    )
+}
+
 /// Whether a `result` record is a failure, and what to call it.
 ///
 /// A run whose only problem was a refused tool is **not** an error: `permission_denials` is
@@ -1017,10 +1075,12 @@ fn structured_answer(record: &StreamRecord) -> Result<Option<EventKind>, VendorE
 /// would blame the user's own permission choice on the vendor.
 fn result_error(record: &StreamRecord) -> Option<VendorError> {
     let result = record.result();
-    if !result.is_error() {
+    let subtype = record.subtype().unwrap_or("error");
+    // Exhausted schema retries are the vendor's documented failure whatever `is_error` says; no
+    // run has been observed to set it false, so the subtype is not left to depend on it.
+    if !result.is_error() && subtype != EXHAUSTED_STRUCTURED_OUTPUT_RETRIES {
         return None;
     }
-    let subtype = record.subtype().unwrap_or("error");
     let terminal_reason = result.terminal_reason();
     let errors = result.error_texts().join("\n");
 
@@ -1080,8 +1140,11 @@ const NAMED_RESULT_SUBTYPES: &[&str] = &[
     "error_during_execution",
     "error_max_turns",
     "error_max_budget_usd",
-    "error_max_structured_output_retries",
+    EXHAUSTED_STRUCTURED_OUTPUT_RETRIES,
 ];
+
+/// The subtype of a `--json-schema` run that used up its retries without a valid answer.
+const EXHAUSTED_STRUCTURED_OUTPUT_RETRIES: &str = "error_max_structured_output_retries";
 
 /// The harness's code for a failed result, from a subtype it recognises.
 ///
@@ -1336,7 +1399,7 @@ mod tests {
             (line(1024, 3 * 1024 * 1024), 3 * 1024),
         ] {
             let block = "x".repeat(block_bytes);
-            let mut reducer = TurnReducer::for_limits(&limits);
+            let mut reducer = TurnReducer::for_limits(&limits, false);
             stream_text(&mut reducer, &[block.as_str()]);
             let completed = reduce(&mut reducer, &completed_line("text", &block));
             assert!(
@@ -1348,7 +1411,7 @@ mod tests {
 
         // Nothing longer than the buffered budget can be read, whatever the line limit says.
         for limits in [line(16, 16), line(4 * 1024 * 1024, 16)] {
-            let mut reducer = TurnReducer::for_limits(&limits);
+            let mut reducer = TurnReducer::for_limits(&limits, false);
             stream_text(&mut reducer, &["seventeen bytes!!"]);
             assert_eq!(
                 reducer.retained_text_capacity(),
@@ -2623,6 +2686,209 @@ mod tests {
                 "expected the subtype in the code {label}"
             );
             assert_eq!(error.message, message, "expected the message {label}");
+        }
+    }
+
+    /// A reducer for a run launched with `--json-schema`.
+    fn schema_reducer() -> TurnReducer {
+        TurnReducer::builder()
+            .expects_structured_output(true)
+            .build()
+    }
+
+    fn reduce_lines(reducer: &mut TurnReducer, lines: &[String]) -> Vec<EventKind> {
+        lines
+            .iter()
+            .flat_map(|line| reduce(reducer, line))
+            .collect()
+    }
+
+    /// Claude Code 2.1.325 with the harness argv and an unsatisfiable schema (`n` with `minimum:
+    /// 10`, `maximum: 5`), reduced to the members the reducer reads: two rejected
+    /// `StructuredOutput` calls, free text, then a `success` `result` with no `structured_output`
+    /// (#382). `prose` is what the model wrote.
+    fn unsatisfiable_schema_turn(prose: &str) -> Vec<String> {
+        vec![
+            tool_use_line("toolu_first", "StructuredOutput", &json!({"n": 7})),
+            tool_result_line(
+                "toolu_first",
+                true,
+                "Output does not match required schema: /n: must be <= 5",
+            ),
+            tool_use_line("toolu_second", "StructuredOutput", &json!({"n": 7})),
+            tool_result_line(
+                "toolu_second",
+                true,
+                "Output does not match required schema: /n: must be >= 10",
+            ),
+            completed_line("text", prose),
+            json!({"type": "result", "subtype": "success", "is_error": false,
+                   "terminal_reason": "completed", "result": prose,
+                   "usage": {"input_tokens": 3, "output_tokens": 5}})
+            .to_string(),
+        ]
+    }
+
+    fn terminal_error(events: &[EventKind]) -> &VendorError {
+        match events.last() {
+            Some(EventKind::Error { error }) => error,
+            other => {
+                panic!("expected the turn to end as an Error | received: {other:?} in {events:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn a_schema_turn_whose_result_has_no_answer_ends_as_an_error_not_completed() {
+        let prose = "CANARY-model-prose I could not satisfy the schema";
+        let mut reducer = schema_reducer();
+        let events = reduce_lines(&mut reducer, &unsatisfiable_schema_turn(prose));
+
+        assert!(
+            !events.contains(&EventKind::Completed),
+            "expected no Completed for a schema turn without an answer | received: {events:?}"
+        );
+        let error = terminal_error(&events);
+        assert_eq!(error.code.as_str(), "claude-structured-output-missing");
+        assert!(
+            !error.retryable,
+            "expected a missing answer not to be retryable"
+        );
+        for expected in ["success", "absent", "JSON object"] {
+            assert!(
+                error.message.contains(expected),
+                "expected the message to name {expected:?} | received: {}",
+                error.message
+            );
+        }
+        assert!(
+            !error.message.contains("CANARY-model-prose"),
+            "expected the vendor result prose to stay out of the message | received: {}",
+            error.message
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EventKind::StructuredOutput { .. })),
+            "expected no answer to be invented | received: {events:?}"
+        );
+    }
+
+    /// The same turn without a schema is an ordinary completion: nothing asked for an answer.
+    #[test]
+    fn a_turn_without_a_schema_completes_when_the_result_has_no_answer() {
+        let mut reducer = TurnReducer::new();
+        let events = reduce_lines(&mut reducer, &unsatisfiable_schema_turn("plain prose"));
+        assert_eq!(
+            events.last(),
+            Some(&EventKind::Completed),
+            "expected Completed without a schema | received: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EventKind::Error { .. })),
+            "expected no Error without a schema | received: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_schema_turn_whose_structured_output_is_not_an_object_names_what_it_was() {
+        for (shape, label) in [
+            ("null", "null"),
+            (r#""CANARY-string-answer""#, "a string"),
+            ("7", "a number"),
+            ("true", "a boolean"),
+            (r#"["CANARY-array-answer"]"#, "an array"),
+        ] {
+            let line = success_result_with(
+                serde_json::from_str(&format!(r#"{{"structured_output":{shape}}}"#))
+                    .expect("expected valid JSON"),
+            );
+            let events = reduce(&mut schema_reducer(), &line);
+            let error = terminal_error(&events);
+            assert_eq!(
+                error.code.as_str(),
+                "claude-structured-output-missing",
+                "expected {shape} to end the turn as an Error | received: {events:?}"
+            );
+            assert!(
+                error.message.contains(label),
+                "expected the message to name {label:?} for {shape} | received: {}",
+                error.message
+            );
+            assert!(
+                !error.message.contains("CANARY"),
+                "expected the value to stay out of the message | received: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn a_schema_turn_with_an_object_answer_still_completes_with_it() {
+        let mut reducer = schema_reducer();
+        let events = reduce_lines(&mut reducer, &structured_answer_turn("expiry"));
+        let usage = mango_external_agents::Usage {
+            input_tokens: Some(3),
+            output_tokens: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(
+            events,
+            vec![
+                EventKind::Usage { usage },
+                EventKind::StructuredOutput {
+                    value: json!({"word": "ok"})
+                },
+                EventKind::Completed,
+            ]
+        );
+    }
+
+    /// A subtype nobody documented is the vendor's own string, so the message labels it rather
+    /// than printing it.
+    #[test]
+    fn the_missing_answer_message_does_not_echo_an_undocumented_subtype() {
+        let line = json!({"type": "result", "subtype": "sk-live-subtype-canary",
+                          "is_error": false})
+        .to_string();
+        let events = reduce(&mut schema_reducer(), &line);
+        let error = terminal_error(&events);
+        assert_eq!(error.code.as_str(), "claude-structured-output-missing");
+        assert!(
+            !error.message.contains("sk-live-subtype-canary"),
+            "expected the subtype to stay out of the message | received: {}",
+            error.message
+        );
+    }
+
+    /// The vendor names the subtype as the failure; whether it also sets `is_error` is
+    /// unobserved, so both are the same error, with or without a schema on the run.
+    #[test]
+    fn exhausted_structured_output_retries_are_an_error_whatever_is_error_says() {
+        for expects in [true, false] {
+            for is_error in [false, true] {
+                let line = json!({"type": "result",
+                                  "subtype": "error_max_structured_output_retries",
+                                  "is_error": is_error,
+                                  "errors": ["Failed after 5 attempts."]})
+                .to_string();
+                let mut reducer = TurnReducer::builder()
+                    .expects_structured_output(expects)
+                    .build();
+                let events = reduce(&mut reducer, &line);
+                let [EventKind::Error { error }] = events.as_slice() else {
+                    panic!(
+                        "expected one Error with is_error {is_error}, schema {expects} | received: {events:?}"
+                    );
+                };
+                assert_eq!(
+                    error.code.as_str(),
+                    "claude-error_max_structured_output_retries"
+                );
+                assert_eq!(error.message, "Failed after 5 attempts.");
+            }
         }
     }
 }
