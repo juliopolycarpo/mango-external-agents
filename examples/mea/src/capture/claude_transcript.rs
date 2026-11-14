@@ -156,6 +156,10 @@ async fn claude_with(
     })?;
 
     println!("capturing claude/{}: {}", scenario.name, scenario.purpose);
+    if schema.is_some() {
+        // stderr, like the failure lines: the operator reads it before the file is committed.
+        eprintln!("{}", verbatim_answer_notice(scenario.name));
+    }
     let discovery = harness.discover(host).await?;
     if let AuthState::LoggedOut { login_hint } = &discovery.auth {
         return Err(Error::HostConfiguration {
@@ -281,6 +285,17 @@ async fn converse(session: &dyn Session, scenario: &Scenario) -> Result<Option<S
             })
         }
     }
+}
+
+/// The one-line notice that a schema capture keeps the model's answer as written.
+///
+/// Redaction cannot hide the answer: its key names and numbers are what qualification and the
+/// replay tests read. So the operator is told, and the schema and the prompt are what must elicit
+/// no real data.
+fn verbatim_answer_notice(scenario: &str) -> String {
+    format!(
+        "claude/{scenario}: the model's answer (key names and numbers) is kept verbatim in the transcript; the schema and prompt must elicit no real data. Review the file before committing"
+    )
 }
 
 /// The line printed when a capture fails and its cleanup fails too: the conversation's own error,

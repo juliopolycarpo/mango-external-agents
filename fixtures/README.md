@@ -84,7 +84,12 @@ Redacted whatever the value type:
 Retained on purpose:
 
 - The key names and numbers of the model's answer. They come from the operator's `--json-schema`
-  and the scripted prompt, so the answer's shape stays for qualification.
+  and the scripted prompt, so the answer's shape stays for qualification. Redaction cannot tell a
+  placeholder from a real figure, so an answer is kept as the model wrote it: a schema or prompt
+  that elicits real data (a balance, an id, a usage count) commits that data. The built-in
+  `structured-output` prompt asks for the word `mango` and the number `1` only; a schema of your
+  own must elicit nothing more. `mea capture` prints a one-line notice to stderr when it records
+  a schema turn; read the file before committing it.
 - `toolu_…` ids, as values and as the keys of `wire_tool_inputs`. They are opaque and random per
   call, the same ids are already kept under `id` and `tool_use_id`, and a call has to pair with its
   result.
