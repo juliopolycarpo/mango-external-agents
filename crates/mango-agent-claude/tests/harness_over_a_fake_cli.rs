@@ -2246,6 +2246,87 @@ mod a_turn {
         );
     }
 
+    /// A `--json-schema` turn as Claude Code 2.1.325 streamed it (#362), reduced to the members the
+    /// harness reads and replayed as inline lines: `mea capture` has no Claude transcript recorder,
+    /// so this is not a fixture.
+    fn schema_turn_lines() -> Vec<String> {
+        let answer = serde_json::json!({"word": "ok"});
+        [
+            serde_json::json!({"type": "system", "subtype": "init",
+                "session_id": "b01414e7-4b4b-43a2-9109-a33e21664340", "model": "claude-sonnet-5"}),
+            serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_answer", "name": "StructuredOutput",
+                 "input": answer}]}}),
+            serde_json::json!({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_answer",
+                 "content": "Structured output provided successfully"}]}}),
+            serde_json::json!({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed"}}),
+            serde_json::json!({"type": "result", "subtype": "success", "is_error": false,
+                "result": answer.to_string(), "structured_output": answer,
+                "credential_expires_at": "CANARY-credential-expiry",
+                "usage": {"input_tokens": 3, "output_tokens": 5}}),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+    }
+
+    /// The whole path a schema turn takes: the argv carries the schema, the stream's tool call is
+    /// not an activity, and the answer arrives after the turn started and before `Completed`.
+    #[tokio::test]
+    async fn a_schema_turn_yields_its_answer_between_the_start_and_the_completion() {
+        // Already in the compact, key-sorted form the harness re-serialises a schema to.
+        let schema = r#"{"properties":{"word":{"type":"string"}},"type":"object"}"#;
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_help(HELP_2_1_270)
+                .with_turn(Run::replaying(&schema_turn_lines().join("\n"))),
+        );
+        let session = ClaudeHarness::new()
+            .with_json_schema(schema)
+            .expect("expected a usable schema")
+            .open_session(&host(Arc::clone(&launcher)), OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session");
+
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "Reply with the word ok."))
+            .await
+            .expect("expected a turn");
+        let events = drain(&mut turn).await;
+
+        let argvs = launcher.turn_argvs();
+        assert_eq!(
+            value_after(&argvs[0], "--json-schema"),
+            Some(schema),
+            "expected the turn's argv to carry the schema | received: {argvs:?}"
+        );
+        let usage = mango_external_agents::Usage {
+            input_tokens: Some(3),
+            output_tokens: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(
+            events,
+            vec![
+                EventKind::TurnStarted {
+                    native_turn_id: String::from("turn-1")
+                },
+                EventKind::Usage { usage },
+                EventKind::StructuredOutput {
+                    value: serde_json::json!({"word": "ok"})
+                },
+                EventKind::Completed,
+            ],
+            "expected the start, the answer and the completion in that order, with no activity"
+        );
+        let written = serde_json::to_string(&events).expect("expected the events to serialise");
+        assert!(
+            !written.contains("CANARY-credential-expiry"),
+            "expected the vendor's credential expiry to stay off every event | received: {written}"
+        );
+    }
+
     /// The catalog the reducer read off `system/init` has to actually reach
     /// [`SessionState`](mango_external_agents::SessionState), not just the `RunInit` the reducer's
     /// own unit tests inspect — this is the wiring `apply_init` is for.
