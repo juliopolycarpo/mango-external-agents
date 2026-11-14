@@ -714,6 +714,11 @@ mod tests {
     fn the_turn_flag_names_are_exactly_the_flags_build_can_emit() {
         let schema = r#"{"type":"object"}"#;
         let efforts = [String::from("high")];
+        // `/tmp/...` is not absolute on Windows, so the path comes from the host's temp dir.
+        let mcp_path = std::env::temp_dir().join("servers.json");
+        let mcp_path = mcp_path
+            .to_str()
+            .expect("expected a native UTF-8 fixture path");
         let mut emitted = std::collections::BTreeSet::new();
         for established in [false, true] {
             for mode in [None, Some(CliMode::Manual)] {
@@ -726,7 +731,7 @@ mod tests {
                             model: with_options.then_some("opus"),
                             effort: with_options.then_some("high"),
                             accepted_efforts: Some(&efforts),
-                            mcp_config: with_options.then_some("/tmp/mcp.json"),
+                            mcp_config: with_options.then_some(mcp_path),
                             json_schema: with_options.then_some(schema),
                             ..base()
                         };
