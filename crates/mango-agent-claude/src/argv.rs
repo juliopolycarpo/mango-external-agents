@@ -37,6 +37,12 @@ pub struct TurnArgv<'a> {
     pub declares_permission_prompts: bool,
     /// A `--mcp-config` file this turn should load, when the host configured servers.
     pub mcp_config: Option<&'a str>,
+    /// The JSON Schema the host asked this turn's answer to be validated against.
+    ///
+    /// Raw host text: [`build`](TurnArgv::build) refuses what [`crate::json_schema::compact`]
+    /// refuses and passes the compact form. The caller has already checked that this build
+    /// declares `--json-schema`.
+    pub json_schema: Option<&'a str>,
 }
 
 impl std::fmt::Debug for TurnArgv<'_> {
@@ -61,6 +67,7 @@ impl std::fmt::Debug for TurnArgv<'_> {
                 &self.declares_permission_prompts,
             )
             .field("mcp_config_present", &self.mcp_config.is_some())
+            .field("json_schema_present", &self.json_schema.is_some())
             .finish()
     }
 }
@@ -84,6 +91,7 @@ impl TurnArgv<'_> {
     ///     accepted_efforts: None,
     ///     declares_permission_prompts: false,
     ///     mcp_config: None,
+    ///     json_schema: None,
     /// }
     /// .build()
     /// .expect("expected valid argv");
@@ -117,6 +125,13 @@ impl TurnArgv<'_> {
                 received: value_summary(mcp_config),
             });
         }
+
+        // Validated here as well as at open: the fields are public, so a caller can build a
+        // `TurnArgv` that never went through the harness.
+        let json_schema = self
+            .json_schema
+            .map(crate::json_schema::compact)
+            .transpose()?;
 
         let mut argv: Vec<String> = [
             self.program,
@@ -172,6 +187,11 @@ impl TurnArgv<'_> {
         }
         if let Some(mcp_config) = self.mcp_config {
             argv.extend([String::from("--mcp-config"), String::from(mcp_config)]);
+        }
+        if let Some(json_schema) = json_schema {
+            // Inline, because the flag takes the schema itself rather than a path, so it is
+            // visible in a process listing. The prompt never is.
+            argv.extend([String::from("--json-schema"), json_schema]);
         }
         Ok(argv)
     }
@@ -287,6 +307,7 @@ mod tests {
             accepted_efforts: None,
             declares_permission_prompts: false,
             mcp_config: None,
+            json_schema: None,
         }
     }
 
@@ -584,6 +605,48 @@ mod tests {
     }
 
     #[test]
+    fn passes_a_json_schema_only_when_the_host_supplied_one() {
+        assert_eq!(
+            value_after(
+                &base().build().expect("expected valid argv"),
+                "--json-schema"
+            ),
+            None,
+            "expected the default argv to carry no --json-schema"
+        );
+        let argv = TurnArgv {
+            json_schema: Some("{\n \"type\": \"object\"\n}"),
+            ..base()
+        }
+        .build()
+        .expect("expected valid argv");
+        assert_eq!(
+            value_after(&argv, "--json-schema"),
+            Some(r#"{"type":"object"}"#),
+            "expected the compact schema after --json-schema"
+        );
+    }
+
+    #[test]
+    fn refuses_a_json_schema_that_could_become_another_flag_or_is_not_json() {
+        for schema in ["-1", "--dangerously-skip-permissions", "{broken", "[]", ""] {
+            let error = TurnArgv {
+                json_schema: Some(schema),
+                ..base()
+            }
+            .build()
+            .expect_err("expected an unusable schema to be refused");
+            assert!(
+                matches!(
+                    error,
+                    mango_external_agents::Error::HostConfiguration { .. }
+                ),
+                "expected a host-configuration refusal for {schema:?} | received {error:?}"
+            );
+        }
+    }
+
+    #[test]
     fn refuses_direct_argv_values_that_could_change_the_invocation() {
         for argv in [
             TurnArgv {
@@ -621,6 +684,7 @@ mod tests {
                 model: Some("model-secret"),
                 effort: Some("effort-secret"),
                 mcp_config: Some("/tmp/mcp-secret.json"),
+                json_schema: Some("{\"title\":\"schema-secret\"}"),
                 ..base()
             }
         );
@@ -629,6 +693,7 @@ mod tests {
             "model-secret",
             "effort-secret",
             "/tmp/mcp-secret.json",
+            "schema-secret",
         ] {
             assert!(
                 !debug.contains(secret),
@@ -636,6 +701,10 @@ mod tests {
             );
         }
         assert!(debug.contains("model_present: true"), "received {debug:?}");
+        assert!(
+            debug.contains("json_schema_present: true"),
+            "received {debug:?}"
+        );
     }
 
     #[test]

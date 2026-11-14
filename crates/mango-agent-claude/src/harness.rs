@@ -70,6 +70,9 @@ fn classify_surface(surface: Option<&CliSurface>, version: Option<&str>) -> Opti
 pub struct ClaudeHarness {
     descriptor: HarnessDescriptor,
     executable: ExecutablePath,
+    /// The compact `--json-schema` argument every session of this harness passes, when the host
+    /// opted in. Validated when set, so an unusable schema never reaches a launch.
+    json_schema: Option<Arc<str>>,
 }
 
 impl Default for ClaudeHarness {
@@ -93,6 +96,7 @@ impl ClaudeHarness {
                 vendor_environment_keys: VENDOR_ENVIRONMENT_KEYS,
             },
             executable: ExecutablePath::default(),
+            json_schema: None,
         }
     }
 
@@ -109,6 +113,42 @@ impl ClaudeHarness {
     pub fn with_executable(mut self, executable: impl Into<std::path::PathBuf>) -> Self {
         self.executable = ExecutablePath::resolved(executable);
         self
+    }
+
+    /// A harness whose turns ask Claude to validate its answer against `schema`.
+    ///
+    /// Opt-in: a harness built without this passes no `--json-schema`, so the default argv is
+    /// unchanged. The flag is documented for headless runs
+    /// (<https://code.claude.com/docs/en/headless.md>). The schema is checked here, before any
+    /// session opens or process starts: it must parse as a JSON object and fit
+    /// [`MAX_JSON_SCHEMA_BYTES`](crate::json_schema::MAX_JSON_SCHEMA_BYTES) once compacted. The
+    /// argument is inline, so it is visible in a process listing; keep secrets out of a schema.
+    ///
+    /// Opening a session on a build whose `--help` does not declare `--json-schema` is refused
+    /// rather than run without the schema.
+    ///
+    /// This maps no structured answer onto events. What the stream-json `result` record carries
+    /// for this flag was not measured, so a host that needs the validated value cannot read it
+    /// through this library yet; see `docs/harness-claude.md`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::HostConfiguration`] naming what was received and the shape expected.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_agent_claude::ClaudeHarness;
+    ///
+    /// let harness = ClaudeHarness::new()
+    ///     .with_json_schema(r#"{"type":"object","required":["name"]}"#)
+    ///     .expect("expected a usable schema");
+    /// assert!(ClaudeHarness::new().with_json_schema("-1").is_err());
+    /// # drop(harness);
+    /// ```
+    pub fn with_json_schema(mut self, schema: &str) -> Result<Self> {
+        self.json_schema = Some(Arc::from(crate::json_schema::compact(schema)?));
+        Ok(self)
     }
 
     /// The executable this session should spawn: the host's per-request answer, or the harness's.
@@ -464,7 +504,13 @@ impl Harness for ClaudeHarness {
         // `remove_dir_all` against the host's own scratch root. Gathered into one call so a failed
         // open has one error path, and that path hands the removal to the blocking pool for the
         // same reason the write runs there.
-        let opened = match Self::opened(request, survey, self.descriptor(), host.now()) {
+        let opened = match Self::opened(
+            request,
+            survey,
+            self.descriptor(),
+            host.now(),
+            self.json_schema.is_some(),
+        ) {
             Ok(opened) => opened,
             Err(error) => {
                 crate::mcp::release_off_worker(mcp_config.take()).await;
@@ -472,15 +518,18 @@ impl Harness for ClaudeHarness {
             }
         };
 
-        Ok(Box::new(ClaudeSession::new(
-            host.clone(),
-            executable,
-            SessionState::new(std::sync::Arc::clone(host.clock()), opened.snapshot),
-            opened.availability,
-            opened.surface,
-            opened.resume_pending,
-            mcp_config.take(),
-        )))
+        Ok(Box::new(
+            ClaudeSession::new(
+                host.clone(),
+                executable,
+                SessionState::new(std::sync::Arc::clone(host.clock()), opened.snapshot),
+                opened.availability,
+                opened.surface,
+                opened.resume_pending,
+                mcp_config.take(),
+            )
+            .with_json_schema(self.json_schema.clone()),
+        ))
     }
 }
 
@@ -504,6 +553,7 @@ impl ClaudeHarness {
         survey: Survey,
         descriptor: &HarnessDescriptor,
         observed_at: std::time::SystemTime,
+        wants_json_schema: bool,
     ) -> Result<OpenedSession> {
         if !survey.installed() {
             return Err(Error::Launch {
@@ -543,6 +593,22 @@ impl ClaudeHarness {
             return Err(Error::not_supported(
                 mango_external_agents::Capability::McpPassthrough,
             ));
+        }
+        // Refused for the same reason: a session that dropped the schema would return free-form
+        // text where the host asked for validated output, and report success.
+        if wants_json_schema
+            && !survey
+                .surface
+                .as_ref()
+                .is_some_and(CliSurface::declares_json_schema)
+        {
+            return Err(Error::HostConfiguration {
+                expected: "a Claude build whose --help declares --json-schema",
+                received: format!(
+                    "a build that declares no such flag (version {})",
+                    survey.found()
+                ),
+            });
         }
         let resume_pending = request.resume.is_some();
         let native_session_id = match &request.resume {

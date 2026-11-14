@@ -4714,6 +4714,100 @@ mod mcp_passthrough {
     }
 }
 
+mod json_schema_passthrough {
+    use super::*;
+
+    const SCHEMA: &str = "{\n  \"type\": \"object\",\n  \"required\": [\"name\"]\n}";
+
+    async fn first_turn_argv(harness: ClaudeHarness, launcher: &Arc<FakeClaudeCli>) -> Vec<String> {
+        let session = harness
+            .open_session(&host(Arc::clone(launcher)), OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session");
+        session
+            .start_turn(TurnRequest::new("turn-1", "hello"))
+            .await
+            .expect("expected a turn");
+        launcher.turn_argvs().pop().expect("expected a turn launch")
+    }
+
+    #[tokio::test]
+    async fn the_default_harness_passes_no_schema_even_on_a_build_that_declares_the_flag() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+        let argv = first_turn_argv(ClaudeHarness::new(), &launcher).await;
+        assert_eq!(
+            value_after(&argv, "--json-schema"),
+            None,
+            "received {argv:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn passes_the_compact_schema_on_the_turn_command_line() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+        let harness = ClaudeHarness::new()
+            .with_json_schema(SCHEMA)
+            .expect("expected a usable schema");
+        let argv = first_turn_argv(harness, &launcher).await;
+        // Key order depends on whether another workspace member enables serde_json's
+        // `preserve_order`, so the pin is the parsed value plus the compact one-line shape.
+        let argument = value_after(&argv, "--json-schema")
+            .unwrap_or_else(|| panic!("expected --json-schema | received {argv:?}"));
+        assert!(
+            !argument.contains(char::is_whitespace),
+            "expected a compact one-line schema | received {argument:?}"
+        );
+        let passed: serde_json::Value =
+            serde_json::from_str(argument).expect("expected the argument to be JSON");
+        assert_eq!(
+            passed,
+            serde_json::json!({"type": "object", "required": ["name"]})
+        );
+        // The prompt still travels on stdin only.
+        assert!(
+            argv.iter().all(|argument| argument != "hello"),
+            "received {argv:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_a_build_that_does_not_declare_the_flag_before_any_turn_starts() {
+        // The 2.1.260 excerpt declares no `--json-schema`.
+        let launcher = Arc::new(FakeClaudeCli::new());
+        let harness = ClaudeHarness::new()
+            .with_json_schema(SCHEMA)
+            .expect("expected a usable schema");
+        let error = harness
+            .open_session(&host(Arc::clone(&launcher)), OpenSession::new("chat-1"))
+            .await
+            .map(drop)
+            .expect_err("expected a refusal rather than a session that drops the schema");
+        assert!(
+            matches!(
+                error.cause(),
+                Error::HostConfiguration { expected, .. }
+                    if expected.contains("--json-schema")
+            ),
+            "received {error:?}"
+        );
+        assert!(launcher.turn_argvs().is_empty(), "expected no turn launch");
+    }
+
+    #[test]
+    fn refuses_an_unusable_schema_before_a_harness_exists_to_spawn_anything() {
+        for schema in ["{broken", "-1", "[]", ""] {
+            let error = ClaudeHarness::new()
+                .with_json_schema(schema)
+                .map(drop)
+                .expect_err("expected an unusable schema to be refused");
+            assert!(
+                matches!(error, Error::HostConfiguration { .. }),
+                "expected a host-configuration refusal for {schema:?} | received {error:?}"
+            );
+        }
+    }
+}
+
 mod cancelling_and_closing {
     use super::*;
 

@@ -41,6 +41,9 @@ const PERMISSION_PROMPTS_FLAG: &str = "--permission-prompts";
 /// The MCP servers a turn passes through. Declared for as long as the CLI has had MCP.
 const MCP_CONFIG_FLAG: &str = "--mcp-config";
 
+/// The host-supplied schema a turn validates its answer against. Opt-in; absent from older builds.
+const JSON_SCHEMA_FLAG: &str = "--json-schema";
+
 /// Long flags every turn puts on the wire.
 ///
 /// Every one of these is unconditional except `--model`, which is passed only when a model was
@@ -160,6 +163,14 @@ impl CliSurface {
     pub fn declares_mcp_config(&self) -> bool {
         self.flags.contains(MCP_CONFIG_FLAG)
     }
+
+    /// Whether this build accepts a host-supplied output schema.
+    ///
+    /// Fails closed like [`declares_mcp_config`](Self::declares_mcp_config): the flag goes on the
+    /// argv only when the binary said it exists, because an unknown option ends the run at startup.
+    pub fn declares_json_schema(&self) -> bool {
+        self.flags.contains(JSON_SCHEMA_FLAG)
+    }
 }
 
 fn option_block<'a>(options: &'a [Option_], flag: &str) -> Option<&'a str> {
@@ -270,6 +281,26 @@ mod tests {
     fn only_a_build_that_declares_the_flag_is_told_who_answers_prompts() {
         assert!(!CliSurface::parse(HELP_2_1_227).declares_permission_prompts());
         assert!(CliSurface::parse(HELP_2_1_260).declares_permission_prompts());
+    }
+
+    #[test]
+    fn only_a_build_that_declares_the_flag_is_offered_a_json_schema() {
+        assert!(
+            CliSurface::parse(HELP_2_1_270).declares_json_schema(),
+            "expected 2.1.270 to declare --json-schema"
+        );
+        for (label, help) in [("2.1.227", HELP_2_1_227), ("2.1.260", HELP_2_1_260)] {
+            assert!(
+                !CliSurface::parse(help).declares_json_schema(),
+                "expected the {label} excerpt to declare no --json-schema"
+            );
+        }
+        assert!(
+            CliSurface::parse(include_str!("../fixtures/claude/contract/help.txt"))
+                .declares_json_schema(),
+            "expected the pinned public contract to declare --json-schema"
+        );
+        assert!(!CliSurface::parse("claude: command not found").declares_json_schema());
     }
 
     #[test]
