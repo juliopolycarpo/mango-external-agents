@@ -1,0 +1,7 @@
+{
+  "command": [
+    "claude-agent-acp",
+    "--version"
+  ],
+  "output": "0.107.0"
+}

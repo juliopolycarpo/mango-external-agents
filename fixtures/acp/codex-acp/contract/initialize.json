@@ -1,0 +1,44 @@
+{
+  "protocolVersion": 1,
+  "agentCapabilities": {
+    "auth": {
+      "logout": {}
+    },
+    "providers": {},
+    "loadSession": true,
+    "promptCapabilities": {
+      "embeddedContext": true,
+      "image": true
+    },
+    "sessionCapabilities": {
+      "resume": {},
+      "list": {},
+      "close": {},
+      "delete": {},
+      "fork": {},
+      "title": {},
+      "additionalDirectories": {},
+      "subagents": {},
+      "systemPrompt": {}
+    },
+    "mcpCapabilities": {
+      "acp": false,
+      "http": true,
+      "sse": false
+    }
+  },
+  "authMethods": [
+    {
+      "id": "api-key",
+      "name": "API Key"
+    },
+    {
+      "id": "chat-gpt",
+      "name": "ChatGPT"
+    }
+  ],
+  "agentInfo": {
+    "name": "@agentclientprotocol/codex-acp",
+    "version": "2.6.0"
+  }
+}
