@@ -27,7 +27,11 @@ fn scripted_cli(turn_lines: Vec<String>) -> Arc<FakeClaudeCli> {
 const SCHEMA: &str = r#"{"type":"object","properties":{"word":{"type":"string"}}}"#;
 /// A credential-shaped string no redaction rule names a value for.
 const CANARY_TEXT: &str = "canary-credential-7731";
-/// The numeric spelling of the same fact: `credential_expires_at` is a timestamp, not text.
+/// A `credential_expires_at` as Claude Code 2.1.325 writes it: a string.
+const CANARY_EXPIRES_AT_TEXT: &str = "2031-08-19T04:17:09.731Z";
+/// A number a record could carry in a credential-shaped member. A default of "redact strings"
+/// keeps it, so only the member name hides it. Claude Code 2.1.325 does not emit
+/// `credential_expires_at` as a number; a later release could.
 const CANARY_NUMBER: u64 = 7_731_424_242;
 /// A plan reset time, a Unix timestamp. Distinct from [`CANARY_NUMBER`] and from the header's
 /// capture time, so a substring check on one cannot pass for another.
@@ -124,7 +128,7 @@ fn answered_turn_lines(facts: &MachineFacts) -> Vec<String> {
         rate_limit_event(),
         json!({"type": "result", "subtype": "success", "is_error": false,
             "result": answer.to_string(), "structured_output": answer,
-            "credential_expires_at": CANARY_NUMBER,
+            "credential_expires_at": CANARY_EXPIRES_AT_TEXT,
             "credential_hint": CANARY_TEXT,
             "email": "someone@example.com", "organization_id": CANARY_TEXT,
             "usage": {"input_tokens": 3, "output_tokens": 5}}),
@@ -196,12 +200,49 @@ fn the_registry_names_its_scenario_and_says_it_needs_a_schema() {
     );
 }
 
-#[test]
-fn a_credential_member_is_redacted_whatever_its_value_type() {
+/// Redacts one `result` record whose `credential_expires_at` is `expires_at`, and returns the
+/// redacted line and its parsed record.
+fn redact_result_expiring_at(expires_at: Value) -> (String, Value) {
     let facts = MachineFacts::new();
     let redacted = redact_line(
-        &json!({"type": "result", "credential_expires_at": CANARY_NUMBER,
-                "credentialHint": CANARY_TEXT, "access_token": CANARY_TEXT,
+        &json!({"type": "result", "credential_expires_at": expires_at}).to_string(),
+        facts.paths(),
+    )
+    .expect("expected a JSON object to be kept");
+    let record = serde_json::from_str(&redacted).expect("expected JSON");
+    (redacted, record)
+}
+
+/// The type Claude Code 2.1.325 emits. The default string rule would hide it too, so this pins the
+/// observed shape; the name rule is what [`a_numeric_credential_expiry_is_redacted_by_name`] pins.
+#[test]
+fn a_string_credential_expiry_is_redacted() {
+    let (redacted, record) = redact_result_expiring_at(json!(CANARY_EXPIRES_AT_TEXT));
+
+    assert!(
+        !redacted.contains(CANARY_EXPIRES_AT_TEXT),
+        "expected no {CANARY_EXPIRES_AT_TEXT:?} in the redacted line | received: {redacted}"
+    );
+    assert_eq!(record["credential_expires_at"], redact::PLACEHOLDER);
+}
+
+/// A number is not a string, so the walk would keep it: only the member name hides it.
+#[test]
+fn a_numeric_credential_expiry_is_redacted_by_name() {
+    let (redacted, record) = redact_result_expiring_at(json!(CANARY_NUMBER));
+
+    assert!(
+        !redacted.contains(&CANARY_NUMBER.to_string()),
+        "expected no {CANARY_NUMBER} in the redacted line | received: {redacted}"
+    );
+    assert_eq!(record["credential_expires_at"], redact::PLACEHOLDER);
+}
+
+#[test]
+fn credential_and_account_members_are_redacted_and_token_counts_survive() {
+    let facts = MachineFacts::new();
+    let redacted = redact_line(
+        &json!({"type": "result", "credentialHint": CANARY_TEXT, "access_token": CANARY_TEXT,
                 "nested": {"accountUuid": CANARY_TEXT, "email": "someone@example.com"},
                 "usage": {"input_tokens": 3, "output_tokens": 5,
                           "cache_creation_input_tokens": 7}})
@@ -210,18 +251,14 @@ fn a_credential_member_is_redacted_whatever_its_value_type() {
     )
     .expect("expected a JSON object to be kept");
 
-    for canary in [
-        CANARY_TEXT,
-        &CANARY_NUMBER.to_string(),
-        "someone@example.com",
-    ] {
+    for canary in [CANARY_TEXT, "someone@example.com"] {
         assert!(
             !redacted.contains(canary),
             "expected no {canary:?} in the redacted line | received: {redacted}"
         );
     }
     let record: Value = serde_json::from_str(&redacted).expect("expected JSON");
-    assert_eq!(record["credential_expires_at"], redact::PLACEHOLDER);
+    assert_eq!(record["credentialHint"], redact::PLACEHOLDER);
     assert_eq!(record["nested"]["accountUuid"], redact::PLACEHOLDER);
     assert_eq!(
         record["usage"],
@@ -1085,7 +1122,7 @@ async fn a_qualified_capture_writes_the_redacted_transcript_and_nothing_private(
     assert!(body[5]["structured_output"].is_object());
 
     for private in [
-        CANARY_NUMBER.to_string(),
+        CANARY_EXPIRES_AT_TEXT.to_owned(),
         "someone@example.com".to_owned(),
         facts.cwd.clone(),
         facts.home.clone(),

@@ -456,9 +456,10 @@ const USER_KEYED_MEMBERS: &[&str] = &["by_type"];
 
 /// Fragments that make a member name credential-, account- or plan-shaped, matched after the name
 /// is lowercased and stripped of `_` and `-`. Such a member is replaced whatever its value, a
-/// number included: a default of "redact strings" does not reach `credential_expires_at` or a
-/// reset time. The plan fragments back up [`RATE_LIMIT_EVENT_STRUCTURE`] for plan usage that
-/// shows up in a record of another type.
+/// number included: a default of "redact strings" does not reach a numeric reset time, or a
+/// `credential_expires_at` that a later Claude Code writes as a number (2.1.325 writes a string).
+/// The plan fragments back up [`RATE_LIMIT_EVENT_STRUCTURE`] for plan usage that shows up in a
+/// record of another type.
 const CREDENTIAL_NAME_FRAGMENTS: &[&str] = &[
     "account",
     "apikey",
