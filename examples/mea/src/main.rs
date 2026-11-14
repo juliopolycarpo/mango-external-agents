@@ -241,7 +241,12 @@ async fn discover_with(
             let host = host.clone();
             (
                 kind,
-                tokio::spawn(async move { harness.discover(&host).await.map_err(|e| refusal(&e)) }),
+                tokio::spawn(async move {
+                    harness
+                        .discover(&host)
+                        .await
+                        .map_err(|e| command_failure(&e))
+                }),
             )
         })
         .collect();
@@ -382,7 +387,10 @@ async fn turn_with(
     let discovery = if options.transport == Some(TransportKind::UnixSocket) {
         None
     } else {
-        let discovery = harness.discover(host).await.map_err(|e| refusal(&e))?;
+        let discovery = harness
+            .discover(host)
+            .await
+            .map_err(|e| command_failure(&e))?;
         if let AuthState::LoggedOut { login_hint } = &discovery.auth {
             return Err(format!("not signed in; run `{login_hint}`"));
         }
@@ -396,7 +404,7 @@ async fn turn_with(
     let session = harness
         .open_session(host, request)
         .await
-        .map_err(|e| refusal(&e))?;
+        .map_err(|e| command_failure(&e))?;
     eprintln!("session: {}", session.ids().native_session_id);
     eprintln!("{}", transport_report(session.snapshot().transport));
 
@@ -529,7 +537,8 @@ fn transport_report(selection: TransportSelection) -> String {
 
 /// A session id nobody has to be able to reproduce.
 ///
-/// Flattens a library refusal for an operator, naming what `Display` deliberately bounds.
+/// The words for a refusal whose typed fields carry what `Display` deliberately bounds, or `None`
+/// when the library's own sentence is enough.
 ///
 /// The library keeps a vendor-reported version out of its own diagnostics: a build whose banner
 /// nothing could parse falls back to the line the CLI printed, so `Display` reports that line's
@@ -540,33 +549,38 @@ fn transport_report(selection: TransportSelection) -> String {
 /// `mea turn --kind claude` against an old CLI prints
 /// `expected version 2.1.211 or newer, received 2.1.9` instead of `… a vendor-reported version
 /// (5 bytes)`.
-fn refusal(error: &mango_external_agents::Error) -> String {
-    match error {
-        mango_external_agents::Error::VersionGate { found, minimum } => {
-            format!("expected version {minimum} or newer, received {found}")
-        }
+fn refusal_words(cause: &mango_external_agents::Error) -> Option<String> {
+    match cause {
+        mango_external_agents::Error::VersionGate { found, minimum } => Some(format!(
+            "expected version {minimum} or newer, received {found}"
+        )),
         // The login command is typed on the error and left out of its `Display`. The spawn path
         // prints it after `discover`; an attach skips `discover`, so the refusal has to carry it.
         mango_external_agents::Error::AuthRequired { login_hint } => {
-            format!("not signed in; run `{login_hint}`")
+            Some(format!("not signed in; run `{login_hint}`"))
         }
-        mango_external_agents::Error::Vendor(vendor) => vendor_refusal(vendor),
-        other => other.to_string(),
+        mango_external_agents::Error::Vendor(vendor) => Some(vendor_refusal(vendor)),
+        _ => None,
     }
 }
 
-/// The final summary of a failed command, with the vendor's own words when the vendor failed it.
+/// A failed command as an operator reads it: [`refusal_words`] for the error's cause, then the
+/// cleanup and pid notes [`failure::describe`] adds.
 ///
-/// [`failure::describe`] keeps the cleanup and pid notes but prints a vendor failure as its bare
-/// `<code>: vendor failure`. This puts [`vendor_refusal`]'s reason, vendor code and request id in
-/// place of that prefix, also when an operation annotated the error (dispatch, cleanup).
+/// [`failure::describe`] prints a vendor failure as its bare `<code>: vendor failure`, so the
+/// prefix it writes for the cause is swapped for the words an operator needs. The cause is found
+/// through the dispatch and cleanup annotations: the ACP handshake, for one, marks a vendor error
+/// from a closed link `NotSubmitted` before `open_session` returns it, and a cleanup that did not
+/// finish wraps the error that ended the session. Every failure printed by `discover`, `doctor`,
+/// `turn` and `capture` goes through here.
 fn command_failure(error: &mango_external_agents::Error) -> String {
     let described = failure::describe(error);
-    let mango_external_agents::Error::Vendor(vendor) = error.cause() else {
+    let cause = error.cause();
+    let Some(words) = refusal_words(cause) else {
         return described;
     };
-    match described.strip_prefix(&vendor.to_string()) {
-        Some(notes) => format!("{}{notes}", vendor_refusal(vendor)),
+    match described.strip_prefix(&cause.to_string()) {
+        Some(notes) => format!("{words}{notes}"),
         None => described,
     }
 }
@@ -622,8 +636,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        HarnessChoice, Options, acp_profile_ids, describe, discover_with, harness_lines, refusal,
-        registry, run, session_request, transport_report,
+        HarnessChoice, Options, acp_profile_ids, command_failure, describe, discover_with,
+        harness_lines, registry, run, session_request, transport_report, turn_with,
     };
     use mango_external_agents::testing::FakeLauncher;
     use mango_external_agents::{
@@ -665,7 +679,7 @@ mod tests {
             minimum: String::from("2.1.211"),
         };
         assert_eq!(
-            refusal(&gate),
+            command_failure(&gate),
             "expected version 2.1.211 or newer, received 2.1.9"
         );
     }
@@ -678,7 +692,10 @@ mod tests {
         let signed_out = Error::AuthRequired {
             login_hint: String::from("codex login"),
         };
-        assert_eq!(refusal(&signed_out), "not signed in; run `codex login`");
+        assert_eq!(
+            command_failure(&signed_out),
+            "not signed in; run `codex login`"
+        );
     }
 
     /// Everything else keeps the library's own bounded sentence.
@@ -688,11 +705,11 @@ mod tests {
             expected: String::from("a loaded session"),
             received: String::from("payload-secret"),
         };
-        assert_eq!(refusal(&protocol), protocol.to_string());
+        assert_eq!(command_failure(&protocol), protocol.to_string());
         assert!(
-            !refusal(&protocol).contains("payload-secret"),
+            !command_failure(&protocol).contains("payload-secret"),
             "expected the vendor payload to stay out, received {}",
-            refusal(&protocol)
+            command_failure(&protocol)
         );
     }
 
@@ -708,7 +725,7 @@ mod tests {
             .with_vendor_code("-32603", true)
             .with_request_id("req-7"),
         );
-        let shown = refusal(&vendor);
+        let shown = command_failure(&vendor);
         assert_eq!(
             shown,
             "acp-request-failed: vendor failure: service degraded, try again later (vendor code -32603) (request req-7)",
@@ -723,7 +740,7 @@ mod tests {
             mango_external_agents::ErrorCode::from_static("acp-link-closed"),
             "the agent's stderr: password=hunter2 retry with ghp_Canary4Abc9Def2Ghi7Jkl3Mno8Pqr5Stu1V",
         ));
-        let shown = refusal(&vendor);
+        let shown = command_failure(&vendor);
         assert!(
             !shown.contains("hunter2") && !shown.contains("ghp_Canary"),
             "expected no credential in the printed reason | received: {shown}"
@@ -837,12 +854,39 @@ mod tests {
         probes: Arc<AtomicUsize>,
         /// The vendor message a probe fails with; `None` probes as not installed.
         probe_failure: Option<&'static str>,
+        /// The vendor message `open_session` fails with; `None` fails as a closed session.
+        open_failure: Option<&'static str>,
+        /// Whether both failures carry the dispatch annotation the real harnesses add.
+        annotated: bool,
     }
 
     impl CountingDiscoveryHarness {
         fn failing_probe(mut self, message: &'static str) -> Self {
             self.probe_failure = Some(message);
             self
+        }
+
+        fn failing_open(mut self, message: &'static str) -> Self {
+            self.open_failure = Some(message);
+            self
+        }
+
+        /// Marks every failure `NotSubmitted`, as the ACP handshake does when its link closes.
+        fn annotating_failures(mut self) -> Self {
+            self.annotated = true;
+            self
+        }
+
+        fn vendor_failure(&self, code: &'static str, message: &str) -> Error {
+            let error = Error::Vendor(mango_external_agents::VendorError::new(
+                mango_external_agents::ErrorCode::from_static(code),
+                message,
+            ));
+            if self.annotated {
+                error.with_dispatch(mango_external_agents::Dispatch::NotSubmitted)
+            } else {
+                error
+            }
         }
 
         fn new(identity: HarnessIdentity, probes: Arc<AtomicUsize>) -> Self {
@@ -861,6 +905,8 @@ mod tests {
                 },
                 probes,
                 probe_failure: None,
+                open_failure: None,
+                annotated: false,
             }
         }
     }
@@ -878,10 +924,7 @@ mod tests {
         async fn probe(&self, _host: &HostContext) -> Result<Discovery> {
             self.probes.fetch_add(1, Ordering::Relaxed);
             if let Some(message) = self.probe_failure {
-                return Err(Error::Vendor(mango_external_agents::VendorError::new(
-                    mango_external_agents::ErrorCode::from_static("probe-failed"),
-                    message,
-                )));
+                return Err(self.vendor_failure("probe-failed", message));
             }
             Ok(Discovery::not_installed())
         }
@@ -891,6 +934,9 @@ mod tests {
             _host: &HostContext,
             _request: OpenSession,
         ) -> Result<Box<dyn Session>> {
+            if let Some(message) = self.open_failure {
+                return Err(self.vendor_failure("open-failed", message));
+            }
             Err(Error::Closed {
                 subject: "test session",
             })
@@ -1000,6 +1046,87 @@ mod tests {
             Some("probe-failed: vendor failure: the version probe timed out"),
             "expected the probe's code and message in the report"
         );
+    }
+
+    /// A probe error the harness annotated (as the ACP handshake does) keeps its message in the
+    /// sweep's report.
+    #[tokio::test]
+    async fn an_annotated_discovery_failure_carries_the_vendors_message() {
+        let registry = HarnessRegistry::new(vec![Arc::new(
+            CountingDiscoveryHarness::new(HarnessIdentity::codex(), Arc::default())
+                .failing_probe("the version probe timed out")
+                .annotating_failures(),
+        ) as Arc<dyn Harness>])
+        .expect("expected a fake registry");
+
+        let reports = discover_with(&registry, &fake_host(), None)
+            .await
+            .expect("expected discovery to finish");
+
+        assert_eq!(
+            reports[0].result.as_ref().err().map(String::as_str),
+            Some("probe-failed: vendor failure: the version probe timed out"),
+            "expected the code and the message under the dispatch annotation"
+        );
+    }
+
+    /// `mea turn` that is refused inside `open_session` with an annotated vendor error names the
+    /// vendor's reason, not the code alone.
+    #[tokio::test]
+    async fn an_annotated_open_session_failure_carries_the_vendors_message() {
+        let registry = HarnessRegistry::new(vec![Arc::new(
+            CountingDiscoveryHarness::new(HarnessIdentity::claude(), Arc::default())
+                .failing_open("a transport that closed under session/new")
+                .annotating_failures(),
+        ) as Arc<dyn Harness>])
+        .expect("expected a fake registry");
+        let options =
+            Options::parse_for("turn", &["--harness", "claude", "hello"].map(String::from))
+                .expect("expected valid turn arguments");
+
+        let failure = turn_with(&registry, &fake_host(), &options)
+            .await
+            .expect_err("expected the scripted open failure");
+
+        assert_eq!(
+            failure, "open-failed: vendor failure: a transport that closed under session/new",
+            "expected the code and the message under the dispatch annotation | received: {failure}"
+        );
+    }
+
+    /// A vendor error whose process cleanup is still owed keeps its message in a refusal, and the
+    /// operator is told the child may still be running.
+    #[test]
+    fn a_refusal_under_a_cleanup_control_keeps_the_message_and_the_pid_note() {
+        let failure = Error::CleanupRequired {
+            control: Arc::new(UnconfirmedChild),
+            source: Box::new(vendor_failure("the agent closed the link")),
+        };
+        let shown = command_failure(&failure);
+        assert_eq!(
+            shown,
+            "claude-structured-output-missing: vendor failure: the agent closed the link; process-tree cleanup is unconfirmed for launched pid 4242; inspect the process before retrying",
+            "expected the message ahead of the cleanup note | received: {shown}"
+        );
+    }
+
+    /// A named recovery identity without a native process.
+    struct UnconfirmedChild;
+
+    #[async_trait::async_trait]
+    impl mango_external_agents::ProcessControl for UnconfirmedChild {
+        fn pid(&self) -> Option<u32> {
+            Some(4242)
+        }
+        fn stderr_tail(&self) -> String {
+            String::new()
+        }
+        async fn wait(&self) -> Result<mango_external_agents::ExitStatus> {
+            Ok(Default::default())
+        }
+        async fn kill(&self, _reason: mango_external_agents::CancelReason) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[tokio::test]

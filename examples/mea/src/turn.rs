@@ -321,20 +321,26 @@ fn report_dispatch(turn: &TurnStream, json: bool) {
 /// twice would be a bad example for the hosts `docs/adopt.md` sends here — so it prints the
 /// verdict and stops.
 fn report_start_failure(error: &Error, json: bool) {
-    let dispatch = error.dispatch();
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "startFailed": error.to_string(),
-                "dispatch": dispatch,
-                "safeToReplay": dispatch.is_safe_to_replay(),
-                "needsReconciliation": dispatch.needs_reconciliation(),
-            })
-        );
+        println!("{}", start_failure_json(error));
         return;
     }
+    let dispatch = error.dispatch();
     println!("start refused ({dispatch}): {}", retry_advice(dispatch));
+}
+
+/// The `--json` line for a refused start, separate from the printing so a test can read it.
+///
+/// `startFailed` is the summary the command ends with, so a script that reads only this line gets
+/// the vendor's message, bounded and escaped, and not its code alone.
+fn start_failure_json(error: &Error) -> serde_json::Value {
+    let dispatch = error.dispatch();
+    serde_json::json!({
+        "startFailed": crate::command_failure(error),
+        "dispatch": dispatch,
+        "safeToReplay": dispatch.is_safe_to_replay(),
+        "needsReconciliation": dispatch.needs_reconciliation(),
+    })
 }
 
 /// What a host may do next, given how far the refused attempt got.
@@ -1764,6 +1770,71 @@ mod tests {
     struct StartFailureSession {
         inner: Box<dyn Session>,
         closed: AtomicBool,
+        /// What `start_turn` refuses with.
+        failure: Error,
+    }
+
+    fn scripted_start_failure() -> Error {
+        Error::Protocol {
+            expected: String::from("a turn to start"),
+            received: String::from("the scripted start failure"),
+        }
+    }
+
+    /// The error a refused `start_turn` hands back, read through the fake session.
+    async fn start_refusal(failure: Error) -> Error {
+        let session = StartFailureSession::refusing_with(failure).await;
+        match session
+            .start_turn(TurnRequest::new("mea-turn-1", "work"))
+            .await
+        {
+            Ok(_) => {
+                panic!("expected StartFailureSession to refuse the start | received: a stream")
+            }
+            Err(error) => error,
+        }
+    }
+
+    /// The `--json` start-failure line carries the vendor's message with its code, as the final
+    /// summary does.
+    #[tokio::test]
+    async fn the_start_failed_json_field_names_the_vendor_code_and_message() {
+        let refusal = start_refusal(
+            Error::Vendor(VendorError::new(
+                ErrorCode::from_static("scripted-vendor-failure"),
+                "the model does not exist\nso nothing started",
+            ))
+            .with_dispatch(mango_external_agents::Dispatch::NotSubmitted),
+        )
+        .await;
+
+        let line = super::start_failure_json(&refusal);
+
+        assert_eq!(
+            line["startFailed"],
+            "scripted-vendor-failure: vendor failure: the model does not exist\\nso nothing started",
+            "expected the vendor code and the escaped message | received: {line}"
+        );
+        assert_eq!(
+            line["dispatch"],
+            serde_json::json!(mango_external_agents::Dispatch::NotSubmitted),
+            "expected the dispatch annotation to stay on the line | received: {line}"
+        );
+    }
+
+    impl StartFailureSession {
+        async fn refusing_with(failure: Error) -> Self {
+            let inner = FakeHarness::new()
+                .without_approvals()
+                .open_session(&host(), OpenSession::new("mea-test"))
+                .await
+                .expect("expected a fake session");
+            Self {
+                inner,
+                closed: AtomicBool::new(false),
+                failure,
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -1773,10 +1844,7 @@ mod tests {
         }
 
         async fn start_turn(&self, _request: TurnRequest) -> Result<TurnStream> {
-            Err(Error::Protocol {
-                expected: String::from("a turn to start"),
-                received: String::from("the scripted start failure"),
-            })
+            Err(self.failure.clone())
         }
 
         async fn respond(&self, response: PermissionResponse) -> Result<()> {
@@ -1803,6 +1871,7 @@ mod tests {
         let session = StartFailureSession {
             inner,
             closed: AtomicBool::new(false),
+            failure: scripted_start_failure(),
         };
 
         let error = run(
@@ -1878,6 +1947,7 @@ mod tests {
                 "start" => Box::new(StartFailureSession {
                     inner: fake,
                     closed: AtomicBool::new(false),
+                    failure: scripted_start_failure(),
                 }),
                 "vendor" => Box::new(VendorFailureSession {
                     inner: fake,
