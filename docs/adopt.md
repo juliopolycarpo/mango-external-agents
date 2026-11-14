@@ -415,6 +415,11 @@ The `testing` feature ships fakes that spawn nothing:
 - `RecordingBroker` and `FrozenClock` turn a policy decision and an event's timestamp into values
   a test can assert on.
 
+The Claude and ACP harness crates also ship a fake of their vendor CLI behind their own `testing`
+feature: `mango_agent_claude::testing::FakeClaudeCli` (see
+[Testing against a fake `claude`](harness-claude.md#testing-against-a-fake-claude-the-testing-feature))
+and `mango_agent_acp::testing::FakeAcpAgent`.
+
 Two complete examples are compiled by the test suite, so neither can drift from the API. The core
 crate's README (`crates/mango-external-agents/README.md`) is a whole host against `FakeLauncher`
 and `FakeHarness`, run as a doctest. The Claude crate's README (`crates/mango-agent-claude/README.md`)

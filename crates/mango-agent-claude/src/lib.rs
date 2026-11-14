@@ -17,6 +17,8 @@ pub mod protocol;
 mod redacted;
 pub mod reducer;
 pub mod session;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod version;
 
 pub use harness::{ClaudeHarness, harness};
@@ -37,8 +39,13 @@ pub fn harness_id() -> mango_external_agents::HarnessId {
     mango_external_agents::HarnessId::claude()
 }
 
-/// The fake `claude` launcher the integration tests share, compiled once for the unit tests that
-/// need a launcher too.
+// Lets the helpers shared with the integration tests name this crate the way an external test
+// does, so one file serves both.
+#[cfg(test)]
+extern crate self as mango_agent_claude;
+
+/// The test helpers the integration tests share (the host, the scratch roots, the `ControlTap`),
+/// compiled once for the unit tests that need them too.
 #[cfg(test)]
 #[path = "../tests/support/mod.rs"]
 mod test_support;
