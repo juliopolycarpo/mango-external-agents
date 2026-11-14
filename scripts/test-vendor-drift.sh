@@ -18,6 +18,8 @@ source "$repo_root/scripts/upsert-vendor-drift-issue.sh"
 source "$repo_root/scripts/vendor-codex.sh"
 # shellcheck source=check-claude-bare-reference.sh
 source "$repo_root/scripts/check-claude-bare-reference.sh"
+# shellcheck source=check-vendor-acp-docs.sh
+source "$repo_root/scripts/check-vendor-acp-docs.sh"
 
 fail() {
   echo "test failed: $*" >&2
@@ -256,6 +258,107 @@ test_claude_bare_reference() {
   expect_status 2 validate_reference "$reference/missing"
 }
 
+# Writes the page the named fake fetcher serves for a URL, one argument per line; see
+# test-fixtures/fake-doc-curl.sh.
+write_fake_doc() {
+  local root="$1"
+  local url="$2"
+  shift 2
+  mkdir -p "$root"
+  printf '%s\n' "$@" > "$root/$(printf '%s' "$url" | tr -c 'A-Za-z0-9' '_')"
+}
+
+# Serves a clean page for every document a vendor's watch reads.
+write_clean_fake_docs() {
+  local root="$1"
+  rm -rf -- "$root"
+  write_fake_doc "$root" 'https://code.claude.com/docs/llms.txt' '# Claude Code Docs'
+  write_fake_doc "$root" 'https://code.claude.com/docs/en/cli-reference.md' 'claude -p --print "query"'
+  write_fake_doc "$root" 'https://learn.chatgpt.com/llms.txt' '- [Codex CLI](https://learn.chatgpt.com/docs/codex/cli.md)'
+  write_fake_doc "$root" 'https://learn.chatgpt.com/docs/developer-commands.md?surface=cli' 'codex exec "task"'
+}
+
+test_vendor_acp_document() {
+  local document="$test_root/vendor-acp-document.md"
+  local error="$test_root/vendor-acp-document.error"
+  local url='https://example.test/reference.md'
+  local mention
+  printf '%s\n' '# Commands' 'codex exec runs a task. The macpherson and acpi names are unrelated.' > "$document"
+  validate_document "$url" 'codex exec' "$document" >/dev/null
+  for mention in '| `codex acp` | Run as an ACP agent |' 'Use --acp to serve stdio.' 'Agent Client Protocol support' \
+    'agent-client-protocol' 'See [claude-agent-acp](https://example.test/claude-agent-acp).' 'AcP'; do
+    printf '%s\n' '# Commands' 'codex exec runs a task.' "$mention" > "$document"
+    expect_status 1 validate_document "$url" 'codex exec' "$document"
+  done
+  validate_document "$url" 'codex exec' "$document" > /dev/null 2> "$error" || true
+  assert_contains "$error" "expected no ACP page or command in $url" 'ACP mention names the document'
+  assert_contains "$error" '3:AcP' 'ACP mention names the matching line'
+  printf '%s\n' 'A page that moved and no longer lists the command.' > "$document"
+  validate_document "$url" 'codex exec' "$document" > /dev/null 2> "$error" || true
+  assert_contains "$error" "expected $url to contain codex exec" 'a moved page names the missing anchor'
+  expect_status 2 validate_document "$url" 'codex exec' "$document"
+  expect_status 2 validate_document "$url" 'codex exec' "$document.missing"
+}
+
+test_vendor_acp_docs_watch() {
+  local docs="$test_root/vendor-acp-docs"
+  local fake_bin="$test_root/fake-doc-bin"
+  local error="$test_root/vendor-acp-docs.error"
+  local original_path="$PATH"
+  local claude_index='https://code.claude.com/docs/llms.txt'
+  local claude_reference='https://code.claude.com/docs/en/cli-reference.md'
+  local codex_index='https://learn.chatgpt.com/llms.txt'
+  local codex_reference='https://learn.chatgpt.com/docs/developer-commands.md?surface=cli'
+  mkdir -p "$fake_bin"
+  ln -s "$repo_root/scripts/test-fixtures/fake-doc-curl.sh" "$fake_bin/curl"
+  export PATH="$fake_bin:$PATH"
+  export FAKE_DOC_ROOT="$docs"
+
+  assert_eq "$(vendor_documents claude | wc -l | tr -d ' ')" '2' 'Claude watches its index and CLI reference'
+  assert_eq "$(vendor_documents codex | wc -l | tr -d ' ')" '2' 'Codex watches its index and CLI reference'
+  expect_status 2 vendor_documents gemini
+
+  write_clean_fake_docs "$docs"
+  check_vendor claude >/dev/null
+  check_vendor codex >/dev/null
+  expect_status 2 check_vendor gemini
+
+  write_fake_doc "$docs" "$claude_index" '# Claude Code Docs' '- [ACP](https://code.claude.com/docs/en/acp.md): Run Claude Code as an ACP agent'
+  expect_status 1 check_vendor claude
+  check_vendor claude > /dev/null 2> "$error" || true
+  assert_contains "$error" "expected no ACP page or command in $claude_index" 'the Claude index mention is named'
+  check_vendor codex >/dev/null
+
+  write_clean_fake_docs "$docs"
+  write_fake_doc "$docs" "$claude_reference" 'claude -p --print' '| `--acp` | Serve over ACP |'
+  expect_status 1 check_vendor claude
+
+  write_clean_fake_docs "$docs"
+  write_fake_doc "$docs" "$codex_reference" 'codex exec' '| `codex acp` | Run as an Agent Client Protocol agent |'
+  expect_status 1 check_vendor codex
+  check_vendor claude >/dev/null
+
+  write_clean_fake_docs "$docs"
+  write_fake_doc "$docs" "$codex_index" '- [Codex CLI](https://learn.chatgpt.com/docs/codex/cli.md)' '- [ACP](https://learn.chatgpt.com/docs/acp.md)'
+  expect_status 1 check_vendor codex
+
+  # An unreadable page is "could not verify", and it outranks a mention found on the other page.
+  rm -f -- "$docs/$(printf '%s' "$codex_reference" | tr -c 'A-Za-z0-9' '_')"
+  expect_status 2 check_vendor codex
+  check_vendor codex > /dev/null 2> "$error" || true
+  assert_contains "$error" "expected to read $codex_reference, received a failed download" 'a failed download names the URL'
+
+  # A page that answers but lost its anchor (a moved page) must not pass as clean.
+  write_clean_fake_docs "$docs"
+  write_fake_doc "$docs" "$claude_reference" 'Page not found'
+  expect_status 2 check_vendor claude
+
+  expect_status 2 main
+  expect_status 2 main claude codex
+  unset FAKE_DOC_ROOT
+  export PATH="$original_path"
+}
+
 test_issue_deduplication() {
   local fake_bin="$test_root/fake-bin"
   local report="$test_root/issue.md"
@@ -310,6 +413,8 @@ test_codex_generator_cleans_up_in_a_standalone_process
 test_contract_comparison
 test_drift_report
 test_claude_bare_reference
+test_vendor_acp_document
+test_vendor_acp_docs_watch
 test_issue_deduplication
 python3 scripts/test-vendor-result.py
 python3 scripts/test-codex-schema-inventory.py
