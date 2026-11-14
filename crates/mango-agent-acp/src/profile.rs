@@ -24,8 +24,9 @@
 //! - **Verified** — [`VerificationMethod::LiveSession`]: `tests/smoke.rs` drove the installed
 //!   agent and a session opened, answered and closed. `cursor` and `grok` are the two.
 //! - **Captured** — [`VerificationMethod::CommittedCapture`]: a capture committed under
-//!   `fixtures/` proves the handshake this profile's argv produces and nothing past it. `opencode`
-//!   is the one, and it is *not* verified: its capture opened no session.
+//!   `fixtures/` proves the handshake this profile's argv produces and nothing past it. `opencode`,
+//!   `codex-acp` and `claude-agent-acp` carry this alone, and none is verified: their captures opened
+//!   no session.
 //! - **Neither** — no evidence at all. A documented entry nobody has run. It is offered, a host
 //!   can say so in its own interface, and nothing here pretends otherwise.
 
@@ -727,6 +728,12 @@ fn codex_acp() -> AcpProfile {
     // the default-location account. `CODEX_API_KEY`, `OPENAI_API_KEY` and `CODEX_CONFIG` are not
     // forwarded.
     .with_vendor_environment_keys(&["NO_BROWSER", "CODEX_HOME"])
+    .with_verification(VerificationEvidence {
+        agent_version: "@agentclientprotocol/codex-acp 2.6.0",
+        checked_on: "2026-11-14",
+        method: VerificationMethod::CommittedCapture,
+        source: "fixtures/acp/codex-acp/contract",
+    })
 }
 
 /// The ACP adapter that fronts Claude Code.
@@ -754,6 +761,12 @@ fn claude_agent_acp() -> AcpProfile {
     // from <https://code.claude.com/docs/en/env-vars>. `ANTHROPIC_API_KEY`,
     // `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` are not forwarded.
     .with_vendor_environment_keys(&["CLAUDE_CONFIG_DIR"])
+    .with_verification(VerificationEvidence {
+        agent_version: "0.107.0",
+        checked_on: "2026-11-14",
+        method: VerificationMethod::CommittedCapture,
+        source: "fixtures/acp/claude-agent-acp/contract",
+    })
 }
 
 #[cfg(test)]
@@ -885,6 +898,8 @@ mod tests {
                 String::from("cursor"),
                 String::from("grok"),
                 String::from("opencode"),
+                String::from("codex-acp"),
+                String::from("claude-agent-acp"),
             ],
             "expected only the profiles with a committed handshake, received {captured:?}"
         );

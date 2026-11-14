@@ -13,7 +13,13 @@ SELECTIONS = {
         "contract", "historical/contract",
     ],
     "codex": ["**/*.jsonl"],
-    "acp": ["cursor/contract", "grok/contract", "opencode/contract"],
+    "acp": [
+        "cursor/contract",
+        "grok/contract",
+        "opencode/contract",
+        "codex-acp/contract",
+        "claude-agent-acp/contract",
+    ],
 }
 # The recorders write these beside a replay fixture: an incomplete run and a completed run that
 # failed qualification. They are diagnostics, so a stray one must never reach a published crate. `mea`'s
