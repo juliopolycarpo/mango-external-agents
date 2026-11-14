@@ -463,6 +463,17 @@ impl FakeClaudeCli {
         lock(&self.refused).clone()
     }
 
+    /// Every refused launch as a redacted shape, in order: program, argument count, the flag
+    /// names it carried, and how many other arguments were left out.
+    ///
+    /// The shape is for a failure message a test author can read without the argv: a value
+    /// after a flag, a `--flag=value` tail and a positional prompt are all counted, never
+    /// printed, so it is safe to put in a panic or a log. [`refused_launches`](Self::refused_launches)
+    /// still holds the full argv for a test that needs to assert on it.
+    pub fn refused_launch_shapes(&self) -> Vec<String> {
+        lock(&self.refused).iter().map(refused_shape).collect()
+    }
+
     /// Every turn's argv, in order — the launches that are not one of the three probes.
     pub fn turn_argvs(&self) -> Vec<Vec<String>> {
         self.launches()
@@ -672,7 +683,7 @@ impl FakeClaudeCli {
         Error::Launch {
             program: spec.argv.first().cloned().unwrap_or_default(),
             message: format!(
-                "unscripted launch, expected --version, --help, auth status or a queued turn | received {unscripted} ({} arguments); read FakeClaudeCli::refused_launches for the argv",
+                "unscripted launch, expected --version, --help, auth status or a queued turn | received {unscripted} ({} arguments); read FakeClaudeCli::refused_launch_shapes for the flags, or refused_launches for the argv",
                 spec.argv.len()
             ),
         }
@@ -738,6 +749,49 @@ pub fn is_probe(argv: &[String]) -> bool {
     argv.iter()
         .any(|argument| argument == "--version" || argument == "--help")
         || is_auth_status(argv)
+}
+
+/// Reads a refused launch as a shape: the program, the argument count, the flag names and the
+/// number of arguments left out, so a failure can say what was launched without printing a value.
+///
+/// A flag is an argument after the program that starts with `-`; anything after an `=` in it is
+/// dropped. Every other argument is a flag's value, a subcommand or a prompt, and is only counted.
+fn refused_shape(spec: &LaunchSpec) -> String {
+    let program = spec.argv.first().map_or("", String::as_str);
+    let flags: Vec<&str> = spec
+        .argv
+        .iter()
+        .skip(1)
+        .filter_map(|argument| {
+            let name = argument
+                .split_once('=')
+                .map_or(argument.as_str(), |(name, _)| name);
+            is_flag_name(name).then_some(name)
+        })
+        .collect();
+    let redacted = spec.argv.len().saturating_sub(1 + flags.len());
+    let flag_names = if flags.is_empty() {
+        "no flags".to_owned()
+    } else {
+        format!("flags {}", flags.join(", "))
+    };
+    format!(
+        "{program} with {} arguments: {flag_names}; {redacted} values redacted",
+        spec.argv.len()
+    )
+}
+
+/// Whether `word` is shaped like a flag name: one or two dashes, a letter, then letters, digits
+/// or dashes. A value that merely starts with a dash, such as a token or a prompt, fails this
+/// and is counted instead of printed.
+fn is_flag_name(word: &str) -> bool {
+    let Some(rest) = word.strip_prefix("--").or_else(|| word.strip_prefix('-')) else {
+        return false;
+    };
+    rest.starts_with(|first: char| first.is_ascii_alphabetic())
+        && rest
+            .chars()
+            .all(|next| next.is_ascii_alphanumeric() || next == '-')
 }
 
 fn is_auth_status(argv: &[String]) -> bool {
