@@ -11,14 +11,16 @@ tool call reach the host's tools. See [`docs/compliance.md`](docs/compliance.md)
 
 ## The matrix
 
-| Harness      | Declared transport | Carrier                  |
-| ------------ | ------------------ | ------------------------ |
-| Claude       | `stdio`            | Per-turn child process   |
-| Codex        | `stdio`            | App-server child process |
-| ACP profiles | `acp`              | Child pipes              |
+| Harness      | Declared transport | Carrier                                      |
+| ------------ | ------------------ | -------------------------------------------- |
+| Claude       | `stdio`            | Per-turn child process                       |
+| Codex        | `stdio`            | App-server child process                     |
+| Codex        | `unix-socket`      | A running app-server's socket (Unix, opt-in) |
+| ACP profiles | `acp`              | Child pipes                                  |
 
 Core also provides a WebSocket transport for host integrations. The Codex harness does not enable
-OpenAI's experimental WebSocket interface. ACP over HTTP is not shipped: the `agent-client-protocol-http`
+OpenAI's experimental `ws://` interface; its `unix-socket` transport, behind the crate's `unix-socket`
+feature, attaches to an app-server the host already runs. ACP over HTTP is not shipped: the `agent-client-protocol-http`
 crate pulls `aws-lc-rs` in under the ring-only TLS policy this workspace enforces.
 
 A harness declares which transport kinds it supports; the library refuses an unsupported pair with

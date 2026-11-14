@@ -23,6 +23,8 @@ bench = false
 default = []
 # The version-answering launcher, for hosts testing against injected fake processes.
 testing = ["mango-external-agents/testing"]
+# Attach to an app-server the host already runs, over its Unix socket (Unix only).
+unix-socket = ["mango-external-agents/unix-socket"]
 
 [dependencies]
 async-trait.workspace = true
@@ -36,7 +38,13 @@ tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
 mango-external-agents = { workspace = true, features = ["launcher-tokio", "stdio", "testing"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }
+
+# The in-process app-server fake of `tests/unix_socket.rs` listens on a real Unix socket in a short
+# private directory and answers the WebSocket upgrade itself.
+futures-util = { workspace = true, features = ["sink"] }
+tempfile.workspace = true
+tokio-tungstenite = { workspace = true, features = ["handshake"] }
 
 # Non-gating benchmarks: a plain `harness = false` binary with no extra dependencies. Run it with
 # `cargo bench -p mango-agent-codex`; see docs/benchmarks.md.

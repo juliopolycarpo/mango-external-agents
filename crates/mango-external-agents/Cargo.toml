@@ -24,7 +24,21 @@ default = ["stdio"]
 # Line-framed child processes spawned through the host's ProcessLauncher.
 stdio = []
 # A dialled WebSocket URL (tokio-tungstenite over ring).
-websocket = ["dep:futures-util", "dep:rustls", "dep:tokio-tungstenite", "tokio/net"]
+websocket = [
+  "dep:futures-util",
+  "dep:rustls",
+  "dep:tokio-tungstenite",
+  "tokio-tungstenite/connect",
+  "tokio-tungstenite/rustls-tls-native-roots",
+  "tokio/net",
+]
+# The WebSocket handshake over a Unix socket the host names, with no TLS stack behind it.
+unix-socket = [
+  "dep:futures-util",
+  "dep:tokio-tungstenite",
+  "tokio-tungstenite/handshake",
+  "tokio/net",
+]
 # A default ProcessLauncher on tokio::process for hosts without their own spawner.
 launcher-tokio = [
   "dep:nix",
@@ -48,7 +62,7 @@ futures-util = { workspace = true, features = ["sink"], optional = true }
 # TLS is `ring` everywhere: named here with no default features, so the provider is this crate's
 # choice rather than whatever a transitive default would have picked.
 rustls = { workspace = true, features = ["logging", "ring", "std", "tls12"], optional = true }
-tokio-tungstenite = { workspace = true, features = ["connect", "handshake", "rustls-tls-native-roots"], optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
 
 # Signals for the default launcher's escalation. `unsafe_code` is forbidden in this workspace, so
 # the process-group signal goes through a safe binding rather than a raw `libc::kill`.
@@ -66,6 +80,8 @@ windows = { workspace = true, features = ["Win32_System_Threading"], optional = 
 [dev-dependencies]
 # The oracle for `http_endpoint`: tests compare validation with the former harness parser.
 http.workspace = true
+# Short private directories for the Unix socket fakes: a socket path is capped near 100 bytes.
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }
 
 # Non-gating benchmarks: plain `harness = false` binaries with no extra dependencies. Run them with

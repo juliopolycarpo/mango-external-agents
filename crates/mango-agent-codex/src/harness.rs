@@ -23,9 +23,12 @@ use mango_external_agents::session::{
     OpenSession, ResumeMode, Session, SessionIds, SessionPage, SessionQuery, resume_fallback_reason,
 };
 use mango_external_agents::state::{SessionSnapshot, SessionState, TransportSelection};
-use mango_external_agents::transport::{ExecutablePath, StdioSpec, TransportKind};
+use mango_external_agents::transport::{ExecutablePath, StdioSpec, TransportKind, UnixSocketSpec};
 use mango_external_agents::transports::stdio;
+#[cfg(all(unix, feature = "unix-socket"))]
+use mango_external_agents::transports::unix_socket;
 use mango_external_agents::{ClientInfo as HostClientInfo, HostContext};
+use mango_external_agents::{Link, ProcessControl};
 
 use crate::account::{AccountFingerprintKey, CodexAccount, CodexDiscovery};
 use crate::discovery::{self, LOGIN_HINT, PROGRAM};
@@ -95,10 +98,15 @@ const CAPABILITIES: Capabilities = Capabilities {
 
 /// The transports this harness accepts.
 ///
-/// `stdio` only. The app-server also offers `--listen ws://` and a unix socket, and its own README
-/// says of the first: "Websocket transport is currently experimental and unsupported. Do not rely
-/// on it for production workloads." A harness that declared it would be inviting hosts to build on
-/// a surface the vendor has already withdrawn once.
+/// `stdio` first, so it stays the default, then the Unix socket where the build has it: Unix with
+/// this crate's `unix-socket` feature. The app-server also offers `--listen ws://`, and its own
+/// README says of that one: "Websocket transport is currently experimental and unsupported. Do not
+/// rely on it for production workloads." A harness that declared it would be inviting hosts to
+/// build on a surface the vendor has already withdrawn once. The Unix socket is documented as WebSocket
+/// connections over the control socket or a custom path, without that label.
+#[cfg(all(unix, feature = "unix-socket"))]
+const TRANSPORTS: &[TransportKind] = &[TransportKind::Stdio, TransportKind::UnixSocket];
+#[cfg(not(all(unix, feature = "unix-socket")))]
 const TRANSPORTS: &[TransportKind] = &[TransportKind::Stdio];
 
 /// The OpenAI Codex harness.
@@ -106,6 +114,7 @@ const TRANSPORTS: &[TransportKind] = &[TransportKind::Stdio];
 pub struct CodexHarness {
     descriptor: Arc<HarnessDescriptor>,
     executable: ExecutablePath,
+    unix_socket: Option<UnixSocketSpec>,
 }
 
 impl Default for CodexHarness {
@@ -138,6 +147,7 @@ impl CodexHarness {
                 vendor_environment_keys: VENDOR_ENVIRONMENT_KEYS,
             }),
             executable: ExecutablePath::default(),
+            unix_socket: None,
         }
     }
 
@@ -149,6 +159,38 @@ impl CodexHarness {
     #[must_use]
     pub fn with_executable(mut self, executable: ExecutablePath) -> Self {
         self.executable = executable;
+        self
+    }
+
+    /// Names the Unix socket of an app-server the host already runs.
+    ///
+    /// A session opened with [`OpenSession::over_transport`] set to
+    /// [`TransportKind::UnixSocket`] attaches to the server listening there instead of spawning
+    /// one, so the server, and any thread it holds in memory, outlives the session and the host's
+    /// own restarts. Nothing starts or stops that server: it is the host's, as is the socket path
+    /// (`codex app-server --listen unix://PATH`, or the vendor's default control socket path).
+    /// Closing the session closes the connection and leaves the server running.
+    ///
+    /// The transport is declared only on Unix with this crate's `unix-socket` feature; otherwise a
+    /// session that asks for it is refused with `Error::UnsupportedTransport` before anything is
+    /// dialled. Without a path here the same request is refused as host configuration. The server
+    /// is never asked for a token: one that requires it is refused as host configuration too.
+    ///
+    /// Version probing, discovery and native session listing still run the `codex` executable over
+    /// stdio, and an attached session takes its version gate from the server's own `initialize`
+    /// answer rather than from the local binary.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_agent_codex::CodexHarness;
+    ///
+    /// let harness = CodexHarness::new().with_unix_socket("/run/user/1000/codex/app-server.sock");
+    /// # let _ = harness;
+    /// ```
+    #[must_use]
+    pub fn with_unix_socket(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.unix_socket = Some(UnixSocketSpec::new(path));
         self
     }
 
@@ -245,6 +287,69 @@ impl CodexHarness {
         Ok((discovery, probed.account))
     }
 
+    /// Reaches an app-server over the transport the session resolved to.
+    ///
+    /// Stdio spawns one through the host's launcher, after the version floor. A Unix socket dials
+    /// the server the host already runs: nothing is spawned, so there is no local binary to gate,
+    /// and the server's `initialize` answer carries the version the handshake checks.
+    async fn connect(
+        &self,
+        host: &HostContext,
+        request: &OpenSession,
+        transport: TransportKind,
+    ) -> Result<(Link, Arc<dyn ProcessControl>)> {
+        match transport {
+            TransportKind::Stdio => {
+                let executable = self.program_for(request);
+                // Before the app-server exists: an older build creates its sqlite state, an
+                // installation id and system skills under `CODEX_HOME` merely by starting, so the
+                // handshake's own refusal would come after the damage.
+                // Returned as the bare `VersionGate`, the shape the handshake's refusal has always
+                // had.
+                refuse_outdated_before_spawn(host, &executable, request.discovery.as_ref()).await?;
+                let opened = stdio::open(
+                    host,
+                    &StdioSpec::new([PROGRAM, "app-server"]),
+                    &executable,
+                    VENDOR_ENVIRONMENT_KEYS,
+                )
+                .await?;
+                Ok((opened.link, opened.control))
+            }
+            #[cfg(all(unix, feature = "unix-socket"))]
+            TransportKind::UnixSocket => {
+                let spec = self.unix_socket.as_ref().ok_or_else(|| {
+                    Error::HostConfiguration {
+                        expected: "a Unix socket path set with CodexHarness::with_unix_socket",
+                        received: String::from("none"),
+                    }
+                    .with_dispatch(Dispatch::NotSubmitted)
+                })?;
+                // Raced against the host's cancel, not checked once before: a server that accepts
+                // and never answers the upgrade would otherwise hold the open for the whole
+                // `request_timeout`. Biased, so a cancel that already happened never dials. The
+                // open future is dropped on cancel, which closes the half-open connection.
+                let opened = tokio::select! {
+                    biased;
+                    () = host.cancel().cancelled() => {
+                        return Err(Error::Cancelled {
+                            reason: mango_external_agents::CancelReason::Shutdown,
+                        }
+                        .with_dispatch(Dispatch::NotSubmitted));
+                    }
+                    opened = unix_socket::open(spec, host.limits()) => opened
+                        .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?,
+                };
+                Ok((opened.link, opened.control))
+            }
+            other => Err(Error::UnsupportedTransport {
+                harness: self.descriptor.identity.id.clone(),
+                transport: other,
+            }
+            .with_dispatch(Dispatch::NotSubmitted)),
+        }
+    }
+
     /// The executable this session should spawn: the request's, then the harness's.
     fn program_for(&self, request: &OpenSession) -> ExecutablePath {
         request
@@ -291,28 +396,16 @@ impl Harness for CodexHarness {
         let cwd = host
             .absolute_cwd()
             .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
-        let executable = self.program_for(&request);
-        // Before the app-server exists: an older build creates its sqlite state, an installation id
-        // and system skills under `CODEX_HOME` merely by starting, so the handshake's own refusal
-        // would come after the damage.
-        // Returned as the bare `VersionGate`, the shape the handshake's refusal has always had.
-        refuse_outdated_before_spawn(host, &executable, request.discovery.as_ref()).await?;
-        let transport = stdio::open(
-            host,
-            &StdioSpec::new([PROGRAM, "app-server"]),
-            &executable,
-            VENDOR_ENVIRONMENT_KEYS,
-        )
-        .await?;
+        let (link, control) = self.connect(host, &request, effective_transport).await?;
 
         let cleanup = ProcessCleanupGuard::new(
-            transport.control,
+            control,
             *host.limits(),
             mango_external_agents::CancelReason::Shutdown,
         );
         let shared = Arc::new(Shared::new(host.clone(), request.session_id.clone()));
         let client = Arc::new(Client::connect(
-            transport.link,
+            link,
             CodexSession::handler(Arc::clone(&shared)),
             ClientOptions::new(PEER_NAME)
                 .with_code_prefix(CODE_PREFIX)
@@ -1073,6 +1166,32 @@ mod tests {
             },
             SystemTime::now(),
         )
+    }
+
+    /// Stdio stays first, so it stays the default whether or not the socket is built in.
+    #[test]
+    fn stdio_is_the_default_transport_and_the_socket_is_declared_only_where_it_is_built() {
+        use mango_external_agents::Harness;
+        use mango_external_agents::transport::TransportKind;
+
+        let harness = crate::CodexHarness::new();
+        let declared = harness.descriptor().transports;
+
+        assert_eq!(
+            harness.descriptor().default_transport(),
+            Some(TransportKind::Stdio),
+            "expected stdio first in {declared:?}"
+        );
+        let socket_built = cfg!(all(unix, feature = "unix-socket"));
+        assert_eq!(
+            declared.contains(&TransportKind::UnixSocket),
+            socket_built,
+            "expected unix-socket declared: {socket_built} | received: {declared:?}"
+        );
+        assert!(
+            !declared.contains(&TransportKind::WebSocket),
+            "expected the experimental ws:// listener to stay undeclared, received {declared:?}"
+        );
     }
 
     #[test]

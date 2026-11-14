@@ -517,6 +517,12 @@ From the same page's transport notes:
 > The app-server command and WebSocket transport are experimental and aren’t supported for
 > production workloads.
 
+Re-read on 2026-11-13: that sentence is gone, and the page labels only the `ws://` listener
+("WebSocket transport is experimental and unsupported"). Its Unix socket line, "WebSocket
+connections over Codex’s default app-server control socket or a custom Unix socket path, using
+the standard HTTP Upgrade handshake", carries no label, and the Codex harness declares that
+transport. See [`harness-codex.md`](harness-codex.md#transports).
+
 **Restricting the vendor's own authentication.** The harness starts `codex app-server` with no
 authentication option and sends no login request; the one server request that asks a client for
 credentials, `account/chatgptAuthTokens/refresh`, is refused. As with Claude, the child environment
@@ -537,7 +543,8 @@ the 0.167.1 reproduction pin. The 0.154.0 tag does not contain that README:
   OpenAI Compliance Logs Platform." The host's own name is therefore passed through unchanged; the
   library never substitutes its own.
 - "Websocket transport is currently experimental and unsupported. Do not rely on it for production
-  workloads." — which is why the harness declares `stdio` only.
+  workloads." — which is why the harness leaves `ws://` undeclared and declares `stdio` and the Unix
+  socket, the latter unlabelled in the 2026-11-13 guide.
 
 **What this harness reads about an account:** `account/read`, and only the account *kind* plus, for
 a ChatGPT sign-in, the plan name and — only when the host calls

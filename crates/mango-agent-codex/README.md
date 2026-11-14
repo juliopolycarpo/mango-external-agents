@@ -44,6 +44,14 @@ The protocol types are hand-written against OpenAI's own published schema rather
 its source tree; `docs/harness-codex.md` records why, along with the surface driven, the permission
 matrix, and the known gaps. Compliance posture is in `docs/compliance.md`.
 
+## Attaching to a running app-server
+
+With the `unix-socket` feature on Unix, `CodexHarness::with_unix_socket(path)` and
+`OpenSession::over_transport(TransportKind::UnixSocket)` attach a session to an app-server the host
+already runs with `codex app-server --listen unix://PATH`. The library never starts that server and
+never presents a token; closing the session leaves the server running. `docs/harness-codex.md`
+has the details and the vendor document.
+
 ## Host tests
 
 The optional `testing` feature exports `testing::VersionAnsweringLauncher` and forwards the

@@ -109,9 +109,10 @@ fn transport(named: &str) -> Result<TransportKind, String> {
     match named {
         "stdio" => Ok(TransportKind::Stdio),
         "websocket" => Ok(TransportKind::WebSocket),
+        "unix-socket" => Ok(TransportKind::UnixSocket),
         "acp" => Ok(TransportKind::Acp),
         other => Err(format!(
-            "expected `stdio`, `websocket` or `acp`, received {other:?}"
+            "expected `stdio`, `websocket`, `unix-socket` or `acp`, received {other:?}"
         )),
     }
 }
@@ -254,7 +255,7 @@ mod tests {
             // A value outside the accepted set must be refused, never quietly read as the
             // permissive end of the axis.
             vec!["--level", "plan"],
-            vec!["--transport", "unix-socket"],
+            vec!["--transport", "unix"],
         ] {
             assert!(
                 Options::parse(&args.into_iter().map(String::from).collect::<Vec<_>>()).is_err()
@@ -282,7 +283,18 @@ mod tests {
             transport("websocket").expect("websocket"),
             TransportKind::WebSocket
         );
+        assert_eq!(
+            transport("unix-socket").expect("unix-socket"),
+            TransportKind::UnixSocket
+        );
         assert_eq!(transport("acp").expect("acp"), TransportKind::Acp);
+        assert_eq!(
+            transport("unix"),
+            Err(String::from(
+                "expected `stdio`, `websocket`, `unix-socket` or `acp`, received \"unix\""
+            )),
+            "expected the refusal to list every accepted name"
+        );
     }
 }
 

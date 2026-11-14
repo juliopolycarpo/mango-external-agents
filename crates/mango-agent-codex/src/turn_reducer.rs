@@ -302,15 +302,16 @@ impl TurnReducer {
 
     /// The reducer for a session that reads its connection under `limits`.
     ///
-    /// This harness reads its app-server over stdio, where a message reaches the reducer decoded,
-    /// in one line: at most `max_line_bytes` as the vendor wrote it, at most three times that once
-    /// each invalid byte is repaired to a 3-byte U+FFFD, and never more than `max_buffered_bytes`,
-    /// which the repaired line is counted against.
+    /// Over stdio a message reaches the reducer decoded, in one line: at most `max_line_bytes` as
+    /// the vendor wrote it, at most three times that once each invalid byte is repaired to a
+    /// 3-byte U+FFFD, and never more than `max_buffered_bytes`, which the repaired line is counted
+    /// against.
     ///
-    /// The bound equals the largest decoded stdio line only because this harness is stdio-only. On
-    /// a websocket the limit applies to the decoded message against `max_line_bytes` alone (see
-    /// `SocketReceiver::bounded` in the websocket transport), so a websocket transport would need
-    /// its own bound rather than this one.
+    /// The bound equals the largest decoded stdio line. Over the Unix socket the limit applies to
+    /// the decoded message against `max_line_bytes` alone (see `SocketReceiver::bounded` in the
+    /// shared socket link), so no message reaches the reducer larger than `max_line_bytes` and
+    /// this bound is never the one that binds there; it stays the one limit for both transports
+    /// rather than a second figure that could drift.
     pub(crate) fn for_limits(limits: &Limits) -> Self {
         let line = &limits.line;
         Self::builder()

@@ -45,17 +45,18 @@ check() {
 # bare line is the one a host that supplies its own transport and launcher compiles.
 core=(-p mango-external-agents --no-default-features)
 check "${core[@]}"
-for feature in stdio websocket launcher-tokio testing; do
+for feature in stdio websocket unix-socket launcher-tokio testing; do
   check "${core[@]}" --features "$feature"
 done
 check -p mango-external-agents --all-features
 check "${core[@]}" --all-targets
 
-# Harness crates: Codex and ACP expose `testing`; check each feature independently of dev deps.
+# Harness crates: Codex and ACP expose `testing`, Codex also `unix-socket`; check each feature independently of dev deps.
 # Every harness also gets its own bare library check.
 check -p mango-agent-claude --no-default-features
 check -p mango-agent-codex --no-default-features
 check -p mango-agent-codex --no-default-features --features testing
+check -p mango-agent-codex --no-default-features --features unix-socket
 check -p mango-agent-acp --no-default-features
 check -p mango-agent-acp --no-default-features --features testing
 echo "✓ isolated feature checks passed on Rust $toolchain"

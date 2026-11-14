@@ -81,6 +81,7 @@ for what each public contract guarantees and which types are protected against f
 | ---------------- | ----------------------------------------------------------------------------- |
 | `stdio`          | Default. Child processes through the host's launcher, framed by lines         |
 | `websocket`      | A dialled `ws://`/`wss://` endpoint (tokio-tungstenite over `ring`)           |
+| `unix-socket`    | A Unix socket a vendor server listens on, upgraded to a WebSocket (Unix only) |
 | `launcher-tokio` | `TokioLauncher`, for hosts with no spawner of their own                       |
 | `testing`        | `FakeLauncher`, `FakeHarness`, `ScriptedLink`, `RecordingBroker`, conformance |
 
