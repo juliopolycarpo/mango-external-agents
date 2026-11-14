@@ -855,6 +855,47 @@ impl FakeVendorFailure {
 }
 
 #[test]
+fn a_schema_capture_notice_says_the_answer_is_kept_verbatim_and_names_the_scenario() {
+    assert_eq!(
+        verbatim_answer_notice(STRUCTURED_OUTPUT),
+        "claude/structured-output: the model's answer (key names and numbers) is kept verbatim in the transcript; the schema and prompt must elicit no real data. Review the file before committing"
+    );
+}
+
+#[test]
+fn a_schema_capture_notice_is_one_line() {
+    let notice = verbatim_answer_notice(STRUCTURED_OUTPUT);
+    assert!(
+        !notice.contains('\n') && !notice.is_empty(),
+        "expected a nonempty single-line notice | received: {notice:?}"
+    );
+}
+
+#[test]
+fn a_built_in_scenario_elicits_no_figure_but_the_placeholder_one() {
+    for scenario in SCENARIOS {
+        let digit_runs: Vec<&str> = scenario
+            .prompt
+            .split(|character: char| !character.is_ascii_digit())
+            .filter(|run| !run.is_empty())
+            .collect();
+        assert!(
+            digit_runs.iter().all(|run| *run == "1"),
+            "(claude/{}): expected a prompt whose only figure is the placeholder 1 | received digit runs: {digit_runs:?} in {:?}",
+            scenario.name,
+            scenario.prompt
+        );
+        assert!(
+            scenario.prompt.contains("every number with 1")
+                && scenario.prompt.contains("every string with the word mango"),
+            "(claude/{}): expected a prompt that fills every string and number with a placeholder | received: {:?}",
+            scenario.name,
+            scenario.prompt
+        );
+    }
+}
+
+#[test]
 fn the_primary_failure_line_carries_the_vendor_message_and_the_scenario() {
     let line = primary_failure_line("structured-output", &FakeVendorFailure::error());
 
