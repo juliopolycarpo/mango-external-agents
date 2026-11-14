@@ -81,6 +81,8 @@ jobs:
         env:
           VERSION: ${{ steps.resolve.outputs.version }}
         run: scripts/check-versions.sh "$VERSION"
+      # scripts/check.sh parses ci.yml through scripts/check-script-tests.sh, which needs PyYAML.
+      - run: sudo apt-get install --yes --no-install-recommends python3-yaml
       - run: scripts/check.sh
       # The same gate a maintainer runs before the tag exists. It wraps the workspace dry run and
       # adds what that cannot answer: that the publishable set is still exactly $CRATES, and that
