@@ -355,7 +355,7 @@ async fn record(
         eprintln!(
             "codex/{}: capture failed before cleanup: {}",
             scenario.name,
-            crate::failure::describe(primary)
+            crate::command_failure(primary)
         );
     })?;
     Ok(recorder.lines.join("\n") + "\n")
@@ -1267,7 +1267,7 @@ mod tests {
             .expect("capture must retain cleanup ownership");
         let expected: Arc<dyn ProcessControl> = control;
         assert!(Arc::ptr_eq(&retained, &expected));
-        assert!(crate::failure::describe(&error).contains("launched pid 42"));
+        assert!(crate::command_failure(&error).contains("launched pid 42"));
         assert_eq!(error.dispatch(), Dispatch::Accepted);
         assert!(matches!(
             error.cause(),

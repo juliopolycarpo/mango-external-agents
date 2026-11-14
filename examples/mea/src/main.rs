@@ -566,16 +566,17 @@ fn refusal_words(cause: &mango_external_agents::Error) -> Option<String> {
 }
 
 /// A failed command as an operator reads it: [`refusal_words`] for the error's cause, then the
-/// cleanup and pid notes [`failure::describe`] adds.
+/// cleanup and pid notes [`failure::cleanup_notes`] adds.
 ///
-/// [`failure::describe`] prints a vendor failure as its bare `<code>: vendor failure`, so the
+/// The error's `Display` prints a vendor failure as its bare `<code>: vendor failure`, so the
 /// prefix it writes for the cause is swapped for the words an operator needs. The cause is found
 /// through the dispatch and cleanup annotations: the ACP handshake, for one, marks a vendor error
 /// from a closed link `NotSubmitted` before `open_session` returns it, and a cleanup that did not
 /// finish wraps the error that ended the session. Every failure printed by `discover`, `doctor`,
-/// `turn` and `capture` goes through here.
+/// `turn` and `capture` goes through here, including the primary error a capture reports before
+/// its cleanup error replaces it. No other formatter exists, so none can drop the vendor's message.
 fn command_failure(error: &mango_external_agents::Error) -> String {
-    let described = failure::describe(error);
+    let described = format!("{error}{}", failure::cleanup_notes(error));
     let cause = error.cause();
     let Some(words) = refusal_words(cause) else {
         return described;
