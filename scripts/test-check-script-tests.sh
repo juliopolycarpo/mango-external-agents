@@ -3,6 +3,9 @@
 # both scripts/check.sh and .github/workflows/ci.yml, and the ci.yml step must be able to run and
 # fail the gate. Each case builds a small scratch repository (named fixtures, no network, no cargo)
 # and runs the real check against it. It needs PyYAML, like the check.
+# The cases hold shell and workflow text, `$(...)` and `${{ ... }}` included, in single quotes so it
+# reaches the check unexpanded.
+# shellcheck disable=SC2016 # literal shell text under test, never meant to expand here
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -34,8 +37,9 @@ make_repo() {
 }
 
 # WorkflowFixture: a ci.yml whose `policy` job runs the files in $3 and is gated, plus the one test
-# $2 placed as variant $1 describes. `clean` places nothing extra. Every variant but `clean` and
-# `matrix-os` must make the check refuse $2.
+# $2 placed as variant $1 describes. `clean` places nothing extra. `block` places the multi-line
+# run block in $run_block; `matrix-custom` places a matrixed job from $matrix_lines and the step
+# guard $matrix_guard. Whether the check refuses $2 is each case's own expectation.
 workflow_fixture() {
   local variant=$1 placed=$2 in_ci=$3 name
   local needs='[policy]' triggers='pull_request' gate=true
@@ -43,6 +47,7 @@ workflow_fixture() {
   [ "$variant" = gate-less ] && gate=false
   echo 'name: CI'
   echo "on: { $triggers: { branches: [main] } }"
+  [ "$variant" = shell-workflow ] && echo "defaults: { run: { shell: '$shell_name' } }"
   echo 'jobs:'
   # A YAML comment naming a test is not a run, with or without the file behind it.
   echo '  # test-ghost.sh is only mentioned in a comment'
@@ -52,7 +57,13 @@ workflow_fixture() {
   echo '      - uses: actions/checkout@v7'
   for name in $in_ci; do echo "      - run: scripts/$name"; done
   case "$variant" in
-    clean | matrix-os | matrix-os-unlisted | orphan-job | job-if | job-continue-on-error) ;;
+    clean | shell-job | matrix-os | matrix-os-unlisted | matrix-custom | orphan-job | job-if | job-continue-on-error) ;;
+    shell-step)
+      echo "      - shell: '$shell_name'"
+      echo "        run: scripts/$placed" ;;
+    block)
+      echo '      - run: |'
+      while IFS= read -r line; do printf '          %s\n' "$line"; done <<<"$run_block" ;;
     never-true-if)
       echo "      - if: github.event_name == 'release'"
       echo "        run: scripts/$placed" ;;
@@ -76,11 +87,28 @@ workflow_fixture() {
       echo '          echo done' ;;
     interpreter-and-env)
       echo "      - run: RUSTUP_TOOLCHAIN=1.97 python3 scripts/$placed --flag" ;;
-    no-pull-request | gate-less)
+    no-pull-request | gate-less | shell-workflow)
       echo "      - run: scripts/$placed" ;;
     *) echo "(check-script-tests): unknown workflow variant '$variant'" >&2; exit 1 ;;
   esac
   case "$variant" in
+    shell-job)
+      echo '  shelled:'
+      echo '    runs-on: ubuntu-latest'
+      echo "    defaults: { run: { shell: '$shell_name' } }"
+      echo '    steps:'
+      echo "      - run: scripts/$placed"
+      needs='[policy, shelled]' ;;
+    matrix-custom)
+      echo '  matrixed:'
+      echo '    runs-on: ${{ matrix.os }}'
+      echo '    strategy:'
+      echo '      matrix:'
+      while IFS= read -r line; do printf '        %s\n' "$line"; done <<<"$matrix_lines"
+      echo '    steps:'
+      echo "      - if: $matrix_guard"
+      echo "        run: scripts/$placed"
+      needs='[policy, matrixed]' ;;
     matrix-os | matrix-os-unlisted)
       echo '  matrixed:'
       # shellcheck disable=SC2016 # the workflow text must contain the literal ${{ matrix.os }}
@@ -123,6 +151,7 @@ workflow_fixture() {
   fi
 }
 
+run_block='' shell_name='' matrix_lines='' matrix_guard=''
 base='test-alpha.sh test-beta.py test-vendor-drift.sh test-package-admission.sh'
 
 # expect_pass <case>: the check exits 0.
@@ -195,7 +224,7 @@ make_repo "$work/repo" "$base" "$without_beta" false-if
 expect_fail 'a step under if: false' "${blocked_prefix}a step of job 'policy' has \`if: False\`"
 
 make_repo "$work/repo" "$base" "$without_beta" matrix-os-unlisted
-expect_fail 'a step limited to an OS the matrix does not list' "the matrix os list is ['ubuntu-latest', 'macos-latest'], expected it to contain 'windows-latest'"
+expect_fail 'a step limited to an OS the matrix does not list' "the matrix os values are ['ubuntu-latest', 'macos-latest'], expected it to contain 'windows-latest'"
 
 make_repo "$work/repo" "$base" "$without_beta" orphan-job
 expect_fail 'a job missing from the gate needs' "${blocked_prefix}job 'orphan' is not in the needs of the gate job"
@@ -227,6 +256,101 @@ expect_fail 'a workflow that does not trigger on pull_request' '.github/workflow
 make_repo "$work/repo" "$base" "$without_beta" gate-less
 # shellcheck disable=SC2016 # the backticks are literal Markdown in the expected message, not command substitution
 expect_fail 'a workflow without a gate job' '.github/workflows/ci.yml: the workflow has no `gate` job'
+
+# Shell constructs inside a run block. A command counts only when it runs unconditionally and its
+# failure fails the step; a construct the check does not follow is refused with the reason.
+# block_pass <case> <block>: the block places the test and the check passes.
+block_pass() {
+  run_block=$2
+  make_repo "$work/repo" "$base" "$without_beta" block
+  expect_pass "$1"
+}
+# block_fail <case> <block> <reason>: the block places the test and the check names the reason.
+block_fail() {
+  run_block=$2
+  make_repo "$work/repo" "$base" "$without_beta" block
+  expect_fail "$1" "${blocked_prefix}$3"
+}
+not_followed='which the check does not follow'
+
+block_pass 'a command after ; on the same line' 'echo start; scripts/test-beta.py'
+block_pass 'a command after a quoted ; in an earlier command' $'echo "a; b"\nscripts/test-beta.py'
+block_pass 'a command that ends in a comment' 'scripts/test-beta.py # runs the lane'
+block_pass 'a command whose failure exits the step' 'scripts/test-beta.py || exit 1'
+block_pass 'a command after set +e was undone by set -e' $'set +e\ntrue\nset -e\nscripts/test-beta.py'
+block_pass 'a command with redirections' 'scripts/test-beta.py > log 2>&1'
+block_pass 'a command after a here-string' $'grep x <<<word\nscripts/test-beta.py'
+block_pass 'a command after a here-document' $'cat <<EOF\nnote\nEOF\nscripts/test-beta.py'
+block_pass 'a command after an exit that only runs on failure' $'scripts/test-alpha.sh || exit 3\nscripts/test-beta.py'
+
+block_fail 'a command in a one-line if' 'if true; then scripts/test-beta.py; fi' "it is inside a shell \`if\` block, $not_followed"
+block_fail 'a command in a multi-line if' $'if [ -n "$RUN" ]; then\n  scripts/test-beta.py\nfi' "it is inside a shell \`if\` block, $not_followed"
+block_fail 'a command in the else branch' $'if true; then\n  echo skip\nelse\n  scripts/test-beta.py\nfi' "it is inside a shell \`if\` block, $not_followed"
+block_fail 'a command that is an if condition' $'if scripts/test-beta.py; then\n  echo ok\nfi' "it is inside a shell \`if\` block, $not_followed"
+block_fail 'a command in a for loop' 'for lane in a b; do scripts/test-beta.py; done' "it is inside a shell \`for\` block, $not_followed"
+block_fail 'a command in a while loop' $'while false; do\n  scripts/test-beta.py\ndone' "it is inside a shell \`while\` block, $not_followed"
+block_fail 'a command in a case arm' $'case "$X" in\n  a) scripts/test-beta.py ;;\nesac' "it is inside a shell \`case\` block, $not_followed"
+block_fail 'a command in a function body' $'lane() { scripts/test-beta.py; }\nlane' "it is inside a shell \`function\` block, $not_followed"
+block_fail 'a command in a brace group' '{ scripts/test-beta.py; }' "it is inside a shell \`{\` block, $not_followed"
+block_fail 'a command in a subshell' '(scripts/test-beta.py)' "it is inside a shell \`(\` block, $not_followed"
+block_fail 'a command guarded by &&' '[ -n "$RUN" ] && scripts/test-beta.py' "it is joined to the command before it by \`&&\`, $not_followed"
+block_fail 'a command behind ||' 'false || scripts/test-beta.py' "it is joined to the command before it by \`||\`, $not_followed"
+block_fail 'a command whose status feeds &&' 'scripts/test-beta.py && echo passed' "it is joined to the command after it by \`&&\`, $not_followed"
+block_fail 'a command whose failure is handled by ||' 'scripts/test-beta.py || echo failed' "its failure is handled by \`|| echo failed\`, $not_followed"
+block_fail 'a command piped into another' 'scripts/test-beta.py | tee log' "it is joined to the command after it by \`|\`, $not_followed"
+block_fail 'a command fed by a pipe' 'echo input | scripts/test-beta.py' "it is joined to the command before it by \`|\`, $not_followed"
+block_fail 'a command in the background' 'scripts/test-beta.py &' "it is joined to the command after it by \`&\`, $not_followed"
+block_fail 'a command after set +e' $'set +e\nscripts/test-beta.py' 'it follows `set +e`, which turns off errexit'
+block_fail 'a command after set +e on the same line' 'set +e; scripts/test-beta.py' 'it follows `set +e`, which turns off errexit'
+block_fail 'a command after set +eu' $'set +eu\nscripts/test-beta.py' 'it follows `set +eu`, which turns off errexit'
+block_fail 'a command after set +o errexit' $'set +o errexit\nscripts/test-beta.py' 'it follows `set +o errexit`, which turns off errexit'
+block_fail 'a command after exit on the same line' 'exit 0; scripts/test-beta.py' 'it follows `exit 0` on an earlier line of the same run block'
+block_fail 'a command after a conditional exit 0' $'[ -n "$SKIP" ] && exit 0\nscripts/test-beta.py' 'it follows `exit 0`, which a condition can reach to end the run block early'
+block_fail 'a name in a here-document' $'cat <<EOF\nscripts/test-beta.py\nEOF' 'it appears in a here-document'
+block_fail 'a name in a command substitution' 'echo $(scripts/test-beta.py)' '`echo $(scripts/test-beta.py)` names it but does not start with it as a command'
+
+# The shell has to stop at a failing command, wherever it is declared.
+shell_pass() {
+  shell_name=$2
+  make_repo "$work/repo" "$base" "$without_beta" "$3"
+  expect_pass "$1"
+}
+shell_fail() {
+  shell_name=$2
+  make_repo "$work/repo" "$base" "$without_beta" "$3"
+  expect_fail "$1" "${blocked_prefix}its step runs under \`shell: $2\`, expected bash or sh, which stop at a failing command"
+}
+shell_pass 'a step under shell: bash' bash shell-step
+shell_pass 'a step under shell: sh' sh shell-step
+shell_pass 'a job defaulting to shell: bash' bash shell-job
+shell_pass 'a workflow defaulting to shell: bash' bash shell-workflow
+shell_fail 'a step under shell: pwsh' pwsh shell-step
+shell_fail 'a step under a custom shell without -e' 'bash {0}' shell-step
+shell_fail 'a job defaulting to shell: python' python shell-job
+shell_fail 'a workflow defaulting to shell: pwsh' pwsh shell-workflow
+
+# A matrix is expanded the way GitHub does: the cross product of its lists, minus `exclude`, plus
+# `include` (merged into the combinations it extends, or a new combination).
+matrix_pass() {
+  matrix_lines=$2 matrix_guard=$3
+  make_repo "$work/repo" "$base" "$without_beta" matrix-custom
+  expect_pass "$1"
+}
+matrix_fail() {
+  matrix_lines=$2 matrix_guard=$3
+  make_repo "$work/repo" "$base" "$without_beta" matrix-custom
+  expect_fail "$1" "${blocked_prefix}a step of job 'matrixed' has \`if: $3\` but $4"
+}
+
+matrix_pass 'an OS added by an include entry' $'os: [ubuntu-latest]\ninclude:\n  - os: windows-latest' "matrix.os == 'windows-latest'"
+matrix_pass 'an OS that only include entries name' $'include:\n  - os: windows-latest' "matrix.os == 'windows-latest'"
+matrix_pass 'an OS added to a combination by include' $'node: [20]\ninclude:\n  - node: 20\n    os: macos-latest' "matrix.os == 'macos-latest'"
+matrix_pass 'an OS with one of its combinations excluded' $'os: [ubuntu-latest, macos-latest]\narch: [x64, arm]\nexclude:\n  - os: ubuntu-latest\n    arch: arm' "matrix.os == 'ubuntu-latest'"
+matrix_fail 'an OS that no include entry adds' $'os: [ubuntu-latest]\ninclude:\n  - os: macos-latest' "matrix.os == 'windows-latest'" "the matrix os values are ['ubuntu-latest', 'macos-latest'], expected it to contain 'windows-latest'"
+matrix_fail 'an OS that exclude removes' $'os: [ubuntu-latest, macos-latest]\nexclude:\n  - os: ubuntu-latest' "matrix.os == 'ubuntu-latest'" "the matrix os values are ['macos-latest'], expected it to contain 'ubuntu-latest'"
+matrix_fail 'an OS that every combination excludes' $'os: [ubuntu-latest]\narch: [x64]\nexclude:\n  - arch: x64' "matrix.os == 'ubuntu-latest'" "the matrix os values are [], expected it to contain 'ubuntu-latest'"
+matrix_fail 'an os list that is an expression' 'os: ${{ fromJSON(needs.plan.outputs.os) }}' "matrix.os == 'ubuntu-latest'" "its matrix cannot be expanded: matrix.os is '\${{ fromJSON(needs.plan.outputs.os) }}', expected a list"
+matrix_fail 'an include os that is an expression' $'os: [ubuntu-latest]\ninclude:\n  - os: ${{ inputs.os }}' "matrix.os == 'ubuntu-latest'" "its matrix cannot be expanded: a matrix entry sets os to '\${{ inputs.os }}', expected a literal"
 
 # An indirect parent is held to the same rule.
 make_repo "$work/repo" "$base" "test-alpha.sh test-beta.py test-package-admission.sh" orphan-job test-vendor-drift.sh
