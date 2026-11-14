@@ -75,3 +75,18 @@ same check through the runner fails.
 Every `scripts/test-*.sh` and `scripts/test-*.py` runs in both `scripts/check.sh` and `ci.yml`, or is
 declared in `scripts/check-script-tests.sh` as run through a parent test that does. That script fails
 for a test that only one of the two runs, one that neither runs, and a stale reference.
+
+Naming a test in `ci.yml` is not enough. `scripts/ci-script-steps.py` parses the workflow as YAML
+(PyYAML, `python3-yaml`) and counts a test as run only when:
+
+- it is a command of a `run:` step, not text in an `echo` or a comment;
+- its job is listed in the `needs` of the `gate` job, and neither the job nor the step sets
+  `continue-on-error`;
+- its job has no `if:`, and its step has no `if:` or only one `matrix.os == '<os>'` test naming an
+  OS the job's matrix lists;
+- no earlier line of the same `run:` block is an `exit`, and its own line does not end in
+  `|| true`, `|| :` or `|| exit 0`;
+- the workflow triggers on `pull_request` and has a `gate` job.
+
+It does not follow shell conditionals inside a `run:` block, `set +e`, or `matrix.include` entries.
+`scripts/test-check-script-tests.sh` pins each rule against a scratch workflow.
