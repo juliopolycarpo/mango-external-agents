@@ -59,6 +59,37 @@ for its documented statement that `--bare` is opt-in. A changed or missing state
 managed Claude drift issue, because a default flip would change which local configuration a scripted
 turn loads.
 
+The Claude and Codex scheduled lanes also run `scripts/check-vendor-acp-docs.sh`. It reads two public
+Markdown pages per vendor, without a login, and fails when either names ACP (`acp` as a word, or
+"Agent Client Protocol"):
+
+| Vendor | Pages                                                                                                                                               |
+| ------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Claude | [documentation index](https://code.claude.com/docs/llms.txt), [CLI reference](https://code.claude.com/docs/en/cli-reference.md)                     |
+| Codex  | [documentation index](https://learn.chatgpt.com/llms.txt), [command line options](https://learn.chatgpt.com/docs/developer-commands.md?surface=cli) |
+
+Each page must still contain a phrase it carries today (`Claude Code Docs`, `--print`, `Codex CLI`,
+`codex exec`). A page that moved, emptied or stopped answering exits 2, "could not verify", and does
+not pass as clean. Either outcome opens the managed `drift(<vendor>)` issue. The contract
+comparison still runs, so when a release ships the mode the issue carries the help diff too. The
+issue body for a mention is the generic failure text; the workflow log names the page and the
+matching line. The step runs on the schedule only, so a vendor page cannot block a pull request.
+Its tests use the named fake fetcher `scripts/test-fixtures/fake-doc-curl.sh` and reach no network.
+
+An accepted mention (say, an index line about a third-party adapter) keeps the watch failing every
+Monday. Narrow `ACP_PATTERN` in the script in the same change that records the decision in
+[the ACP convergence assessment](acp-convergence.md).
+
+The watch sees a documented ACP mode before a release ships it, which the help diff cannot. The help
+diff still catches a flag that ships undocumented.
+
+Subcommand help texts stay out of the public contracts. Each one would be a committed contract that
+the pinned job must reproduce byte for byte on Ubuntu, macOS and Windows (the `app` row of
+`codex --help` shows how platforms differ), and every wording change in a command the library never
+calls would open a drift issue. The top-level help and the documentation watch are the trigger. An
+ACP flag in a subcommand's help before any watched page names it stays unwatched:
+[#451](https://github.com/juliopolycarpo/mango-external-agents/issues/451).
+
 To inspect a Codex schema without touching the checkout, use:
 
 ```bash

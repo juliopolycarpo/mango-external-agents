@@ -139,16 +139,24 @@ The weekly `latest-capture` job in [vendor-drift.yml](../.github/workflows/vendo
 installs the newest Claude Code and Codex, regenerates the public contracts and opens the managed
 `drift(claude)` or `drift(codex)` issue when the diff is not empty
 ([vendor-drift.md](vendor-drift.md)). The contracts record each CLI's own help text, so a native ACP
-mode surfaces there first.
+mode surfaces there, or in the documentation watch below.
 
-- **Trigger:** a `drift(claude)` or `drift(codex)` issue whose diff adds an `acp` command, an
-  ACP-named flag, or an ACP entry in `codex app-server --listen`.
+- **Trigger:** a `drift(claude)` or `drift(codex)` issue that shows one of:
+  - a diff that adds an `acp` command, an ACP-named flag, or an ACP entry in
+    `codex app-server --listen`;
+  - a failed documentation watch (`scripts/check-vendor-acp-docs.sh`) where the vendor's
+    documentation index or CLI reference now mentions ACP. The workflow log names the page and the
+    line ([vendor-drift.md](vendor-drift.md)).
+- **Not a trigger:** the same watch failing because a page could not be read or no longer has its
+  anchor phrase. That is a broken watch to repair, not a vendor signal.
 - **Action:** whoever triages it reopens this assessment: cite the vendor document that describes
   the mode, re-read the capability table against a fresh `initialize` capture, decide criterion by
-  criterion, and record the outcome here with a new read date.
+  criterion, and record the outcome here with a new read date. A documentation page without a
+  shipped command does not meet criterion 1.
 
 The lane does not watch two things:
 
-- An ACP flag under another subcommand's help, or a vendor documentation page that announces a mode
-  before a release ships it: [#432](https://github.com/juliopolycarpo/mango-external-agents/issues/432).
+- An ACP flag under another subcommand's help before any watched page names it. Subcommand help is
+  kept out of the public contracts ([vendor-drift.md](vendor-drift.md)):
+  [#451](https://github.com/juliopolycarpo/mango-external-agents/issues/451).
 - An adapter's own `initialize` answer: [#434](https://github.com/juliopolycarpo/mango-external-agents/issues/434).
