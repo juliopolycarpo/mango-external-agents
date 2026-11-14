@@ -97,6 +97,63 @@ impl SubagentFixture {
             .collect()
     }
 
+    /// The `item/agentMessage/delta` frames the vendor sent on a thread other than `parent`.
+    fn foreign_message_deltas(&self, parent: &str) -> usize {
+        self.transcript
+            .every_received()
+            .into_iter()
+            .filter(|frame| frame["method"] == "item/agentMessage/delta")
+            .filter(|frame| {
+                frame.pointer("/params/threadId").and_then(Value::as_str) != Some(parent)
+            })
+            .count()
+    }
+
+    /// The `TextDelta` events the parent turn alone should produce, worked out from the frames.
+    ///
+    /// Mirrors the reducer's documented rule without calling it: each parent delta is one event,
+    /// and a parent message's completion adds whatever its deltas did not deliver, or the whole
+    /// text when it does not begin with them (the vendor rewrote it). Frames of any other thread
+    /// contribute nothing, so a child's text reaching the host makes the replay exceed this.
+    fn expected_parent_text_events(&self, parent: &str) -> usize {
+        let on_parent = |frame: &&Value| {
+            frame.pointer("/params/threadId").and_then(Value::as_str) == Some(parent)
+        };
+        let frames = self.transcript.every_received();
+        let parent_deltas = || {
+            frames
+                .iter()
+                .copied()
+                .filter(|frame| frame["method"] == "item/agentMessage/delta")
+                .filter(on_parent)
+        };
+        let streamed_for = |item_id: &str| -> String {
+            parent_deltas()
+                .filter(|frame| {
+                    frame.pointer("/params/itemId").and_then(Value::as_str) == Some(item_id)
+                })
+                .filter_map(|frame| frame.pointer("/params/delta").and_then(Value::as_str))
+                .collect()
+        };
+        let completions = frames
+            .iter()
+            .copied()
+            .filter(|frame| frame["method"] == "item/completed")
+            .filter(on_parent)
+            .filter_map(|frame| frame.pointer("/params/item"))
+            .filter(|item| item["type"] == "agentMessage")
+            .filter(|item| {
+                let text = item["text"].as_str().unwrap_or_default();
+                let streamed = streamed_for(item["id"].as_str().unwrap_or_default());
+                !text
+                    .strip_prefix(streamed.as_str())
+                    .unwrap_or(text)
+                    .is_empty()
+            })
+            .count();
+        parent_deltas().count() + completions
+    }
+
     /// The nonempty `agentThreadId` every such item carries, once they agree.
     fn child_thread(&self) -> String {
         let ids: std::collections::BTreeSet<&str> = self
@@ -229,6 +286,46 @@ fn two_child_threads_in_one_fixture_are_refused_by_name() {
         },
     };
     let _ = fixture.child_thread();
+}
+
+/// The oracle counts a parent delta, a parent rewrite, and nothing a child says.
+#[test]
+fn the_expected_text_events_count_parent_frames_and_ignore_the_child() {
+    let delta = |thread: &str, item: &str, text: &str| {
+        serde_json::json!({"method": "item/agentMessage/delta", "params": {
+            "threadId": thread, "itemId": item, "delta": text}})
+    };
+    let completed = |thread: &str, item: &str, text: &str| {
+        serde_json::json!({"method": "item/completed", "params": {
+            "threadId": thread, "item": {"type": "agentMessage", "id": item, "text": text}}})
+    };
+    let fixture = SubagentFixture {
+        header: Vec::new(),
+        transcript: Transcript {
+            steps: Vec::new(),
+            greeting: vec![
+                delta("parent", "rewritten", "ab"),
+                delta("parent", "rewritten", "cd"),
+                // Does not begin with "abcd": rewritten, so the whole text is one more event.
+                completed("parent", "rewritten", "xyz"),
+                delta("parent", "whole", "ok"),
+                // Equals what streamed: adds nothing.
+                completed("parent", "whole", "ok"),
+                delta("child", "kid", "hi"),
+                completed("child", "kid", "bye"),
+            ],
+        },
+    };
+    let expected = fixture.expected_parent_text_events("parent");
+    assert_eq!(
+        expected, 4,
+        "(subagent replay): expected 3 parent deltas and 1 rewrite, none from the child | received {expected}"
+    );
+    let foreign = fixture.foreign_message_deltas("parent");
+    assert_eq!(
+        foreign, 1,
+        "(subagent replay): expected the child's one delta counted as foreign | received {foreign}"
+    );
 }
 
 /// Every event kind and activity the replayed turn produced for the subagent.
@@ -385,6 +482,23 @@ async fn a_real_subagent_frame_attributes_the_activity_to_the_child_thread_and_g
         completed.len(),
         3,
         "(subagent replay): expected three completed activities (spawn, collab call, completion) | received {completed:?}"
+    );
+
+    // The child thread's assistant text rode the same connection and is not the host's answer. The
+    // capture holds child deltas, so this count only matches if none of them was emitted.
+    let foreign = fixture.foreign_message_deltas(&parent);
+    assert!(
+        foreign > 0,
+        "(subagent replay): expected the fixture to hold child agentMessage deltas | received {foreign}"
+    );
+    let text_events = events
+        .iter()
+        .filter(|event| matches!(event, EventKind::TextDelta { .. }))
+        .count();
+    let expected_text_events = fixture.expected_parent_text_events(&parent);
+    assert_eq!(
+        text_events, expected_text_events,
+        "(subagent replay): expected {expected_text_events} TextDelta events from the parent thread alone | received {text_events} with {foreign} child deltas on the connection"
     );
 
     // Nothing granted host tool execution: no approval or question reached the host, the host's
