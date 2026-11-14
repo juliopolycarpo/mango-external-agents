@@ -134,12 +134,14 @@ async fn codex_contract_with(host: &HostContext, out_dir: &Path, workspace: &Pat
         &["CODEX_HOME"],
     )
     .await?;
-    let help = command_output(
-        host,
-        vec![String::from("codex"), String::from("--help")],
-        &["CODEX_HOME"],
-    )
-    .await?;
+    let help = codex_portable_help(
+        &command_output(
+            host,
+            vec![String::from("codex"), String::from("--help")],
+            &["CODEX_HOME"],
+        )
+        .await?,
+    );
     let app_server_help = command_output(
         host,
         vec![
@@ -169,8 +171,9 @@ async fn codex_contract_with(host: &HostContext, out_dir: &Path, workspace: &Pat
     .await?;
 
     let contract = contract_dir(out_dir);
-    // Stored verbatim, as the Claude help is: the check compares bytes, so any reworded or added
-    // subcommand, flag or `--listen` value is a diff a maintainer reads.
+    // Stored as printed, as the Claude help is, except for the platform-gated subcommands
+    // `codex_portable_help` drops. The check compares bytes, so any reworded or added subcommand,
+    // flag or `--listen` value is a diff a maintainer reads.
     write_text(&contract.join("help.txt"), &format!("{help}\n"))?;
     write_text(
         &contract.join("app-server-help.txt"),
@@ -505,6 +508,37 @@ fn claude_surface(help: &str) -> Value {
     })
 }
 
+/// Codex subcommands that only the macOS and Windows builds list in `codex --help`.
+///
+/// The pinned drift lane reproduces the contract on all three operating systems and the weekly lane
+/// on Linux, so a row that exists on two of them would make every run fail on the third. `app`
+/// launches the desktop app, which Codex does not ship for Linux.
+const PLATFORM_ONLY_CODEX_COMMANDS: &[&str] = &["app"];
+
+/// `help` without the rows of [`PLATFORM_ONLY_CODEX_COMMANDS`] and their wrapped description lines.
+///
+/// A row is a line indented by exactly two spaces whose first word is the command; its wrapped
+/// description continues on lines indented deeper. Everything else is kept byte for byte.
+fn codex_portable_help(help: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut dropping = false;
+    for line in help.lines() {
+        let command_row = line
+            .strip_prefix("  ")
+            .filter(|rest| !rest.starts_with(' '))
+            .and_then(|rest| rest.split_whitespace().next());
+        if let Some(name) = command_row {
+            dropping = PLATFORM_ONLY_CODEX_COMMANDS.contains(&name);
+        } else if !line.starts_with("    ") {
+            dropping = false;
+        }
+        if !dropping {
+            kept.push(line);
+        }
+    }
+    kept.join("\n")
+}
+
 fn contract_dir(out_dir: &Path) -> PathBuf {
     out_dir.join("contract")
 }
@@ -555,8 +589,8 @@ mod tests {
 
     use super::{
         CONTRACT_TIMEOUT, acp_initialize, acp_with, claude_surface, claude_with,
-        codex_contract_with, command_name, command_output, copy_generated_schema,
-        normalize_acp_initialize, write_json,
+        codex_contract_with, codex_portable_help, command_name, command_output,
+        copy_generated_schema, normalize_acp_initialize, write_json,
     };
     use crate::capture::tests::{CaptureCleanupLauncher, CaptureStop, capture_host_with_limits};
     use mango_external_agents::testing::{FakeLauncher, FakeProcess};
@@ -693,6 +727,24 @@ mod tests {
         assert_eq!(launches[1].argv, vec!["claude", "--help"]);
         assert!(!out.join("contract/auth-status.json").exists());
         std::fs::remove_dir_all(out).expect("expected temporary capture cleanup");
+    }
+
+    #[test]
+    fn codex_help_drops_the_desktop_app_row_that_only_macos_and_windows_list() {
+        let printed = "Commands:\n  plugin  Manage plugins\n  acp     A hypothetical native ACP mode\n  app     Launch the Desktop app (opens\n          the installer if missing)\n  completion  Generate scripts\n\nOptions:\n  -c, --config <key=value>\n          Override a value";
+
+        let portable = codex_portable_help(printed);
+
+        assert_eq!(
+            portable,
+            "Commands:\n  plugin  Manage plugins\n  acp     A hypothetical native ACP mode\n  completion  Generate scripts\n\nOptions:\n  -c, --config <key=value>\n          Override a value",
+            "(codex help): expected only the app row and its wrapped line dropped, an unknown subcommand kept | received {portable:?}"
+        );
+        assert_eq!(
+            codex_portable_help("Commands:\n  plugin  Manage plugins"),
+            "Commands:\n  plugin  Manage plugins",
+            "(codex help): expected a Linux listing to pass through unchanged"
+        );
     }
 
     #[tokio::test]
