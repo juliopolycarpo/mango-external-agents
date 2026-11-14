@@ -332,6 +332,10 @@ mod tests {
 
     #[test]
     fn a_socket_path_goes_with_the_unix_socket_transport_as_typed() {
+        // Built from the temporary directory so the path is absolute on every platform the parser
+        // tests run on; a Unix-style literal has no drive letter on Windows.
+        let socket = std::env::temp_dir().join("codex").join("app-server.sock");
+        let socket_argument = socket.display().to_string();
         let options = Options::parse_for(
             "turn",
             &arguments(&[
@@ -340,16 +344,13 @@ mod tests {
                 "--transport",
                 "unix-socket",
                 "--socket",
-                "/run/user/1000/codex/app-server.sock",
+                &socket_argument,
                 "hello",
             ]),
         )
         .unwrap_or_else(|error| panic!("expected (mea turn) to accept it, received {error}"));
         assert_eq!(options.transport, Some(TransportKind::UnixSocket));
-        assert_eq!(
-            options.socket,
-            Some(PathBuf::from("/run/user/1000/codex/app-server.sock"))
-        );
+        assert_eq!(options.socket, Some(socket));
     }
 
     #[test]
