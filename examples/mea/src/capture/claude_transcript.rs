@@ -671,6 +671,9 @@ struct ValueContext {
     /// The value sits under a key of a [`MODEL_KEYED_MEMBERS`] map, which the transcript writes
     /// through [`redact_model_id`].
     model_key: bool,
+    /// The value sits under a key of a [`ChildKeys::UserChosen`] map. The key is data, reported
+    /// once in [`DriftReport::map_keys`], so it is not judged again as a member name.
+    user_key: bool,
 }
 
 fn redact_value(
@@ -697,6 +700,11 @@ fn redact_value(
             // the model's answer the keys are the schema's own and stay.
             let model_keyed = !context.answer
                 && member.is_some_and(|member| MODEL_KEYED_MEMBERS.contains(&member));
+            // A map whose keys a user or a tool author chose. Inside the model's answer the keys
+            // are the schema's own and are not reported.
+            let user_chosen = !context.answer
+                && member
+                    .is_some_and(|member| child_keys_of(member) == Some(ChildKeys::UserChosen));
             let mut redacted = Map::new();
             for (name, value) in members {
                 // Keys are rewritten too: a map keyed by a path would carry it.
@@ -706,6 +714,10 @@ fn redact_value(
                     redact::rewrite_paths(&name, paths)
                 };
                 let key = unused_key(&redacted, written.clone());
+                if user_chosen {
+                    // Whatever the value, the transcript keeps the key.
+                    drift.note_map_key(&written);
+                }
                 // The rules that deny a member because no review kept it, not because its name is
                 // credential-shaped: a new shape shows up here, so the operator is told its name.
                 let denied_by_default = USER_KEYED_MEMBERS.contains(&name.as_str())
@@ -727,6 +739,7 @@ fn redact_value(
                         tool_call,
                         answer: context.answer || ANSWER_MEMBERS.contains(&name.as_str()),
                         model_key: model_keyed,
+                        user_key: user_chosen,
                     };
                     redact_value(value, Some(&name), inner, paths, drift)
                 };
@@ -756,6 +769,7 @@ fn redact_value(
             _ => {
                 if let Some(member) = member
                     && !context.answer
+                    && !context.user_key
                     && !REVIEWED_REDACTED_STRING_MEMBERS.contains(&member)
                 {
                     // As the transcript writes the key, so the report holds nothing the file does not.
@@ -778,11 +792,23 @@ fn redact_value(
     }
 }
 
+/// Whether [`REVIEWED_RETAINED_MEMBERS`] lists `member`.
+fn is_reviewed_retained(member: &str) -> bool {
+    child_keys_of(member).is_some()
+}
+
+/// What the keys under `member` are, or `None` when no review lists the member.
+fn child_keys_of(member: &str) -> Option<ChildKeys> {
+    REVIEWED_RETAINED_MEMBERS
+        .iter()
+        .find_map(|(name, children)| (*name == member).then_some(*children))
+}
+
 /// Notes the name of a retained number, boolean or object member that no review has seen.
 ///
 /// Called for every non-string value the walk keeps. A member that is denied never gets here, and
 /// neither does anything inside the model's answer, whose members are the schema's own. A value
-/// under a model-keyed map sits at a model id, which is data and not a member name.
+/// under a model-keyed or a user-chosen map sits at a key, which is data and not a member name.
 fn note_retained_member(
     member: Option<&str>,
     context: ValueContext,
@@ -792,7 +818,8 @@ fn note_retained_member(
     if let Some(member) = member
         && !context.answer
         && !context.model_key
-        && !REVIEWED_RETAINED_MEMBERS.contains(&member)
+        && !context.user_key
+        && !is_reviewed_retained(member)
     {
         // As the transcript writes the key, so the report holds nothing the file does not.
         drift.note_retained(&redact::rewrite_paths(member, paths));
@@ -860,63 +887,83 @@ const REVIEWED_REDACTED_STRING_MEMBERS: &[&str] = &[
     "version",
 ];
 
+/// Who chose the keys under a reviewed member that holds an object, which decides how the drift
+/// report treats them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChildKeys {
+    /// A number or a boolean: there are no children to judge.
+    Leaf,
+    /// The vendor's own structure. A child is a member name, judged against the reviewed lists
+    /// like any other, so a stable CLI stays quiet and a new child is reported.
+    Vendor,
+    /// A map keyed by model id (see [`MODEL_KEYED_MEMBERS`]). The key is written through
+    /// [`redact_model_id`], so it is neither a member name nor reported.
+    ModelIds,
+    /// A map keyed by names a user or a tool author chose, such as the parameters of a tool call.
+    /// A key here is data: no list can review it, so every key is reported, as written, in the
+    /// drift report's own line. Only the direct children are keys; the members below them are
+    /// judged by name.
+    UserChosen,
+}
+
 /// Number, boolean and object members the committed Claude transcripts under
 /// `fixtures/claude/transcripts/` already show and that the recorder keeps, so they are expected
-/// and not reported as new. A number or a boolean is written as the CLI gave it, and an object is
-/// walked into, so a name that is not here is one no review has seen: a map keyed by names a user
-/// chose would show up as its member name and the keys inside it. A name here records that it is
-/// understood, not that every value under it is safe. Sorted.
-const REVIEWED_RETAINED_MEMBERS: &[&str] = &[
-    "cacheCreationInputTokens",
-    "cacheReadInputTokens",
-    "cache_creation",
-    "cache_creation_input_tokens",
-    "cache_read_input_tokens",
-    "caller",
-    "content",
-    "content_block",
-    "contextWindow",
-    "context_management",
-    "costUSD",
-    "delta",
-    "duration_api_ms",
-    "duration_ms",
-    "ephemeral_1h_input_tokens",
-    "ephemeral_5m_input_tokens",
-    "estimated_tokens",
-    "estimated_tokens_delta",
-    "event",
-    "file",
-    "index",
-    "inputTokens",
-    "input_tokens",
-    "is_error",
-    "iterations",
-    "maxOutputTokens",
-    "message",
-    "modelUsage",
-    "numLines",
-    "num_turns",
-    "outputTokens",
-    "output_tokens",
-    "output_tokens_details",
-    "permission_denials",
-    "plugins",
-    "server_tool_use",
-    "startLine",
-    "thinking_tokens",
-    "time_to_request_ms",
-    "tool_input",
-    "tool_result_meta",
-    "tool_use_result",
-    "totalLines",
-    "total_cost_usd",
-    "ttft_ms",
-    "ttft_stream_ms",
-    "usage",
-    "webSearchRequests",
-    "web_fetch_requests",
-    "web_search_requests",
+/// and not reported as new, each with who chose the keys under it. A number or a boolean is written
+/// as the CLI gave it, and an object is walked into, so a name that is not here is one no review has
+/// seen. A name here records that it is understood, not that every value under it is safe; its
+/// [`ChildKeys`] records what its children are, and the test over the committed transcripts fails
+/// when a member holds an object its entry does not declare. Sorted by name.
+const REVIEWED_RETAINED_MEMBERS: &[(&str, ChildKeys)] = &[
+    ("cacheCreationInputTokens", ChildKeys::Leaf),
+    ("cacheReadInputTokens", ChildKeys::Leaf),
+    ("cache_creation", ChildKeys::Vendor),
+    ("cache_creation_input_tokens", ChildKeys::Leaf),
+    ("cache_read_input_tokens", ChildKeys::Leaf),
+    ("caller", ChildKeys::Vendor),
+    ("content", ChildKeys::Vendor),
+    ("content_block", ChildKeys::Vendor),
+    ("contextWindow", ChildKeys::Leaf),
+    ("context_management", ChildKeys::Vendor),
+    ("costUSD", ChildKeys::Leaf),
+    ("delta", ChildKeys::Vendor),
+    ("duration_api_ms", ChildKeys::Leaf),
+    ("duration_ms", ChildKeys::Leaf),
+    ("ephemeral_1h_input_tokens", ChildKeys::Leaf),
+    ("ephemeral_5m_input_tokens", ChildKeys::Leaf),
+    ("estimated_tokens", ChildKeys::Leaf),
+    ("estimated_tokens_delta", ChildKeys::Leaf),
+    ("event", ChildKeys::Vendor),
+    ("file", ChildKeys::Vendor),
+    ("index", ChildKeys::Leaf),
+    ("inputTokens", ChildKeys::Leaf),
+    ("input_tokens", ChildKeys::Leaf),
+    ("is_error", ChildKeys::Leaf),
+    ("iterations", ChildKeys::Vendor),
+    ("maxOutputTokens", ChildKeys::Leaf),
+    ("message", ChildKeys::Vendor),
+    ("modelUsage", ChildKeys::ModelIds),
+    ("numLines", ChildKeys::Leaf),
+    ("num_turns", ChildKeys::Leaf),
+    ("outputTokens", ChildKeys::Leaf),
+    ("output_tokens", ChildKeys::Leaf),
+    ("output_tokens_details", ChildKeys::Vendor),
+    ("permission_denials", ChildKeys::Vendor),
+    ("plugins", ChildKeys::Vendor),
+    ("server_tool_use", ChildKeys::Vendor),
+    ("startLine", ChildKeys::Leaf),
+    ("thinking_tokens", ChildKeys::Leaf),
+    ("time_to_request_ms", ChildKeys::Leaf),
+    ("tool_input", ChildKeys::UserChosen),
+    ("tool_result_meta", ChildKeys::Vendor),
+    ("tool_use_result", ChildKeys::Vendor),
+    ("totalLines", ChildKeys::Leaf),
+    ("total_cost_usd", ChildKeys::Leaf),
+    ("ttft_ms", ChildKeys::Leaf),
+    ("ttft_stream_ms", ChildKeys::Leaf),
+    ("usage", ChildKeys::Vendor),
+    ("webSearchRequests", ChildKeys::Leaf),
+    ("web_fetch_requests", ChildKeys::Leaf),
+    ("web_search_requests", ChildKeys::Leaf),
 ];
 
 /// How many names of each kind the drift report prints before it only counts the rest.
@@ -941,6 +988,9 @@ struct DriftReport {
     /// Members whose number, boolean or object the recorder kept and that
     /// [`REVIEWED_RETAINED_MEMBERS`] does not list.
     retained: BTreeSet<String>,
+    /// Keys of a member [`REVIEWED_RETAINED_MEMBERS`] declares [`ChildKeys::UserChosen`], as the
+    /// transcript writes them. A key there is data, so it is always listed and never reviewed.
+    map_keys: BTreeSet<String>,
 }
 
 impl DriftReport {
@@ -956,24 +1006,41 @@ impl DriftReport {
         self.retained.insert(name.to_owned());
     }
 
+    fn note_map_key(&mut self, key: &str) {
+        self.map_keys.insert(key.to_owned());
+    }
+
     /// One line per kind that is not empty. Each gives the count of distinct names and the first
     /// [`DRIFT_NAMES_SHOWN`] of them in sorted order, every name escaped for a terminal and cut at
-    /// [`DRIFT_NAME_CHARS`] characters.
+    /// [`DRIFT_NAME_CHARS`] characters. The keys of a user-chosen map are listed the same way, with
+    /// a trailer that says they are not for review.
     fn lines(&self, scenario: &str) -> Vec<String> {
+        const REVIEW: &str = "review them against the lists in claude_transcript.rs";
         [
-            ("members replaced by the deny-by-default rule", &self.denied),
+            (
+                "members replaced by the deny-by-default rule",
+                &self.denied,
+                REVIEW,
+            ),
             (
                 "members not seen before, their strings replaced",
                 &self.unseen,
+                REVIEW,
             ),
             (
                 "members not seen before, their numbers, booleans and objects kept",
                 &self.retained,
+                REVIEW,
+            ),
+            (
+                "keys inside user-chosen maps, written to the transcript as given",
+                &self.map_keys,
+                "the keys are the user's choice, so check that none names something private",
             ),
         ]
         .into_iter()
-        .filter(|(_, names)| !names.is_empty())
-        .map(|(what, names)| {
+        .filter(|(_, names, _)| !names.is_empty())
+        .map(|(what, names, trailer)| {
             let shown: Vec<String> = names
                 .iter()
                 .take(DRIFT_NAMES_SHOWN)
@@ -986,7 +1053,7 @@ impl DriftReport {
                 String::new()
             };
             format!(
-                "claude/{scenario}: {what} ({}): {}{more}; review them against the lists in claude_transcript.rs",
+                "claude/{scenario}: {what} ({}): {}{more}; {trailer}",
                 names.len(),
                 shown.join(", "),
             )

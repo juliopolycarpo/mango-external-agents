@@ -104,7 +104,7 @@ Retained on purpose:
 
 The by-name rules only know the shapes seen at the pinned Claude Code, so a later release can add a
 member that is redacted without anyone noticing. After it writes the transcript (qualified,
-`.unqualified` or `.partial`), `mea capture` prints up to three lines to stderr:
+`.unqualified` or `.partial`), `mea capture` prints up to four lines to stderr:
 
 - `members replaced by the deny-by-default rule`: members of a `system/init` or `rate_limit_event`
   record outside its allow-list, and `by_type`, that the committed transcripts do not already show.
@@ -117,15 +117,29 @@ member that is redacted without anyone noticing. After it writes the transcript 
   A `mea` test replays the committed `fixtures/claude/transcripts/` through the recorder and fails
   when any of the three lists is incomplete for them, so the lists stay in step with what the
   fixtures show.
+- `keys inside user-chosen maps, written to the transcript as given`: the direct keys of a member
+  that `REVIEWED_RETAINED_MEMBERS` declares `UserChosen`, today `tool_input`, the parameters of a
+  tool call that a tool author named. A key there is data, so no list can review it: every key is
+  listed on every run that has one, a name a reviewed list holds included, and is not also judged
+  as a member name. Only the direct keys are listed; the members below them are judged by name.
+  The committed transcripts show `content` and `file_path` on this line, and a `mea` test pins
+  that.
+
+`REVIEWED_RETAINED_MEMBERS` states for each member who chose the keys under it: `Leaf` (a number or
+a boolean), `Vendor` (the vendor's structure, judged by name as above), `ModelIds` (a map keyed by
+model id, redacted and not reported) or `UserChosen`. A `mea` test reads the committed transcripts
+as raw JSON and fails when a reviewed member holds an object its entry does not declare, or when a
+`Vendor` member holds a child that no list names. A name is listed flat, not per parent, so a
+vendor child that shares a name with a member reviewed elsewhere passes.
 
 Each line gives the count of distinct names and the first 12 in sorted order, then `and N more`.
 A name is escaped for a terminal and cut at 48 characters. The report holds names only, never a
-value, and nothing is printed when no member is new. A name inside the model's answer is the
+value, and nothing is printed when no member is new and no user-chosen map has a key. A name inside the model's answer is the
 operator's schema and is left out. Reading a name is the prompt to review it: move it to the
 allow-list if the reducer reads it, add it to the reviewed set if it is understood and stays
-redacted or kept, or add a rule if it carries something private. The report cannot tell a
-data-keyed map from a record: the keys of a map of strings, numbers or objects appear as names
-unless a review lists them.
+redacted or kept, or add a rule if it carries something private. A map keyed by data that
+`REVIEWED_RETAINED_MEMBERS` does not declare is still read as a record: its keys appear as names
+unless a review lists them, so declare such a map `UserChosen` when you review its member.
 
 ## Three classes of fixture
 

@@ -2528,14 +2528,314 @@ fn a_retained_member_name_is_reported_as_the_transcript_writes_it() {
 
 #[test]
 fn the_reviewed_retained_members_are_sorted_and_unique() {
-    let mut sorted = REVIEWED_RETAINED_MEMBERS.to_vec();
+    let names: Vec<&str> = REVIEWED_RETAINED_MEMBERS
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    let mut sorted = names.clone();
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(
-        REVIEWED_RETAINED_MEMBERS,
-        sorted.as_slice(),
+        names, sorted,
         "expected the reviewed list sorted without a repeat"
     );
+}
+
+#[test]
+fn only_the_members_the_walk_keys_by_model_id_are_declared_model_id_maps() {
+    for (name, children) in REVIEWED_RETAINED_MEMBERS {
+        assert_eq!(
+            *children == ChildKeys::ModelIds,
+            MODEL_KEYED_MEMBERS.contains(name),
+            "expected {name:?} declared ModelIds exactly when MODEL_KEYED_MEMBERS {MODEL_KEYED_MEMBERS:?} lists it | received: {children:?}"
+        );
+    }
+}
+
+/// A reviewed-members table that gets `tool_input` wrong, to prove the check reads the table.
+const TABLE_WITH_UNDECLARED_CHILDREN: &[(&str, ChildKeys)] = &[
+    ("message", ChildKeys::Vendor),
+    ("tool_input", ChildKeys::Leaf),
+];
+
+/// What a reviewed member holds that its declaration does not cover, one line each, found by
+/// reading the raw JSON and not through the recorder, so the check is not the walk grading itself.
+///
+/// A [`ChildKeys::Leaf`] member must hold no object. A [`ChildKeys::Vendor`] member's non-null
+/// children that carry something must each be a name some reviewed list or rule already holds. A user-chosen or
+/// model-id map is covered whatever it holds. Members the recorder replaces whole or that are the
+/// model's answer are not entered.
+fn children_outside_declaration(records: &[Value], reviewed: &[(&str, ChildKeys)]) -> Vec<String> {
+    fn is_listed(name: &str) -> bool {
+        is_reviewed_retained(name)
+            || REVIEWED_REDACTED_STRING_MEMBERS.contains(&name)
+            || STRUCTURAL_STRING_MEMBERS.contains(&name)
+            || REVIEWED_DENIED_MEMBERS.contains(&name)
+            || ANSWER_MEMBERS.contains(&name)
+            || is_credential_member(name)
+            // The two names the walk handles by rule: `model` through `redact_model_id`, `cwd`
+            // by rewriting it to the fixture's directory.
+            || matches!(name, "model" | "cwd")
+    }
+
+    /// A child with nothing in it: the walk has no value to keep and no name below it to judge.
+    fn carries_nothing(child: &Value) -> bool {
+        match child {
+            Value::Null => true,
+            Value::Array(items) => items.is_empty(),
+            Value::Object(members) => members.is_empty(),
+            _ => false,
+        }
+    }
+
+    fn walk(
+        value: &Value,
+        member: Option<&str>,
+        reviewed: &[(&str, ChildKeys)],
+        found: &mut Vec<String>,
+    ) {
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    walk(item, member, reviewed, found);
+                }
+            }
+            Value::Object(children) => {
+                let declared = member.and_then(|member| {
+                    reviewed
+                        .iter()
+                        .find_map(|(name, kind)| (*name == member).then_some(*kind))
+                });
+                if let (Some(member), Some(kind)) = (member, declared) {
+                    match kind {
+                        ChildKeys::Leaf if !children.is_empty() => found.push(format!(
+                            "{member:?} is declared Leaf but holds an object with keys {:?}",
+                            children.keys().collect::<Vec<_>>()
+                        )),
+                        ChildKeys::Vendor => {
+                            for (key, child) in children {
+                                if !carries_nothing(child) && !is_listed(key) {
+                                    found.push(format!(
+                                        "{member:?} is declared Vendor but its child {key:?} is in no reviewed list"
+                                    ));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for (key, child) in children {
+                    let skipped = ANSWER_MEMBERS.contains(&key.as_str())
+                        || REVIEWED_DENIED_MEMBERS.contains(&key.as_str())
+                        || USER_KEYED_MEMBERS.contains(&key.as_str());
+                    if !skipped {
+                        walk(child, Some(key), reviewed, found);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut found = Vec::new();
+    for record in records {
+        walk(record, None, reviewed, &mut found);
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+fn committed_transcript_records() -> Vec<Value> {
+    committed_transcript_lines()
+        .iter()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+#[test]
+fn every_child_key_of_a_reviewed_member_in_the_committed_transcripts_is_listed_or_covered() {
+    let found =
+        children_outside_declaration(&committed_transcript_records(), REVIEWED_RETAINED_MEMBERS);
+
+    assert!(
+        found.is_empty(),
+        "expected every child of a reviewed member to be a listed name or under a declared map | received: {found:#?}"
+    );
+}
+
+#[test]
+fn a_reviewed_member_declared_without_the_children_it_holds_is_caught() {
+    let records = [json!({"type": "result", "message": {
+        "novelChild": 1, "type": "x", "tool_input": {"file_path": "p"}}})];
+
+    let found = children_outside_declaration(&records, TABLE_WITH_UNDECLARED_CHILDREN);
+
+    assert_eq!(
+        found,
+        vec![
+            String::from(
+                r#""message" is declared Vendor but its child "novelChild" is in no reviewed list"#
+            ),
+            String::from(
+                r#""tool_input" is declared Leaf but holds an object with keys ["file_path"]"#
+            ),
+        ],
+        "expected the undeclared child and the Leaf that holds an object, each named"
+    );
+}
+
+/// The committed transcripts show one tool call's parameters under `permission_denials`.
+const COMMITTED_USER_CHOSEN_KEYS: &[&str] = &["content", "file_path"];
+
+#[test]
+fn the_committed_claude_transcripts_report_only_the_keys_of_their_user_chosen_maps() {
+    let drift = drift_over(&committed_transcript_lines());
+
+    let keys: Vec<&str> = drift.map_keys.iter().map(String::as_str).collect();
+    assert_eq!(
+        keys, COMMITTED_USER_CHOSEN_KEYS,
+        "expected the keys under the declared user-chosen maps of the committed transcripts"
+    );
+}
+
+/// A parameter name a tool author chose, which no reviewed list holds.
+const TOOL_PARAMETER_KEY: &str = "customerLedgerRef";
+
+#[test]
+fn a_key_of_a_user_chosen_map_is_reported_whether_or_not_a_list_holds_its_name() {
+    let drift = drift_over(&lines_of(&[
+        json!({"type": "result", "permission_denials": [
+        {"tool_name": "mcp__ledger__lookup", "tool_input": {
+            TOOL_PARAMETER_KEY: "x", "message": "y", "usage": 2, "event": {"index": 1}}}]}),
+    ]));
+
+    let keys: Vec<&str> = drift.map_keys.iter().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        vec![TOOL_PARAMETER_KEY, "event", "message", "usage"],
+        "expected every direct key of tool_input, a reviewed name included"
+    );
+}
+
+#[test]
+fn a_user_chosen_key_is_not_also_judged_as_a_member_name() {
+    let drift = drift_over(&lines_of(&[
+        json!({"type": "result", "permission_denials": [
+        {"tool_input": {TOOL_PARAMETER_KEY: "x", "novelCounter": 3, "novelGroup": {"leaf": true}}}]}),
+    ]));
+
+    assert!(
+        drift.unseen.is_empty() && !drift.retained.contains(TOOL_PARAMETER_KEY),
+        "expected a map key outside the by-name sets | received strings: {:?} retained: {:?}",
+        drift.unseen,
+        drift.retained
+    );
+    assert!(
+        !drift.retained.contains("novelCounter") && !drift.retained.contains("novelGroup"),
+        "expected a number and an object key outside the retained set | received: {:?}",
+        drift.retained
+    );
+}
+
+#[test]
+fn the_members_below_a_user_chosen_key_are_judged_by_name() {
+    let drift = drift_over(&lines_of(&[
+        json!({"type": "result", "permission_denials": [
+        {"tool_input": {"nested": {"deeperName": 3, "novelNote": "x"}}}]}),
+    ]));
+
+    assert_eq!(
+        drift.map_keys.iter().collect::<Vec<_>>(),
+        vec!["nested"],
+        "expected only the direct child to be a map key"
+    );
+    assert!(
+        drift.retained.contains("deeperName") && drift.unseen.contains("novelNote"),
+        "expected the deeper members reported by name | received retained: {:?} strings: {:?}",
+        drift.retained,
+        drift.unseen
+    );
+}
+
+#[test]
+fn a_user_chosen_map_inside_the_models_answer_is_the_schemas_own_and_not_reported() {
+    let drift = drift_over(&lines_of(&[
+        json!({"type": "result", "structured_output": {
+        "tool_input": {TOOL_PARAMETER_KEY: 1}}}),
+    ]));
+
+    assert!(
+        drift.map_keys.is_empty(),
+        "expected no key from inside the answer | received: {:?}",
+        drift.map_keys
+    );
+}
+
+#[test]
+fn a_user_chosen_key_is_reported_as_the_transcript_writes_it() {
+    let facts = MachineFacts::new();
+    let home_keyed = format!("{}/ledger", facts.home);
+    let drift = drift_over(&lines_of(&[
+        json!({"type": "result", "permission_denials": [
+        {"tool_input": {home_keyed.clone(): "x"}}]}),
+    ]));
+
+    assert!(
+        !drift.map_keys.is_empty() && drift.map_keys.iter().all(|key| !key.contains(&facts.home)),
+        "expected the home directory rewritten in the map key | received: {:?}",
+        drift.map_keys
+    );
+}
+
+#[test]
+fn a_user_chosen_key_is_listed_even_when_its_value_is_denied_or_null() {
+    let drift = drift_over(&lines_of(&[
+        json!({"type": "result", "permission_denials": [
+        {"tool_input": {"access_token": CANARY_TEXT, "emptyParam": null}}]}),
+    ]));
+
+    assert_eq!(
+        drift.map_keys.iter().collect::<Vec<_>>(),
+        vec!["access_token", "emptyParam"],
+        "expected every key the transcript keeps, whatever its value"
+    );
+}
+
+#[tokio::test]
+async fn a_capture_lists_the_user_chosen_keys_on_its_notices_and_never_their_values() {
+    let facts = MachineFacts::new();
+    let out = tempfile::tempdir().expect("expected an output directory");
+    let mut lines = answered_turn_lines(&facts);
+    lines.insert(
+        2,
+        json!({"type": "assistant", "permission_denials": [{"tool_name": "mcp__ledger__lookup",
+            "tool_input": {TOOL_PARAMETER_KEY: CANARY_TEXT, "amount": NOVEL_COUNT}}],
+            "message": {"id": "msg_0", "role": "assistant", "content": []}})
+        .to_string(),
+    );
+    let notices = RecordedNotices::default();
+
+    capture_noticed(
+        scripted_cli(lines),
+        out.path(),
+        &facts,
+        Some(SCHEMA),
+        None,
+        &notices,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("expected the capture to qualify, received {error}"));
+
+    let recorded = notices.recorded();
+    assert!(
+        recorded
+            .iter()
+            .any(|notice| notice.contains(TOOL_PARAMETER_KEY)
+                && notice.contains("keys inside user-chosen maps")),
+        "expected the key in a user-chosen map notice | received: {recorded:?}"
+    );
+    assert_no_value_in(&recorded, &[CANARY_TEXT, &NOVEL_COUNT.to_string()]);
 }
 
 #[tokio::test]
