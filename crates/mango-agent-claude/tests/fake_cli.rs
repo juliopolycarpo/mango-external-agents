@@ -278,6 +278,50 @@ async fn a_flag_shaped_value_after_a_known_flag_is_counted_and_never_named() {
 }
 
 #[tokio::test]
+async fn a_known_flag_name_that_is_a_flags_value_is_counted_and_never_named() {
+    let cli = FakeClaudeCli::new();
+    // `TurnArgv::build` refuses these values, so only a host's own launcher can emit them.
+    let words = [
+        "claude",
+        "--model",
+        "--print",
+        "--session-id",
+        "--resume",
+        "--verbose",
+    ];
+
+    refusal(cli.spawn(launch(&words)).await, &words);
+
+    let shapes = cli.refused_launch_shapes();
+    assert_eq!(
+        shapes,
+        vec![
+            "claude with 6 arguments: flags --model, --session-id, --verbose; 2 values redacted"
+                .to_owned()
+        ],
+        "expected a value-taking flag's next word to be counted even when it is a known flag name | received: {shapes:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_known_flag_name_after_a_valueless_flag_or_an_equals_value_is_named() {
+    let cli = FakeClaudeCli::new();
+    let words = ["claude", "--print", "--verbose", "--model=opus", "--effort"];
+
+    refusal(cli.spawn(launch(&words)).await, &words);
+
+    let shapes = cli.refused_launch_shapes();
+    assert_eq!(
+        shapes,
+        vec![
+            "claude with 5 arguments: flags --print, --verbose, --model, --effort; 0 values redacted"
+                .to_owned()
+        ],
+        "expected no word skipped after a valueless flag, an = value or a trailing flag | received: {shapes:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_flag_the_library_never_emits_is_counted_and_never_named() {
     let cli = FakeClaudeCli::new();
     let words = [

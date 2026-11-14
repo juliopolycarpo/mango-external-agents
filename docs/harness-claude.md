@@ -1240,7 +1240,8 @@ It records every launch (`launches`, `turn_argvs`) and every line written to a c
 did not queue. The error carries no argv, like every `Error::Launch`, and points at
 `refused_launch_shapes`, which reads each refusal as the program, the argument count and the flag
 names, with every value left out. Only the flags the turn argv builder emits are named; a value
-shaped like a flag, or a flag the library never passes, is counted. `refused_launches` holds the
+shaped like a flag, the word after a flag that takes a value (`--model --print` names `--model`
+and counts `--print`), or a flag the library never passes, is counted. `refused_launches` holds the
 full argv. `Run::completing` scripts a turn whose output does not matter. Any `auth`
 subcommand other than `status` is always refused: the library never logs in, so the fake never
 pretends to.
