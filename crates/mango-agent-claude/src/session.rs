@@ -2313,7 +2313,8 @@ async fn pump(
 /// whatever is still open. The usage is different: it is real data, and it is ordinary payload.
 /// When it is sent (no close was refused) but does not fit, the queue overflows and the turn ends
 /// as `stream-overflow`, exactly as it would for a delta, since dropping it silently would hide an
-/// incomplete transcript. The terminal itself needs no room.
+/// incomplete transcript. The terminal itself needs no room. A structured answer is data the same
+/// way, and is never dropped for a refused close: it is sent whatever `room` says.
 async fn emit_run_end(sink: &EventSink, event: EventKind, room: &mut bool) -> Result<()> {
     let close = match event {
         EventKind::ReasoningEnded => StructureClose::reasoning(),
@@ -2323,6 +2324,10 @@ async fn emit_run_end(sink: &EventSink, event: EventKind, room: &mut bool) -> Re
         terminal @ (EventKind::Completed | EventKind::Error { .. }) => {
             return sink.emit(terminal).await;
         }
+        // The turn's answer, not a diagnostic: dropped behind a refused close it would leave the
+        // host a `Completed` with no value, which reads as a schema run that produced none. Sent
+        // regardless of `room`, so a queue with no space for it fails the turn as `stream-overflow`.
+        answer @ EventKind::StructuredOutput { .. } => return sink.emit(answer).await,
         payload if *room => return sink.emit(payload).await,
         _ => return Ok(()),
     };
@@ -2670,6 +2675,63 @@ mod tests {
     };
     use mango_external_agents::{CancelReason, CancelToken, ExitStatus, Resumability};
     use std::sync::Arc;
+
+    /// A one-event sink and its receiver: the first payload fills it, so the next close is refused.
+    /// The receiver stays with the caller, because a dropped one closes the stream.
+    fn one_event_sink() -> (
+        mango_external_agents::EventSink,
+        mango_external_agents::EventReceiver,
+    ) {
+        use mango_external_agents::testing::FrozenClock;
+        use mango_external_agents::{AttemptId, EventSink, SessionId, TurnId};
+        EventSink::new(
+            SessionId::new("session"),
+            TurnId::new("turn"),
+            AttemptId::FIRST,
+            Arc::new(FrozenClock::default()),
+            1,
+        )
+    }
+
+    /// A close the queue has no room for sets `room` to false, and the usage behind it is
+    /// dropped by design. The answer is not: dropping it would complete the turn without a value.
+    #[tokio::test]
+    async fn a_structured_answer_behind_a_refused_close_is_sent_not_dropped() {
+        use mango_external_agents::EventKind;
+        let (sink, _events) = one_event_sink();
+        sink.emit(EventKind::TextDelta {
+            text: String::from("fills the one-event queue"),
+        })
+        .await
+        .expect("expected the first payload to fit");
+        let mut room = true;
+        super::emit_run_end(&sink, EventKind::ReasoningEnded, &mut room)
+            .await
+            .expect("expected a refused close to be dropped quietly");
+        assert!(!room, "expected the refused close to be remembered");
+
+        let usage = super::emit_run_end(
+            &sink,
+            EventKind::Usage {
+                usage: mango_external_agents::Usage::default(),
+            },
+            &mut room,
+        )
+        .await;
+        assert!(
+            usage.is_ok() && !sink.is_terminal(),
+            "expected the usage to be dropped behind the refused close | received: {usage:?}"
+        );
+
+        let answer = EventKind::structured_output(serde_json::json!({"word": "ok"}))
+            .expect("expected a small answer");
+        let sent = super::emit_run_end(&sink, answer, &mut room).await;
+        assert!(
+            sent.is_err() && sink.is_terminal(),
+            "expected the answer to be sent and to fail the turn as overflow, not vanish | received: {sent:?}, terminal: {}",
+            sink.is_terminal()
+        );
+    }
 
     #[tokio::test]
     async fn shared_teardown_preserves_process_identity_and_message() {
