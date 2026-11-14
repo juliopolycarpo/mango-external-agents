@@ -1982,7 +1982,7 @@ mod tests {
             assert!(
                 matches!(error.cause(), Error::Protocol { expected, .. } if expected == "a confirmed process cleanup")
             );
-            assert!(crate::failure::describe(&error).contains("4242"));
+            assert!(crate::command_failure(&error).contains("4242"));
         }
     }
 
@@ -2023,11 +2023,11 @@ mod tests {
         };
         let mut primary_report = String::new();
         let result = super::with_cleanup::<()>(Err(primary), Err(cleanup), |error| {
-            primary_report = crate::failure::describe(error)
+            primary_report = crate::command_failure(error)
         })
         .expect_err("both failed");
         assert!(primary_report.contains("launched pid 41"));
-        assert!(crate::failure::describe(&result).contains("launched pid 42"));
+        assert!(crate::command_failure(&result).contains("launched pid 42"));
         assert!(Arc::ptr_eq(
             &result.cleanup_control().expect("returned owner"),
             &remaining
@@ -2040,7 +2040,7 @@ mod tests {
             control: Arc::new(CleanupControl(None)),
             source: Box::new(Error::Closed { subject: "cleanup" }),
         };
-        let report = crate::failure::describe(&error);
+        let report = crate::command_failure(&error);
         assert!(report.contains("unconfirmed"));
         assert!(report.contains("control has no pid"));
     }

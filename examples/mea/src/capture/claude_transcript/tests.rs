@@ -631,6 +631,35 @@ fn an_unqualified_report_names_the_vendor_failure_and_only_structural_words() {
     );
 }
 
+/// A vendor failure the way the harness reports one: a code and the vendor's own reason.
+struct FakeVendorFailure;
+
+impl FakeVendorFailure {
+    const CODE: &'static str = "claude-turn-failed";
+    const MESSAGE: &'static str = "the model fake-model-1 does not exist";
+
+    fn error() -> Error {
+        Error::Vendor(mango_external_agents::VendorError::new(
+            mango_external_agents::ErrorCode::from_static(Self::CODE),
+            Self::MESSAGE,
+        ))
+    }
+}
+
+#[test]
+fn the_primary_failure_line_carries_the_vendor_message_and_the_scenario() {
+    let line = primary_failure_line("structured-output", &FakeVendorFailure::error());
+
+    assert!(
+        line.starts_with("claude/structured-output: capture failed before cleanup: "),
+        "expected the scenario and the cleanup context | received: {line}"
+    );
+    assert!(
+        line.contains(FakeVendorFailure::CODE) && line.contains(FakeVendorFailure::MESSAGE),
+        "expected the vendor code and message as `<code>: vendor failure: <message>` | received: {line}"
+    );
+}
+
 #[test]
 fn the_header_names_the_scenario_the_cli_version_and_the_capture_time() {
     let lines = header(&SCENARIOS[0], Some("2.1.325"), Some(1_790_000_000), None);

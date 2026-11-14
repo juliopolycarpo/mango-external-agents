@@ -196,11 +196,7 @@ async fn claude_with(
         .filter_map(|line| redact_line(line, paths))
         .collect();
     let outcome = crate::failure::with_cleanup(conversation, closed, |primary| {
-        eprintln!(
-            "claude/{}: capture failed before cleanup: {}",
-            scenario.name,
-            crate::failure::describe(primary)
-        );
+        eprintln!("{}", primary_failure_line(scenario.name, primary));
     });
 
     let partial = directory.join(format!("{}.partial.jsonl", scenario.name));
@@ -285,6 +281,15 @@ async fn converse(session: &dyn Session, scenario: &Scenario) -> Result<Option<S
             })
         }
     }
+}
+
+/// The line printed when a capture fails and its cleanup fails too: the conversation's own error,
+/// which the cleanup error returned to the caller would otherwise hide.
+fn primary_failure_line(scenario: &str, primary: &Error) -> String {
+    format!(
+        "claude/{scenario}: capture failed before cleanup: {}",
+        crate::command_failure(primary)
+    )
 }
 
 fn unexpected_prompt(received: &str) -> Error {

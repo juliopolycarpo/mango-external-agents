@@ -328,7 +328,7 @@ async fn command_lines(
         eprintln!(
             "{}: public capture failed before cleanup: {}",
             command_name(&argv),
-            crate::failure::describe(primary)
+            crate::command_failure(primary)
         );
     })
 }
@@ -393,7 +393,7 @@ async fn acp_initialize(
         eprintln!(
             "{}: public capture failed before cleanup: {}",
             profile.display_name,
-            crate::failure::describe(primary)
+            crate::command_failure(primary)
         );
     })
 }
