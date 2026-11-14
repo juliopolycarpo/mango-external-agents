@@ -50,27 +50,44 @@ pub(crate) const WORST_CASE_CONDITIONAL_FLAGS: [&str; 7] = [
     "--json-schema",
 ];
 
-/// Every flag name [`TurnArgv::build`] can put on a turn's command line, with no value.
+/// A flag [`TurnArgv::build`] can put on a turn's command line.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) struct TurnFlag {
+    /// The flag as written, with no value.
+    pub(crate) name: &'static str,
+    /// Whether the flag's value is the next argument. A value written `--flag=value` needs no
+    /// next argument.
+    pub(crate) takes_value: bool,
+}
+
+#[cfg(any(test, feature = "testing"))]
+const fn flag(name: &'static str, takes_value: bool) -> TurnFlag {
+    TurnFlag { name, takes_value }
+}
+
+/// Every flag [`TurnArgv::build`] can put on a turn's command line.
 ///
 /// The fake CLI names a refused launch's flags from this list and counts every other word, so a
-/// flag-shaped value such as `-sk-ant-abc` is never printed. Tests pin the list against the argv
-/// the builder produces: a flag added to `build` without an entry here fails them.
+/// flag-shaped value such as `-sk-ant-abc` is never printed. `takes_value` lets it count the word
+/// after `--model` even when that word is itself a listed name, as in `--model --print`. Tests pin
+/// the list against the argv the builder produces: a flag added to `build`, or a flag that gains
+/// or loses a value, without a matching entry here fails them.
 #[cfg(any(test, feature = "testing"))]
-pub(crate) const TURN_FLAG_NAMES: [&str; 14] = [
-    "--print",
-    "--input-format",
-    "--output-format",
-    "--verbose",
-    "--include-partial-messages",
-    "--forward-subagent-text",
-    "--permission-mode",
-    "--permission-prompts",
-    "--resume",
-    "--session-id",
-    "--model",
-    "--effort",
-    "--mcp-config",
-    "--json-schema",
+pub(crate) const TURN_FLAGS: [TurnFlag; 14] = [
+    flag("--print", false),
+    flag("--input-format", true),
+    flag("--output-format", true),
+    flag("--verbose", false),
+    flag("--include-partial-messages", false),
+    flag("--forward-subagent-text", false),
+    flag("--permission-mode", true),
+    flag("--permission-prompts", true),
+    flag("--resume", true),
+    flag("--session-id", true),
+    flag("--model", true),
+    flag("--effort", true),
+    flag("--mcp-config", true),
+    flag("--json-schema", true),
 ];
 
 /// Everything the argv depends on, gathered so the builder decides nothing on its own.
@@ -708,10 +725,11 @@ mod tests {
         );
     }
 
-    /// Every combination of the optional flags: the names `build` emits and `TURN_FLAG_NAMES`
-    /// lists must be the same set, so the fake CLI neither prints a value nor hides a real flag.
+    /// Every combination of the optional flags: the flags `build` emits, each with whether a value
+    /// follows it, and `TURN_FLAGS` must be the same set, so the fake CLI neither prints a value
+    /// nor hides a real flag.
     #[test]
-    fn the_turn_flag_names_are_exactly_the_flags_build_can_emit() {
+    fn the_turn_flags_are_exactly_the_flags_build_can_emit_with_their_value_shape() {
         let schema = r#"{"type":"object"}"#;
         let efforts = [String::from("high")];
         // `/tmp/...` is not absolute on Windows, so the path comes from the host's temp dir.
@@ -736,22 +754,27 @@ mod tests {
                             ..base()
                         };
                         let argv = turn.build().expect("expected valid argv");
-                        emitted.extend(
-                            argv.into_iter()
-                                .skip(1)
-                                .filter(|word| word.starts_with("--")),
-                        );
+                        // `build` refuses a value that starts with `-`, so a flag takes a value
+                        // exactly when the next word is not itself a flag.
+                        for (index, word) in argv.iter().enumerate().skip(1) {
+                            if word.starts_with("--") {
+                                let takes_value = argv
+                                    .get(index + 1)
+                                    .is_some_and(|next| !next.starts_with("--"));
+                                emitted.insert((word.clone(), takes_value));
+                            }
+                        }
                     }
                 }
             }
         }
-        let listed: std::collections::BTreeSet<String> = super::TURN_FLAG_NAMES
+        let listed: std::collections::BTreeSet<(String, bool)> = super::TURN_FLAGS
             .iter()
-            .map(|flag| (*flag).to_owned())
+            .map(|flag| (flag.name.to_owned(), flag.takes_value))
             .collect();
         assert_eq!(
             listed, emitted,
-            "expected TURN_FLAG_NAMES to equal the flags TurnArgv::build emits | received left: listed, right: emitted"
+            "expected TURN_FLAGS to equal the (flag, takes_value) pairs TurnArgv::build emits | received left: listed, right: emitted"
         );
     }
 
