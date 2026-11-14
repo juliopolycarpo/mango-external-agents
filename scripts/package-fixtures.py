@@ -15,18 +15,27 @@ SELECTIONS = {
     "codex": ["**/*.jsonl"],
     "acp": ["cursor/contract", "grok/contract", "opencode/contract"],
 }
+# The recorders write these beside a replay fixture: an incomplete run and a completed run that
+# failed qualification. They are diagnostics, so a stray one must never reach a published crate.
+DIAGNOSTIC_SUFFIXES = (".partial.jsonl", ".unqualified.jsonl")
+
+
+def is_diagnostic(path):
+    """Report whether a path is a recorder diagnostic rather than a replay fixture."""
+    return path.name.endswith(DIAGNOSTIC_SUFFIXES)
 
 
 def selected_files(source, selections):
     """Return selected relative files, rejecting absent selections."""
     files = set()
     for selection in selections:
-        matches = list(source.glob(selection))
+        matches = [match for match in source.glob(selection) if not is_diagnostic(match)]
         if not matches:
             raise ValueError(f"{source / selection}: expected fixture selection, received no files")
         for match in matches:
             if match.is_dir():
-                files.update(path.relative_to(source) for path in match.rglob("*") if path.is_file())
+                files.update(path.relative_to(source) for path in match.rglob("*")
+                             if path.is_file() and not is_diagnostic(path))
             elif match.is_file():
                 files.add(match.relative_to(source))
     return files
