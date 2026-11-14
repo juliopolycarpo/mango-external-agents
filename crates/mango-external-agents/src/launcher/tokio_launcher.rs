@@ -860,9 +860,9 @@ impl Drop for TokioChild {
                 // The same escalation `kill` runs, rather than a sleep and a signal: it asks first,
                 // stops the moment nothing is left, and never signals a tree that is already gone.
                 Ok(runtime) => {
-                    runtime.spawn(async move {
-                        let _ = end_process_tree(pid, grace, exit).await;
-                    });
+                    // Called here, not inside the task: a runtime shutting down drops the task
+                    // unpolled, and only a future that already exists can still send the signal.
+                    runtime.spawn(end_process_tree(pid, grace, exit));
                 }
                 // Nothing left to wait a grace on, so there is nowhere to wait between asking and
                 // insisting. Still checked first: a tree that is already gone must not be signalled,
@@ -942,8 +942,58 @@ async fn tree_ends_within(
 /// Takes the reaper's view of the leader rather than the child itself, so the drop path — which no
 /// longer holds a handle — runs the same escalation as [`ProcessControl::kill`] instead of a sleep
 /// and a signal of its own.
+///
+/// A runtime that shuts down drops this future wherever it stands, and a runtime already shutting
+/// down drops a task spawned to run it before its first poll. Either way no grace is left to wait
+/// on, so the drop sends the final signal itself, as [`TokioChild`]'s drop does with no runtime.
+/// The signal is armed when this function is called, not at the first poll, so the unpolled case
+/// is covered too.
 #[cfg(unix)]
-async fn end_process_tree(
+fn end_process_tree(
+    pid: u32,
+    grace: Duration,
+    exit: watch::Receiver<Option<ExitStatus>>,
+) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
+    let mut abandoned = FinalSignalIfDropped {
+        pid,
+        exit: exit.clone(),
+        armed: true,
+    };
+    async move {
+        let ended = escalate_process_tree(pid, grace, exit).await;
+        // A method call, so the block captures the whole guard rather than only its flag.
+        abandoned.disarm();
+        ended
+    }
+}
+
+/// Sends the signal that cannot be declined when an escalation is dropped before it finished.
+#[cfg(unix)]
+struct FinalSignalIfDropped {
+    pid: u32,
+    exit: watch::Receiver<Option<ExitStatus>>,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl FinalSignalIfDropped {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FinalSignalIfDropped {
+    fn drop(&mut self) {
+        // An empty group is never signalled: its number may already name somebody else.
+        if self.armed && !tree_is_gone(self.pid, &self.exit) {
+            insist_tree_stops(self.pid);
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn escalate_process_tree(
     pid: u32,
     grace: Duration,
     exit: watch::Receiver<Option<ExitStatus>>,
@@ -981,6 +1031,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
+    #[cfg(target_os = "linux")]
+    mod native_cleanup;
     mod stop_bound;
 
     /// Diagnostic failures do not send signals: the repeated-stop case only observes our group.
@@ -1179,6 +1231,47 @@ mod tests {
                 std::io::stdout().flush().expect("flush ready marker");
                 loop {
                     std::thread::sleep(Duration::from_secs(60));
+                }
+            }
+            // Synthetic native cleanup qualification: a leader that starts one helper in its own
+            // process group, reports itself, and exits only when the test releases its stdin. The
+            // helper inherits this stdout, so the pipe closes only once both members are gone.
+            // These are test-owned stand-ins, not vendor frames.
+            #[cfg(target_os = "linux")]
+            "native-cleanup-leader" => {
+                use std::io::Write as _;
+                let executable =
+                    std::env::current_exe().expect("expected the test binary's own path");
+                let helper = std::process::Command::new(executable)
+                    .args(["launcher_fixture_child", "--nocapture", "--test-threads=1"])
+                    .env(FIXTURE_MODE, "native-cleanup-helper")
+                    .stdin(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("expected the native cleanup helper to start");
+                // Never waited on: the launcher's cleanup or the test's own guard ends it.
+                std::mem::forget(helper);
+                // The helper above inherited the test's blocked stop signals. The leader takes
+                // SIGINT again, like a vendor that honours it while a helper does not.
+                let mut interrupt = nix::sys::signal::SigSet::empty();
+                interrupt.add(nix::sys::signal::Signal::SIGINT);
+                interrupt.thread_unblock().expect("unblock leader SIGINT");
+                println!("MEA-NATIVE-LEADER {}", std::process::id());
+                std::io::stdout().flush().expect("flush leader marker");
+                // Stdin end of file releases it too, so a host that drops every handle frees it.
+                let mut release = String::new();
+                let _ = std::io::stdin().read_line(&mut release);
+            }
+            // Runs until a signal ends it. The test blocks SIGINT and SIGTERM before it launches
+            // the leader, and the mask is inherited, so only the final signal reaches this process.
+            #[cfg(target_os = "linux")]
+            "native-cleanup-helper" => {
+                use std::io::Write as _;
+                println!("MEA-NATIVE-HELPER {}", std::process::id());
+                std::io::stdout().flush().expect("flush helper marker");
+                // Finite, so a test process that is killed outright cannot leave it running.
+                for _ in 0..12 {
+                    std::thread::sleep(Duration::from_secs(10));
                 }
             }
             #[cfg(windows)]

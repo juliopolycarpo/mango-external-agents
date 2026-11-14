@@ -553,3 +553,29 @@ contained helpers continue until they finish or the host calls `kill` or drops t
 Dropping a handle requests cleanup while the host runtime remains live; the Job's close policy
 terminates remaining members during runtime shutdown. A failed attachment terminates the suspended
 child and reports launch failure rather than returning an uncontained process.
+
+### Native cleanup on Linux
+
+`launcher/tokio_launcher/tests/native_cleanup.rs` drives the real `TokioLauncher` and
+`ProcessCleanupGuard` over a synthetic leader that starts one helper in its own process group. Both
+are re-executions of the test binary that the test launched, pinned by pid and `/proc` start time.
+They are not vendor CLIs and carry no vendor frame. The helper blocks SIGINT and SIGTERM, so only
+SIGKILL ends it. The runs used Linux 7.0.0-42-generic, rustc 1.99.0 (b940084d7 2026-09-28) and
+tokio 1.54.1, on 2026-11-13.
+
+| Situation                                                         | Observed                                                                                                                                            |
+| ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Leader exit                                                       | `wait` returns the leader's status, the helper keeps running and the group stays non-empty. `finish` then ends the group.                           |
+| Cancelled `finish`, or a guard dropped, while the runtime lives   | The started worker runs to the end of the group without its caller.                                                                                 |
+| Joined `finish`                                                   | The group is empty when it returns: no leader, helper or unreaped zombie remains.                                                                   |
+| Runtime shut down, handles still held                             | Nothing runs: the reaper task went with the runtime, and leader and helper keep running. Releasing the last handle outside a runtime sends SIGKILL. |
+| Runtime shutdown drops the last owner, or a stop inside its grace | The group receives SIGKILL from the dropped escalation.                                                                                             |
+
+The last row is a fix from this qualification: before it, the escalation was spawned onto the
+runtime that was shutting down and never ran. `ProcessCleanupGuard::finish` still returns only once
+`killpg` reports the group empty, which counts a zombie as a member until its new parent reaps it.
+
+The limit is Linux only. Windows containment and macOS are not covered, and no live vendor
+installation is. A host that shuts its runtime down while still holding a control has no cleanup
+until it drops that control, as `docs/lifecycle.md` says: the library keeps no registry that
+outlives the runtime.
