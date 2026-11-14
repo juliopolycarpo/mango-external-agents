@@ -2403,6 +2403,81 @@ mod a_turn {
         );
     }
 
+    /// The error ends the turn, not the conversation: the vendor finished the run, so the
+    /// session it reported is still the one the next turn resumes (#386).
+    #[tokio::test]
+    async fn a_turn_after_a_schema_turn_without_an_answer_resumes_the_same_session() {
+        const REPORTED: &str = "b01414e7-4b4b-43a2-9109-a33e21664340";
+        let schema =
+            r#"{"properties":{"n":{"maximum":5,"minimum":10,"type":"integer"}},"type":"object"}"#;
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_help(HELP_2_1_270)
+                .with_turn(Run::replaying(
+                    &unsatisfiable_schema_turn_lines("gave up in prose").join("\n"),
+                ))
+                .with_turn(Run::replaying(&schema_turn_lines().join("\n"))),
+        );
+        let session = ClaudeHarness::new()
+            .with_json_schema(schema)
+            .expect("expected a usable schema")
+            .open_session(&host(Arc::clone(&launcher)), OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session");
+
+        let mut first = session
+            .start_turn(TurnRequest::new("turn-1", "Reply with n."))
+            .await
+            .expect("expected a first turn");
+        let first_events = drain(&mut first).await;
+        assert!(
+            matches!(
+                first_events.last(),
+                Some(EventKind::Error { error }) if error.code.as_str() == "claude-structured-output-missing"
+            ),
+            "expected the first turn to end as claude-structured-output-missing | received: {first_events:?}"
+        );
+        assert_eq!(
+            session.snapshot().resumability,
+            mango_external_agents::Resumability::Resumable,
+            "expected the finished run to leave the conversation resumable after the error terminal"
+        );
+        assert_eq!(
+            session.ids().native_session_id,
+            REPORTED,
+            "expected the session to keep the handle the run reported"
+        );
+
+        let mut second = session
+            .start_turn(TurnRequest::new("turn-2", "Reply with the word ok."))
+            .await
+            .expect("expected a second turn to start after the missing-answer error");
+        let second_events = drain(&mut second).await;
+
+        let argvs = launcher.turn_argvs();
+        assert_eq!(
+            argvs.len(),
+            2,
+            "expected two launches | received: {argvs:?}"
+        );
+        assert_eq!(
+            value_after(&argvs[1], "--resume"),
+            Some(REPORTED),
+            "expected the second turn to resume the session the first run reported | received: {:?}",
+            argvs[1]
+        );
+        assert!(
+            value_after(&argvs[1], "--session-id").is_none(),
+            "expected a resume, not a freshly minted --session-id | received: {:?}",
+            argvs[1]
+        );
+        assert_eq!(
+            second_events.last(),
+            Some(&EventKind::Completed),
+            "expected the resumed turn to complete | received: {second_events:?}"
+        );
+    }
+
     /// Without a schema the same frames complete: nothing asked for an answer.
     #[tokio::test]
     async fn the_same_turn_without_a_schema_completes() {
