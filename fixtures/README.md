@@ -62,6 +62,13 @@ Redacted whatever the value type:
 - A `rate_limit_event`: it reports plan usage (utilisation, reset times, overage state, the names
   of the account's windows). Only `type`, `uuid` and `session_id` are kept; every other member is
   replaced whole, so an unknown member is denied by default. Nothing replays the record.
+- A `system/init` record: it carries the user's configuration (`analytics_disabled`,
+  `product_feedback_disabled`, `output_style`, `agents`, `tools`, `mcp_servers`, `memory_paths`,
+  `messaging_socket_path`, the fast-mode state). Only `type`, `subtype`, `uuid`, `session_id`,
+  `cwd`, `claude_code_version`, `model`, `permissionMode`, `capabilities`, `slash_commands`,
+  `terminal_slash_commands`, `skills` and `plugins` are kept (the ones the reducer reads, plus the
+  ids); every other member is replaced whole, so an unknown member is denied by default. Strings
+  inside the kept lists still become `[REDACTED]`, so each list keeps its length and not its names.
 - `subagent_stats.by_type`: its keys are subagent type names, which a user can define themselves.
 - Strings inside `input`, `structured_output` and `wire_tool_inputs` (the same tool input again,
   keyed by tool-use id), even under a name such as `type` or `id`.
@@ -82,8 +89,8 @@ Retained on purpose:
   call, the same ids are already kept under `id` and `tool_use_id`, and a call has to pair with its
   result.
 - Per-turn usage, cost and timing: token counts, `total_cost_usd`, `duration_ms`, `modelUsage`
-  (keyed by a plain model id), `subagent_stats` counters and the boolean feature flags of `init`. They
-  describe this turn, not the plan.
+  (keyed by a plain model id) and `subagent_stats` counters. They describe this turn, not the
+  plan.
 - `permissionMode`. The recorder passes `--permission-mode plan` itself, so the value is the
   capture's request and not the operator's default.
 - `session_id`, `uuid` and `claude_code_version`, as before, and a plain vendor `model` id.
