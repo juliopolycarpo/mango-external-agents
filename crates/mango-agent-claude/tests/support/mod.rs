@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use mango_agent_claude::protocol::StreamRecord;
 use mango_agent_claude::testing::is_probe;
 pub use mango_agent_claude::testing::{
     DEFAULT_HELP, DEFAULT_VERSION, FakeClaudeCli, Run, SIGNED_IN, SIGNED_OUT, SlowStop, SpawnGate,
@@ -25,6 +26,44 @@ use mango_external_agents::{
 
 /// A captured `read a file` turn, replayed byte for byte across every test that needs one.
 pub const READ_TURN: &str = include_str!("../../fixtures/claude/transcripts/read-turn.jsonl");
+
+/// The stream-json lines of a recording, with its blank and `#` header lines skipped.
+///
+/// A recording written by `mea capture --harness claude --transcripts` opens with `# claude/...`
+/// and `# capture {json}` lines that are metadata, not child output. Any other line must be one
+/// stream-json object record; one that is not is a damaged fixture, so it is reported with its
+/// 1-based line number in the file (header and blank lines count) instead of being dropped.
+///
+/// This is the fixture reader. The harness stays lenient about vendor noise on a live stdout,
+/// which is why this check lives here and not in [`StreamRecord::parse`].
+pub fn recorded_lines(transcript: &str) -> Result<Vec<&str>, String> {
+    let mut lines = Vec::new();
+    for (index, line) in transcript.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if StreamRecord::parse(trimmed).is_none() {
+            return Err(format!(
+                "(recording line {}): expected a blank line, a `#` header line or one stream-json \
+                 object record | received: {trimmed}",
+                index + 1
+            ));
+        }
+        lines.push(line);
+    }
+    Ok(lines)
+}
+
+/// [`recorded_lines`], each parsed as the record the reducer reads. A fixture that does not parse
+/// fails the test that loaded it.
+pub fn recorded_records(transcript: &str) -> Vec<StreamRecord> {
+    recorded_lines(transcript)
+        .unwrap_or_else(|message| panic!("{message}"))
+        .into_iter()
+        .filter_map(StreamRecord::parse)
+        .collect()
+}
 
 /// An excerpt from before `--effort` and `--permission-prompts` existed, which is what proves an
 /// older build keeps working with those features off.
