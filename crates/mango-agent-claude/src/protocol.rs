@@ -468,6 +468,22 @@ impl<'a> ResultRecord<'a> {
             .filter(|value| value.is_object())
     }
 
+    /// What the record's `structured_output` is, as a fixed label that carries none of its content.
+    ///
+    /// For an error message that names the shape received beside the shape expected: `absent`,
+    /// `null`, `a boolean`, `a number`, `a string`, `an array` or `an object`.
+    pub fn structured_output_shape(&self) -> &'static str {
+        match self.fields.get("structured_output") {
+            None => "absent",
+            Some(Value::Null) => "null",
+            Some(Value::Bool(_)) => "a boolean",
+            Some(Value::Number(_)) => "a number",
+            Some(Value::String(_)) => "a string",
+            Some(Value::Array(_)) => "an array",
+            Some(Value::Object(_)) => "an object",
+        }
+    }
+
     /// The vendor's own stable code for why the run ended.
     ///
     /// `max_turns`, `aborted_streaming`, `hook_stopped`, `prompt_too_long`, `budget_exhausted`,
@@ -736,6 +752,26 @@ mod tests {
             record(r#"{"type":"result"}"#).result().structured_output(),
             None
         );
+    }
+
+    #[test]
+    fn a_structured_output_shape_is_a_label_never_the_value() {
+        for (member, label) in [
+            ("", "absent"),
+            (r#","structured_output":null"#, "null"),
+            (r#","structured_output":true"#, "a boolean"),
+            (r#","structured_output":7"#, "a number"),
+            (r#","structured_output":"CANARY""#, "a string"),
+            (r#","structured_output":["CANARY"]"#, "an array"),
+            (r#","structured_output":{"word":"CANARY"}"#, "an object"),
+        ] {
+            let line = format!(r#"{{"type":"result"{member}}}"#);
+            assert_eq!(
+                record(&line).result().structured_output_shape(),
+                label,
+                "expected {member:?} to read as {label}"
+            );
+        }
     }
 
     #[test]

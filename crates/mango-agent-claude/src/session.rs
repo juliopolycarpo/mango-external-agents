@@ -2052,7 +2052,8 @@ async fn pump(
     stop: CancelToken,
     input: String,
 ) {
-    let mut reducer = TurnReducer::for_limits(shared.host.limits());
+    let expects_structured_output = shared.lock().json_schema.is_some();
+    let mut reducer = TurnReducer::for_limits(shared.host.limits(), expects_structured_output);
     // The host's own patience for a child that should be exiting; it owns the process, so it owns
     // how long the turn waits on one that is not.
     let exit_grace = crate::deadlines::exit_grace(shared.host.limits());
