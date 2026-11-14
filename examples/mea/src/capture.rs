@@ -22,8 +22,13 @@ use serde_json::{Map, Value, json};
 
 use crate::redact;
 
+mod claude_transcript;
 mod contracts;
 
+pub use claude_transcript::{
+    claude as claude_transcripts, scenario_names as claude_scenario_names,
+    scenario_needs_schema as claude_scenario_needs_schema,
+};
 pub use contracts::{DEFAULT_ACP_CAPTURE_PROFILE, acp, claude, codex_contract, manifest};
 
 /// Which direction a recorded line went.
@@ -102,6 +107,16 @@ const SCENARIOS: &[Scenario] = &[
 /// The named Codex transcript scenarios, for the CLI's `--scenario` parser.
 pub fn scenario_names() -> Vec<&'static str> {
     SCENARIOS.iter().map(|scenario| scenario.name).collect()
+}
+
+/// Every transcript scenario name either harness registers, for the CLI's `--scenario` parser.
+///
+/// The harness pairing is checked by the options, which know which harness was chosen.
+pub fn all_scenario_names() -> Vec<&'static str> {
+    scenario_names()
+        .into_iter()
+        .chain(claude_scenario_names())
+        .collect()
 }
 
 /// Records every Codex scenario, or only `selected`, into `out_dir`.
@@ -830,8 +845,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        SCENARIOS, Scenario, codex_with, header, model_list_page, record, review_target,
-        thread_start_params, unconfigured_turn_params, unlisted_model,
+        SCENARIOS, Scenario, all_scenario_names, codex_with, header, model_list_page, record,
+        review_target, thread_start_params, unconfigured_turn_params, unlisted_model,
     };
     use mango_external_agents::process::{
         ByteSource, LaunchSpec, ManagedProcess, ProcessControl, ProcessLauncher,
@@ -841,6 +856,27 @@ mod tests {
         CancelReason, Dispatch, EnvSource, Error, ExitStatus, HostContext, Limits, Result,
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn all_scenario_names_lists_each_harness_scenario_once() {
+        let all = all_scenario_names();
+
+        for name in super::scenario_names()
+            .into_iter()
+            .chain(super::claude_scenario_names())
+        {
+            assert_eq!(
+                all.iter().filter(|listed| **listed == name).count(),
+                1,
+                "expected scenario {name:?} listed exactly once | received: {all:?}"
+            );
+        }
+        assert_eq!(
+            all.len(),
+            super::scenario_names().len() + super::claude_scenario_names().len(),
+            "expected the Codex and Claude scenarios and nothing else | received: {all:?}"
+        );
+    }
 
     /// A Codex app-server that answers every request, and names a thread for `thread/start`.
     fn app_server() -> FakeProcess {

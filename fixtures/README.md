@@ -24,6 +24,24 @@ finished. When requested, a transcript diagnostic retains its caller prefix and 
 `# incomplete capture`; it is not a replay fixture. A completed recording that fails scenario checks
 instead gains `# unqualified capture`. Qualified transcripts require those checks to pass.
 
+## Claude transcript recorder
+
+`mea capture --harness claude --transcripts --scenario structured-output --json-schema FILE` records
+the stream-json lines a real, already signed-in `claude` emits for one schema turn into
+`<out>/transcripts/structured-output.jsonl`. It never signs in or reads a token. The turn runs
+through `ClaudeHarness`; a launcher wrapper copies the stdout of the turn launch only. Like the Codex
+transcripts the file is archival and has no manifest, with `# claude/...` and `# capture {json}`
+header lines that give the `claude --version` line and the capture time, and it is redacted at write
+time (credential-shaped members such as `credential_expires_at`, account identity, the capture's
+paths). The labels and cleanup rules above apply: `# incomplete capture` in
+`structured-output.partial.jsonl` when the run fails or the child's stop is unconfirmed, `#
+unqualified capture` in `structured-output.unqualified.jsonl` when the file lacks an assistant
+`StructuredOutput` tool call or a final `result` with an object `structured_output`. The file is an
+archival transcript, like `codex/subagent.jsonl` under the historical sets below: no manifest, no
+`reproducible` flag, and nothing in CI can re-record it, since it belongs to one account and one CLI
+build. See [Transcript capture](../docs/harness-claude.md#transcript-capture) for the redaction
+rules.
+
 ## Three classes of fixture
 
 **Reproducible public contracts.** CI can install the CLI that produced them at the pin and record
@@ -55,7 +73,9 @@ bytes, and that is the point of keeping them:
 
 - `claude/historical/contract/` contains the old `auth status` shape.
 - `claude/help/` covers versions before and after features the parser supports.
-- `claude/transcripts/` and the Codex JSONL files record real vendor conversations.
+- `claude/transcripts/` and the Codex JSONL files record real vendor conversations. A Claude
+  transcript recorded by `mea capture` carries the `#` header described above; the two older files
+  there do not.
 - `codex/subagent.jsonl` is a maintainer capture from an authenticated Codex 0.167.2 run on
   2026-11-14 with model `gpt-5.6-terra`, recorded by `mea capture --harness codex --transcripts
   --scenario subagent --model gpt-5.6-terra`. `mea` qualified it: it holds `subAgentActivity` items

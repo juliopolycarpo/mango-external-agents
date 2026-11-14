@@ -199,7 +199,7 @@ fn scrub(value: Value, paths: Paths<'_>, redact_free_form_text: bool) -> Value {
 /// The working directory first: it usually sits inside the home directory, and rewriting the home
 /// prefix first would leave a `/home/user/...` the workspace rule no longer recognises. The
 /// account name last, for the same reason — both directories usually contain it.
-fn rewrite_paths(text: &str, paths: Paths<'_>) -> String {
+pub(crate) fn rewrite_paths(text: &str, paths: Paths<'_>) -> String {
     let mut rewritten = String::from(text);
     if !paths.cwd.is_empty() {
         rewritten = rewritten.replace(paths.cwd, FIXTURE_CWD);
