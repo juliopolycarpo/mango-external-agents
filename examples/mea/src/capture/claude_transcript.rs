@@ -125,7 +125,8 @@ pub async fn claude(
 /// [`claude`] on a host and tap the caller built, so a test can inject its own launcher.
 ///
 /// `host` must launch through `tap`, or the transcript stays empty and the capture reports it.
-/// `notices` receives the operator-facing lines that follow a written transcript, see
+/// `notices` receives the operator-facing lines: the verbatim-answer notice, the primary failure
+/// when a cleanup failure hides it, and the drift report that follows a written transcript, see
 /// [`DriftReport`].
 #[allow(
     clippy::too_many_arguments,
@@ -175,8 +176,9 @@ async fn claude_with(
 
     println!("capturing claude/{}: {}", scenario.name, scenario.purpose);
     if schema.is_some() {
-        // stderr, like the failure lines: the operator reads it before the file is committed.
-        eprintln!("{}", verbatim_answer_notice(scenario.name));
+        // Through the notice sink, which reaches stderr like the failure lines: the operator reads
+        // it before the file is committed.
+        notices.notice(&verbatim_answer_notice(scenario.name));
     }
     let discovery = harness.discover(host).await?;
     if let AuthState::LoggedOut { login_hint } = &discovery.auth {
@@ -219,7 +221,7 @@ async fn claude_with(
         .filter_map(|line| redact_line(line, paths, &mut drift))
         .collect();
     let outcome = crate::failure::with_cleanup(conversation, closed, |primary| {
-        eprintln!("{}", primary_failure_line(scenario.name, primary));
+        notices.notice(&primary_failure_line(scenario.name, primary));
     });
 
     let partial = directory.join(format!("{}.partial.jsonl", scenario.name));
