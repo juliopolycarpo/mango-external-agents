@@ -756,22 +756,31 @@ pub fn is_probe(argv: &[String]) -> bool {
 /// number of arguments left out, so a failure can say what was launched without printing a value.
 ///
 /// A flag is an argument after the program whose name, cut at `=`, is one the turn argv builder
-/// emits ([`TURN_FLAG_NAMES`](crate::argv::TURN_FLAG_NAMES)). Every other argument is a flag's value,
+/// emits ([`TURN_FLAGS`](crate::argv::TURN_FLAGS)). Every other argument is a flag's value,
 /// a subcommand, a prompt or a flag the library never passes, and is only counted: a value shaped
-/// like a flag, such as `-sk-ant-abc` after `--model`, is a value here.
+/// like a flag, such as `-sk-ant-abc` after `--model`, is a value here. So is the word after a
+/// flag that takes its value as the next argument, even when that word is a listed flag name
+/// (`--model --print` names `--model` and counts `--print`).
 fn refused_shape(spec: &LaunchSpec) -> String {
     let program = spec.argv.first().map_or("", String::as_str);
-    let flags: Vec<&str> = spec
-        .argv
-        .iter()
-        .skip(1)
-        .filter_map(|argument| {
-            let name = argument
-                .split_once('=')
-                .map_or(argument.as_str(), |(name, _)| name);
-            crate::argv::TURN_FLAG_NAMES.contains(&name).then_some(name)
-        })
-        .collect();
+    let mut flags: Vec<&str> = Vec::new();
+    let mut arguments = spec.argv.iter().skip(1);
+    while let Some(argument) = arguments.next() {
+        let (name, has_inline_value) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), false), |(name, _)| (name, true));
+        let Some(flag) = crate::argv::TURN_FLAGS
+            .iter()
+            .find(|flag| flag.name == name)
+        else {
+            continue;
+        };
+        flags.push(flag.name);
+        if flag.takes_value && !has_inline_value {
+            // The next argument is this flag's value, whatever it looks like.
+            arguments.next();
+        }
+    }
     let redacted = spec.argv.len().saturating_sub(1 + flags.len());
     let flag_names = if flags.is_empty() {
         "no flags".to_owned()
