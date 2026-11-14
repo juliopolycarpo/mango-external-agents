@@ -69,6 +69,9 @@ jobs:
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-deny,dprint,git-cliff
+      # scripts/check-script-tests.sh parses this file with PyYAML. Declared here so the lane does
+      # not depend on what the runner image happens to ship; a no-op when it is already installed.
+      - run: sudo apt-get install --yes --no-install-recommends python3-yaml
       - run: cargo deny check -D unmatched-skip -D unnecessary-skip
       - run: scripts/test-check-deny.sh
       - run: scripts/check-versions.sh

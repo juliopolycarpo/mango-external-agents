@@ -15,7 +15,9 @@ It is a library, not a daemon: no listener, no service, no telemetry, no login h
    non-gating benchmarks; `docs/benchmarks.md` explains how to record a Base / Variant / Delta
    receipt for a performance claim.
 4. Tools the scripts expect on `PATH`: `cargo-nextest`, `cargo-deny`, `cargo-hack`, `dprint`,
-   `git-cliff`. CI installs the same set through `taiki-e/install-action`.
+   `git-cliff`. CI installs the same set through `taiki-e/install-action`. `python3` also needs
+   PyYAML (`python3-yaml`), which `scripts/check-script-tests.sh` uses to parse `ci.yml`; the Policy
+   job installs it with apt.
 
 ## Working Loop
 
