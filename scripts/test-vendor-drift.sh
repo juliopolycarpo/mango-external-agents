@@ -354,7 +354,7 @@ test_vendor_acp_docs_watch() {
   expect_status 2 check_vendor claude
 
   expect_status 2 main
-  expect_status 2 main claude codex
+  expect_status 2 main claude "$test_root/unused-report.md" codex
   unset FAKE_DOC_ROOT
   export PATH="$original_path"
 }
@@ -370,6 +370,163 @@ write_acp_allowlist() {
     printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$path"
     shift 3
   done
+}
+
+test_vendor_acp_docs_report() {
+  local docs="$test_root/vendor-acp-report-docs"
+  local fake_bin="$test_root/fake-report-doc-bin"
+  local allowlist="$test_root/acp-report-allowlist.txt"
+  local report="$test_root/acp-report/acp-docs.md"
+  local expected="$test_root/acp-report-expected.md"
+  local original_path="$PATH"
+  local original_allowlist="$ACP_DOCS_ALLOWLIST"
+  local claude_index='https://code.claude.com/docs/llms.txt'
+  local claude_reference='https://code.claude.com/docs/en/cli-reference.md'
+  local reviewed='- [claude-agent-acp](https://code.claude.com/docs/en/adapter.md): Third-party ACP adapter'
+  mkdir -p "$fake_bin"
+  ln -s "$repo_root/scripts/test-fixtures/fake-doc-curl.sh" "$fake_bin/curl"
+  export PATH="$fake_bin:$PATH"
+  export FAKE_DOC_ROOT="$docs"
+  ACP_DOCS_ALLOWLIST="$allowlist"
+  write_acp_allowlist "$allowlist"
+
+  # A passing watch writes no report and removes one left by an earlier run.
+  write_clean_fake_docs "$docs"
+  mkdir -p "$(dirname "$report")"
+  printf 'left over from an earlier run\n' > "$report"
+  check_vendor claude "$report" > /dev/null
+  if [ -e "$report" ]; then
+    fail "a passing watch must not leave a report; received $(tr '\n' '|' < "$report")"
+  fi
+
+  # A mention reports the page URL and the matching line with its line number. Exit status stays 1.
+  write_fake_doc "$docs" "$claude_index" '# Claude Code Docs' '- [ACP](https://code.claude.com/docs/en/acp.md): Run Claude Code as an ACP agent'
+  expect_status 1 check_vendor claude "$report"
+  cat > "$expected" <<'EXPECTED'
+### https://code.claude.com/docs/llms.txt
+
+Lines naming ACP that no reviewed allowlist entry accepts, with their line numbers (showing 1 of 1; each line is cut at 200 characters):
+
+```text
+2:- [ACP](https://code.claude.com/docs/en/acp.md): Run Claude Code as an ACP agent
+```
+
+EXPECTED
+  assert_eq "$(cat "$report")" "$(cat "$expected")" 'ACP mention report shape'
+  # The fake curl is silent on success and the report holds page text only: nothing else leaks in.
+  assert_not_contains "$report" "$test_root" 'the report names no local path'
+
+  # Both pages are reported in one report, and a reviewed line is left out of it.
+  write_acp_allowlist "$allowlist" claude "$reviewed" 'third-party adapter'
+  write_fake_doc "$docs" "$claude_index" '# Claude Code Docs' "$reviewed" '- [ACP](https://code.claude.com/docs/en/acp.md)'
+  write_fake_doc "$docs" "$claude_reference" 'claude -p --print' '| `--acp` | Serve over ACP |'
+  expect_status 1 check_vendor claude "$report"
+  assert_contains "$report" '### https://code.claude.com/docs/llms.txt' 'the index page is reported'
+  assert_contains "$report" '3:- [ACP](https://code.claude.com/docs/en/acp.md)' 'the index line is reported'
+  assert_contains "$report" '### https://code.claude.com/docs/en/cli-reference.md' 'the CLI reference page is reported'
+  assert_contains "$report" '2:| `--acp` | Serve over ACP |' 'the CLI reference line is reported'
+  assert_not_contains "$report" 'claude-agent-acp' 'a reviewed line is not reported'
+
+  # More mentions than the report shows are counted, so a maintainer knows to open the page.
+  write_fake_doc "$docs" "$claude_index" '# Claude Code Docs' 'ACP one' 'ACP two' 'ACP three' 'ACP four'
+  expect_status 1 check_vendor claude "$report"
+  assert_contains "$report" '(showing 3 of 4; each line is cut at 200 characters)' 'a long list states how much it shows'
+  assert_not_contains "$report" 'ACP four' 'the fourth mention stays out of the report'
+
+  # An unreadable page reports its URL and no curl output; exit status 2.
+  write_clean_fake_docs "$docs"
+  write_acp_allowlist "$allowlist"
+  rm -f -- "$docs/$(printf '%s' "$claude_reference" | tr -c 'A-Za-z0-9' '_')"
+  expect_status 2 check_vendor claude "$report"
+  assert_contains "$report" "### $claude_reference" 'a failed download names the URL'
+  assert_contains "$report" 'The page could not be downloaded.' 'a failed download says so'
+  assert_not_contains "$report" 'fake curl' 'curl output stays out of the report'
+
+  # A moved page reports the text it lost; exit status 2.
+  write_clean_fake_docs "$docs"
+  write_fake_doc "$docs" "$claude_reference" 'Page not found'
+  expect_status 2 check_vendor claude "$report"
+  assert_contains "$report" "### $claude_reference" 'a moved page names the URL'
+  assert_contains "$report" 'The page no longer contains the text `--print`' 'a moved page names the lost anchor'
+
+  # A stale allowlist entry is reported by its line, without the allowlist path; exit status 1.
+  write_acp_allowlist "$allowlist" claude "$reviewed" 'third-party adapter'
+  write_clean_fake_docs "$docs"
+  expect_status 1 check_vendor claude "$report"
+  assert_contains "$report" '### Reviewed allowlist' 'a stale entry has its own section'
+  assert_contains "$report" "1:$reviewed" 'a stale entry names its line, numbered'
+  assert_not_contains "$report" "$allowlist" 'the report names no local allowlist path'
+
+  # The report is optional, `main` passes it through and refuses a third argument.
+  write_fake_doc "$docs" "$claude_index" '# Claude Code Docs' 'Run with --acp.'
+  write_acp_allowlist "$allowlist"
+  rm -f -- "$report"
+  expect_status 1 main claude "$report"
+  assert_contains "$report" '2:Run with --acp.' 'main writes the report'
+  expect_status 1 main claude
+  expect_status 2 main claude "$report" extra
+
+  unset FAKE_DOC_ROOT
+  ACP_DOCS_ALLOWLIST="$original_allowlist"
+  export PATH="$original_path"
+}
+
+test_docs_drift_report() {
+  local docs_report="$test_root/docs-report-fragment.md"
+  local report="$test_root/docs-report/report.md"
+  local expected="$test_root/docs-report-expected.md"
+  local committed="$test_root/docs-report-committed"
+  local observed="$test_root/docs-report-observed"
+  printf '### https://example.test/reference.md\n\nLines naming ACP:\n\n```text\n3:Use --acp.\n```\n\n' > "$docs_report"
+
+  # With no contract difference the docs result is the whole report, led by the managed marker.
+  rm -rf -- "$(dirname "$report")"
+  write_docs_report codex "$docs_report" "$report"
+  cat > "$expected" <<'EXPECTED'
+<!-- vendor-drift:codex -->
+# Vendor drift: codex
+
+## Documentation watch
+
+The documentation watch for an ACP page or command failed in this run: a vendor document
+now mentions ACP outside the reviewed allowlist, or could not be read.
+
+### https://example.test/reference.md
+
+Lines naming ACP:
+
+```text
+3:Use --acp.
+```
+
+EXPECTED
+  assert_eq "$(cat "$report")" "$(cat "$expected")" 'docs-only drift report shape'
+  assert_eq "$(head -n 1 "$report")" '<!-- vendor-drift:codex -->' 'the marker leads the docs-only report'
+
+  # With a contract difference the diff stays and the docs section follows it.
+  mkdir -p "$committed" "$observed"
+  printf 'same\n' > "$committed/contract.json"
+  printf 'different\n' > "$observed/contract.json"
+  expect_status 1 write_report claude "$committed" "$observed" "$report"
+  write_docs_report claude "$docs_report" "$report"
+  assert_eq "$(head -n 1 "$report")" '<!-- vendor-drift:claude -->' 'the marker leads the combined report'
+  assert_contains "$report" 'diff --git' 'the contract diff is kept'
+  assert_contains "$report" '## Documentation watch' 'the docs section is added'
+  assert_contains "$report" '3:Use --acp.' 'the matching line is added'
+  assert_eq "$(grep -c 'vendor-drift:' "$report")" '1' 'the marker appears once'
+
+  # A watch that failed before it wrote page detail says so instead of an empty section.
+  rm -f -- "$report"
+  write_docs_report claude "$docs_report.missing" "$report"
+  assert_contains "$report" 'The watch wrote no page detail. Inspect this workflow run for its output.' \
+    'a missing docs report is explained'
+
+  # The command line mode needs its three arguments. The script runs as a process because every
+  # sourced script defines its own `main`.
+  expect_status 2 "$repo_root/scripts/write-vendor-drift-report.sh" --docs claude "$docs_report"
+  rm -f -- "$report"
+  "$repo_root/scripts/write-vendor-drift-report.sh" --docs claude "$docs_report" "$report"
+  assert_contains "$report" '<!-- vendor-drift:claude -->' 'the --docs mode writes the report'
 }
 
 test_vendor_acp_allowlist_entries() {
@@ -553,6 +710,8 @@ test_drift_report
 test_claude_bare_reference
 test_vendor_acp_document
 test_vendor_acp_docs_watch
+test_vendor_acp_docs_report
+test_docs_drift_report
 test_vendor_acp_allowlist_entries
 test_vendor_acp_document_allowlist
 test_vendor_acp_docs_allowlist_watch

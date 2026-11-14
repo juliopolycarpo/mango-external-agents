@@ -190,7 +190,7 @@ mode surfaces there, or in the documentation watch below.
   - a diff that adds an `acp` command, an ACP-named flag, or an ACP entry in
     `codex app-server --listen`;
   - a failed documentation watch (`scripts/check-vendor-acp-docs.sh`) where the vendor's
-    documentation index or CLI reference now mentions ACP. The workflow log names the page and the
+    documentation index or CLI reference now mentions ACP. The issue body names the page and the
     line ([vendor-drift.md](vendor-drift.md)).
 - **Not a trigger:** the same watch failing because a page could not be read or no longer has its
   anchor phrase, or because a reviewed allowlist entry matches no line any more. Those are a broken
