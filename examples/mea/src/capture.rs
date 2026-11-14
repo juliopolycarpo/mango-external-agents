@@ -845,8 +845,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        SCENARIOS, Scenario, codex_with, header, model_list_page, record, review_target,
-        thread_start_params, unconfigured_turn_params, unlisted_model,
+        SCENARIOS, Scenario, all_scenario_names, codex_with, header, model_list_page, record,
+        review_target, thread_start_params, unconfigured_turn_params, unlisted_model,
     };
     use mango_external_agents::process::{
         ByteSource, LaunchSpec, ManagedProcess, ProcessControl, ProcessLauncher,
@@ -856,6 +856,27 @@ mod tests {
         CancelReason, Dispatch, EnvSource, Error, ExitStatus, HostContext, Limits, Result,
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn all_scenario_names_lists_each_harness_scenario_once() {
+        let all = all_scenario_names();
+
+        for name in super::scenario_names()
+            .into_iter()
+            .chain(super::claude_scenario_names())
+        {
+            assert_eq!(
+                all.iter().filter(|listed| **listed == name).count(),
+                1,
+                "expected scenario {name:?} listed exactly once | received: {all:?}"
+            );
+        }
+        assert_eq!(
+            all.len(),
+            super::scenario_names().len() + super::claude_scenario_names().len(),
+            "expected the Codex and Claude scenarios and nothing else | received: {all:?}"
+        );
+    }
 
     /// A Codex app-server that answers every request, and names a thread for `thread/start`.
     fn app_server() -> FakeProcess {

@@ -36,9 +36,10 @@ time (credential-shaped members such as `credential_expires_at`, account identit
 paths). The labels and cleanup rules above apply: `# incomplete capture` in
 `structured-output.partial.jsonl` when the run fails or the child's stop is unconfirmed, `#
 unqualified capture` in `structured-output.unqualified.jsonl` when the file lacks an assistant
-`StructuredOutput` tool call or a final `result` with an object `structured_output`. The class is
-the labelled maintainer capture: nothing in CI can re-record it, and it belongs to one account and one
-CLI build. See [Transcript capture](../docs/harness-claude.md#transcript-capture) for the redaction
+`StructuredOutput` tool call or a final `result` with an object `structured_output`. The file is an
+archival transcript, like `codex/subagent.jsonl` under the historical sets below: no manifest, no
+`reproducible` flag, and nothing in CI can re-record it, since it belongs to one account and one CLI
+build. See [Transcript capture](../docs/harness-claude.md#transcript-capture) for the redaction
 rules.
 
 ## Three classes of fixture

@@ -1,8 +1,15 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime};
 
-use mango_external_agents::testing::{FakeLauncher, FakeProcess};
-use mango_external_agents::{ExitStatus, ProcessControl};
+use mango_external_agents::testing::{FakeHarness, FakeLauncher, FakeProcess};
+use mango_external_agents::{
+    ActivityKind, EventSink, ExitStatus, Interaction, InteractionId, InteractionKind,
+    PermissionEffect, PermissionOption, PermissionRequest, PermissionResponse, ProcessControl,
+    Question, QuestionForm, QuestionId, QuestionRequest, QuestionResponse, SessionState,
+    SystemClock, TurnStream,
+};
 
 use super::*;
 use crate::json_schema_tests::{HELP_WITH_JSON_SCHEMA, ScriptedClaudeCli};
@@ -981,4 +988,148 @@ async fn a_turn_whose_child_cannot_be_stopped_leaves_only_an_incomplete_diagnost
             "expected {private:?} redacted | received: {partial}"
         );
     }
+}
+
+/// Which interaction a [`PromptingSession`] raises when its turn starts.
+#[derive(Clone, Copy)]
+enum Prompt {
+    Approval,
+    Question,
+}
+
+/// A session whose turn asks for a permission or an answer and counts every reply it receives.
+///
+/// The recorder must leave both unanswered, so the counter is the observable half of that rule.
+struct PromptingSession {
+    inner: Box<dyn Session>,
+    prompt: Prompt,
+    replies: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Session for PromptingSession {
+    fn state(&self) -> &SessionState {
+        self.inner.state()
+    }
+
+    async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
+        let session_id = self.ids().session_id;
+        let (sink, events) = EventSink::new(
+            session_id.clone(),
+            request.turn_id.clone(),
+            request.attempt,
+            Arc::new(SystemClock),
+            3,
+        );
+        let expires = SystemTime::now() + Duration::from_secs(60);
+        match self.prompt {
+            Prompt::Approval => {
+                let approval = PermissionRequest::new(
+                    Interaction::new(
+                        InteractionId::new("capture-approval"),
+                        InteractionKind::Permission,
+                        session_id,
+                        expires,
+                    ),
+                    ActivityKind::Command,
+                    "change a file",
+                    vec![PermissionOption::new("deny", PermissionEffect::Reject)],
+                );
+                sink.emit(EventKind::ApprovalRequested { request: approval })
+                    .await?;
+            }
+            Prompt::Question => {
+                let question = QuestionRequest::new(
+                    Interaction::new(
+                        InteractionId::new("capture-question"),
+                        InteractionKind::Question,
+                        session_id,
+                        expires,
+                    ),
+                    vec![
+                        Question::new(
+                            QuestionId::new("branch"),
+                            "Which branch?",
+                            QuestionForm::FreeText { placeholder: None },
+                        )
+                        .required(),
+                    ],
+                );
+                sink.emit(EventKind::QuestionAsked { request: question })
+                    .await?;
+            }
+        }
+        Ok(TurnStream::accepted(
+            request.turn_id,
+            request.attempt,
+            "prompting-turn",
+            events,
+        ))
+    }
+
+    async fn respond(&self, _response: PermissionResponse) -> Result<()> {
+        self.replies.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn answer(&self, _response: QuestionResponse) -> Result<()> {
+        self.replies.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn cancel(&self, reason: CancelReason) -> Result<()> {
+        self.inner.cancel(reason).await
+    }
+
+    async fn close(&self, reason: CloseReason) -> Result<()> {
+        self.inner.close(reason).await
+    }
+}
+
+async fn converse_with_prompt(prompt: Prompt) -> (Result<Option<String>>, usize) {
+    let inner = FakeHarness::new()
+        .open_session(
+            &host_over(Arc::new(FakeLauncher::new())),
+            OpenSession::new("mea-test"),
+        )
+        .await
+        .expect("expected a fake session");
+    let session = PromptingSession {
+        inner,
+        prompt,
+        replies: AtomicUsize::new(0),
+    };
+    let outcome = converse(&session, &SCENARIOS[0]).await;
+    (outcome, session.replies.load(Ordering::SeqCst))
+}
+
+#[tokio::test]
+async fn an_approval_request_fails_the_capture_unanswered() {
+    let (outcome, replies) = converse_with_prompt(Prompt::Approval).await;
+
+    match outcome {
+        Err(Error::Protocol { received, .. }) => assert_eq!(
+            received, "an approval request; left unanswered",
+            "expected the approval named in the refusal"
+        ),
+        other => panic!("expected Error::Protocol for an approval request | received: {other:?}"),
+    }
+    assert_eq!(
+        replies, 0,
+        "expected no permission granted or denied by the recorder"
+    );
+}
+
+#[tokio::test]
+async fn a_question_fails_the_capture_unanswered() {
+    let (outcome, replies) = converse_with_prompt(Prompt::Question).await;
+
+    match outcome {
+        Err(Error::Protocol { received, .. }) => assert_eq!(
+            received, "a question; left unanswered",
+            "expected the question named in the refusal"
+        ),
+        other => panic!("expected Error::Protocol for a question | received: {other:?}"),
+    }
+    assert_eq!(replies, 0, "expected no answer sent by the recorder");
 }

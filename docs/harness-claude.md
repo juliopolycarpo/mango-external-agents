@@ -489,9 +489,9 @@ What a host does:
    CLI answered, and the terminal carries no `Dispatch`. The CLI's zero usage and `num_turns: 0`
    are the vendor's own report. The host's `RecoveryRecord` for the turn still decides replay.
 
-Not captured with `mea capture`: that command records `--version` and `--help` for Claude and runs
-no turn, so there is no fixture for this record. The tests replay the observed line through the
-fake CLI.
+No fixture records this one: the recorder in [Transcript capture](#transcript-capture) drives a
+schema turn, and a strict resume of an unknown conversation fails before one starts. The tests
+replay the observed line through the fake CLI.
 
 Closing stdin is also what the vendor documents as cancelling a pending prompt, and this harness
 closes it immediately after the prompt — so a run that would otherwise wait for an answer nobody

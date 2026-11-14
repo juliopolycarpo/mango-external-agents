@@ -21,7 +21,7 @@ const HELP_WITHOUT_JSON_SCHEMA: &str = include_str!("../../../fixtures/claude/he
 const SIGNED_IN: &str = r#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}"#;
 
 /// A `--json-schema` turn as Claude Code 2.1.325 streamed it, reduced to the members the harness
-/// reads. These lines are inline, not a fixture: `mea capture` records no Claude turn.
+/// reads. These lines are inline, not a captured fixture; `mea capture --transcripts` records the real thing.
 fn schema_turn_lines() -> Vec<String> {
     let answer = serde_json::json!({"word": "ok"});
     [
