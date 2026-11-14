@@ -239,6 +239,7 @@ test_claude_bare_reference() {
   local reference="$test_root/claude-headless.html"
   printf '%s\n' 'Without it, <code>claude -p</code> loads the same context as an interactive session.' > "$reference"
   validate_reference "$reference" >/dev/null
+  # shellcheck disable=SC2016 # the backticks are literal Markdown, not command substitution
   printf '%s\n' 'Without it, `claude -p` discovers and loads them as an interactive session would. --bare will become the default for -p in a future release.' > "$reference"
   validate_reference "$reference" >/dev/null
   printf '%s\n' 'Without it, <code>claude&nbsp;-p</code>' 'discovers and loads them as an interactive session would.' > "$reference"
@@ -285,6 +286,7 @@ test_vendor_acp_document() {
   local mention
   printf '%s\n' '# Commands' 'codex exec runs a task. The macpherson and acpi names are unrelated.' > "$document"
   validate_document "$url" 'codex exec' "$document" >/dev/null
+  # shellcheck disable=SC2016 # the backticks are literal Markdown, not command substitution
   for mention in '| `codex acp` | Run as an ACP agent |' 'Use --acp to serve stdio.' 'Agent Client Protocol support' \
     'agent-client-protocol' 'See [claude-agent-acp](https://example.test/claude-agent-acp).' 'AcP'; do
     printf '%s\n' '# Commands' 'codex exec runs a task.' "$mention" > "$document"
@@ -330,10 +332,12 @@ test_vendor_acp_docs_watch() {
   check_vendor codex >/dev/null
 
   write_clean_fake_docs "$docs"
+  # shellcheck disable=SC2016 # the backticks are literal Markdown, not command substitution
   write_fake_doc "$docs" "$claude_reference" 'claude -p --print' '| `--acp` | Serve over ACP |'
   expect_status 1 check_vendor claude
 
   write_clean_fake_docs "$docs"
+  # shellcheck disable=SC2016 # the backticks are literal Markdown, not command substitution
   write_fake_doc "$docs" "$codex_reference" 'codex exec' '| `codex acp` | Run as an Agent Client Protocol agent |'
   expect_status 1 check_vendor codex
   check_vendor claude >/dev/null
@@ -377,11 +381,13 @@ test_vendor_acp_allowlist_entries() {
   local error="$test_root/acp-allowlist.error"
   local original="$ACP_DOCS_ALLOWLIST"
   ACP_DOCS_ALLOWLIST="$allowlist"
+  # shellcheck disable=SC2016 # the backticks are literal Markdown, not command substitution
   write_acp_allowlist "$allowlist" \
     claude '- [claude-agent-acp](https://example.test/adapter.md): adapter' 'third-party adapter index line' \
     codex '| `codex acp` | Run as an ACP agent |' 'reviewed table row'
   assert_eq "$(accepted_lines claude)" '- [claude-agent-acp](https://example.test/adapter.md): adapter' \
     'Claude accepted line'
+  # shellcheck disable=SC2016 # the backticks are literal Markdown, not command substitution
   assert_eq "$(accepted_lines codex)" '| `codex acp` | Run as an ACP agent |' \
     'Codex accepted line keeps its own pipes'
   write_acp_allowlist "$allowlist"
