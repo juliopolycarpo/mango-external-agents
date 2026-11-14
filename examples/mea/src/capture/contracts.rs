@@ -43,8 +43,10 @@ pub async fn claude(out_dir: &Path, workspace: &Path) -> Result<()> {
 /// Captures the public OpenAI app-server schema handshake contract under `out_dir/contract`.
 ///
 /// The existing transcript capture stays separate because it records a live account conversation.
-/// This operation only reads the installed CLI's version and invokes the documented schema
-/// generator in `workspace/codex-schema`.
+/// This operation reads the installed CLI's version, its `--help` and `app-server --help` text, and
+/// invokes the documented schema generator in `workspace/codex-schema`. The two help texts make a
+/// new subcommand or a changed `--listen` transport list show up as drift. None of the probes needs
+/// a login or starts a session.
 ///
 /// # Examples
 ///
@@ -132,6 +134,24 @@ async fn codex_contract_with(host: &HostContext, out_dir: &Path, workspace: &Pat
         &["CODEX_HOME"],
     )
     .await?;
+    let help = codex_portable_help(
+        &command_output(
+            host,
+            vec![String::from("codex"), String::from("--help")],
+            &["CODEX_HOME"],
+        )
+        .await?,
+    );
+    let app_server_help = command_output(
+        host,
+        vec![
+            String::from("codex"),
+            String::from("app-server"),
+            String::from("--help"),
+        ],
+        &["CODEX_HOME"],
+    )
+    .await?;
     let generated = workspace.join("codex-schema");
     std::fs::create_dir_all(&generated).map_err(|error| Error::HostConfiguration {
         expected: "a writable Codex schema workspace",
@@ -151,6 +171,14 @@ async fn codex_contract_with(host: &HostContext, out_dir: &Path, workspace: &Pat
     .await?;
 
     let contract = contract_dir(out_dir);
+    // Stored as printed, as the Claude help is, except for the platform-gated subcommands
+    // `codex_portable_help` drops. The check compares bytes, so any reworded or added subcommand,
+    // flag or `--listen` value is a diff a maintainer reads.
+    write_text(&contract.join("help.txt"), &format!("{help}\n"))?;
+    write_text(
+        &contract.join("app-server-help.txt"),
+        &format!("{app_server_help}\n"),
+    )?;
     copy_generated_schema(
         &generated.join("v1/InitializeParams.json"),
         &contract.join("initialize-params.schema.json"),
@@ -172,6 +200,8 @@ async fn codex_contract_with(host: &HostContext, out_dir: &Path, workspace: &Pat
             "format": 1,
             "probes": [
                 "codex --version",
+                "codex --help",
+                "codex app-server --help",
                 "codex app-server generate-json-schema --out <workspace>/codex-schema"
             ],
             "reproducible": manifest::is_reproducible("codex"),
@@ -478,6 +508,37 @@ fn claude_surface(help: &str) -> Value {
     })
 }
 
+/// Codex subcommands that only the macOS and Windows builds list in `codex --help`.
+///
+/// The pinned drift lane reproduces the contract on all three operating systems and the weekly lane
+/// on Linux, so a row that exists on two of them would make every run fail on the third. `app`
+/// launches the desktop app, which Codex does not ship for Linux.
+const PLATFORM_ONLY_CODEX_COMMANDS: &[&str] = &["app"];
+
+/// `help` without the rows of [`PLATFORM_ONLY_CODEX_COMMANDS`] and their wrapped description lines.
+///
+/// A row is a line indented by exactly two spaces whose first word is the command; its wrapped
+/// description continues on lines indented deeper. Everything else is kept byte for byte.
+fn codex_portable_help(help: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut dropping = false;
+    for line in help.lines() {
+        let command_row = line
+            .strip_prefix("  ")
+            .filter(|rest| !rest.starts_with(' '))
+            .and_then(|rest| rest.split_whitespace().next());
+        if let Some(name) = command_row {
+            dropping = PLATFORM_ONLY_CODEX_COMMANDS.contains(&name);
+        } else if !line.starts_with("    ") {
+            dropping = false;
+        }
+        if !dropping {
+            kept.push(line);
+        }
+    }
+    kept.join("\n")
+}
+
 fn contract_dir(out_dir: &Path) -> PathBuf {
     out_dir.join("contract")
 }
@@ -527,8 +588,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        CONTRACT_TIMEOUT, acp_initialize, acp_with, claude_surface, claude_with, command_name,
-        command_output, copy_generated_schema, normalize_acp_initialize, write_json,
+        CONTRACT_TIMEOUT, acp_initialize, acp_with, claude_surface, claude_with,
+        codex_contract_with, codex_portable_help, command_name, command_output,
+        copy_generated_schema, normalize_acp_initialize, write_json,
     };
     use crate::capture::tests::{CaptureCleanupLauncher, CaptureStop, capture_host_with_limits};
     use mango_external_agents::testing::{FakeLauncher, FakeProcess};
@@ -665,6 +727,118 @@ mod tests {
         assert_eq!(launches[1].argv, vec!["claude", "--help"]);
         assert!(!out.join("contract/auth-status.json").exists());
         std::fs::remove_dir_all(out).expect("expected temporary capture cleanup");
+    }
+
+    #[test]
+    fn codex_help_drops_the_desktop_app_row_that_only_macos_and_windows_list() {
+        let printed = "Commands:\n  plugin  Manage plugins\n  acp     A hypothetical native ACP mode\n  app     Launch the Desktop app (opens\n          the installer if missing)\n  completion  Generate scripts\n\nOptions:\n  -c, --config <key=value>\n          Override a value";
+
+        let portable = codex_portable_help(printed);
+
+        assert_eq!(
+            portable,
+            "Commands:\n  plugin  Manage plugins\n  acp     A hypothetical native ACP mode\n  completion  Generate scripts\n\nOptions:\n  -c, --config <key=value>\n          Override a value",
+            "(codex help): expected only the app row and its wrapped line dropped, an unknown subcommand kept | received {portable:?}"
+        );
+        assert_eq!(
+            codex_portable_help("Commands:\n  plugin  Manage plugins"),
+            "Commands:\n  plugin  Manage plugins",
+            "(codex help): expected a Linux listing to pass through unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_codex_capture_records_both_help_surfaces_with_digests() {
+        let launcher = Arc::new(FakeLauncher::new());
+        let version = || {
+            FakeProcess::transcript([format!(
+                "codex-cli {}",
+                mango_agent_codex::MINIMUM_CODEX_VERSION
+            )])
+            .with_exit(success())
+        };
+        // The version gate and the contract each ask for the version.
+        launcher.push(version());
+        launcher.push(version());
+        launcher.push(
+            FakeProcess::transcript(["Codex CLI", "", "Commands:", "  exec  Run Codex"])
+                .with_exit(success()),
+        );
+        launcher.push(
+            FakeProcess::transcript(["[experimental] Run the app server", "  --listen <URL>"])
+                .with_exit(success()),
+        );
+        launcher.push(FakeProcess::transcript(["generated"]).with_exit(success()));
+        let out = temp_dir("codex-out");
+        let workspace = temp_dir("codex-workspace");
+        // The fake generator writes nothing, so the schemas it would have produced are placed.
+        let generated = workspace.join("codex-schema/v1");
+        std::fs::create_dir_all(&generated).expect("expected a generated schema directory");
+        for name in ["InitializeParams.json", "InitializeResponse.json"] {
+            std::fs::write(generated.join(name), "{}\n").expect("expected a generated schema");
+        }
+
+        codex_contract_with(&host(Arc::clone(&launcher)), &out, &workspace)
+            .await
+            .expect("expected public Codex contract capture");
+
+        let launched: Vec<String> = launcher
+            .launches()
+            .iter()
+            .map(|launch| launch.argv[1..].join(" "))
+            .collect();
+        let schema_argv = format!(
+            "app-server generate-json-schema --out {}",
+            workspace.join("codex-schema").to_string_lossy()
+        );
+        assert_eq!(
+            launched,
+            [
+                "--version",
+                "--version",
+                "--help",
+                "app-server --help",
+                schema_argv.as_str()
+            ],
+            "(codex capture): expected version, version, help, app-server help, schema | received {launched:?}"
+        );
+        let contract = out.join("contract");
+        assert_eq!(
+            std::fs::read_to_string(contract.join("help.txt")).expect("expected help.txt"),
+            "Codex CLI\n\nCommands:\n  exec  Run Codex\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(contract.join("app-server-help.txt"))
+                .expect("expected app-server-help.txt"),
+            "[experimental] Run the app server\n  --listen <URL>\n"
+        );
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(contract.join("manifest.json")).expect("expected manifest"),
+        )
+        .expect("expected manifest JSON");
+        assert_eq!(
+            manifest["probes"],
+            json!([
+                "codex --version",
+                "codex --help",
+                "codex app-server --help",
+                "codex app-server generate-json-schema --out <workspace>/codex-schema"
+            ])
+        );
+        for file in ["help.txt", "app-server-help.txt"] {
+            assert!(
+                manifest["files"][file]
+                    .as_str()
+                    .is_some_and(|digest| digest.starts_with("sha256:")),
+                "(codex manifest): expected a sha256 digest for {file} | received {:?}",
+                manifest["files"][file]
+            );
+        }
+        super::manifest::verify(&contract.join("manifest.json"))
+            .expect("expected the written digests to verify");
+        assert_eq!(launcher.live_children(), 0);
+        std::fs::remove_dir_all(out).expect("expected temporary capture cleanup");
+        std::fs::remove_dir_all(workspace).expect("expected temporary workspace cleanup");
     }
 
     #[tokio::test]
