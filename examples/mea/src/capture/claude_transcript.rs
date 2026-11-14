@@ -504,10 +504,14 @@ const ANSWER_MEMBERS: &[&str] = &["input", "structured_output", "wire_tool_input
 
 /// Members whose subtree is a tool's data: the call's arguments repeated under
 /// `permission_denials`, and the tool's result. A tool author names the fields, so one called
-/// `type`, `id` or `role` is the author's and its string is replaced like any other.
+/// `type`, `id` or `role` is the author's and its string is replaced like any other. A number
+/// becomes `0` and a boolean `false`, so a field keeps its type and no figure of the author's
+/// survives.
 ///
-/// Unlike [`ANSWER_MEMBERS`], the members below are still judged by name for the drift report: the
-/// vendor owns this record's frame, and a field it adds there is worth a review.
+/// Unlike [`ANSWER_MEMBERS`], the members below are still judged by name for the drift report when
+/// a string or an object sits under an unlisted name: the vendor owns this record's frame, and a
+/// field it adds there is worth a review. A number or a boolean is replaced and not reported, so a
+/// numeric field a later Claude Code adds goes by unnoticed.
 const TOOL_DATA_MEMBERS: &[&str] = &["tool_input", "tool_use_result"];
 
 /// The members of a `rate_limit_event` that identify the record rather than describe the account.
@@ -842,7 +846,15 @@ fn redact_value(
                 placeholder()
             }
         },
-        // A number or a boolean is kept as is; a null carries nothing and has no name to review.
+        // A tool author's number or boolean is data like their strings, so it is replaced by the
+        // same type's neutral value: `0` and `false` keep what a replay reads as a number or a
+        // flag, where a placeholder string would change the type. The model's answer keeps its
+        // numbers (see `ANSWER_MEMBERS`), so the answer's own `tool_input` property is not
+        // touched. Nothing is kept, so nothing is reported as retained.
+        Value::Number(_) if context.tool_data && !context.answer => Value::from(0),
+        Value::Bool(_) if context.tool_data && !context.answer => Value::Bool(false),
+        // Everywhere else a number or a boolean is kept as is; a null carries nothing and has no
+        // name to review.
         other => {
             if !other.is_null() {
                 note_retained_member(member, context, paths, drift);
@@ -975,8 +987,9 @@ enum ChildKeys {
 /// Number, boolean and object members the committed Claude transcripts under
 /// `fixtures/claude/transcripts/` already show and that the recorder keeps, so they are expected
 /// and not reported as new, each with who chose the keys under it. A number or a boolean is written
-/// as the CLI gave it, and an object is walked into, so a name that is not here is one no review has
-/// seen. A name here records that it is understood, not that every value under it is safe; its
+/// as the CLI gave it (except under [`TOOL_DATA_MEMBERS`], where it is replaced), and an object is
+/// walked into, so a name that is not here is one no review has seen. `numLines`, `startLine` and
+/// `totalLines` are listed for the committed transcripts, which predate that replacement. A name here records that it is understood, not that every value under it is safe; its
 /// [`ChildKeys`] records what its children are, and the test over the committed transcripts fails
 /// when a member holds an object its entry does not declare. Sorted by name.
 const REVIEWED_RETAINED_MEMBERS: &[(&str, ChildKeys)] = &[
