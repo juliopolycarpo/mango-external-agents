@@ -282,9 +282,42 @@ pub struct FakeLauncher {
     state: Arc<LauncherState>,
 }
 
+/// Why a fake launch fails: the two answers a launcher can give for a child that never started.
+#[derive(Clone, Debug)]
+enum Refusal {
+    /// The launcher established the program does not exist.
+    MissingProgram,
+    /// Any other failure to start, with the summary the error carries.
+    Launch(String),
+}
+
+impl Refusal {
+    fn error_for(&self, spec: &LaunchSpec) -> Error {
+        let program = spec.program().unwrap_or_default().to_owned();
+        match self {
+            Self::MissingProgram => Error::ProgramNotFound { program },
+            Self::Launch(message) => Error::Launch {
+                program,
+                message: message.clone(),
+            },
+        }
+    }
+}
+
+/// What the next launch does.
+#[derive(Debug)]
+enum Queued {
+    Process(FakeProcess),
+    Refusal(Refusal),
+}
+
 #[derive(Debug, Default)]
 struct LauncherState {
-    queued: Mutex<VecDeque<FakeProcess>>,
+    queued: Mutex<VecDeque<Queued>>,
+    /// What a launch does once the queue is empty. Unset, the launch fails with an
+    /// [`Error::Launch`] that says nothing was queued, so an under-scripted test never reads as
+    /// a missing program.
+    exhausted: Option<Refusal>,
     launches: Mutex<Vec<LaunchSpec>>,
     /// Shared with every child, so `written` is one list across all of them.
     written: Arc<Mutex<Vec<String>>>,
@@ -294,9 +327,76 @@ struct LauncherState {
 }
 
 impl FakeLauncher {
-    /// A launcher with nothing queued. Spawning from it fails, which is the honest answer.
+    /// A launcher with nothing queued. Spawning from it fails with an [`Error::Launch`], which is
+    /// the honest answer: it is not [`Error::ProgramNotFound`], so a probe reads it as a failure to
+    /// start rather than as "not installed".
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A launcher whose every unqueued launch reports that the program does not exist.
+    ///
+    /// The answer a host's launcher gives for a CLI that is not installed: a probe reads it as
+    /// [`Discovery::not_installed`](crate::Discovery::not_installed). Children queued with
+    /// [`push`](Self::push) still start first.
+    ///
+    /// ```
+    /// use mango_external_agents::testing::FakeLauncher;
+    ///
+    /// let launcher = FakeLauncher::missing_program();
+    /// assert!(launcher.launches().is_empty());
+    /// ```
+    pub fn missing_program() -> Self {
+        Self::exhausted_with(Refusal::MissingProgram)
+    }
+
+    /// A launcher whose every unqueued launch fails to start for a reason that is not a missing
+    /// program, carrying `message` as the [`Error::Launch`] summary.
+    ///
+    /// The answer for a CLI that is present and cannot be executed, or a host resource failure
+    /// such as no file descriptors left. A probe returns it to the host as an error. Name the OS
+    /// error in `message`, such as `a launcher failure (PermissionDenied, os error 13)`.
+    ///
+    /// ```
+    /// use mango_external_agents::testing::FakeLauncher;
+    ///
+    /// let launcher = FakeLauncher::refusing_launches("a launcher failure (PermissionDenied)");
+    /// assert!(launcher.launches().is_empty());
+    /// ```
+    pub fn refusing_launches(message: impl Into<String>) -> Self {
+        Self::exhausted_with(Refusal::Launch(message.into()))
+    }
+
+    fn exhausted_with(refusal: Refusal) -> Self {
+        Self {
+            state: Arc::new(LauncherState {
+                exhausted: Some(refusal),
+                ..LauncherState::default()
+            }),
+        }
+    }
+
+    /// Queues a launch that reports the program does not exist, after whatever is already queued.
+    ///
+    /// For a script where an earlier launch starts and a later one fails, such as a version probe
+    /// that runs and a second probe that cannot.
+    pub fn push_missing_program(&self) {
+        self.push_queued(Queued::Refusal(Refusal::MissingProgram));
+    }
+
+    /// Queues a launch that fails to start with an [`Error::Launch`] carrying `message`.
+    ///
+    /// The queued counterpart of [`refusing_launches`](Self::refusing_launches).
+    pub fn push_launch_refusal(&self, message: impl Into<String>) {
+        self.push_queued(Queued::Refusal(Refusal::Launch(message.into())));
+    }
+
+    fn push_queued(&self, queued: Queued) {
+        self.state
+            .queued
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(queued);
     }
 
     /// A launcher whose one child writes `transcript`, a line at a time, then exits.
@@ -312,11 +412,7 @@ impl FakeLauncher {
 
     /// Queues the next child.
     pub fn push(&self, process: FakeProcess) {
-        self.state
-            .queued
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push_back(process);
+        self.push_queued(Queued::Process(process));
     }
 
     /// Every launch, in order.
@@ -388,11 +484,18 @@ impl ProcessLauncher for FakeLauncher {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .pop_front();
-        let Some(process) = queued else {
-            return Err(Error::Launch {
-                program: spec.program().unwrap_or_default().to_owned(),
-                message: String::from("no fake process queued for this launch"),
-            });
+        let process = match queued {
+            Some(Queued::Process(process)) => process,
+            Some(Queued::Refusal(refusal)) => return Err(refusal.error_for(&spec)),
+            None => {
+                return Err(match &self.state.exhausted {
+                    Some(refusal) => refusal.error_for(&spec),
+                    None => Error::Launch {
+                        program: spec.program().unwrap_or_default().to_owned(),
+                        message: String::from("no fake process queued for this launch"),
+                    },
+                });
+            }
         };
 
         let wants_stdin = spec.stdin;
@@ -1099,6 +1202,74 @@ mod tests {
         assert!(
             matches!(error, Error::Launch { .. }),
             "expected a launch refusal, received {error:?}"
+        );
+        assert!(
+            !error.is_program_not_found(),
+            "expected an unqueued launch not to read as a missing program | received: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_program_launcher_reports_the_program_it_was_asked_for() {
+        let error = FakeLauncher::missing_program()
+            .spawn(spec(&["codex", "--version"]))
+            .await
+            .err()
+            .expect("expected a refusal, received a child");
+        assert!(
+            matches!(&error, Error::ProgramNotFound { program } if program == "codex"),
+            "expected Error::ProgramNotFound for codex | received: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusing_launcher_reports_a_launch_failure_with_its_message() {
+        let error = FakeLauncher::refusing_launches("a launcher failure (PermissionDenied)")
+            .spawn(spec(&["codex"]))
+            .await
+            .err()
+            .expect("expected a refusal, received a child");
+        assert!(
+            matches!(&error, Error::Launch { program, message }
+                if program == "codex" && message == "a launcher failure (PermissionDenied)"),
+            "expected Error::Launch for codex naming PermissionDenied | received: {error:?}"
+        );
+    }
+
+    /// The probes launch more than once, so a script has to start one child and refuse the next.
+    #[tokio::test]
+    async fn queued_refusals_take_their_turn_between_children() {
+        let launcher = FakeLauncher::new();
+        launcher.push(FakeProcess::transcript(["one"]));
+        launcher.push_missing_program();
+        launcher.push_launch_refusal("a launcher failure (Uncategorized, os error 24)");
+        launcher.push(FakeProcess::transcript(["two"]));
+
+        assert!(launcher.spawn(spec(&["claude"])).await.is_ok());
+        let missing = launcher
+            .spawn(spec(&["claude"]))
+            .await
+            .err()
+            .expect("expected the queued missing program");
+        assert!(
+            missing.is_program_not_found(),
+            "expected Error::ProgramNotFound second | received: {missing:?}"
+        );
+        let refused = launcher
+            .spawn(spec(&["claude"]))
+            .await
+            .err()
+            .expect("expected the queued launch refusal");
+        assert!(
+            matches!(&refused, Error::Launch { message, .. }
+                if message == "a launcher failure (Uncategorized, os error 24)"),
+            "expected Error::Launch naming os error 24 third | received: {refused:?}"
+        );
+        assert!(launcher.spawn(spec(&["claude"])).await.is_ok());
+        assert_eq!(
+            launcher.launches().len(),
+            2,
+            "expected only the two started children to be recorded as launches"
         );
     }
 }

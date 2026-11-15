@@ -408,6 +408,16 @@ impl ExitStatus {
 #[async_trait::async_trait]
 pub trait ProcessLauncher: Send + Sync {
     /// Starts one child, or explains why it could not.
+    ///
+    /// # Errors
+    ///
+    /// A launcher that learned the program does not exist returns
+    /// [`Error::ProgramNotFound`]. A version probe reads that, and
+    /// only that, as "not installed". Every other failure to start is
+    /// [`Error::Launch`] with a payload-free summary of the OS error: a
+    /// program that is present but not executable, a host resource limit, or a failure the launcher
+    /// cannot attribute to the program. Return `Launch` when unsure. A host that reports a present
+    /// CLI as missing tells its user to install software they already have.
     async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess>;
 }
 

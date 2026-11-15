@@ -227,9 +227,18 @@ impl ProcessLauncher for TokioLauncher {
 
         #[cfg(not(windows))]
         {
-            let mut child = configured_command(&spec, program)
-                .spawn()
-                .map_err(|error| launch_error(program, error))?;
+            let spawned = configured_command(&spec, program).spawn();
+            let mut child = match spawned {
+                Ok(child) => child,
+                Err(error) => {
+                    return Err(classify_spawn_failure(
+                        SpawnFacts::of(&spec, program),
+                        error,
+                        true,
+                    )
+                    .await);
+                }
+            };
             let pid = child.id();
             let stdout = child.stdout.take().ok_or_else(|| missing_stdout(program))?;
             let stdin = child.stdin.take();
@@ -258,8 +267,18 @@ impl ProcessLauncher for TokioLauncher {
 
         #[cfg(windows)]
         {
-            let (mut child, containment_job) =
-                launch_windows(&spec, program).map_err(|error| launch_error(program, error))?;
+            let launched = launch_windows(&spec, program);
+            let (mut child, containment_job) = match launched {
+                Ok(launched) => launched,
+                Err(failure) => {
+                    return Err(classify_spawn_failure(
+                        SpawnFacts::of(&spec, program),
+                        failure.error,
+                        failure.program_may_be_absent,
+                    )
+                    .await);
+                }
+            };
             let pid = child.id();
             let stdout = child
                 .stdout()
@@ -313,11 +332,164 @@ impl ProcessLauncher for TokioLauncher {
     }
 }
 
-/// Keeps native launch diagnostics bounded to a stable operating-system error kind.
-fn launch_error(program: &str, error: std::io::Error) -> Error {
-    Error::Launch {
-        program: program.to_owned(),
-        message: format!("a launcher failure ({:?})", error.kind()),
+/// What a failed spawn is classified against: the child's own view of where to look.
+///
+/// Owned, so the classification can run on the blocking pool: it touches the filesystem, which a
+/// slow network mount can stall.
+struct SpawnFacts {
+    program: String,
+    cwd: std::path::PathBuf,
+    /// The `PATH` in the child's environment. The allowlist is the whole environment, so this is
+    /// not the host process's `PATH`; `None` when the host did not pass one. Read only by the Unix
+    /// scan.
+    #[cfg(unix)]
+    search_path: Option<String>,
+}
+
+impl SpawnFacts {
+    fn of(spec: &LaunchSpec, program: &str) -> Self {
+        Self {
+            program: program.to_owned(),
+            cwd: spec.cwd.clone(),
+            #[cfg(unix)]
+            search_path: spec.env.get("PATH").cloned(),
+        }
+    }
+}
+
+/// Classifies a failed spawn on the blocking pool, so no filesystem check runs on an async thread.
+///
+/// Falls back to the unclassified [`Error::Launch`] when the pool task cannot report, which keeps
+/// the failure on the side that never reads as "not installed".
+async fn classify_spawn_failure(
+    facts: SpawnFacts,
+    error: std::io::Error,
+    may_be_absent: bool,
+) -> Error {
+    let fallback = Error::Launch {
+        program: facts.program.clone(),
+        message: format!("a launcher failure ({})", describe_os_error(&error)),
+    };
+    tokio::task::spawn_blocking(move || launch_error(&facts, &error, may_be_absent))
+        .await
+        .unwrap_or(fallback)
+}
+
+/// Classifies a failed spawn: the program is missing, or something else stopped the launch.
+///
+/// Only a few errors can mean a missing program, and none is proof alone.
+///
+/// `NotFound`. The operating system reports `ENOENT` (or the Windows equivalent) for several
+/// absences that are not the program:
+///
+/// - a working directory that does not exist, which `spawn` reports the same way.
+/// - for a program named by path, an interpreter or dynamic loader the file asks for, such as a
+///   script whose `#!` line names a missing interpreter. The program file itself exists then.
+///
+/// Both come back as [`Error::Launch`]. A bare program name with a broken interpreter cannot be
+/// told from a name that is not on `PATH` without redoing the lookup, so that case is reported as
+/// missing.
+///
+/// `PermissionDenied`, a symlink loop or a name that is too long, for a bare name on Unix. The
+/// `execvp` family reports `EACCES` when it found nothing and some `PATH` directory could not be
+/// searched, so a program installed nowhere fails this way whenever the child's `PATH` holds a
+/// directory its user cannot enter. A loop or an over-long entry stops the search at that
+/// directory too. The program is missing unless a file of that name, not a directory, exists in
+/// some entry of the child's `PATH` (relative entries and empty ones resolved against the child's
+/// working directory). If one does, the program is there and could not be run: `Launch`. The scan
+/// reads the child's `PATH` from the launch spec, never this process's, and uses the system
+/// default (`/bin:/usr/bin`) when the spec has none, as `execvp` does. It does not look for the
+/// execute bit, because a file that cannot be run is the case it exists to report.
+///
+/// Every other kind is [`Error::Launch`]. `may_be_absent` is false when the caller knows the
+/// program was found, such as a failed Windows PowerShell fallback, which runs only for a script
+/// that exists.
+///
+/// The message holds the error kind and the OS error number, both safe to print: `PermissionDenied`
+/// for a file without the execute bit, `os error 24` for no descriptors left. The kind alone says
+/// `Uncategorized` for several of the host's own limits.
+fn launch_error(facts: &SpawnFacts, error: &std::io::Error, may_be_absent: bool) -> Error {
+    let summary = |reason: &str| Error::Launch {
+        program: facts.program.clone(),
+        message: format!("{reason} ({})", describe_os_error(error)),
+    };
+    if !may_be_absent {
+        return summary("a launcher failure");
+    }
+    let names_a_path = facts.program.contains(['/', std::path::MAIN_SEPARATOR]);
+    match error.kind() {
+        std::io::ErrorKind::NotFound => {
+            if !facts.cwd.is_dir() {
+                return summary("a working directory that does not exist");
+            }
+            if names_a_path && facts.cwd.join(&facts.program).exists() {
+                return summary("a program whose interpreter or loader does not exist");
+            }
+            Error::program_not_found(&facts.program)
+        }
+        _ if !names_a_path
+            && ends_a_path_search_early(error)
+            && !path_holds_a_file_named(facts) =>
+        {
+            Error::program_not_found(&facts.program)
+        }
+        _ => summary("a launcher failure"),
+    }
+}
+
+/// Whether `execvp` gives this error for a name it found nowhere: `EACCES` from a directory it
+/// could not search, `ELOOP` or `ENAMETOOLONG` from a `PATH` entry it could not use. The last two
+/// have no stable [`std::io::ErrorKind`], so they are read by number.
+#[cfg(unix)]
+fn ends_a_path_search_early(error: &std::io::Error) -> bool {
+    use nix::errno::Errno;
+    error.kind() == std::io::ErrorKind::PermissionDenied
+        || error
+            .raw_os_error()
+            .is_some_and(|code| code == Errno::ELOOP as i32 || code == Errno::ENAMETOOLONG as i32)
+}
+
+/// Windows reports a failed lookup as `NotFound`, so no other error can mean a missing program.
+#[cfg(not(unix))]
+fn ends_a_path_search_early(_: &std::io::Error) -> bool {
+    false
+}
+
+/// Whether some entry of the child's `PATH` holds a non-directory named like the program.
+///
+/// Unix only: Windows reports its own lookup failures as `NotFound`, and the `PATH` rules there
+/// (extensions, the current directory first) are not worth guessing at. On Windows this is
+/// `true`, so a refusal that is not `NotFound` stays a launch failure.
+#[cfg(unix)]
+fn path_holds_a_file_named(facts: &SpawnFacts) -> bool {
+    /// What `execvp` searches when the environment has no `PATH`.
+    const DEFAULT_SEARCH_PATH: &str = "/bin:/usr/bin";
+    let search_path = facts.search_path.as_deref().unwrap_or(DEFAULT_SEARCH_PATH);
+    search_path.split(':').any(|entry| {
+        // An empty entry means the working directory, and a relative one is under it. `join`
+        // keeps an absolute entry as it is.
+        let directory = if entry.is_empty() {
+            facts.cwd.clone()
+        } else {
+            facts.cwd.join(entry)
+        };
+        // `metadata` follows links, so a dangling link is not a file; an entry the user cannot
+        // search fails here, which is how the directory that caused the refusal is skipped.
+        std::fs::metadata(directory.join(&facts.program)).is_ok_and(|found| !found.is_dir())
+    })
+}
+
+#[cfg(not(unix))]
+fn path_holds_a_file_named(_: &SpawnFacts) -> bool {
+    true
+}
+
+/// The error kind and OS error number, never the message: that can carry the path the operating
+/// system was handed.
+fn describe_os_error(error: &std::io::Error) -> String {
+    match error.raw_os_error() {
+        Some(code) => format!("{:?}, os error {code}", error.kind()),
+        None => format!("{:?}", error.kind()),
     }
 }
 
@@ -375,16 +547,46 @@ fn native_exit_status(status: std::process::ExitStatus) -> ExitStatus {
     }
 }
 
+/// A failed Windows spawn, with whether it can mean the program is absent.
+#[cfg(windows)]
+struct WindowsSpawnFailure {
+    error: std::io::Error,
+    /// False for a failure that is not about finding the program: creating the Job, or the
+    /// PowerShell fallback, which runs only for a script that was found. A `NotFound` from
+    /// `powershell.exe` itself must not read as the script being missing.
+    program_may_be_absent: bool,
+}
+
+#[cfg(windows)]
+impl WindowsSpawnFailure {
+    fn lookup(error: std::io::Error) -> Self {
+        Self {
+            error,
+            program_may_be_absent: true,
+        }
+    }
+
+    fn elsewhere(error: std::io::Error) -> Self {
+        Self {
+            error,
+            program_may_be_absent: false,
+        }
+    }
+}
+
 /// Spawns a Windows child in a Job before vendor code starts.
 #[cfg(windows)]
 fn launch_windows(
     spec: &LaunchSpec,
     program: &str,
-) -> std::io::Result<(
-    Box<dyn process_wrap::tokio::ChildWrapper>,
-    Arc<win32job::Job>,
-)> {
-    let outer_job = containment_job()?;
+) -> std::result::Result<
+    (
+        Box<dyn process_wrap::tokio::ChildWrapper>,
+        Arc<win32job::Job>,
+    ),
+    WindowsSpawnFailure,
+> {
+    let outer_job = containment_job().map_err(WindowsSpawnFailure::elsewhere)?;
     let mut command = contained_command(
         configured_command(spec, program),
         spec.hide_window,
@@ -399,18 +601,19 @@ fn launch_windows(
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("ps1"));
             if error.kind() != std::io::ErrorKind::NotFound && !script {
-                return Err(error);
+                return Err(WindowsSpawnFailure::lookup(error));
             }
             let Some(fallback) = super::powershell::fallback(spec) else {
-                return Err(error);
+                return Err(WindowsSpawnFailure::lookup(error));
             };
-            let containment_job = containment_job()?;
+            let containment_job = containment_job().map_err(WindowsSpawnFailure::elsewhere)?;
             let child = contained_command(
                 configured_command(&fallback, &fallback.argv[0]),
                 fallback.hide_window,
                 Arc::clone(&containment_job),
             )
-            .spawn()?;
+            .spawn()
+            .map_err(WindowsSpawnFailure::elsewhere)?;
             Ok((child, containment_job))
         })
 }
@@ -2153,7 +2356,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_program_that_does_not_exist_is_a_typed_launch_failure() {
+    async fn a_program_that_does_not_exist_is_reported_as_not_found() {
         let mut spec = fixture("lines");
         spec.argv[0] = String::from("mea-no-such-program");
 
@@ -2163,20 +2366,669 @@ mod tests {
             .err()
             .expect("expected a refusal, received a child");
         assert!(
-            matches!(error, crate::Error::Launch { .. }),
-            "expected a launch failure, received {error:?}"
+            matches!(error, crate::Error::ProgramNotFound { .. }),
+            "expected Error::ProgramNotFound for a program that is on no path | received: {error:?}"
         );
-        // The kind is what an operator acts on, and it is the only part of an `io::Error` that
-        // cannot carry the path the operating system was handed.
+        // The requested name is host text; the diagnostic keeps it out.
         let rendered = error.to_string();
         assert!(
-            rendered.ends_with("received a launcher failure (NotFound)"),
-            "expected the io error kind, received {rendered}"
-        );
-        assert!(
             !rendered.contains("mea-no-such-program"),
-            "expected the requested program to stay out of the diagnostic, received {rendered}"
+            "expected the requested program to stay out of the diagnostic | received: {rendered}"
         );
+    }
+
+    /// The `NotFound` classification is a pure function of the failure and the filesystem, so
+    /// every platform checks it without spawning anything.
+    mod classification {
+        use super::super::{SpawnFacts, launch_error};
+        use crate::Error;
+        use std::io::{Error as IoError, ErrorKind};
+        use std::path::Path;
+
+        /// The program and working directory a spawn was asked for, with no `PATH` of its own.
+        fn facts(program: &str, cwd: &Path) -> SpawnFacts {
+            SpawnFacts {
+                program: program.to_owned(),
+                cwd: cwd.to_path_buf(),
+                #[cfg(unix)]
+                search_path: None,
+            }
+        }
+
+        #[test]
+        fn not_found_for_a_bare_name_in_an_existing_directory_is_a_missing_program() {
+            let error = launch_error(
+                &facts("claude", &std::env::temp_dir()),
+                &IoError::from(ErrorKind::NotFound),
+                true,
+            );
+            assert!(
+                matches!(&error, Error::ProgramNotFound { program } if program == "claude"),
+                "expected Error::ProgramNotFound for claude | received: {error:?}"
+            );
+        }
+
+        #[test]
+        fn not_found_with_a_missing_working_directory_is_not_a_missing_program() {
+            let cwd = std::env::temp_dir().join("mea-launch-kind-no-such-directory");
+            let error = launch_error(
+                &facts("claude", &cwd),
+                &IoError::from(ErrorKind::NotFound),
+                true,
+            );
+            assert!(
+                matches!(&error, Error::Launch { message, .. }
+                    if message == "a working directory that does not exist (NotFound)"),
+                "expected Error::Launch naming the working directory | received: {error:?}"
+            );
+        }
+
+        #[test]
+        fn not_found_for_a_file_that_exists_is_a_missing_interpreter_not_a_missing_program() {
+            let directory = tempfile::tempdir().expect("expected a temporary directory");
+            let script = directory.path().join("claude");
+            std::fs::write(&script, "#!/mea-no-such-interpreter\n").expect("expected a script");
+            let error = launch_error(
+                &facts(&script.to_string_lossy(), directory.path()),
+                &IoError::from(ErrorKind::NotFound),
+                true,
+            );
+            assert!(
+                matches!(&error, Error::Launch { message, .. }
+                    if message == "a program whose interpreter or loader does not exist (NotFound)"),
+                "expected Error::Launch naming the interpreter or loader | received: {error:?}"
+            );
+        }
+
+        #[test]
+        fn not_found_for_a_path_that_does_not_exist_is_a_missing_program() {
+            let directory = tempfile::tempdir().expect("expected a temporary directory");
+            let absent = directory.path().join("claude");
+            let error = launch_error(
+                &facts(&absent.to_string_lossy(), directory.path()),
+                &IoError::from(ErrorKind::NotFound),
+                true,
+            );
+            assert!(
+                error.is_program_not_found(),
+                "expected Error::ProgramNotFound for an absent path | received: {error:?}"
+            );
+        }
+
+        /// A failure inside a fallback that runs only for a script that was found, such as the
+        /// Windows PowerShell launch, never means the script is missing.
+        #[test]
+        fn not_found_from_a_step_that_cannot_mean_absence_is_a_launch_failure() {
+            let error = launch_error(
+                &facts("claude.ps1", &std::env::temp_dir()),
+                &IoError::from(ErrorKind::NotFound),
+                false,
+            );
+            assert!(
+                matches!(&error, Error::Launch { message, .. } if message == "a launcher failure (NotFound)"),
+                "expected Error::Launch when absence is excluded | received: {error:?}"
+            );
+        }
+
+        /// A permission refusal where the program is known to exist is the issue's own case.
+        #[test]
+        fn a_permission_refusal_for_an_explicit_path_is_a_launch_failure_naming_the_kind() {
+            let error = launch_error(
+                &facts("/opt/claude/bin/claude", &std::env::temp_dir()),
+                &IoError::from(ErrorKind::PermissionDenied),
+                true,
+            );
+            assert!(
+                matches!(&error, Error::Launch { message, .. } if message == "a launcher failure (PermissionDenied)"),
+                "expected Error::Launch naming PermissionDenied | received: {error:?}"
+            );
+        }
+
+        #[test]
+        fn a_permission_refusal_from_a_step_that_cannot_mean_absence_is_a_launch_failure() {
+            let error = launch_error(
+                &facts("claude", &std::env::temp_dir()),
+                &IoError::from(ErrorKind::PermissionDenied),
+                false,
+            );
+            assert!(
+                matches!(&error, Error::Launch { message, .. } if message == "a launcher failure (PermissionDenied)"),
+                "expected Error::Launch when absence is excluded | received: {error:?}"
+            );
+        }
+
+        /// `ErrorKind` alone says `Uncategorized` for descriptor exhaustion, which names nothing.
+        #[cfg(unix)]
+        #[test]
+        fn a_failure_with_an_os_error_number_names_it() {
+            const EMFILE: i32 = 24;
+            let error = launch_error(
+                &facts("claude", &std::env::temp_dir()),
+                &IoError::from_raw_os_error(EMFILE),
+                true,
+            );
+            let rendered = error.to_string();
+            assert!(
+                matches!(&error, Error::Launch { .. }) && rendered.ends_with("os error 24)"),
+                "expected Error::Launch naming os error 24 | received: {rendered}"
+            );
+        }
+
+        /// `execvp` reports `EACCES` for a name found nowhere when some `PATH` directory could not
+        /// be searched, so a refusal for a bare name is classified by looking at the child's
+        /// `PATH`, never the host process's.
+        #[cfg(unix)]
+        mod path_scan {
+            use super::super::super::{SpawnFacts, launch_error};
+            use crate::Error;
+            use nix::errno::Errno;
+            use std::io::{Error as IoError, ErrorKind};
+            use std::path::Path;
+
+            fn facts_over(program: &str, cwd: &Path, search_path: Option<&str>) -> SpawnFacts {
+                SpawnFacts {
+                    program: program.to_owned(),
+                    cwd: cwd.to_path_buf(),
+                    search_path: search_path.map(str::to_owned),
+                }
+            }
+
+            fn refused_with(kind: ErrorKind, facts: &SpawnFacts) -> Error {
+                launch_error(facts, &IoError::from(kind), true)
+            }
+
+            fn expect_missing(error: &Error, why: &str) {
+                assert!(
+                    matches!(error, Error::ProgramNotFound { program } if program == "claude"),
+                    "expected Error::ProgramNotFound for claude, {why} | received: {error:?}"
+                );
+            }
+
+            fn expect_present_but_not_run(error: &Error, why: &str) {
+                assert!(
+                    matches!(error, Error::Launch { message, .. }
+                        if message == "a launcher failure (PermissionDenied)"),
+                    "expected Error::Launch naming PermissionDenied, {why} | received: {error:?}"
+                );
+            }
+
+            fn path_of(directories: &[&Path]) -> String {
+                directories
+                    .iter()
+                    .map(|directory| directory.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(":")
+            }
+
+            #[test]
+            fn a_refusal_with_the_program_on_no_path_entry_is_a_missing_program() {
+                let first = tempfile::tempdir().expect("expected a temporary directory");
+                let second = tempfile::tempdir().expect("expected a temporary directory");
+                let path = path_of(&[first.path(), second.path()]);
+                let facts = facts_over("claude", first.path(), Some(path.as_str()));
+                for (label, refusal) in [
+                    ("EACCES", IoError::from(ErrorKind::PermissionDenied)),
+                    ("ELOOP", IoError::from_raw_os_error(Errno::ELOOP as i32)),
+                    (
+                        "ENAMETOOLONG",
+                        IoError::from_raw_os_error(Errno::ENAMETOOLONG as i32),
+                    ),
+                ] {
+                    let error = launch_error(&facts, &refusal, true);
+                    expect_missing(&error, &format!("for {label} with two empty entries"));
+                }
+            }
+
+            #[test]
+            fn a_refusal_with_a_file_of_that_name_on_the_path_is_a_present_program() {
+                let empty = tempfile::tempdir().expect("expected a temporary directory");
+                let installed = tempfile::tempdir().expect("expected a temporary directory");
+                std::fs::write(installed.path().join("claude"), "#!/bin/sh\n")
+                    .expect("expected a file");
+                let path = path_of(&[empty.path(), installed.path()]);
+
+                let error = refused_with(
+                    ErrorKind::PermissionDenied,
+                    &facts_over("claude", empty.path(), Some(path.as_str())),
+                );
+                expect_present_but_not_run(&error, "for a file in the second entry");
+            }
+
+            /// A directory named like the program is not the program.
+            #[test]
+            fn a_directory_of_that_name_on_the_path_is_not_the_program() {
+                let holder = tempfile::tempdir().expect("expected a temporary directory");
+                std::fs::create_dir(holder.path().join("claude")).expect("expected a directory");
+                let path = path_of(&[holder.path()]);
+
+                let error = refused_with(
+                    ErrorKind::PermissionDenied,
+                    &facts_over("claude", holder.path(), Some(path.as_str())),
+                );
+                expect_missing(&error, "for a directory named claude");
+            }
+
+            #[test]
+            fn a_dangling_link_of_that_name_on_the_path_is_not_the_program() {
+                let holder = tempfile::tempdir().expect("expected a temporary directory");
+                std::os::unix::fs::symlink(
+                    holder.path().join("no-such-target"),
+                    holder.path().join("claude"),
+                )
+                .expect("expected a symlink");
+                let path = path_of(&[holder.path()]);
+
+                let error = refused_with(
+                    ErrorKind::PermissionDenied,
+                    &facts_over("claude", holder.path(), Some(path.as_str())),
+                );
+                expect_missing(&error, "for a link that points nowhere");
+            }
+
+            /// A relative entry is under the child's working directory, not this process's.
+            #[test]
+            fn a_relative_path_entry_is_resolved_against_the_childs_working_directory() {
+                let cwd = tempfile::tempdir().expect("expected a temporary directory");
+                std::fs::create_dir(cwd.path().join("bin")).expect("expected a directory");
+                std::fs::write(cwd.path().join("bin").join("claude"), "#!/bin/sh\n")
+                    .expect("expected a file");
+
+                let under_cwd = refused_with(
+                    ErrorKind::PermissionDenied,
+                    &facts_over("claude", cwd.path(), Some("bin")),
+                );
+                expect_present_but_not_run(
+                    &under_cwd,
+                    "for bin/claude under the working directory",
+                );
+
+                let elsewhere = tempfile::tempdir().expect("expected a temporary directory");
+                let not_there = refused_with(
+                    ErrorKind::PermissionDenied,
+                    &facts_over("claude", elsewhere.path(), Some("bin")),
+                );
+                expect_missing(&not_there, "for a working directory with no bin/claude");
+            }
+
+            /// An empty entry means the working directory.
+            #[test]
+            fn an_empty_path_entry_is_the_childs_working_directory() {
+                let cwd = tempfile::tempdir().expect("expected a temporary directory");
+                std::fs::write(cwd.path().join("claude"), "#!/bin/sh\n").expect("expected a file");
+
+                let error = refused_with(
+                    ErrorKind::PermissionDenied,
+                    &facts_over("claude", cwd.path(), Some("/mea-no-such-directory:")),
+                );
+                expect_present_but_not_run(&error, "for claude in the working directory");
+            }
+
+            /// The scan reads the spec's `PATH`: `sh` is on this process's `PATH`, and an
+            /// environment that does not list its directory does not hold it.
+            #[test]
+            fn the_childs_path_decides_not_the_host_processs() {
+                let empty = tempfile::tempdir().expect("expected a temporary directory");
+                let path = path_of(&[empty.path()]);
+
+                let error = launch_error(
+                    &facts_over("sh", empty.path(), Some(path.as_str())),
+                    &IoError::from(ErrorKind::PermissionDenied),
+                    true,
+                );
+                assert!(
+                    matches!(&error, Error::ProgramNotFound { program } if program == "sh"),
+                    "expected Error::ProgramNotFound for sh outside the child's PATH | received: {error:?}"
+                );
+            }
+
+            /// With no `PATH` in the spec, `execvp` searches the system default.
+            #[test]
+            fn a_spec_without_a_path_is_searched_in_the_system_default() {
+                let cwd = tempfile::tempdir().expect("expected a temporary directory");
+
+                let present = launch_error(
+                    &facts_over("sh", cwd.path(), None),
+                    &IoError::from(ErrorKind::PermissionDenied),
+                    true,
+                );
+                assert!(
+                    matches!(&present, Error::Launch { .. }),
+                    "expected Error::Launch for sh, which the default path holds | received: {present:?}"
+                );
+                let absent = launch_error(
+                    &facts_over("mea-no-such-program", cwd.path(), None),
+                    &IoError::from(ErrorKind::PermissionDenied),
+                    true,
+                );
+                assert!(
+                    matches!(&absent, Error::ProgramNotFound { program }
+                        if program == "mea-no-such-program"),
+                    "expected Error::ProgramNotFound for a name the default path lacks | received: {absent:?}"
+                );
+            }
+
+            /// A name with a directory part is not searched for; the file is where it says.
+            #[test]
+            fn a_program_named_by_path_is_never_scanned_for() {
+                let empty = tempfile::tempdir().expect("expected a temporary directory");
+                let path = path_of(&[empty.path()]);
+
+                let error = refused_with(
+                    ErrorKind::PermissionDenied,
+                    &facts_over("./claude", empty.path(), Some(path.as_str())),
+                );
+                assert!(
+                    matches!(&error, Error::Launch { message, .. }
+                        if message == "a launcher failure (PermissionDenied)"),
+                    "expected Error::Launch for a program named by path | received: {error:?}"
+                );
+            }
+
+            /// Other kinds are never read as a missing program, whatever the `PATH` holds.
+            #[test]
+            fn a_resource_failure_is_never_a_missing_program() {
+                let empty = tempfile::tempdir().expect("expected a temporary directory");
+                let path = path_of(&[empty.path()]);
+
+                let error = refused_with(
+                    ErrorKind::OutOfMemory,
+                    &facts_over("claude", empty.path(), Some(path.as_str())),
+                );
+                assert!(
+                    matches!(&error, Error::Launch { .. }),
+                    "expected Error::Launch for an out-of-memory refusal | received: {error:?}"
+                );
+            }
+        }
+    }
+
+    /// Real spawns on Unix, where an unexecutable file on `PATH` is the failure the issue is about.
+    #[cfg(unix)]
+    mod unix_spawns {
+        use super::{TokioLauncher, fixture};
+        use crate::Error;
+        use crate::process::ProcessLauncher;
+        use std::os::unix::fs::PermissionsExt;
+
+        /// A launch of the bare name `claude` that resolves through a `PATH` of one directory.
+        fn bare_claude_over(directory: &std::path::Path) -> crate::process::LaunchSpec {
+            let mut spec = fixture("lines");
+            spec.argv[0] = String::from("claude");
+            spec.env.insert(
+                String::from("PATH"),
+                directory.to_string_lossy().into_owned(),
+            );
+            spec
+        }
+
+        async fn refusal(spec: crate::process::LaunchSpec) -> Error {
+            TokioLauncher::new()
+                .spawn(spec)
+                .await
+                .err()
+                .expect("expected a refusal, received a child")
+        }
+
+        /// A launch of the bare name `claude` over several `PATH` directories, searched in order.
+        fn bare_claude_over_all(directories: &[&std::path::Path]) -> crate::process::LaunchSpec {
+            let mut spec = bare_claude_over(std::path::Path::new(""));
+            spec.env.insert(
+                String::from("PATH"),
+                directories
+                    .iter()
+                    .map(|directory| directory.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(":"),
+            );
+            spec
+        }
+
+        /// A directory nobody can enter, restored to a mode that lets its temporary parent clean
+        /// up even when the test panics first.
+        struct SealedDirectory {
+            path: std::path::PathBuf,
+        }
+
+        impl SealedDirectory {
+            /// Seals a new directory under `parent`, or says why this environment cannot: a
+            /// process that ignores directory permissions (root, or a capability-bearing user)
+            /// searches it regardless, which leaves nothing to test.
+            fn under(parent: &std::path::Path) -> Result<Self, String> {
+                let path = parent.join("sealed");
+                std::fs::create_dir(&path).expect("expected a directory");
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+                    .expect("expected the mode to change");
+                let sealed = Self { path };
+                match std::fs::read_dir(&sealed.path) {
+                    Err(_) => Ok(sealed),
+                    Ok(_) => Err(String::from(
+                        "this process can read a mode-000 directory (running as root, or with \
+                         CAP_DAC_OVERRIDE), so no PATH entry is unsearchable to it",
+                    )),
+                }
+            }
+        }
+
+        impl Drop for SealedDirectory {
+            fn drop(&mut self) {
+                let _ =
+                    std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+
+        /// Writes a script that is complete and closed before anything can exec it.
+        ///
+        /// The mode is set at creation and the handle is synced and dropped before this returns, so
+        /// this thread never holds the file open for writing while it is run. Another test's
+        /// `fork` can still carry a copy of the descriptor for a moment; see
+        /// [`refusal_once_unbusy`].
+        fn write_executable_script(path: &std::path::Path, contents: &str) {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o755)
+                .open(path)
+                .expect("expected a script to be created");
+            file.write_all(contents.as_bytes())
+                .expect("expected the script to be written");
+            file.sync_all().expect("expected the script to be synced");
+            drop(file);
+        }
+
+        /// `ETXTBSY` (os error 26): the file is open for writing somewhere.
+        fn is_text_file_busy(error: &Error) -> bool {
+            matches!(error, Error::Launch { message, .. } if message.contains("os error 26)"))
+        }
+
+        /// Spawns until the answer is not `ETXTBSY`, which is not an answer about the program.
+        ///
+        /// Tests run in threads of one process, and a `fork` on another thread between a script's
+        /// `open` and its `close` hands the child a write descriptor that lives until that child
+        /// execs. Exec of the script then fails with `ETXTBSY` although this test closed its handle.
+        /// The wait is bounded, and a launch that stays busy fails the test with the error, so a
+        /// real `ETXTBSY` is never accepted as the expected result.
+        async fn refusal_once_unbusy(spec: crate::process::LaunchSpec) -> Error {
+            const ATTEMPTS: usize = 100;
+            const PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+            let mut error = refusal(spec.clone()).await;
+            for _ in 1..ATTEMPTS {
+                if !is_text_file_busy(&error) {
+                    return error;
+                }
+                tokio::time::sleep(PAUSE).await;
+                error = refusal(spec.clone()).await;
+            }
+            error
+        }
+
+        #[test]
+        fn text_file_busy_is_recognised_by_its_os_error_number_only() {
+            let busy = Error::Launch {
+                program: String::from("claude"),
+                message: String::from("a launcher failure (ExecutableFileBusy, os error 26)"),
+            };
+            let denied = Error::Launch {
+                program: String::from("claude"),
+                message: String::from("a launcher failure (PermissionDenied, os error 13)"),
+            };
+            assert!(
+                is_text_file_busy(&busy),
+                "expected os error 26 to read as busy | received: {busy:?}"
+            );
+            assert!(
+                !is_text_file_busy(&denied) && !is_text_file_busy(&Error::program_not_found("x")),
+                "expected neither a permission refusal nor a missing program to read as busy"
+            );
+        }
+
+        /// The case behind the review: the CLI is installed nowhere, and the child's `PATH` holds a
+        /// directory its user cannot enter. glibc's `execvp` then fails with `EACCES`, which
+        /// without the scan reads as a present CLI that cannot be run.
+        #[tokio::test]
+        async fn a_missing_program_behind_an_unsearchable_path_entry_is_still_missing() {
+            let parent = tempfile::tempdir().expect("expected a temporary directory");
+            let sealed = match SealedDirectory::under(parent.path()) {
+                Ok(sealed) => sealed,
+                Err(reason) => {
+                    eprintln!("skipped: {reason}");
+                    return;
+                }
+            };
+            let empty = tempfile::tempdir().expect("expected a temporary directory");
+
+            let error = refusal(bare_claude_over_all(&[sealed.path.as_path(), empty.path()])).await;
+            assert!(
+                error.is_program_not_found(),
+                "expected Error::ProgramNotFound for claude with PATH=[sealed directory, empty \
+                 directory] | received: {error:?}"
+            );
+        }
+
+        /// The same `PATH`, with the program present and not executable: still a launch failure.
+        #[tokio::test]
+        async fn a_present_program_behind_an_unsearchable_path_entry_is_not_missing() {
+            let parent = tempfile::tempdir().expect("expected a temporary directory");
+            let sealed = match SealedDirectory::under(parent.path()) {
+                Ok(sealed) => sealed,
+                Err(reason) => {
+                    eprintln!("skipped: {reason}");
+                    return;
+                }
+            };
+            let installed = tempfile::tempdir().expect("expected a temporary directory");
+            let cli = installed.path().join("claude");
+            std::fs::write(&cli, "#!/bin/sh\nexit 0\n").expect("expected a file");
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o644))
+                .expect("expected the mode to change");
+
+            let error = refusal(bare_claude_over_all(&[
+                sealed.path.as_path(),
+                installed.path(),
+            ]))
+            .await;
+            assert!(
+                matches!(&error, Error::Launch { message, .. }
+                    if message == "a launcher failure (PermissionDenied, os error 13)"),
+                "expected Error::Launch naming PermissionDenied (os error 13) for a 0644 claude \
+                 behind a sealed entry | received: {error:?}"
+            );
+        }
+
+        #[test]
+        fn a_sealed_directory_says_why_it_cannot_seal_when_permissions_are_ignored() {
+            // Whatever this environment is, the helper either seals or names the reason.
+            let parent = tempfile::tempdir().expect("expected a temporary directory");
+            match SealedDirectory::under(parent.path()) {
+                Ok(sealed) => assert!(
+                    std::fs::read_dir(&sealed.path).is_err(),
+                    "expected a sealed directory to refuse reading"
+                ),
+                Err(reason) => assert!(
+                    reason.contains("mode-000"),
+                    "expected a reason naming the mode | received: {reason}"
+                ),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_bare_name_on_no_path_directory_is_a_missing_program() {
+            let directory = tempfile::tempdir().expect("expected a temporary directory");
+            let error = refusal(bare_claude_over(directory.path())).await;
+            assert!(
+                error.is_program_not_found(),
+                "expected Error::ProgramNotFound for claude on an empty PATH | received: {error:?}"
+            );
+        }
+
+        /// The issue's case: the CLI is installed and has lost its execute bit.
+        #[tokio::test]
+        async fn a_file_on_path_without_the_execute_bit_is_not_a_missing_program() {
+            let directory = tempfile::tempdir().expect("expected a temporary directory");
+            let cli = directory.path().join("claude");
+            std::fs::write(&cli, "#!/bin/sh\nexit 0\n").expect("expected a file");
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o644))
+                .expect("expected the mode to change");
+
+            let error = refusal(bare_claude_over(directory.path())).await;
+            assert!(
+                matches!(&error, Error::Launch { message, .. }
+                    if message == "a launcher failure (PermissionDenied, os error 13)"),
+                "expected Error::Launch naming PermissionDenied (os error 13) | received: {error:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_explicit_path_without_the_execute_bit_is_not_a_missing_program() {
+            let directory = tempfile::tempdir().expect("expected a temporary directory");
+            let cli = directory.path().join("claude");
+            std::fs::write(&cli, "#!/bin/sh\nexit 0\n").expect("expected a file");
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o644))
+                .expect("expected the mode to change");
+            let mut spec = fixture("lines");
+            spec.argv[0] = cli.to_string_lossy().into_owned();
+
+            let error = refusal(spec).await;
+            assert!(
+                matches!(&error, Error::Launch { message, .. }
+                    if message == "a launcher failure (PermissionDenied, os error 13)"),
+                "expected Error::Launch naming PermissionDenied (os error 13) | received: {error:?}"
+            );
+        }
+
+        /// `spawn` reports a missing working directory as `ENOENT`, the same code as a missing
+        /// program, so a program that is present must not be read as absent.
+        #[tokio::test]
+        async fn a_missing_working_directory_is_not_a_missing_program() {
+            let directory = tempfile::tempdir().expect("expected a temporary directory");
+            let mut spec = fixture("lines");
+            spec.cwd = directory.path().join("no-such-directory");
+
+            let error = refusal(spec).await;
+            assert!(
+                matches!(&error, Error::Launch { message, .. }
+                    if message == "a working directory that does not exist (NotFound, os error 2)"),
+                "expected Error::Launch naming the working directory (os error 2) | received: {error:?}"
+            );
+        }
+
+        /// A script whose `#!` interpreter is gone also fails with `ENOENT`.
+        #[tokio::test]
+        async fn a_script_with_a_missing_interpreter_is_not_a_missing_program() {
+            let directory = tempfile::tempdir().expect("expected a temporary directory");
+            let cli = directory.path().join("claude");
+            write_executable_script(&cli, "#!/mea-no-such-interpreter\n");
+            let mut spec = fixture("lines");
+            spec.argv[0] = cli.to_string_lossy().into_owned();
+
+            let error = refusal_once_unbusy(spec).await;
+            assert!(
+                matches!(&error, Error::Launch { message, .. }
+                    if message == "a program whose interpreter or loader does not exist (NotFound, os error 2)"),
+                "expected Error::Launch naming the interpreter (os error 2) | received: {error:?}"
+            );
+        }
     }
 
     #[tokio::test]

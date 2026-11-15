@@ -257,7 +257,31 @@ pub enum Error {
         login_hint: String,
     },
 
-    /// The CLI could not be found, or could not be started.
+    /// The launcher established that no such program exists.
+    ///
+    /// The one launch failure that means "not installed". A version probe reads this and nothing
+    /// else as an absent CLI: [`Launch`](Self::Launch) covers a program that is present and could
+    /// not be started (no execute permission, a format the system cannot run, no file
+    /// descriptors left), and a host that reported those as missing would tell a user to install
+    /// software they already have. A launcher that cannot tell the two apart returns
+    /// [`Launch`](Self::Launch).
+    ///
+    /// Build it with [`Error::program_not_found`]; test for it, through any dispatch annotation,
+    /// with [`Error::is_program_not_found`].
+    ProgramNotFound {
+        /// The executable the launcher was asked for.
+        ///
+        /// Host-provided text, reported by [`Display`](fmt::Display) through
+        /// [`redact::program_name`] like [`Launch`](Self::Launch)'s program.
+        program: String,
+    },
+
+    /// The program was found, or the launcher cannot say whether it was, and it could not be
+    /// started.
+    ///
+    /// Not "not installed": that is [`ProgramNotFound`](Self::ProgramNotFound), and a version
+    /// probe returns this one to the host as an error. Through 0.8.0 a probe read this variant as
+    /// an absent CLI.
     Launch {
         /// The executable the launcher was asked for.
         ///
@@ -412,6 +436,11 @@ impl fmt::Display for Error {
             Self::AuthRequired { .. } => formatter.write_str(
                 "expected a signed-in CLI, received a signed-out one; inspect the typed login hint",
             ),
+            Self::ProgramNotFound { program } => write!(
+                formatter,
+                "expected to launch {}, received no such program",
+                redact::program_name(program)
+            ),
             Self::Launch { program, message } => write!(
                 formatter,
                 "expected to launch {}, received {message}",
@@ -494,6 +523,45 @@ impl Error {
     /// The typed refusal every unimplemented optional method returns.
     pub fn not_supported(capability: Capability) -> Self {
         Self::NotSupported { capability }
+    }
+
+    /// A launcher's answer that the program does not exist.
+    ///
+    /// ```
+    /// use mango_external_agents::Error;
+    ///
+    /// let error = Error::program_not_found("claude");
+    /// assert!(error.is_program_not_found());
+    /// assert_eq!(error.to_string(), "expected to launch claude, received no such program");
+    /// ```
+    pub fn program_not_found(program: impl Into<String>) -> Self {
+        Self::ProgramNotFound {
+            program: program.into(),
+        }
+    }
+
+    /// Whether the launcher said the program does not exist, which is what "not installed" means.
+    ///
+    /// Looks through a dispatch annotation like [`Self::cause`]. Every other launch failure,
+    /// including [`Error::Launch`] from a launcher that cannot tell, is `false`.
+    ///
+    /// An error that carries a child's cleanup control is `false` too, whatever its cause. A child
+    /// that may still be running is not "not installed", and a host that tested only this
+    /// predicate would drop it without reconciling. Check [`Self::cleanup_control`] to learn why.
+    ///
+    /// ```
+    /// use mango_external_agents::{Dispatch, Error};
+    ///
+    /// let missing = Error::program_not_found("claude").with_dispatch(Dispatch::NotSubmitted);
+    /// assert!(missing.is_program_not_found());
+    /// let unstartable = Error::Launch {
+    ///     program: String::from("claude"),
+    ///     message: String::from("a launcher failure (PermissionDenied)"),
+    /// };
+    /// assert!(!unstartable.is_program_not_found());
+    /// ```
+    pub fn is_program_not_found(&self) -> bool {
+        self.cleanup_control().is_none() && matches!(self.cause(), Self::ProgramNotFound { .. })
     }
 
     /// Whether an identical retry could plausibly succeed.
@@ -991,6 +1059,79 @@ mod tests {
             host_program.to_string(),
             "expected to launch custom executable, received a launcher failure (PermissionDenied)"
         );
+    }
+
+    /// A missing program is its own variant, so "not installed" never rides on a message string.
+    #[test]
+    fn a_missing_program_is_typed_and_redacts_the_program() {
+        let missing = Error::program_not_found("/opt/secret-canary/claude");
+        assert!(
+            matches!(&missing, Error::ProgramNotFound { program } if program == "/opt/secret-canary/claude"),
+            "expected Error::ProgramNotFound keeping the program | received: {missing:?}"
+        );
+        assert_eq!(
+            missing.to_string(),
+            "expected to launch claude, received no such program"
+        );
+        let custom = Error::program_not_found("/opt/bin/customer-secret-canary");
+        assert_eq!(
+            custom.to_string(),
+            "expected to launch custom executable, received no such program"
+        );
+        assert!(!missing.retryable());
+        assert_eq!(missing.dispatch(), Dispatch::AcceptanceUnknown);
+    }
+
+    /// The probes decide "not installed" with this predicate, and an annotation must not hide it.
+    #[test]
+    fn only_a_missing_program_reads_as_program_not_found() {
+        let missing = Error::program_not_found("claude");
+        assert!(missing.is_program_not_found());
+        assert!(
+            missing
+                .clone()
+                .with_dispatch(Dispatch::NotSubmitted)
+                .is_program_not_found(),
+            "expected a dispatch annotation to keep the missing program visible"
+        );
+        let cleanup = Error::CleanupRequired {
+            control: Arc::new(UnreapedControl),
+            source: Box::new(missing),
+        };
+        assert!(
+            !cleanup.is_program_not_found(),
+            "expected an error carrying a cleanup control not to read as a missing program | \
+             received: {cleanup:?}"
+        );
+        // The cause is still reachable for a host that reconciles first.
+        assert!(
+            matches!(cleanup.cause(), Error::ProgramNotFound { .. }),
+            "expected cause() to see through the cleanup wrapper | received: {:?}",
+            cleanup.cause()
+        );
+        let annotated_cleanup = cleanup.with_dispatch(Dispatch::NotSubmitted);
+        assert!(
+            !annotated_cleanup.is_program_not_found(),
+            "expected a dispatch annotation not to hide the cleanup control | \
+             received: {annotated_cleanup:?}"
+        );
+
+        for other in [
+            Error::Launch {
+                program: String::from("claude"),
+                message: String::from("a launcher failure (NotFound)"),
+            },
+            Error::Launch {
+                program: String::from("claude"),
+                message: String::from("a launcher failure (PermissionDenied)"),
+            },
+            Error::Closed { subject: "link" },
+        ] {
+            assert!(
+                !other.is_program_not_found(),
+                "expected only ProgramNotFound to read as a missing program | received: {other:?}"
+            );
+        }
     }
 
     /// A link failure that says only "no safe detail" cannot be acted on either.

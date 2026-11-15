@@ -713,6 +713,28 @@ fn an_activity_update_and_result_are_constructible_through_their_builders() {
     );
 }
 
+/// A host's launcher, compiled as its own crate, can say "no such program" and still build the
+/// `Launch` literal it wrote against 0.8.0; the probes read only the first as "not installed".
+#[test]
+fn a_launcher_outside_the_crate_separates_a_missing_program_from_a_launch_failure() {
+    let missing = Error::program_not_found("claude");
+    assert!(missing.is_program_not_found());
+    assert!(
+        matches!(&missing, Error::ProgramNotFound { program } if program == "claude"),
+        "expected Error::ProgramNotFound naming claude | received: {missing:?}"
+    );
+
+    // The 0.8.0 shape still compiles, and is not "not installed".
+    let unstartable = Error::Launch {
+        program: String::from("claude"),
+        message: String::from("a launcher failure (PermissionDenied, os error 13)"),
+    };
+    assert!(
+        !unstartable.is_program_not_found(),
+        "expected Error::Launch not to read as a missing program | received: {unstartable:?}"
+    );
+}
+
 /// Dispatch certainty is stated without promising the vendor deduplicates anything.
 #[test]
 fn a_failure_states_how_far_its_request_got_without_promising_idempotency() {
