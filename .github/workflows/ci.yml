@@ -37,19 +37,18 @@ jobs:
       - run: rustup show active-toolchain
       # Only main saves. A pull request's cache is visible to that pull request alone, so a save
       # there stores one more copy per open pull request and is restored by nothing else. `rust` is
-      # the key the vendor-drift lanes restore; they build a subset of this job's
-      # dependency tree and save nothing.
+      # the key the `powerset` job and the vendor-drift lanes restore; the vendor-drift lanes build a
+      # subset of this job's dependency tree, and none of them saves.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: rust
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
-          tool: cargo-hack,cargo-nextest
+          tool: cargo-nextest
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: scripts/run-without-self-dev-dependency.sh cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
-      - run: scripts/check-features.sh powerset --locked
       - run: cargo nextest run --workspace --all-features --locked
       - if: matrix.os == 'ubuntu-latest'
         run: |
@@ -64,6 +63,38 @@ jobs:
       - run: scripts/test-check-tls.sh
       - run: scripts/check-tls.sh
       - run: scripts/check-standalone.sh
+
+  # The depth-2 feature powerset is clippy over every feature pair of the four library crates, all
+  # targets. It is the longest step of `rust`, so it runs beside it instead of after it. It runs on
+  # all three systems because the platform code is `cfg(windows)` and `cfg(unix)`. It keeps its own
+  # cache, saved on main only: the powerset builds dependencies with feature sets the `rust` job
+  # never selects, and a cache `rust` saved would not hold them. rust-cache hashes every installed
+  # toolchain into the key, so the toolchain step runs before the cache step.
+  powerset:
+    name: Feature powerset (${{ matrix.os }})
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: powerset
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-hack
+      # The powerset runs in a copy of the tree that cargo resolves offline, so the registry
+      # sources have to be on disk first. In the `rust` job the earlier clippy steps fetched them;
+      # here nothing does when the cache is empty.
+      - run: cargo fetch --locked
+      - run: scripts/check-features.sh powerset --locked
 
   policy:
     name: Policy (deny, versions, docs format)
@@ -164,7 +195,7 @@ jobs:
   gate:
     name: Gate
     if: always()
-    needs: [rust, policy, msrv, msrv-windows]
+    needs: [rust, powerset, policy, msrv, msrv-windows]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

@@ -58,7 +58,7 @@ run scripts/check-standalone.sh
 run cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 # Selects test targets, so it runs in the copy without the crates' self dev-dependency.
 run scripts/run-without-self-dev-dependency.sh cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
-# The same driver and lane as the `rust` job in ci.yml; scripts/test-check-powerset.sh pins the two together.
+# The same driver and lane as the `powerset` job in ci.yml; scripts/test-check-powerset.sh pins the two together.
 if cargo hack --version >/dev/null 2>&1; then
   run scripts/check-features.sh powerset --locked
 else

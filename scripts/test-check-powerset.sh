@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Regression coverage for scripts/check-features.sh, the one driver behind the feature powerset
-# (scripts/check.sh, ci.yml's `rust` job) and the minimum-Rust feature check (ci.yml's `msrv` job).
+# (scripts/check.sh, ci.yml's `powerset` job) and the minimum-Rust feature check (ci.yml's `msrv`
+# job).
 # With cargo-hack installed check.sh runs the powerset lane and fails when it fails; without
 # cargo-hack it warns once, names the skipped gate, and still returns the status of every other gate.
 #
@@ -8,7 +9,10 @@
 # fake, so a case costs milliseconds and no cargo build. The expected cargo commands are written
 # out below from an independent list of the four library crates, so dropping a crate from the
 # driver, loosening the depth, or dropping a flag fails this test. ci.yml and check.sh must reach
-# those commands through the driver and carry no cargo-hack command of their own.
+# those commands through the driver and carry no cargo-hack command of their own. ci.yml runs the
+# powerset in its own `powerset` job on all three systems, beside the `rust` job that no longer
+# does; that job is pinned below against the real workflow and against scratch copies that break
+# it one way at a time.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -23,13 +27,165 @@ packages=''
 for crate in "${library_crates[@]}"; do packages="$packages -p $crate"; done
 packages=${packages# }
 
-# ci.yml reaches each lane through the driver, once, and holds no cargo-hack command of its own.
-for lane_step in 'powerset --locked' 'msrv --locked'; do
-  ci_count=$(grep -cxE " *- run: scripts/check-features\.sh $lane_step" .github/workflows/ci.yml || true)
-  if [ "$ci_count" -ne 1 ]; then
-    fail "expected exactly one 'scripts/check-features.sh $lane_step' step in .github/workflows/ci.yml | received $ci_count"
+# ci_job_lines <workflow> <job id>: the non-comment lines of one top-level job.
+ci_job_lines() {
+  awk -v job="$2" '
+    /^jobs:/ { in_jobs = 1; next }
+    in_jobs && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { current = $1; sub(/:$/, "", current) }
+    in_jobs && current == job && !/^[[:space:]]*#/ { print }
+  ' "$1"
+}
+
+# ci_step_owners <workflow> <text>: the job id of every non-comment line containing the text.
+ci_step_owners() {
+  awk -v needle="$2" '
+    /^jobs:/ { in_jobs = 1; next }
+    in_jobs && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { current = $1; sub(/:$/, "", current) }
+    in_jobs && !/^[[:space:]]*#/ && index($0, needle) > 0 { print current }
+  ' "$1" | paste -sd' ' -
+}
+
+# ci_uses_step <job lines> <action prefix>: the `uses:` step of that action with its `with:` block.
+ci_uses_step() {
+  awk -v prefix="$2" '
+    /^ +- / { in_step = index($0, "- uses: " prefix) > 0 }
+    in_step { print }
+  ' <<<"$1"
+}
+
+# powerset_job_problem <workflow>: prints why the workflow does not run the powerset the way its
+# `powerset` job must, or nothing when it does. Every message is `expected ... | received ...`.
+powerset_job_problem() {
+  local workflow=$1 step='scripts/check-features.sh powerset --locked'
+  local count owners job rust_job os_line blocking gate_needs toolchain_line cache_line cache_step action fetch_line step_line
+  count=$(grep -cxE ' *- run: scripts/check-features\.sh powerset --locked' "$workflow" || true)
+  if [ "$count" -ne 1 ]; then
+    echo "expected exactly one '- run: $step' step in $workflow | received $count"
+    return
   fi
-done
+  owners=$(ci_step_owners "$workflow" "$step")
+  if [ "$owners" != powerset ]; then
+    echo "expected '$step' in $workflow to run in the 'powerset' job only, not in 'rust' | received it in: ${owners:-no job}"
+    return
+  fi
+  job=$(ci_job_lines "$workflow" powerset)
+  rust_job=$(ci_job_lines "$workflow" rust)
+  os_line=$(grep -E '^ +os: ' <<<"$job" | sed 's/^ *//' || true)
+  if [ "$os_line" != 'os: [ubuntu-latest, macos-latest, windows-latest]' ]; then
+    echo "expected the 'powerset' job in $workflow to run on 'os: [ubuntu-latest, macos-latest, windows-latest]' | received: ${os_line:-no os matrix}"
+    return
+  fi
+  if ! grep -qxE ' +runs-on: \$\{\{ matrix\.os \}\}' <<<"$job"; then
+    echo "expected the 'powerset' job in $workflow to set 'runs-on: \${{ matrix.os }}' | received: $(grep -E '^ +runs-on:' <<<"$job" | sed 's/^ *//' || echo none)"
+    return
+  fi
+  # A job-level `if:` or a continue-on-error would let the powerset skip or fail without failing the gate.
+  blocking=$(grep -E '^    if:|continue-on-error:' <<<"$job" | sed 's/^ *//' | head -n 1 || true)
+  if [ -n "$blocking" ]; then
+    echo "expected the 'powerset' job in $workflow to have no job-level if: or continue-on-error | received: $blocking"
+    return
+  fi
+  gate_needs=$(ci_job_lines "$workflow" gate | sed -n 's/^ *needs: *\[\(.*\)\].*/\1/p' | tr -d ' ')
+  case ",$gate_needs," in
+    *,powerset,*) ;;
+    *)
+      echo "expected the 'gate' job in $workflow to list 'powerset' in needs | received needs: [${gate_needs:-none}]"
+      return
+      ;;
+  esac
+  # rust-cache hashes the installed toolchains into its key, so the toolchain step comes first.
+  toolchain_line=$(grep -nxE ' +- run: rustup show active-toolchain' <<<"$job" | head -n 1 | cut -d: -f1 || true)
+  cache_line=$(grep -nE '^ +- uses: Swatinem/rust-cache@' <<<"$job" | head -n 1 | cut -d: -f1 || true)
+  if [ -z "$toolchain_line" ] || [ -z "$cache_line" ] || [ "$toolchain_line" -ge "$cache_line" ]; then
+    echo "expected the 'powerset' job in $workflow to run 'rustup show active-toolchain' before the rust-cache step | received the toolchain step at job line ${toolchain_line:-none}, the cache step at ${cache_line:-none}"
+    return
+  fi
+  # Its own cache, saved on main only: a cache the `rust` job saved would lack the dependency
+  # builds of the feature pairs, and a pull request save is restorable by that pull request alone.
+  cache_step=$(ci_uses_step "$job" 'Swatinem/rust-cache@')
+  if ! grep -qxE ' +shared-key: powerset' <<<"$cache_step" || ! grep -qxF "          save-if: \${{ github.ref == 'refs/heads/main' }}" <<<"$cache_step"; then
+    echo "expected the rust-cache step of the 'powerset' job in $workflow to set 'shared-key: powerset' and save on refs/heads/main only | received: $(grep -E '(shared-key|save-if|key):' <<<"$cache_step" | sed 's/^ *//' | paste -sd, - || true)"
+    return
+  fi
+  # The same pinned actions as the `rust` job, so the cache key and the tool versions match.
+  for action in 'actions/checkout@' 'Swatinem/rust-cache@' 'taiki-e/install-action@'; do
+    if [ "$(grep -F -- "uses: $action" <<<"$job" | sed 's/^ *- //')" != "$(grep -F -- "uses: $action" <<<"$rust_job" | sed 's/^ *- //')" ]; then
+      echo "expected the 'powerset' job in $workflow to use the same pinned $action step as the 'rust' job | received: $(grep -F -- "uses: $action" <<<"$job" | sed 's/^ *- //' || echo none)"
+      return
+    fi
+  done
+  if ! grep -qE '^ +tool: ([^,]+,)*cargo-hack(,|$)' <<<"$job"; then
+    echo "expected the 'powerset' job in $workflow to install cargo-hack through taiki-e/install-action | received: $(grep -E '^ +tool:' <<<"$job" | sed 's/^ *//' || echo no tool entry)"
+    return
+  fi
+  # The powerset resolves a copy of the tree offline, so the registry sources are fetched first:
+  # with an empty cache nothing else in this job downloads them.
+  fetch_line=$(grep -nxE ' +- run: cargo fetch --locked' <<<"$job" | head -n 1 | cut -d: -f1 || true)
+  step_line=$(grep -nxF "      - run: $step" <<<"$job" | head -n 1 | cut -d: -f1 || true)
+  if [ -z "$fetch_line" ] || [ -z "$step_line" ] || [ "$fetch_line" -ge "$step_line" ]; then
+    echo "expected the 'powerset' job in $workflow to run 'cargo fetch --locked' before the powerset step | received the fetch at job line ${fetch_line:-none}, the powerset step at ${step_line:-none}"
+    return
+  fi
+  if ! grep -qxE ' +persist-credentials: false' <<<"$job"; then
+    echo "expected the 'powerset' job in $workflow to check out with 'persist-credentials: false' | received none"
+    return
+  fi
+  if ! grep -qE '^ +timeout-minutes: [0-9]+$' <<<"$job"; then
+    echo "expected the 'powerset' job in $workflow to set timeout-minutes | received none"
+  fi
+}
+
+# Both jobs hold one pinned powerset: the real workflow passes, and each single edit below is
+# refused with a message that names the received value.
+problem=$(powerset_job_problem .github/workflows/ci.yml)
+if [ -n "$problem" ]; then fail "$problem"; fi
+
+# expect_powerset_refusal <label> <expected message fragment> <sed args...>: applies the edit to a
+# scratch copy of ci.yml and requires the pin to refuse it.
+expect_powerset_refusal() {
+  local label=$1 expected=$2 received
+  shift 2
+  sed "$@" .github/workflows/ci.yml > "$work/ci-variant.yml"
+  received=$(powerset_job_problem "$work/ci-variant.yml")
+  case "$received" in
+    *"$expected"*) ;;
+    *) fail "expected the pin to refuse $label with '$expected' | received: ${received:-no refusal}" ;;
+  esac
+}
+in_powerset='/^  powerset:/,/^  policy:/'
+rust_fmt='/^      - run: cargo fmt --all -- --check$/'
+powerset_run='/^      - run: scripts\/check-features\.sh powerset --locked$/'
+add_powerset_run='a\      - run: scripts/check-features.sh powerset --locked'
+expect_powerset_refusal 'the step in both jobs' 'received 2' -e "$rust_fmt$add_powerset_run"
+expect_powerset_refusal 'the step back in the rust job only' 'received it in: rust' \
+  -e "${powerset_run}d" -e "$rust_fmt$add_powerset_run"
+expect_powerset_refusal 'a missing step' 'received 0' -e "${powerset_run}d"
+expect_powerset_refusal 'a matrix without windows' 'received: os: [ubuntu-latest, macos-latest]' \
+  -e "${in_powerset}s/os: \[ubuntu-latest, macos-latest, windows-latest\]/os: [ubuntu-latest, macos-latest]/"
+expect_powerset_refusal 'a job missing from the gate' 'received needs: [rust,policy,msrv,msrv-windows]' \
+  -e 's/needs: \[rust, powerset, /needs: [rust, /'
+expect_powerset_refusal 'a job-level if' 'received: if: github.ref' \
+  -e "/^  powerset:/a\\    if: github.ref == 'refs/heads/main'"
+expect_powerset_refusal 'a cache every ref saves' "'shared-key: powerset' and save on refs/heads/main only" \
+  -e "${in_powerset}s/save-if: .*/save-if: true/"
+expect_powerset_refusal 'a cache under the rust key' "'shared-key: powerset' and save on refs/heads/main only" \
+  -e "${in_powerset}s/shared-key: powerset/shared-key: rust/"
+expect_powerset_refusal 'a toolchain step after the cache' 'before the rust-cache step' \
+  -e "${in_powerset}{/- run: rustup show active-toolchain/d;/save-if: /a\\      - run: rustup show active-toolchain" -e '}'
+expect_powerset_refusal 'an unpinned cache action' 'the same pinned Swatinem/rust-cache@ step' \
+  -e "${in_powerset}s|Swatinem/rust-cache@[0-9a-f]* # v2.9.3|Swatinem/rust-cache@v2|"
+expect_powerset_refusal 'no cargo-hack install' 'install cargo-hack' \
+  -e "${in_powerset}s/tool: cargo-hack/tool: cargo-nextest/"
+expect_powerset_refusal 'no registry fetch' "'cargo fetch --locked' before the powerset step" \
+  -e "${in_powerset}{/- run: cargo fetch --locked/d" -e '}'
+expect_powerset_refusal 'persisted credentials' 'persist-credentials: false' \
+  -e "${in_powerset}s/persist-credentials: false/persist-credentials: true/"
+
+# ci.yml reaches the msrv lane through the driver, once. The powerset step is pinned above.
+ci_count=$(grep -cxE ' *- run: scripts/check-features\.sh msrv --locked' .github/workflows/ci.yml || true)
+if [ "$ci_count" -ne 1 ]; then
+  fail "expected exactly one 'scripts/check-features.sh msrv --locked' step in .github/workflows/ci.yml | received $ci_count"
+fi
 # check.sh may probe for the tool with `cargo hack --version`; nothing else may run it.
 for file in .github/workflows/ci.yml scripts/check.sh; do
   stray=$(grep -v '^ *#' "$file" | grep 'cargo hack' | grep -v 'cargo hack --version' || true)
