@@ -212,6 +212,94 @@ async fn an_unreadable_version_proceeds_to_the_agent() {
     );
 }
 
+/// A version probe that could not start leaves the floor unchecked and the agent launch to report
+/// the launcher's own error. The distinction between a missing program and any other launch
+/// failure matters to discovery, not here.
+#[tokio::test]
+async fn a_version_probe_that_cannot_start_leaves_the_agent_launch_to_report() {
+    for label in ["missing program", "launch failure"] {
+        let launcher = FakeLauncher::new();
+        if label == "missing program" {
+            launcher.push_missing_program();
+        } else {
+            launcher.push_launch_refusal("a launcher failure (Uncategorized, os error 24)");
+        }
+        launcher.push(FakeAcpAgent::new().process());
+
+        let result = AcpHarness::new(profile(Some(FLOOR)))
+            .open_session(&host(&launcher), request())
+            .await;
+
+        assert_launched(&launcher, &["fake-acp acp"]);
+        assert!(
+            result.is_ok(),
+            "expected the agent to launch after a {label} version probe | received {:?}",
+            result.as_ref().err()
+        );
+    }
+}
+
+/// Discovery is where the two kinds part: only a missing program is "not installed".
+#[tokio::test]
+async fn discovery_reports_a_missing_program_as_not_installed() {
+    let launcher = FakeLauncher::missing_program();
+
+    let discovery = AcpHarness::new(profile(Some(FLOOR)))
+        .discover(&host(&launcher))
+        .await
+        .expect("expected a discovery rather than an error for a program that is not there");
+
+    assert_eq!(discovery.gate, GateVerdict::NotInstalled);
+}
+
+#[tokio::test]
+async fn discovery_returns_a_launch_failure_that_is_not_a_missing_program() {
+    let launcher =
+        FakeLauncher::refusing_launches("a launcher failure (PermissionDenied, os error 13)");
+
+    let result = AcpHarness::new(profile(Some(FLOOR)))
+        .discover(&host(&launcher))
+        .await;
+
+    let error = result.expect_err(
+        "expected the launch failure to reach the host | received: a discovery (not installed)",
+    );
+    assert!(
+        matches!(error.cause(), Error::Launch { message, .. }
+            if message == "a launcher failure (PermissionDenied, os error 13)"),
+        "expected Error::Launch naming PermissionDenied (os error 13) | received: {error:?}"
+    );
+}
+
+/// The same split holds when the program name is wrapped by a host's dispatch annotation.
+#[tokio::test]
+async fn discovery_sees_a_missing_program_through_a_dispatch_annotation() {
+    struct AnnotatingLauncher;
+    #[async_trait::async_trait]
+    impl mango_external_agents::ProcessLauncher for AnnotatingLauncher {
+        async fn spawn(
+            &self,
+            spec: mango_external_agents::LaunchSpec,
+        ) -> mango_external_agents::Result<mango_external_agents::ManagedProcess> {
+            Err(Error::program_not_found(spec.program().unwrap_or_default())
+                .with_dispatch(mango_external_agents::Dispatch::NotSubmitted))
+        }
+    }
+    let context = HostContext::builder()
+        .launcher(Arc::new(AnnotatingLauncher))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .build()
+        .expect("expected a host");
+
+    let discovery = AcpHarness::new(profile(Some(FLOOR)))
+        .discover(&context)
+        .await
+        .expect("expected a discovery rather than an error for an annotated missing program");
+
+    assert_eq!(discovery.gate, GateVerdict::NotInstalled);
+}
+
 #[tokio::test]
 async fn a_receipt_for_the_launched_path_carrying_an_outdated_version_refuses_without_any_launch() {
     let launcher = FakeLauncher::new();

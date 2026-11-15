@@ -173,12 +173,28 @@ impl ClaudeHarness {
     /// Everything the three probes established, in one pass.
     async fn survey(&self, host: &HostContext, executable: &ExecutablePath) -> Result<Survey> {
         // An incomplete banner still proves the binary ran, so its complete lines are used and an
-        // empty one leaves an installed CLI whose version is unreadable; only a failed launch
-        // reads as "not installed". A cut-off read may have lost the Claude
-        // Code line behind a wrapper's own, so it is read strictly: only a line that names Claude
-        // Code counts, never the single bare-version form.
-        let (banner, version) = match probe::read(host, executable, &["--version"]).await? {
-            Probed::NotStarted => return Ok(Survey::default()),
+        // empty one leaves an installed CLI whose version is unreadable; only a launcher that
+        // says the program is missing reads as "not installed", and the survey keeps that
+        // launcher's own error for an open to return. Any other launch failure, such as a CLI
+        // without the execute bit, is returned as the launcher's own error. A cut-off read may
+        // have lost the Claude Code line behind a wrapper's own, so it is read strictly: only a
+        // line that names Claude Code counts, never the single bare-version form.
+        let probed = match probe::read_version(host, executable).await {
+            Ok(probed) => probed,
+            Err(error) if error.is_program_not_found() => return Ok(Survey::missing(error)),
+            Err(error) => return Err(error),
+        };
+        let (banner, version) = match probed {
+            // `read_version` returns every launch failure as an error, so a probe that "did not
+            // start" without one is a defect here. Say so rather than inventing a missing program.
+            Probed::NotStarted => {
+                return Err(Error::Launch {
+                    program: String::from(probe::PROGRAM),
+                    message: String::from(
+                        "a version probe that did not start and named no failure",
+                    ),
+                });
+            }
             Probed::StartedEmpty => (String::new(), None),
             Probed::Whole(banner) => {
                 let version = version::parse(&banner);
@@ -241,6 +257,7 @@ impl ClaudeHarness {
             authentication,
             availability,
             surface,
+            missing_program: None,
         })
     }
 
@@ -252,12 +269,15 @@ impl ClaudeHarness {
         executable: &ExecutablePath,
         receipt: Option<&mango_external_agents::DiscoveryReceipt>,
     ) -> Result<Survey> {
-        let Some(receipt) = receipt else {
+        // A receipt that says "not installed" is not reused. Opening would have to return a
+        // missing-program error, and only a launcher can say that: a receipt is a record of an
+        // earlier probe, and the CLI may have been installed since. One `--version` probe on a
+        // path that was about to fail either proceeds or returns the launcher's own answer.
+        let Some(receipt) =
+            receipt.filter(|receipt| !matches!(receipt.discovery.gate, GateVerdict::NotInstalled))
+        else {
             return self.survey(host, executable).await;
         };
-        if matches!(receipt.discovery.gate, GateVerdict::NotInstalled) {
-            return Ok(Survey::default());
-        }
 
         let surface = probe::output(host, executable, &["--help"])
             .await?
@@ -315,6 +335,7 @@ impl ClaudeHarness {
             },
             availability,
             surface,
+            missing_program: None,
         })
     }
 }
@@ -322,6 +343,9 @@ impl ClaudeHarness {
 /// What the probes found, before it is shaped into a [`Discovery`] or a session.
 #[derive(Default)]
 struct Survey {
+    /// The launcher's own error when it said the program does not exist. Kept whole, with the
+    /// program name and any annotation, so an open returns what the launcher reported.
+    missing_program: Option<Error>,
     banner: Option<String>,
     version: Option<String>,
     /// Why this build cannot be driven, when it cannot.
@@ -332,9 +356,17 @@ struct Survey {
 }
 
 impl Survey {
-    /// Whether `--version` reported anything at all.
+    /// A survey of a CLI the launcher reported as missing.
+    fn missing(error: Error) -> Self {
+        Self {
+            missing_program: Some(error),
+            ..Self::default()
+        }
+    }
+
+    /// Whether the launcher found the program, so `--version` could run.
     fn installed(&self) -> bool {
-        self.banner.is_some()
+        self.missing_program.is_none()
     }
 
     /// The one line of `--version` output a host should be shown.
@@ -561,16 +593,17 @@ impl ClaudeHarness {
     /// way.
     fn opened(
         request: OpenSession,
-        survey: Survey,
+        mut survey: Survey,
         descriptor: &HarnessDescriptor,
         observed_at: std::time::SystemTime,
         wants_json_schema: bool,
     ) -> Result<OpenedSession> {
-        if !survey.installed() {
-            return Err(Error::Launch {
-                program: String::from(probe::PROGRAM),
-                message: String::from("a CLI that reported no version"),
-            });
+        // The survey holds an error only when the launcher said the program is missing on this
+        // open's own `--version` probe. A launch failure that is not "missing" never gets here:
+        // `survey` returned it as the error. Either way a host reads what a launcher reported,
+        // not a summary of it and not a name this crate made up.
+        if let Some(missing) = survey.missing_program.take() {
+            return Err(missing);
         }
         if let Some(refusal) = survey.refusal {
             return Err(match refusal {

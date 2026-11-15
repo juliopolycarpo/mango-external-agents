@@ -423,6 +423,71 @@ async fn a_version_probe_that_cannot_launch_returns_that_error_without_a_second_
     );
 }
 
+/// Discovery is where the launcher's two answers part: a missing program is "not installed", and
+/// every other launch failure is an error the host hears about.
+#[tokio::test]
+async fn discovery_reports_a_missing_program_as_not_installed() {
+    for (label, error) in [
+        ("bare", Error::program_not_found("codex")),
+        (
+            "annotated",
+            Error::program_not_found("codex")
+                .with_dispatch(mango_external_agents::Dispatch::NotSubmitted),
+        ),
+    ] {
+        let launcher = Arc::new(RefusingVersionLauncher {
+            inner: Arc::new(FakeLauncher::new()),
+            error,
+            attempts: std::sync::Mutex::new(Vec::new()),
+        });
+        let host = refusing_host(launcher.clone());
+
+        let discovery = CodexHarness::new()
+            .discover(&host)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("expected a not-installed discovery for a {label} missing program | received: {error:?}")
+            });
+
+        assert_eq!(discovery.gate, GateVerdict::NotInstalled);
+        assert_eq!(launcher.attempts.lock().expect("attempts").len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn discovery_returns_a_launch_failure_that_is_not_a_missing_program() {
+    let message = "a launcher failure (PermissionDenied, os error 13)";
+    for operation in ["discover", "account"] {
+        let launcher = Arc::new(RefusingVersionLauncher {
+            inner: Arc::new(FakeLauncher::new()),
+            error: Error::Launch {
+                program: String::from("codex"),
+                message: String::from(message),
+            },
+            attempts: std::sync::Mutex::new(Vec::new()),
+        });
+        let host = refusing_host(launcher.clone());
+        let harness = CodexHarness::new();
+
+        let error = if operation == "discover" {
+            harness.discover(&host).await.err()
+        } else {
+            let key = mango_agent_codex::account::AccountFingerprintKey::new(b"synthetic-key")
+                .expect("test fingerprint key");
+            harness.discover_with_account(&host, &key).await.err()
+        }
+        .unwrap_or_else(|| {
+            panic!("expected {operation} to return the launch failure | received: a not-installed discovery")
+        });
+
+        assert!(
+            matches!(error.cause(), Error::Launch { message: actual, .. } if actual == message),
+            "expected Error::Launch naming PermissionDenied (os error 13) from {operation} | received: {error:?}"
+        );
+        assert_eq!(launcher.attempts.lock().expect("attempts").len(), 1);
+    }
+}
+
 #[tokio::test]
 async fn the_probe_and_the_app_server_run_the_executable_the_host_resolved() {
     let launcher = Arc::new(FakeLauncher::new());
@@ -740,7 +805,7 @@ async fn an_installed_unparseable_or_empty_version_is_unknown_not_absent() {
         assert_eq!(launcher.live_children(), 0);
         assert_launched(&launcher, &["codex --version"]);
     }
-    let launcher = Arc::new(FakeLauncher::new());
+    let launcher = Arc::new(FakeLauncher::missing_program());
     let found = CodexHarness::new()
         .discover(&host(&launcher))
         .await

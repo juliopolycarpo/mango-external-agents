@@ -303,6 +303,9 @@ pub struct FakeClaudeCli {
     launches: Mutex<Vec<LaunchSpec>>,
     /// Launches the script did not cover, kept apart from `launches` so the error can stay argv-free.
     refused: Mutex<Vec<LaunchSpec>>,
+    /// Launches a test made fail on purpose, in the order added; the first whose argument
+    /// matches wins.
+    faults: Mutex<Vec<LaunchFault>>,
     written: Arc<Mutex<Vec<String>>>,
     children: Mutex<Vec<Arc<Child>>>,
     stderr: Mutex<Vec<u8>>,
@@ -346,6 +349,7 @@ impl FakeClaudeCli {
             turns: Mutex::new(VecDeque::new()),
             launches: Mutex::new(Vec::new()),
             refused: Mutex::new(Vec::new()),
+            faults: Mutex::new(Vec::new()),
             written: Arc::new(Mutex::new(Vec::new())),
             children: Mutex::new(Vec::new()),
             stderr: Mutex::new(Vec::new()),
@@ -388,6 +392,42 @@ impl FakeClaudeCli {
     #[must_use]
     pub fn with_auth(self, status: &str) -> Self {
         *lock(&self.auth) = String::from(status);
+        self
+    }
+
+    /// Makes every launch report that the `claude` program does not exist
+    /// ([`Error::ProgramNotFound`]), as a host's launcher does for a CLI that is not installed.
+    #[must_use]
+    pub fn without_program(self) -> Self {
+        lock(&self.faults).push(LaunchFault::new(None, Fault::MissingProgram));
+        self
+    }
+
+    /// Makes launches whose argv holds `argument` (`--version`, `--help`, `status`) report that
+    /// the program does not exist. Other launches proceed.
+    #[must_use]
+    pub fn without_program_for(self, argument: &str) -> Self {
+        lock(&self.faults).push(LaunchFault::new(Some(argument), Fault::MissingProgram));
+        self
+    }
+
+    /// Makes every launch fail to start with an [`Error::Launch`] carrying `message`, as a host's
+    /// launcher does for a present CLI it cannot execute. Name the OS error in `message`, such as
+    /// `a launcher failure (PermissionDenied, os error 13)`.
+    #[must_use]
+    pub fn unstartable(self, message: &str) -> Self {
+        lock(&self.faults).push(LaunchFault::new(None, Fault::Launch(message.to_owned())));
+        self
+    }
+
+    /// Makes launches whose argv holds `argument` fail to start with an [`Error::Launch`]
+    /// carrying `message`. Other launches proceed.
+    #[must_use]
+    pub fn unstartable_for(self, argument: &str, message: &str) -> Self {
+        lock(&self.faults).push(LaunchFault::new(
+            Some(argument),
+            Fault::Launch(message.to_owned()),
+        ));
         self
     }
 
@@ -692,6 +732,12 @@ impl FakeClaudeCli {
 
     fn run_for(&self, spec: &LaunchSpec) -> Result<(Run, Vec<u8>)> {
         let argv = &spec.argv;
+        if let Some(fault) = lock(&self.faults)
+            .iter()
+            .find(|fault| fault.applies_to(argv))
+        {
+            return Err(fault.error_for(spec));
+        }
         if argv.iter().any(|argument| argument == "--version") {
             return Ok((Run::replaying(&lock(&self.version)), Vec::new()));
         }
@@ -807,6 +853,45 @@ fn is_auth_status(argv: &[String]) -> bool {
 
 fn lock<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     value.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// How a launch the test chose to break fails.
+enum Fault {
+    MissingProgram,
+    Launch(String),
+}
+
+/// One failing launch rule: the argument that selects it, and how it fails.
+struct LaunchFault {
+    /// A launch matches when its argv holds this word; every launch matches when unset.
+    argument: Option<String>,
+    fault: Fault,
+}
+
+impl LaunchFault {
+    fn new(argument: Option<&str>, fault: Fault) -> Self {
+        Self {
+            argument: argument.map(str::to_owned),
+            fault,
+        }
+    }
+
+    fn applies_to(&self, argv: &[String]) -> bool {
+        self.argument
+            .as_ref()
+            .is_none_or(|argument| argv.iter().any(|word| word == argument))
+    }
+
+    fn error_for(&self, spec: &LaunchSpec) -> Error {
+        let program = spec.argv.first().cloned().unwrap_or_default();
+        match &self.fault {
+            Fault::MissingProgram => Error::ProgramNotFound { program },
+            Fault::Launch(message) => Error::Launch {
+                program,
+                message: message.clone(),
+            },
+        }
+    }
 }
 
 #[async_trait::async_trait]

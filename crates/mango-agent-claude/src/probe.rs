@@ -4,7 +4,11 @@
 //! non-secret surfaces the vendor documents. None of them takes input, so stdin is closed the
 //! moment the child is up, so a CLI waiting for input does not hold the probe open.
 //!
-//! A launch refusal establishes that the child did not start. A started child that printed
+//! A launch refusal establishes that the child did not start. For `--version` that means "not
+//! installed" only when the launcher said the program is missing (`Error::ProgramNotFound`); any
+//! other launch failure is returned to the caller, because a CLI that is present and cannot be
+//! executed is not an absent one. `--help` and `auth status` read every launch failure as "did not
+//! start" and degrade. A started child that printed
 //! nothing still proves the CLI was present, but has no output to parse. `Probed::Whole` is
 //! output the child finished writing; `Probed::Incomplete` keeps the complete lines before a
 //! read error, size cap or timeout. A cut-off `--help` must not look like a vendor that removed
@@ -85,11 +89,62 @@ pub async fn output(
     })
 }
 
+/// What a probe makes of a launcher that could not start the child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OnLaunchFailure {
+    /// Every launch failure, a missing program included, reads as [`Probed::NotStarted`]. For
+    /// `--help` and `auth status`, which only refine what `--version` already established: a
+    /// failure there leaves the answer unknown rather than ending discovery.
+    ReadAsNotStarted,
+    /// Every launch failure is returned as the launcher gave it, a missing program included. For
+    /// `--version`, whose caller decides what [`Error::ProgramNotFound`] means ("not installed")
+    /// and has to keep the launcher's own error, with its program name and annotations, to hand
+    /// back later. A present CLI that cannot be executed must not become "not installed".
+    ReturnEveryLaunchFailure,
+}
+
 /// Runs one probe and says how much of its output can be trusted.
+///
+/// Any launch failure is [`Probed::NotStarted`]. See [`read_version`] for the stricter reading.
 pub(crate) async fn read(
     host: &HostContext,
     executable: &ExecutablePath,
     arguments: &[&str],
+) -> Result<Probed> {
+    read_with(
+        host,
+        executable,
+        arguments,
+        OnLaunchFailure::ReadAsNotStarted,
+    )
+    .await
+}
+
+/// Runs `--version`, returning every launch failure as the error the launcher gave.
+///
+/// The caller tells a missing program ([`Error::is_program_not_found`], which means the CLI is not
+/// installed) from the rest, and keeps the launcher's own error for the first. A CLI that is
+/// present but cannot be executed is therefore never reported as absent, and a missing program
+/// is never re-invented under a name the launcher did not report. Never returns
+/// [`Probed::NotStarted`].
+pub(crate) async fn read_version(
+    host: &HostContext,
+    executable: &ExecutablePath,
+) -> Result<Probed> {
+    read_with(
+        host,
+        executable,
+        &["--version"],
+        OnLaunchFailure::ReturnEveryLaunchFailure,
+    )
+    .await
+}
+
+async fn read_with(
+    host: &HostContext,
+    executable: &ExecutablePath,
+    arguments: &[&str],
+    on_launch_failure: OnLaunchFailure,
 ) -> Result<Probed> {
     let mut argv = vec![String::from(PROGRAM)];
     argv.extend(arguments.iter().map(|argument| String::from(*argument)));
@@ -103,8 +158,16 @@ pub(crate) async fn read(
     .await
     {
         Ok(transport) => transport,
+        // A child that still needs cleanup is the host's to reconcile, so it is never read as
+        // "did not start".
         Err(error) if error.cleanup_control().is_some() => return Err(error),
-        Err(error) if matches!(error.cause(), Error::Launch { .. }) => {
+        Err(error)
+            if on_launch_failure == OnLaunchFailure::ReadAsNotStarted
+                && matches!(
+                    error.cause(),
+                    Error::Launch { .. } | Error::ProgramNotFound { .. }
+                ) =>
+        {
             return Ok(Probed::NotStarted);
         }
         Err(error) => return Err(error),
@@ -192,7 +255,9 @@ async fn collect(receiver: &mut dyn LinkReceiver, limit: usize, captured: &mut C
 
 #[cfg(test)]
 mod tests {
-    use super::{Captured, End, OUTPUT_LIMIT_BYTES, PROGRAM, Probed, collect, output, read};
+    use super::{
+        Captured, End, OUTPUT_LIMIT_BYTES, PROGRAM, Probed, collect, output, read, read_version,
+    };
     use mango_external_agents::testing::{FakeLauncher, FakeProcess};
     use mango_external_agents::{
         ByteSink, CancelReason, Dispatch, EnvSource, Error, ExecutablePath, ExitStatus,
@@ -836,6 +901,92 @@ mod tests {
             None,
             "expected a failed spawn to have no started child"
         );
+    }
+
+    #[tokio::test]
+    async fn the_version_probe_returns_the_launchers_own_missing_program_error() {
+        let host = host(Arc::new(FakeLauncher::missing_program()));
+        let error = read_version(&host, &ExecutablePath::default())
+            .await
+            .expect_err("expected the launcher's missing-program error, received a probe result");
+        assert!(
+            matches!(&error, Error::ProgramNotFound { program } if program == PROGRAM),
+            "expected Error::ProgramNotFound naming {PROGRAM} | received: {error:?}"
+        );
+    }
+
+    /// A custom executable path is the name the launcher was asked for, so it is the name the
+    /// error carries; nothing downstream may rename it to `claude`.
+    #[tokio::test]
+    async fn the_version_probe_keeps_the_program_name_the_launcher_was_given() {
+        let host = host(Arc::new(FakeLauncher::missing_program()));
+        let executable = ExecutablePath::resolved("/opt/claude/bin/claude");
+        let error = read_version(&host, &executable)
+            .await
+            .expect_err("expected the launcher's missing-program error, received a probe result");
+        assert!(
+            matches!(&error, Error::ProgramNotFound { program }
+                if program == "/opt/claude/bin/claude"),
+            "expected Error::ProgramNotFound naming /opt/claude/bin/claude | received: {error:?}"
+        );
+    }
+
+    /// An annotation from the host's launcher survives, and does not hide the missing program.
+    #[tokio::test]
+    async fn the_version_probe_returns_a_missing_program_with_its_dispatch_annotation() {
+        struct AnnotatedMissingLauncher;
+        #[async_trait::async_trait]
+        impl ProcessLauncher for AnnotatedMissingLauncher {
+            async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
+                Err(Error::program_not_found(spec.program().unwrap_or_default())
+                    .with_dispatch(Dispatch::NotSubmitted))
+            }
+        }
+        let error = read_version(
+            &host(Arc::new(AnnotatedMissingLauncher)),
+            &ExecutablePath::default(),
+        )
+        .await
+        .expect_err("expected the launcher's missing-program error, received a probe result");
+        assert!(
+            error.is_program_not_found() && matches!(error, Error::Operation { .. }),
+            "expected an annotated Error::ProgramNotFound, annotation intact | received: {error:?}"
+        );
+    }
+
+    /// The case behind the issue: a launch failure that is not "no such program" is the host's
+    /// to hear about, and the OS error survives.
+    #[tokio::test]
+    async fn the_version_probe_returns_any_other_launch_failure() {
+        let host = host(Arc::new(FakeLauncher::refusing_launches(
+            "a launcher failure (PermissionDenied, os error 13)",
+        )));
+        let error = read_version(&host, &ExecutablePath::default())
+            .await
+            .expect_err("expected the launch failure to be returned, received a probe result");
+        assert!(
+            matches!(error.cause(), Error::Launch { message, .. }
+                if message == "a launcher failure (PermissionDenied, os error 13)"),
+            "expected Error::Launch naming PermissionDenied (os error 13) | received: {error:?}"
+        );
+    }
+
+    /// `--help` and `auth status` keep degrading: they refine `--version`, which already ran.
+    #[tokio::test]
+    async fn the_lenient_probe_reads_every_launch_failure_as_not_started() {
+        for launcher in [
+            FakeLauncher::missing_program(),
+            FakeLauncher::refusing_launches("a launcher failure (Uncategorized, os error 24)"),
+        ] {
+            let probed = read(
+                &host(Arc::new(launcher)),
+                &ExecutablePath::default(),
+                &["--help"],
+            )
+            .await
+            .expect("expected a launch failure to read as not started");
+            assert_eq!(probed, Probed::NotStarted);
+        }
     }
 
     #[tokio::test]

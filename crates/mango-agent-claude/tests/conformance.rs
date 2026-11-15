@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mango_agent_claude::ClaudeHarness;
+use mango_external_agents::testing::FakeLauncher;
 use mango_external_agents::testing::conformance::{self, Outcome};
 use support::{FakeClaudeCli, READ_TURN, Run, host};
 
@@ -67,6 +68,48 @@ async fn the_claude_harness_is_conformant() {
     assert!(
         launcher.all_children_ended(),
         "expected every child the suite started to be reaped"
+    );
+}
+
+/// What the suite makes of a launcher that cannot start the CLI.
+///
+/// An empty `FakeLauncher::new()` refuses every launch with `Error::Launch`, which discovery now
+/// returns instead of reading as "not installed". The suite records that check as skipped, with the
+/// launch failure as the reason, because nothing was verified: a host whose own conformance run
+/// used to pass this check on an empty launcher sees a skip until it scripts `--version` or uses
+/// `FakeLauncher::missing_program()`, which answers "not installed" and passes. Whether a
+/// discovery error should fail the suite instead is a separate decision.
+#[tokio::test]
+async fn an_unscripted_launcher_skips_the_discovery_check_and_a_missing_program_passes_it() {
+    const CHECK: &str = "discovery stays within the declared ceiling";
+    let outcome_over = |launcher: FakeLauncher| async move {
+        let report = conformance::run(
+            &ClaudeHarness::new(),
+            &support::host_under(Arc::new(launcher), mango_external_agents::Limits::default()),
+            conformance::Options {
+                turn_timeout: Duration::from_secs(1),
+                ..conformance::Options::default()
+            },
+        )
+        .await;
+        report
+            .checks
+            .into_iter()
+            .find(|check| check.name == CHECK)
+            .unwrap_or_else(|| panic!("expected the suite to record the check named {CHECK:?}"))
+            .outcome
+    };
+
+    let unscripted = outcome_over(FakeLauncher::new()).await;
+    assert!(
+        matches!(&unscripted, Outcome::Skipped(why) if why.contains("discovery failed on this machine")),
+        "expected a skip naming the discovery failure for an unscripted launcher | received: {unscripted:?}"
+    );
+    let missing = outcome_over(FakeLauncher::missing_program()).await;
+    assert_eq!(
+        missing,
+        Outcome::Passed,
+        "expected a launcher that reports no such program to pass the discovery check"
     );
 }
 

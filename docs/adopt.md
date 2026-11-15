@@ -81,6 +81,29 @@ let host = HostContext::builder()
 
    Hosts without a spawner of their own take `TokioLauncher` from the `launcher-tokio` feature.
 
+   **Say whether the program was missing.** Return `Error::program_not_found(program)` when the
+   program does not exist, and `Error::Launch { program, message }` for every other failure to
+   start it: no execute permission (`EACCES`), a format the system cannot run, `ETXTBSY`, a host
+   resource limit such as `EMFILE`, or any failure you cannot attribute to the program. A version
+   probe reads only `ProgramNotFound` as "not installed" (`Discovery::not_installed()`); a `Launch`
+   comes back from `discover` as an error, because a CLI that is present and cannot be run is not
+   one a user should be told to install. An unclassified launcher is therefore safe: it surfaces
+   its failures instead of hiding them behind "not installed". Put the OS error in the `Launch`
+   message, as the kind and number (`PermissionDenied, os error 13`), never a path or argv.
+   Releases through 0.8.0 read every `Launch` as not installed, so a launcher that reported a
+   missing program as `Launch` has to return `ProgramNotFound` now. `Error::is_program_not_found`
+   tests for it through a dispatch annotation, and is `false` for an error that carries a
+   `cleanup_control()`: that child is still the host's to reconcile.
+
+   A host conformance suite built on `FakeLauncher::new()` is affected too. The empty fake refuses
+   every launch with `Error::Launch`, so `discover` now returns an error where it used to say "not
+   installed", and `conformance::run` records its "discovery stays within the declared ceiling"
+   check as skipped, with the launch failure as the reason, where it used to pass. The suite does
+   not fail on it, so nothing turns red; read `report.skipped()` to see it. Build the fake with
+   `FakeLauncher::missing_program()` to keep the old answer on purpose, or queue a process that
+   answers `--version` so the check runs against a real discovery. Whether a discovery error should
+   fail the suite rather than skip it is undecided.
+
    **Implement `ProcessControl::interrupt` if you want cancellation to be recoverable.** It has a
    default body returning `InterruptOutcome::Unsupported`, and `TokioLauncher` returns the same off
    Unix, so a launcher that does not override it makes every `Session::cancel` a forced
@@ -326,7 +349,19 @@ a retry. Decide using the existing queries together:
 | `cleanup_control()`         | Retain and finish bounded process cleanup even when submission never happened. `close` returns it on all three harnesses, `cancel` on Claude and Codex. |
 | `session.snapshot().status` | Session usability is separate from the error. A nonretryable error does not prove the session remains healthy.                                          |
 
-The built-in launcher reports `Error::Launch` only while starting an executable. A failure
+The built-in launcher reports `Error::ProgramNotFound` or `Error::Launch` only while starting an
+executable. `TokioLauncher` maps `io::ErrorKind::NotFound` to `ProgramNotFound` and everything else
+to `Launch`, with two carve-outs. `ENOENT` also means a missing working directory, or on Unix a
+script whose `#!` interpreter (or an ELF loader) is gone, so after a `NotFound` it checks the
+working directory and, for a program named by path, whether the file exists, and returns `Launch`
+when either says the program is present. A bare name whose interpreter is missing cannot be told
+from a name that is on no `PATH` without redoing the lookup, so it reads as missing. And on Unix
+`execvp` reports `EACCES` (or `ELOOP`, `ENAMETOOLONG`) for a bare name it found nowhere when the
+child's `PATH` holds a directory its user cannot enter, so for those errors the launcher scans the
+`PATH` in the launch spec, not this process's, with relative and empty entries taken against the
+spec's working directory. It returns `ProgramNotFound` when no entry holds a non-directory of that
+name, and `Launch` when one does (a file without the execute bit). The checks run on the blocking
+pool and only after a failure. Windows has no such scan. A failure
 interrupting, ending or confirming an already-launched tree is `Error::Teardown { pid, message }`:
 `pid` retains the launched leader's numeric identity when available, and the message names a safe
 OS cause or deadline. Neither cause alone proves cleanup complete; retain any `cleanup_control()`
@@ -405,7 +440,10 @@ The `testing` feature ships fakes that spawn nothing:
 
 - `FakeLauncher` replays a transcript or answers each line written to it, and records the argv, the
   cwd and the environment every launch received — which is how a host proves its own secret never
-  reached a vendor child.
+  reached a vendor child. An unqueued launch is an `Error::Launch`, which a probe returns as an
+  error; `FakeLauncher::missing_program()` and `push_missing_program()` produce the "not installed"
+  answer, and `FakeLauncher::refusing_launches(message)` and `push_launch_refusal(message)` produce
+  a launch failure that is not a missing program.
 - `FakeHarness` emits the shape a real harness emits, including an approval that waits for an
   answer, so a host's event mapping can be written before any vendor CLI exists.
 - `Announcer` makes a `FakeProcess` speak without being written to first, which is what a peer that

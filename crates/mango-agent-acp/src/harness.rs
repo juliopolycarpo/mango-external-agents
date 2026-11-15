@@ -380,9 +380,14 @@ impl Harness for AcpHarness {
         }
         let version = match run_version(host, &self.descriptor, argv).await {
             Ok(version) => version,
-            // A launcher that could not start it is the definition of not installed here: the
-            // library does not search `PATH`, so "no such program" is what it learns instead.
-            Err(Error::Launch { .. }) => return Ok(Discovery::not_installed()),
+            // The library does not search `PATH`, so a launcher that says "no such program" is
+            // how it learns the agent is not installed. Any other launch failure, such as a file
+            // without the execute bit, means the agent is present: it goes to the host. A child
+            // that still needs cleanup is the host's to reconcile, and the predicate is false for
+            // it, so it is never swallowed.
+            Err(error) if error.is_program_not_found() => {
+                return Ok(Discovery::not_installed());
+            }
             Err(error) => return Err(error),
         };
 
@@ -814,7 +819,17 @@ impl AcpHarness {
                 }
                 match run_version(host, &self.descriptor, argv).await {
                     Ok(version) => version,
-                    Err(Error::Launch { .. }) => return Ok(()),
+                    // Missing or not startable alike: the agent launch that follows reports the
+                    // launcher's own error, so the floor is not enforced on a probe that never ran.
+                    Err(error)
+                        if error.cleanup_control().is_none()
+                            && matches!(
+                                error.cause(),
+                                Error::Launch { .. } | Error::ProgramNotFound { .. }
+                            ) =>
+                    {
+                        return Ok(());
+                    }
                     Err(error) => return Err(error),
                 }
             }

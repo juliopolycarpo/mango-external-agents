@@ -84,11 +84,16 @@ concludes from the lines that did arrive differs:
   is not parsed and the answer is unknown authentication, which leaves `auto` unavailable, as for
   any unknown account.
 
-A probe whose underlying error is `Error::Launch` contributes no output; a version probe with that
-error reports `GateVerdict::NotInstalled`. Other host errors reach the caller with their typed cause
-and dispatch annotation. A cleanup failure retains its host-owned process control even when its
-underlying cause is `Error::Launch`. The public probe output returns `None` when no complete line
-arrived and `Some("")` when the complete output is one empty line.
+A probe whose underlying error is `Error::ProgramNotFound` or `Error::Launch` contributes no
+output. For `--version` the two differ: `ProgramNotFound` reports `GateVerdict::NotInstalled`, and
+a `Launch` (a CLI on `PATH` without the execute bit, no file descriptors left) is returned from
+`discover` as the launcher's own error, so a present CLI is never reported as absent. `--help` and
+`auth status` read both as "did not start" and degrade: an unreadable help surface leaves the gate
+`Unknown`, an unreadable status leaves the account unknown. Other host errors reach the caller
+with their typed cause and dispatch annotation. A cleanup failure retains its host-owned process
+control even when its underlying cause is `Error::Launch` or `Error::ProgramNotFound`. The public
+probe output returns `None` when no complete line arrived and `Some("")` when the complete output
+is one empty line.
 
 Anthropic's [CLI reference](https://code.claude.com/docs/en/cli-reference.md#cli-flags) cautions
 that `claude --help` does not list every supported flag. This harness deliberately applies the
@@ -840,7 +845,13 @@ An accepted `DiscoveryReceipt` reuses its version and authentication answers whe
 session, but re-runs `--help`. The receipt records normalized discovery facts, not the exact help
 grammar needed to decide current safe argv such as permission modes, effort levels and MCP support;
 inventing that grammar from a capability summary would risk passing an undeclared flag.
-A receipt that says the CLI was not installed retains the no-CLI launch refusal without probing it.
+A receipt that says the CLI was not installed is not reused: it records an earlier probe, the CLI
+may have been installed since, and only a launcher can say a program is missing. The open runs
+`--version` as it does with no receipt. If the CLI is there now, the open proceeds. If it is still
+missing, the open returns the launcher's own `Error::ProgramNotFound`, with the program name and
+annotations the launcher gave (a custom executable path stays that path, never `claude`). Any other
+launch failure reaches the host as the launcher's own error, with the OS error the launcher named,
+rather than as a summary of it.
 
 What the receipt is worth, measured rather than claimed:
 
@@ -1237,7 +1248,8 @@ frames are inline, not captured fixtures; `mea capture --transcripts` records th
 
 It records every launch (`launches`, `turn_argvs`) and every line written to a child's stdin
 (`written`). A turn nobody scripted is a launch error, so a test never passes over a launch it
-did not queue. The error carries no argv, like every `Error::Launch`, and points at
+did not queue. The error is an `Error::Launch`, never `ProgramNotFound`, so an unscripted launch is
+not read as "not installed". It carries no argv, like every `Error::Launch`, and points at
 `refused_launch_shapes`, which reads each refusal as the program, the argument count and the flag
 names, with every value left out. Only the flags the turn argv builder emits are named; a value
 shaped like a flag, the word after a flag that takes a value (`--model --print` names `--model`
@@ -1245,6 +1257,11 @@ and counts `--print`), or a flag the library never passes, is counted. `refused_
 full argv. `Run::completing` scripts a turn whose output does not matter. Any `auth`
 subcommand other than `status` is always refused: the library never logs in, so the fake never
 pretends to.
+
+`without_program()` makes every launch report `Error::ProgramNotFound`, and `unstartable(message)`
+makes every launch an `Error::Launch` carrying `message`. The `_for` forms, `without_program_for`
+and `unstartable_for`, take an argument (`--version`, `--help`, `status`) and fail only the launches
+whose argv holds it, which is how a test breaks one probe and lets the others run.
 
 A host turns it on in its own `[dev-dependencies]` with `features = ["testing"]` on
 `mango-agent-claude`, so the fake never reaches a release build.

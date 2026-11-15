@@ -89,10 +89,11 @@ handshake reports `codex/v0.147.0`, opening and listing refuse before any thread
 the child. Plain numeric tokens keep the same floor checks.
 
 An executable that started but printed no readable version is `GateVerdict::Unknown`.
-Discovery reports `NotInstalled` for the launcher's typed `Error::Launch` unavailability;
-host policy, resource and cancellation refusals remain typed errors, including their dispatch
-and any cleanup control. Opening and listing stop after every failed version-probe launch,
-without attempting an app-server. A `--version` line nobody can parse is
+Discovery reports `NotInstalled` only for the launcher's typed `Error::ProgramNotFound`. Every other
+failure stays a typed error, with its dispatch annotation and any cleanup control: an `Error::Launch`
+(a CLI without the execute bit, a host resource limit), a host policy refusal, a cancellation.
+Opening and listing stop after every failed version-probe launch, without attempting an
+app-server. A `--version` line nobody can parse is
 `GateVerdict::Unknown`, not a refusal: a CLI that changed
 the shape of its version output has not stopped working, and the host may still choose to try.
 
