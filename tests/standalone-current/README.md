@@ -1,7 +1,7 @@
 # Independent Rust host
 
 Copy this directory outside the repository. It has its own workspace and lockfile, and resolves
-all four published SDK crates at `=0.7.1` through crates.io. This is the **current-release**
+all four published SDK crates at `=0.8.0` through crates.io. This is the **current-release**
 consumer: its pin follows the latest published release (bumped after each release, see
 `docs/releasing.md`), and CI runs it on the declared minimum Rust version. It is evidence for the
 published release it names, not for unpublished code in the repository. The fixed
@@ -14,7 +14,7 @@ cargo test --locked --all-features
 cargo run --locked --features bundled-launcher -- codex
 ```
 
-Rust 1.97 or newer and Tokio are required. The executable accepts `claude`, `codex` or `cursor`.
+Rust 1.98 or newer and Tokio are required. The executable accepts `claude`, `codex` or `cursor`.
 Install the chosen vendor CLI yourself and authenticate through its own commands. The SDK never
 logs in. Running the CLI authorizes its current directory. A service must authorize the workspace
 before constructing `HostContext` and must keep its own consent and approval policy.
@@ -24,8 +24,9 @@ before constructing `HostContext` and must keep its own consent and approval pol
 example refuses all tool approvals, reads the terminal, then closes. Event diagnostics print safe
 metadata; a product can render bounded text through the typed event fields.
 
-The named test installation drives ACP with the published `FakeAcpAgent`, Claude with copied
-captures, and Codex with a named app-server fake. Each harness runs discovery and a real harness
+The named test installation drives ACP with the published `FakeAcpAgent`, Claude with the
+published `FakeClaudeCli` replaying copied captures, and Codex with a named app-server fake behind
+the published `VersionAnsweringLauncher`. Each harness runs discovery and a real harness
 session over injected byte-I/O. A second test cancels live work and checks that no fake child remains.
 These are deterministic integration tests, not live vendor or native process qualification.
 

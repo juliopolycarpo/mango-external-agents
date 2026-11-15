@@ -5,88 +5,99 @@ use std::time::Duration;
 
 use mango_agent_acp::testing::{Approval, FakeAcpAgent};
 use mango_agent_acp::{AcpHarness, AcpProfile};
+use mango_agent_claude::testing::{FakeClaudeCli, Run};
+use mango_agent_codex::MINIMUM_CODEX_VERSION;
+use mango_agent_codex::testing::VersionAnsweringLauncher;
 use mango_external_agents::testing::{FakeLauncher, FakeProcess};
 use mango_external_agents::{
-    ByteSink, CancelToken, EnvSource, EventKind, Harness, HostContext, LaunchSpec, ManagedProcess,
+    CancelToken, EnvSource, EventKind, Harness, HostContext, LaunchSpec, ManagedProcess,
     ProcessLauncher, Result, VendorInfo,
 };
 use serde_json::{Value, json};
 
-/// A fake installation selected through launch argv, recording the actual authorized launch spec.
-#[derive(Default)]
+/// A fake installation of the three vendor CLIs, selected by the launched program.
+///
+/// Each vendor is answered by the fake its crate exports: `FakeClaudeCli` for `claude`,
+/// `VersionAnsweringLauncher` (which answers `codex --version` at the crate's own minimum) over a
+/// queue of app-server processes for `codex`, and `FakeAcpAgent` for the custom ACP profile.
 struct InstalledClis {
-    launches: FakeLauncher,
+    claude: FakeClaudeCli,
+    codex_processes: Arc<FakeLauncher>,
+    codex: VersionAnsweringLauncher,
+    acp: FakeLauncher,
     hold_turn: bool,
+}
+
+impl InstalledClis {
+    fn new(hold_turn: bool) -> Self {
+        let turn = if hold_turn {
+            // Claude's print mode keeps running until the host ends it.
+            Run::stalling([r#"{"type":"system","subtype":"init","session_id":"claude-fake"}"#])
+        } else {
+            Run::replaying(include_str!("fixtures/claude-turn.jsonl"))
+        };
+        let codex_processes = Arc::new(FakeLauncher::new());
+        Self {
+            claude: FakeClaudeCli::new()
+                .with_help(include_str!("fixtures/claude-help.txt"))
+                .with_turn(turn),
+            codex: VersionAnsweringLauncher::new(codex_processes.clone()),
+            codex_processes,
+            acp: FakeLauncher::new(),
+            hold_turn,
+        }
+    }
+
+    /// Every launch the fake installation was asked to run, in each vendor's own log.
+    fn launches(&self) -> Vec<LaunchSpec> {
+        let mut launches = self.claude.launches();
+        launches.extend(self.codex_processes.launches());
+        launches.extend(self.acp.launches());
+        launches
+    }
+
+    /// Whether every child the host started has ended.
+    fn children_ended(&self) -> bool {
+        self.claude.all_children_ended()
+            && self.codex_processes.live_children() == 0
+            && self.acp.live_children() == 0
+    }
 }
 
 #[async_trait::async_trait]
 impl ProcessLauncher for InstalledClis {
     async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
-        let program = spec.program().expect("expected executable");
-        let process = if spec.argv.iter().any(|arg| arg == "--version") {
-            let banner = match program {
-                "claude" => "2.1.270 (Claude Code)",
-                "codex" => "codex-cli 0.154.0",
-                _ => "fake-acp 1.2.3",
-            };
-            FakeProcess::transcript([banner])
-        } else if spec.argv.iter().any(|arg| arg == "--help") {
-            FakeProcess::transcript(include_str!("fixtures/claude-help.txt").lines())
-        } else if spec.argv.iter().any(|arg| arg == "auth") {
-            FakeProcess::transcript([
-                r#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}"#,
-            ])
-        } else if program == "claude" {
-            if self.hold_turn {
-                FakeProcess::responding(SilentClaude::answer).with_greeting([
-                    r#"{"type":"system","subtype":"init","session_id":"claude-fake"}"#,
-                ])
-            } else {
-                FakeProcess::transcript(include_str!("fixtures/claude-turn.jsonl").lines())
+        match spec.program().expect("expected executable") {
+            "claude" => self.claude.spawn(spec).await,
+            "codex" => {
+                // The version-answering launcher takes the probe itself; every other launch
+                // is an app-server session and needs a process queued first.
+                if !spec.argv.iter().any(|arg| arg == "--version") {
+                    let cwd = spec.cwd.to_string_lossy().into_owned();
+                    let hold = self.hold_turn;
+                    self.codex_processes
+                        .push(FakeProcess::responding(move |line| {
+                            FakeCodex::answer(line, &cwd, hold)
+                        }));
+                }
+                self.codex.spawn(spec).await
             }
-        } else if program == "codex" {
-            let cwd = spec.cwd.to_string_lossy().into_owned();
-            let hold = self.hold_turn;
-            FakeProcess::responding(move |line| FakeCodex::answer(line, &cwd, hold))
-        } else {
-            let agent = FakeAcpAgent::new().asking_for_approval(Approval::Once);
-            if self.hold_turn {
-                agent.staying_silent().process()
-            } else {
-                agent.process()
+            _ => {
+                let agent = FakeAcpAgent::new().asking_for_approval(Approval::Once);
+                let agent = if self.hold_turn {
+                    agent.staying_silent()
+                } else {
+                    agent
+                };
+                let process = if spec.argv.iter().any(|arg| arg == "--version") {
+                    agent.version_process()
+                } else {
+                    agent.process()
+                };
+                self.acp.push(process);
+                self.acp.spawn(spec).await
             }
-        };
-        self.launches.push(process);
-        let is_held_claude =
-            program == "claude" && self.hold_turn && spec.argv.iter().any(|arg| arg == "--print");
-        let mut child = self.launches.spawn(spec).await?;
-        // Claude consumes stdin before running. EOF must leave the fake child alive until cancel.
-        if is_held_claude {
-            child.stdin = child
-                .stdin
-                .map(|inner| Box::new(KeepAliveInput(inner)) as Box<dyn ByteSink>);
         }
-        Ok(child)
-    }
-}
-
-/// A live Claude process that produces no further stdout until the host terminates it.
-struct SilentClaude;
-impl SilentClaude {
-    fn answer(_line: &str) -> Vec<String> {
-        Vec::new()
-    }
-}
-
-/// Input EOF without ending the process, as Claude's print mode does.
-struct KeepAliveInput(Box<dyn ByteSink>);
-#[async_trait::async_trait]
-impl ByteSink for KeepAliveInput {
-    async fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
-        self.0.write_all(bytes).await
-    }
-    async fn close(&mut self) -> Result<()> {
-        Ok(())
     }
 }
 
@@ -112,7 +123,13 @@ impl FakeCodex {
             return Vec::new();
         }
         let result = match method {
-            Some("initialize") => json!({"userAgent":"unrelated-host/0.154.0"}),
+            // The initialize answer carries the app-server's own version, held to the same floor
+            // as `codex --version`.
+            Some("initialize") => {
+                json!({"userAgent":format!("unrelated-host/{MINIMUM_CODEX_VERSION}")})
+            }
+            // 0.8.0 asks for gateway readiness explicitly before it reads the account.
+            Some("account/gatewayOAuth/read") => json!({"required":false,"status":null}),
             Some("account/read") => {
                 json!({"account":{"type":"chatgpt","planType":"plus"},"requiresOpenaiAuth":true})
             }
@@ -169,7 +186,7 @@ fn harnesses() -> Vec<Box<dyn Harness>> {
 #[tokio::test]
 async fn each_registry_harness_discovers_opens_sends_reads_responds_and_closes() {
     for harness in harnesses() {
-        let launcher = Arc::new(InstalledClis::default());
+        let launcher = Arc::new(InstalledClis::new(false));
         // Exercise the trailing separator supplied by macOS and Windows on every platform.
         let workspace = std::env::temp_dir().join("independent-workspace");
         let cwd = std::path::PathBuf::from(format!(
@@ -210,8 +227,8 @@ async fn each_registry_harness_discovers_opens_sends_reads_responds_and_closes()
         if harness.descriptor().identity.id.as_str() != "claude" {
             assert!(approval);
         }
-        assert_eq!(launcher.launches.live_children(), 0);
-        for launch in launcher.launches.launches() {
+        assert!(launcher.children_ended());
+        for launch in launcher.launches() {
             assert_eq!(launch.cwd, cwd);
             assert!(!launch.env.contains_key("HOST_SECRET"));
         }
@@ -221,10 +238,7 @@ async fn each_registry_harness_discovers_opens_sends_reads_responds_and_closes()
 #[tokio::test]
 async fn each_registry_harness_cancels_live_work_then_closes() {
     for harness in harnesses() {
-        let launcher = Arc::new(InstalledClis {
-            hold_turn: true,
-            ..InstalledClis::default()
-        });
+        let launcher = Arc::new(InstalledClis::new(true));
         let workspace = std::env::temp_dir().join("independent-workspace");
         let cwd = std::path::PathBuf::from(format!(
             "{}{}",
@@ -254,6 +268,6 @@ async fn each_registry_harness_cancels_live_work_then_closes() {
         .expect("expected bounded cancellation")
         .expect("expected cancel and close");
         assert!(cancelled && terminal);
-        assert_eq!(launcher.launches.live_children(), 0);
+        assert!(launcher.children_ended());
     }
 }

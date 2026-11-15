@@ -7,7 +7,7 @@ Mango Protocol, HTTP server, database or recovery loop is required.
 
 [`tests/standalone-current`](../tests/standalone-current/README.md) is a small consumer with its own
 workspace and lockfile. Its four SDK dependencies are exact registry pins at the current published
-release (`=0.7.1`), with no path override. Copy that directory anywhere and run:
+release (`=0.8.0`), with no path override. Copy that directory anywhere and run:
 
 ```sh
 cargo test --locked
@@ -415,10 +415,13 @@ The `testing` feature ships fakes that spawn nothing:
 - `RecordingBroker` and `FrozenClock` turn a policy decision and an event's timestamp into values
   a test can assert on.
 
-The Claude and ACP harness crates also ship a fake of their vendor CLI behind their own `testing`
-feature: `mango_agent_claude::testing::FakeClaudeCli` (see
-[Testing against a fake `claude`](harness-claude.md#testing-against-a-fake-claude-the-testing-feature))
-and `mango_agent_acp::testing::FakeAcpAgent`.
+The harness crates also ship test support behind their own `testing` feature:
+`mango_agent_claude::testing::FakeClaudeCli` (see
+[Testing against a fake `claude`](harness-claude.md#testing-against-a-fake-claude-the-testing-feature)),
+`mango_agent_acp::testing::FakeAcpAgent`, and
+`mango_agent_codex::testing::VersionAnsweringLauncher`, which answers `codex --version` at the
+crate's minimum so a host's own fake app-server passes the version floor. The independent consumer's
+tests combine all three.
 
 Two complete examples are compiled by the test suite, so neither can drift from the API. The core
 crate's README (`crates/mango-external-agents/README.md`) is a whole host against `FakeLauncher`
