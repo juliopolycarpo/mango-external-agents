@@ -5,7 +5,8 @@
 #
 #   powerset  the development toolchain from rust-toolchain.toml. Clippy over every feature pair
 #             (depth 2) of each crate, all targets, warnings denied, in a copy without the crates'
-#             self dev-dependency (see below). Run by CI's `rust` job and scripts/check.sh.
+#             self dev-dependency (see below). Run by CI's `powerset` job on Linux, macOS and
+#             Windows, and by scripts/check.sh.
 #   msrv      the workspace `rust-version`, not the development toolchain. A compile check of
 #             library targets, one package at a time: the bare crate and each feature alone, plus the
 #             core with all features and the bare core with all targets. Run by CI's `msrv` job, the

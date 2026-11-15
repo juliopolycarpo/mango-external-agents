@@ -59,16 +59,19 @@ lock differs by anything else, a self entry it cannot strip, and a workspace wit
 
 These lanes run through it:
 
-- `scripts/check-features.sh powerset`: clippy over every feature pair, all targets.
+- `scripts/check-features.sh powerset`: clippy over every feature pair, all targets. CI runs it in
+  the `powerset` job, a matrix of Linux, macOS and Windows beside the `rust` job, not as a step of it.
 - The bare core with all targets, the last line of `scripts/check-features.sh msrv`.
 - `cargo clippy --workspace --all-targets --no-default-features` in `scripts/check.sh`, `ci.yml`
   and `fresh-dependencies.yml`.
 
 The library-only runs (`cargo hack check --each-feature` in the msrv lane, `cargo check -p
 mango-external-agents --all-features`) stay in the real tree. `scripts/test-check-powerset.sh` pins
-which commands are wrapped. `scripts/test-run-without-self-dev-dependency.sh` reproduces the probe
-in a throwaway workspace: the in-tree `--all-targets` check passes with the feature off, and the
-same check through the runner fails.
+which commands are wrapped, and that `ci.yml` runs the powerset in the `powerset` job on all three
+systems (a `gate` need, the `rust` cache restored without saving) and no longer in `rust`.
+`scripts/test-run-without-self-dev-dependency.sh` reproduces the probe in a throwaway workspace: the
+in-tree `--all-targets` check passes with the feature off, and the same check through the runner
+fails.
 
 ## Script tests
 
@@ -115,10 +118,12 @@ shellcheck and, when the real tool is installed, with a script that has a findin
 
 ## CI caches
 
-Only runs on `refs/heads/main` save a Rust cache: the `rust` job (`shared-key: rust`), the `msrv` and
-`msrv-windows` jobs and the `Fresh dependencies` lane (`key: fresh`) set
-`save-if: ${{ github.ref == 'refs/heads/main' }}`. The vendor-drift and release jobs restore
-the `rust` cache and save nothing (`save-if: false`). A cache on a `refs/pull/*` ref belongs to
+Only runs on `refs/heads/main` save a Rust cache: the `rust` job (`shared-key: rust`), the
+`powerset` job (`shared-key: powerset`), the `msrv` and `msrv-windows` jobs and the
+`Fresh dependencies` lane (`key: fresh`) set `save-if: ${{ github.ref == 'refs/heads/main' }}`. The
+powerset keeps its own cache because it builds dependencies with feature sets the `rust` job never
+selects. The vendor-drift and release jobs restore the `rust` cache and save nothing
+(`save-if: false`). A cache on a `refs/pull/*` ref belongs to
 that pull request and is left alone.
 
 A Swatinem/rust-cache key is `v0-rust-<name>-<os>-<arch>-<environment hash>-<lockfile hash>`, with

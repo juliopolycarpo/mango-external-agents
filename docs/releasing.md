@@ -161,7 +161,7 @@ release.
 
 | Lane                                 | Covers                                                                                                                                                                             | Runs                                                                                                 |
 | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `scripts/check-features.sh powerset` | Clippy over every feature pair (depth 2) of the core and of the Claude, Codex and ACP crates, all targets, in a copy without the self dev-dependency, on the development toolchain | CI `rust` job on Linux, macOS and Windows, `scripts/check.sh`, release verify job                    |
+| `scripts/check-features.sh powerset` | Clippy over every feature pair (depth 2) of the core and of the Claude, Codex and ACP crates, all targets, in a copy without the self dev-dependency, on the development toolchain | CI `powerset` job on Linux, macOS and Windows, `scripts/check.sh`, release verify job                |
 | `scripts/check-features.sh msrv`     | each package alone on the declared minimum Rust: bare, each feature alone, core with all features, bare core with all targets in that copy; library targets otherwise              | CI `msrv` job, fresh-dependencies lane, release verify job, `scripts/check-features.sh msrv` by hand |
 
 `scripts/check-features.sh` is the single driver. A lane fixes the toolchain and the target set; the
