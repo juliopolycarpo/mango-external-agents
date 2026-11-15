@@ -52,7 +52,11 @@ case "${1-}" in
   *) echo "FakeUname: expected -s or -m, received ${1-}" >&2; exit 2 ;;
 esac
 FAKE_UNAME
-chmod +x "$work/fakebin/curl" "$work/fakebin/uname"
+# RecordingTar: logs each call, then runs the real tar, so a case can tell whether the archive was
+# opened at all.
+real_tar=$(command -v tar)
+printf '#!/usr/bin/env bash\necho "$*" >> "$RECORDING_TAR_LOG"\nexec %q "$@"\n' "$real_tar" > "$work/fakebin/tar"
+chmod +x "$work/fakebin/curl" "$work/fakebin/uname" "$work/fakebin/tar"
 
 # make_copy <name> <digest>: a scratch scripts/ directory holding the script and a registry that
 # pins <digest> for the Linux x86_64 asset only.
@@ -73,7 +77,9 @@ run_install() {
   if [ -n "${STEP_GITHUB_PATH-}" ]; then step_env=(GITHUB_PATH="$STEP_GITHUB_PATH"); fi
   status=0
   : > "$work/curl.log"
+  : > "$work/tar.log"
   env -u GITHUB_PATH "${step_env[@]}" PATH="$work/fakebin:$PATH" FAKE_CURL_LOG="$work/curl.log" \
+    RECORDING_TAR_LOG="$work/tar.log" \
     FAKE_CURL_ARCHIVE="$work/$linux_amd64_asset" \
     "$BASH" "$work/$copy/install-actionlint.sh" "$@" > "$work/stdout" 2> "$work/stderr" || status=$?
   stdout_text=$(cat "$work/stdout")
@@ -91,6 +97,7 @@ expected_url="https://github.com/rhysd/actionlint/releases/download/v$version/$l
 [ "$(cat "$work/curl.log")" = "$expected_url" ] || fail "expected one download from $expected_url | received: $(cat "$work/curl.log")"
 grep -q "installed actionlint $version at $work/bin-ok/actionlint" <<<"$stdout_text" || fail "expected the install to report the version and path | received: $stdout_text"
 [ "$(cat "$work/github-path")" = "$work/bin-ok" ] || fail "expected GITHUB_PATH to receive $work/bin-ok | received: $(cat "$work/github-path")"
+[ -s "$work/tar.log" ] || fail "expected the verified archive to be extracted with tar | received no tar call"
 
 # Case 2: without GITHUB_PATH nothing else is written.
 : > "$work/github-path"
@@ -103,6 +110,7 @@ run_install wrong "$work/bin-wrong"
 [ "$status" -eq 1 ] || fail "expected exit 1 for a digest mismatch | received: exit $status: $stderr_text"
 grep -q "expected SHA-256 0000.* received $archive_digest" <<<"$stderr_text" || fail "expected the mismatch to name the pinned and received digests | received: $stderr_text"
 [ ! -e "$work/bin-wrong/actionlint" ] || fail "expected no binary after a digest mismatch | received $work/bin-wrong/actionlint"
+[ ! -s "$work/tar.log" ] || fail "expected no tar call on an archive whose digest does not match | received: $(cat "$work/tar.log")"
 
 # Case 4: an unsupported platform is named and nothing is downloaded.
 FAKE_UNAME_SYSTEM=FreeBSD run_install good "$work/bin-bsd"
