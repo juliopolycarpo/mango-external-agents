@@ -79,7 +79,7 @@ Redacted whatever the value type:
   customer's data is the author's, and the replacement keeps the field's type where a `[REDACTED]`
   string would not. A `null` stays. The names stay. A string, number, boolean or object under a name no review
   lists is reported as below, unless it is a direct key of the map, which the key line below lists
-  (the structural names and `model` are the exception, since the recorder already knows them). The
+  (a string under a structural name or `model` is the exception, since the recorder already knows it). The
   same call's arguments also sit under `input` and `wire_tool_inputs`, which keep their numbers
   as the model's answer, so this rule removes them from `tool_input` only. A `tool_use_result` recorded before this rule keeps a vendor string such as
   `"type": "text"` and its numbers (`numLines`, `totalLines`); the committed transcripts are
