@@ -665,13 +665,13 @@ test_committed_acp_allowlist_is_well_formed() {
 }
 
 # Writes a scratch assessment whose "Accepted documentation mentions" section carries the given
-# lines inside a text fence, after a decoy section that carries the first of them too.
+# lines inside a text fence, after a decoy section whose fence always carries `a decoy line`.
 write_acp_assessment() {
   local path="$1"
   shift
   {
     printf '%s\n' '# ACP convergence assessment' '' '## Another section' '' 'A decoy mention.' ''
-    printf '%s\n' '```text' "${1:-no entry}" '```' ''
+    printf '%s\n' '```text' 'a decoy line' '```' ''
     printf '%s\n' '## Accepted documentation mentions' '' 'Prose before the entries.' '' '```text'
     printf '%s\n' "$@"
     printf '%s\n' '```' '' '## Closing section' '' '```text'
@@ -718,12 +718,14 @@ test_vendor_acp_allowlist_entries_are_recorded() {
   write_acp_assessment "$assessment" "$claude_row (updated)" "prefix $codex_row"
   expect_status 1 unrecorded_allowlist_entries
 
-  # The entry text outside the section does not count: a decoy section carries it.
+  # The entry text before the section does not count: only the decoy section carries it here.
   write_acp_allowlist "$allowlist" claude 'a decoy line' 'third-party adapter'
+  write_acp_assessment "$assessment" 'another line'
+  assert_contains "$assessment" 'a decoy line' 'the decoy section carries the entry'
+  expect_status 1 unrecorded_allowlist_entries
+  # The same entry inside the section is recorded.
   write_acp_assessment "$assessment" 'a decoy line'
   unrecorded_allowlist_entries
-  write_acp_assessment "$assessment" 'another line'
-  expect_status 1 unrecorded_allowlist_entries
   # Nor does a line of a section after it.
   write_acp_allowlist "$allowlist" claude 'a line after the section' 'third-party adapter'
   expect_status 1 unrecorded_allowlist_entries
