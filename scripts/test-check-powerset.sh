@@ -57,7 +57,7 @@ ci_uses_step() {
 # `powerset` job must, or nothing when it does. Every message is `expected ... | received ...`.
 powerset_job_problem() {
   local workflow=$1 step='scripts/check-features.sh powerset --locked'
-  local count owners job rust_job os_line blocking gate_needs toolchain_line cache_line cache_step action
+  local count owners job rust_job os_line blocking gate_needs toolchain_line cache_line cache_step action fetch_line step_line
   count=$(grep -cxE ' *- run: scripts/check-features\.sh powerset --locked' "$workflow" || true)
   if [ "$count" -ne 1 ]; then
     echo "expected exactly one '- run: $step' step in $workflow | received $count"
@@ -118,6 +118,14 @@ powerset_job_problem() {
     echo "expected the 'powerset' job in $workflow to install cargo-hack through taiki-e/install-action | received: $(grep -E '^ +tool:' <<<"$job" | sed 's/^ *//' || echo no tool entry)"
     return
   fi
+  # The powerset resolves a copy of the tree offline, so the registry sources are fetched first:
+  # with an empty cache nothing else in this job downloads them.
+  fetch_line=$(grep -nxE ' +- run: cargo fetch --locked' <<<"$job" | head -n 1 | cut -d: -f1 || true)
+  step_line=$(grep -nxF "      - run: $step" <<<"$job" | head -n 1 | cut -d: -f1 || true)
+  if [ -z "$fetch_line" ] || [ -z "$step_line" ] || [ "$fetch_line" -ge "$step_line" ]; then
+    echo "expected the 'powerset' job in $workflow to run 'cargo fetch --locked' before the powerset step | received the fetch at job line ${fetch_line:-none}, the powerset step at ${step_line:-none}"
+    return
+  fi
   if ! grep -qxE ' +persist-credentials: false' <<<"$job"; then
     echo "expected the 'powerset' job in $workflow to check out with 'persist-credentials: false' | received none"
     return
@@ -168,6 +176,8 @@ expect_powerset_refusal 'an unpinned cache action' 'the same pinned Swatinem/rus
   -e "${in_powerset}s|Swatinem/rust-cache@[0-9a-f]* # v2.9.3|Swatinem/rust-cache@v2|"
 expect_powerset_refusal 'no cargo-hack install' 'install cargo-hack' \
   -e "${in_powerset}s/tool: cargo-hack/tool: cargo-nextest/"
+expect_powerset_refusal 'no registry fetch' "'cargo fetch --locked' before the powerset step" \
+  -e "${in_powerset}{/- run: cargo fetch --locked/d" -e '}'
 expect_powerset_refusal 'persisted credentials' 'persist-credentials: false' \
   -e "${in_powerset}s/persist-credentials: false/persist-credentials: true/"
 

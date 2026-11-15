@@ -90,6 +90,10 @@ jobs:
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-hack
+      # The powerset runs in a copy of the tree that cargo resolves offline, so the registry
+      # sources have to be on disk first. In the `rust` job the earlier clippy steps fetched them;
+      # here nothing does when the cache is empty.
+      - run: cargo fetch --locked
       - run: scripts/check-features.sh powerset --locked
 
   policy:
