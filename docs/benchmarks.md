@@ -152,9 +152,10 @@ instead of criterion or divan:
   `examples/hub-host/tests/bench_runner.rs`, since a bench target cannot run `#[test]`s.
 
 Allocation counts are not measured. A counting global allocator needs `unsafe`, which the
-workspace forbids. To find allocations, use a profiler on the bench binary
-(`target/release/deps/<name>-<hash>`), for example `valgrind --tool=dhat` or `heaptrack`, outside
-the repository.
+workspace forbids. To find allocations, use a profiler on the bench binary, for example
+`valgrind --tool=dhat` or `heaptrack`, outside the repository. `cargo bench --no-run` prints the
+binary's path on its `Executable` line; Cargo 1.100 moved it out of `target/release/deps/`, and the
+build directory layout is not a stable interface.
 
 ## Receipt: the redactor's newer reads
 
