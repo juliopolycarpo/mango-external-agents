@@ -112,12 +112,8 @@ impl ProcessLauncher for InstalledAgents {
     async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
         let program = spec.argv.first().map_or("", String::as_str);
         let Some(resolved) = self.resolve(program) else {
-            return Err(Error::Launch {
-                program: program.to_owned(),
-                message: format!(
-                    "expected an executable on the fixture PATH, received {program:?}"
-                ),
-            });
+            // A program on no fixture PATH entry is the launcher's "no such program" answer.
+            return Err(Error::program_not_found(program));
         };
         let agent = FakeAcpAgent::new().printing_version(resolved.version);
         // Named anywhere in the argv, not only second: a profile may put its own flags — Grok's

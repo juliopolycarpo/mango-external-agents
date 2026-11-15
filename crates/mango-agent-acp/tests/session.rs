@@ -3824,7 +3824,7 @@ async fn a_probe_reads_the_version_the_agent_printed_and_never_claims_a_login_st
         "expected the probe to stay inside the ceiling"
     );
 
-    let empty = FakeLauncher::new();
+    let empty = FakeLauncher::missing_program();
     let missing = AcpHarness::new(profile())
         .discover(&host(&empty))
         .await
