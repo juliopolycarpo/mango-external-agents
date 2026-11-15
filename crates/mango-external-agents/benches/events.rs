@@ -255,7 +255,7 @@ fn main() {
     // A dirty delta carries characters the owned sanitiser strips from the buffer it arrived in.
     // The three stripped-share cases bracket the reclaim rule: half the bytes survive and the
     // buffer is kept, 1 in 16 survive and a 1 KiB buffer is released, 5 bytes of 90 KB survive.
-    let shapes: [(&str, Shape); 13] = [
+    let shapes: [(&str, Shape); 14] = [
         ("delta-16B-ascii", || small_deltas("hello, world....")),
         ("delta-64B-escapes", || small_deltas(&"a\"b\\".repeat(16))),
         ("approval-requested", approval_requests),
@@ -266,6 +266,10 @@ fn main() {
         ("delta-1KiB-unicode", || text_deltas("héllo wörld 日本語 ")),
         ("delta-1KiB-dirty", || {
             text_deltas("clean\u{1b}[0m\u{0}text ")
+        }),
+        // Stripped characters that are two and three bytes long, beside kept ones that are too.
+        ("delta-1KiB-bidi", || {
+            text_deltas("text\u{202e}é—\u{200f}done ")
         }),
         ("delta-1KiB-half-stripped", || {
             deltas_of("\u{1b}x".repeat(512))
@@ -362,11 +366,13 @@ fn main() {
     let unicode = "héllo wörld 日本語 ".repeat(40);
     let dirty = "clean\u{1b}[0m\u{0}text ".repeat(64);
     let control_heavy = format!("{}x", "\u{1b}".repeat(15)).repeat(64);
+    let bidi = "text\u{202e}é—\u{200f}done ".repeat(52);
     for (label, input) in [
         ("ascii-clean", &clean),
         ("unicode-clean", &unicode),
         ("dirty", &dirty),
         ("control-heavy", &control_heavy),
+        ("bidi", &bidi),
     ] {
         bench.run(
             &format!("normalize/sanitize_field-1KiB/{label}"),

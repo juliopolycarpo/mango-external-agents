@@ -100,6 +100,17 @@ time: a `:` or `=` for the credential rules, and the first byte of a removed cha
 control-character stripper. Text between two of them is copied without being read a word at a
 time.
 
+The strip behind `normalize::sanitize_owned` moves the surviving bytes itself instead of calling
+`String::retain`. Rust 1.100 rewrote `retain` to move each kept character after the first removal
+with one `memmove` call of a run-time length, and `normalize/sanitize_field-1KiB/dirty` went from
+about 2.9 ms to about 4.2 ms on the reference machine with no source change (issue #500). The
+compaction in `normalize::compact_strippable` decides each character from its bytes and copies
+two-, three- and four-byte characters by hand, so it holds no `memmove` call: `objdump -d` on the
+`events` bench shows none in `sanitize_owned`, where it is inlined. When the toolchain moves, compare
+`normalize/sanitize_field-1KiB/dirty`, `normalize/sanitize_field-1KiB/bidi` (stripped characters
+that are two and three bytes long) and `events/emit+drain/delta-1KiB-half-stripped`: a step of
+tens of percent in the dirty cases with the clean ones unmoved means the loop changed shape.
+
 When `rust-toolchain.toml` moves, build the `events`, `framing` and `redact` binaries with the old
 and the new toolchain (`RUSTUP_TOOLCHAIN` and a `CARGO_TARGET_DIR` each) and compare
 `normalize/sanitize_field-1KiB/*`, `normalize/bound_text-4KiB/clean-ascii`,

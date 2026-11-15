@@ -169,26 +169,38 @@ const RECLAIM_FLOOR: usize = 256;
 /// them, because a mostly stripped delta would otherwise pin its whole input for as long as the
 /// event is held. The result is byte-identical to `sanitize_field(&raw)`; only the spare capacity
 /// differs.
-pub(crate) fn sanitize_owned(mut raw: String) -> BoundedText {
+pub(crate) fn sanitize_owned(raw: String) -> BoundedText {
     if !may_need_stripping(&raw) {
         return BoundedText {
             text: raw,
             truncated: false,
         };
     }
-    // One pass: a removal always shortens the text, so the length says whether anything went.
-    let before = raw.len();
-    raw.retain(|character| !is_strippable(character));
-    let truncated = raw.len() != before;
+    // The prefilter also flags text that only looks dirty (an em dash leads with `E2`), so find
+    // the first character that is really stripped before taking the buffer apart.
+    let Some(first) = first_strippable_index(&raw) else {
+        return BoundedText {
+            text: raw,
+            truncated: false,
+        };
+    };
+    // A removal always shortens the text, so there is nothing to compare: `first` is a hit.
+    let mut bytes = raw.into_bytes();
+    let kept = compact_strippable(&mut bytes, first);
+    bytes.truncate(kept);
+    // The survivors are whole characters of valid UTF-8, so this validation cannot fail; the lossy
+    // arm only keeps the function total.
+    let mut text = String::from_utf8(bytes)
+        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
     // `shrink_to_fit` moves at most the survivors, under a quarter of the buffer, so the cost is bounded
     // by what is kept rather than by what was stripped. Text that lost only a little keeps its
     // buffer, which is the reuse the owned path exists for.
-    if truncated && raw.capacity() > raw.len().saturating_mul(RECLAIM_RATIO).max(RECLAIM_FLOOR) {
-        raw.shrink_to_fit();
+    if text.capacity() > text.len().saturating_mul(RECLAIM_RATIO).max(RECLAIM_FLOOR) {
+        text.shrink_to_fit();
     }
     BoundedText {
-        truncated,
-        text: raw,
+        text,
+        truncated: true,
     }
 }
 
@@ -389,6 +401,112 @@ fn any_flagged(bytes: &[u8]) -> bool {
 const fn is_flagged_byte(byte: u8) -> bool {
     let control = (byte < 0x20) & (byte != b'\t') & (byte != b'\n');
     control | (byte == 0x7f) | (byte == 0xc2) | (byte == 0xd8) | (byte == 0xe2)
+}
+
+/// The byte offset of the first character [`is_strippable`] removes, or `None` for clean text.
+///
+/// Whole blocks are skipped with the flag test, so the clean text before the first removal costs
+/// a vector compare per block; the characters from the first flagged byte on are decoded.
+fn first_strippable_index(text: &str) -> Option<usize> {
+    let from = flagged_prefix_len(text.as_bytes());
+    text[from..]
+        .char_indices()
+        .find(|(_, character)| is_strippable(*character))
+        .map(|(offset, _)| from + offset)
+}
+
+/// How many leading bytes come before the first byte [`is_flagged_byte`] flags.
+///
+/// The block test of [`contains_flagged_byte`], then a byte search inside the first flagged block.
+/// A flagged byte of valid UTF-8 is an ASCII byte or the lead byte of a sequence, so the result is
+/// always a character boundary.
+fn flagged_prefix_len(bytes: &[u8]) -> usize {
+    let (blocks, remainder) = bytes.as_chunks::<SCAN_BLOCK>();
+    let mut clean = 0;
+    for block in blocks {
+        if any_flagged(block) {
+            return clean + leading_unflagged_bytes(block);
+        }
+        clean += block.len();
+    }
+    clean + leading_unflagged_bytes(remainder)
+}
+
+fn leading_unflagged_bytes(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .take_while(|byte| !is_flagged_byte(**byte))
+        .count()
+}
+
+/// Removes every character [`is_strippable`] names from valid UTF-8 `bytes`, moving the survivors
+/// left, and returns how many bytes survive.
+///
+/// `start` must be a character boundary with nothing strippable before it; those bytes stay where
+/// they are. `String::retain` is the safe way to do this and was good enough until Rust 1.100,
+/// whose version moves each surviving character with one `memmove` call of a run-time length: about
+/// 40% slower on short dirty text and slower still on a long clean run after a removal.
+///
+/// Each character is decided from its bytes without decoding it. An ASCII byte is written
+/// unconditionally and kept by advancing the write offset, so it has no branch; a multi-byte
+/// character is at most four bytes, so each width copies its bytes by hand rather than through a
+/// call. The loop condition is the buffer length itself, which lets the compiler drop the bounds
+/// check on the lead byte it reads.
+fn compact_strippable(bytes: &mut [u8], start: usize) -> usize {
+    let len = bytes.len();
+    let (mut read, mut write) = (start, start);
+    while read < len {
+        let lead = bytes[read];
+        if lead < 0x80 {
+            bytes[write] = lead;
+            write += usize::from(!is_strippable_ascii(lead));
+            read += 1;
+        } else if lead < 0xe0 {
+            if !is_strippable_sequence(&bytes[read..read + 2]) {
+                bytes[write] = lead;
+                bytes[write + 1] = bytes[read + 1];
+                write += 2;
+            }
+            read += 2;
+        } else if lead < 0xf0 {
+            if !is_strippable_sequence(&bytes[read..read + 3]) {
+                bytes[write] = lead;
+                bytes[write + 1] = bytes[read + 1];
+                bytes[write + 2] = bytes[read + 2];
+                write += 3;
+            }
+            read += 3;
+        } else {
+            // Four-byte characters (emoji, supplementary planes) hold nothing strippable.
+            for offset in 0..4 {
+                bytes[write + offset] = bytes[read + offset];
+            }
+            write += 4;
+            read += 4;
+        }
+    }
+    write
+}
+
+/// [`is_strippable`] for a character that is one byte: C0 controls except tab and newline, and DEL.
+const fn is_strippable_ascii(byte: u8) -> bool {
+    let control = (byte < 0x20) & (byte != b'\t') & (byte != b'\n');
+    control | (byte == 0x7f)
+}
+
+/// [`is_strippable`] for the UTF-8 encoding of one multi-byte character, without decoding it.
+///
+/// The stripped code points and their encodings: U+0080..=U+009F is `C2 80..=9F`, U+061C is
+/// `D8 9C`, U+200E and U+200F are `E2 80 8E` and `E2 80 8F`, U+202A..=U+202E is `E2 80 AA..=AE`,
+/// U+2066..=U+2069 is `E2 81 A6..=A9`.
+const fn is_strippable_sequence(sequence: &[u8]) -> bool {
+    matches!(
+        *sequence,
+        [0xc2, 0x80..=0x9f]
+            | [0xd8, 0x9c]
+            | [0xe2, 0x80, 0x8e | 0x8f | 0xaa..=0xae]
+            | [0xe2, 0x81, 0xa6..=0xa9]
+    )
 }
 
 /// C0 and C1 controls except tab and newline, and every bidirectional formatting character.
@@ -597,6 +715,192 @@ mod tests {
                     owned.text,
                     owned.truncated
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn the_byte_level_tests_agree_with_the_character_test_for_every_scalar_value() {
+        let mut buffer = [0_u8; 4];
+        for character in '\0'..=char::MAX {
+            let encoded = character.encode_utf8(&mut buffer).as_bytes();
+            let received = if encoded.len() == 1 {
+                super::is_strippable_ascii(encoded[0])
+            } else {
+                super::is_strippable_sequence(encoded)
+            };
+            assert_eq!(
+                received,
+                super::is_strippable(character),
+                "expected U+{:04X} strippable: {} | received: {received}",
+                u32::from(character),
+                super::is_strippable(character)
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_or_empty_sequence_is_never_strippable() {
+        for sequence in [
+            &[][..],
+            &[0xc2],
+            &[0xd8],
+            &[0xe2],
+            &[0xe2, 0x80],
+            &[0xe2, 0x81],
+        ] {
+            assert!(
+                !super::is_strippable_sequence(sequence),
+                "expected incomplete sequence {sequence:02x?} kept | received strippable"
+            );
+        }
+    }
+
+    #[test]
+    fn the_flagged_prefix_ends_at_the_first_flagged_byte_at_every_offset() {
+        assert_eq!(
+            super::flagged_prefix_len(&[]),
+            0,
+            "expected an empty input to have a flagged prefix of 0"
+        );
+        // No block, one block, two blocks, and every remainder length beside them.
+        for length in 1..=2 * super::SCAN_BLOCK + 2 {
+            let mut bytes = vec![b'a'; length];
+            assert_eq!(
+                super::flagged_prefix_len(&bytes),
+                length,
+                "expected {length} clean bytes to be all prefix"
+            );
+            for offset in 0..length {
+                for probe in [0x00, b'\t', 0x1f, 0x7f, 0xc2, 0xc3, 0xd8, 0xe2, 0xf0] {
+                    bytes[offset] = probe;
+                    let expected = bytes
+                        .iter()
+                        .position(|byte| reference_flagged(*byte))
+                        .unwrap_or(length);
+                    assert_eq!(
+                        super::flagged_prefix_len(&bytes),
+                        expected,
+                        "expected prefix {expected} for byte {probe:#04x} at offset {offset} \
+                         of {length}"
+                    );
+                }
+                bytes[offset] = b'a';
+            }
+        }
+    }
+
+    /// The offset `first_strippable_index` has to find, by the character test alone.
+    fn reference_first_strippable(text: &str) -> Option<usize> {
+        text.char_indices()
+            .find(|(_, character)| super::is_strippable(*character))
+            .map(|(offset, _)| offset)
+    }
+
+    #[test]
+    fn the_first_strippable_index_matches_the_reference_and_skips_lookalikes() {
+        for input in boundary_inputs() {
+            assert_eq!(
+                super::first_strippable_index(&input),
+                reference_first_strippable(&input),
+                "expected the reference offset | input: {input:?}"
+            );
+        }
+        // `E2`, `C2` and `D8` lead bytes the prefilter flags, with nothing to strip behind them.
+        for lookalike in ["—", "’quoted’", "\u{a0}", "\u{620}", "→ done"] {
+            let text = format!("{}{lookalike}", "a".repeat(70));
+            assert_eq!(
+                super::first_strippable_index(&text),
+                None,
+                "expected no strippable character | input: {text:?}"
+            );
+        }
+    }
+
+    /// Runs `compact_strippable` the way `sanitize_owned` does and returns the surviving text.
+    fn compacted(input: &str) -> String {
+        let Some(first) = super::first_strippable_index(input) else {
+            return input.to_owned();
+        };
+        let mut bytes = input.as_bytes().to_vec();
+        let kept = super::compact_strippable(&mut bytes, first);
+        bytes.truncate(kept);
+        String::from_utf8(bytes).expect("expected the survivors to be valid UTF-8")
+    }
+
+    #[test]
+    fn compaction_matches_the_reference_on_every_boundary_input() {
+        for input in boundary_inputs() {
+            let (expected, _) = reference_sanitize(&input);
+            assert_eq!(
+                compacted(&input),
+                expected,
+                "expected the reference text | input: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_handles_empty_all_stripped_and_four_byte_neighbours() {
+        let cases = [
+            ("empty", String::new(), String::new()),
+            ("one control", "\u{1b}".into(), String::new()),
+            (
+                "all ascii controls",
+                "\u{0}\u{1b}\u{7f}".repeat(50),
+                String::new(),
+            ),
+            (
+                "all bidi marks",
+                "\u{202e}\u{2066}\u{200f}\u{61c}\u{85}".repeat(50),
+                String::new(),
+            ),
+            ("four-byte after", "\u{1b}🍋".into(), "🍋".into()),
+            ("four-byte before", "🍋\u{202e}".into(), "🍋".into()),
+            (
+                "four-byte between",
+                "🍋\u{202e}🍋\u{85}🍋\u{0}🍋".into(),
+                "🍋🍋🍋🍋".into(),
+            ),
+            (
+                "kept tab and newline",
+                "\u{1b}\t\u{1b}\n\u{1b}".into(),
+                "\t\n".into(),
+            ),
+            (
+                "lookalikes kept",
+                "\u{2014}\u{202e}\u{2013}\u{a0}\u{85}\u{620}".into(),
+                "\u{2014}\u{2013}\u{a0}\u{620}".into(),
+            ),
+        ];
+        for (label, input, expected) in cases {
+            assert_eq!(
+                compacted(&input),
+                expected,
+                "expected the text of case {label} | input: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_matches_the_reference_for_clean_runs_of_every_length_between_removals() {
+        // Run lengths across the scan blocks, between removals of every width, with a kept
+        // multi-byte character at each end of the run.
+        let removed = ['\u{1b}', '\u{85}', '\u{202e}'];
+        for run in 0..=2 * super::SCAN_BLOCK + 3 {
+            for strip in removed {
+                for kept in ["", "é", "—", "🍋"] {
+                    let body = format!("{kept}{}{kept}", "a".repeat(run));
+                    let input = format!("{strip}{body}{strip}{body}{strip}");
+                    let (expected, _) = reference_sanitize(&input);
+                    assert_eq!(
+                        compacted(&input),
+                        expected,
+                        "expected the reference text for a run of {run} after U+{:04X} with \
+                         {kept:?} at its ends | input: {input:?}",
+                        u32::from(strip)
+                    );
+                }
             }
         }
     }
