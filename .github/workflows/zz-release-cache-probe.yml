@@ -1,0 +1,67 @@
+name: Release cache probe (temporary)
+
+# Replays the steps release.yml runs before its rust-cache steps, to read the restore outcome on a
+# hosted runner. Removed before merge.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CRATES: mango-external-agents mango-agent-claude mango-agent-codex mango-agent-acp
+
+jobs:
+  verify:
+    name: Probe verify (as merged)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain list
+      - id: cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: rust
+          save-if: false
+      - run: echo "cache-hit=${{ steps.cache.outputs.cache-hit }}"; rustup toolchain list
+  verify-ordered:
+    name: Probe verify (toolchain shown first)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup show active-toolchain
+      - id: cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: rust
+          save-if: false
+      - run: echo "cache-hit=${{ steps.cache.outputs.cache-hit }}"
+      - run: rustup toolchain install "$(scripts/check-features.sh --print-toolchain)" --profile minimal
+      - run: cargo build --workspace --all-features --locked 2>&1 | grep -c Compiling || true
+  crates:
+    name: Probe crates
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup show active-toolchain
+      - id: cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: rust
+          save-if: false
+      - run: echo "cache-hit=${{ steps.cache.outputs.cache-hit }}"
