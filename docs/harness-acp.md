@@ -772,7 +772,9 @@ The harness uses that path for both discovery and sessions and returns it in `Di
 `OpenSession::with_executable` can override it for one session. This lets a host support custom
 install locations without editing the profile or changing a user's `PATH`.
 
-- A launcher that could not start the program is `GateVerdict::NotInstalled`.
+- A launcher that says the program does not exist (`Error::ProgramNotFound`) is
+  `GateVerdict::NotInstalled`. Any other launch failure (`Error::Launch`) is returned from
+  `discover`. The floor check before an open skips on either and leaves the agent launch to report.
 - Output with no dotted number is `GateVerdict::Unknown`. An agent that changed the shape of
   `--version` is not an agent that stopped working.
 - The probe stops reading after 64 KiB of output (a line that starts inside it is read whole, and no

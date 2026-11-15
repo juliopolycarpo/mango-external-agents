@@ -21,7 +21,9 @@ The host must keep its runtime alive until shutdown completes and supply a launc
 and reaps its process trees.
 
 `Error::Teardown { pid, message }` names a failed interruption or cleanup of an already-launched
-tree, unlike `Error::Launch`. Like `Error::Link` or `Error::Timeout`, it does not establish a
+tree, unlike `Error::Launch` and `Error::ProgramNotFound`, which end a launch before any child
+exists. Only `ProgramNotFound` reads as "not installed"; see
+[the launch failure contract](contracts.md#launch-failures-a-missing-program-is-its-own-answer). Like `Error::Link` or `Error::Timeout`, it does not establish a
 request's acceptance or make replay safe. The numeric leader id identifies the tree to reconcile;
 the cause alone carries no process control.
 

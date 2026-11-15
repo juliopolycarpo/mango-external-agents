@@ -255,6 +255,38 @@ comparison on a CPU without SHA-NI: the pure Rust replacement exceeded the propo
 regression limit, so ring is retained. Processors with SHA extensions were not measured. No complete
 frozen receipt is available to reconstruct those figures. The TLS provider policy is independent.
 
+## Launch failures: a missing program is its own answer
+
+A version probe has to tell "the CLI is not installed" from "the CLI is there and could not be
+started", because a host renders the first as "install it" and the second as "something broke".
+`ProcessLauncher::spawn` says which with two errors:
+
+| Error                    | A launcher returns it when                                                                        | A probe reads it as                    |
+| ------------------------ | ------------------------------------------------------------------------------------------------- | -------------------------------------- |
+| `Error::ProgramNotFound` | the program does not exist                                                                        | `Discovery::not_installed()`           |
+| `Error::Launch`          | anything else stopped the launch: no execute bit, `ETXTBSY`, `EMFILE`, or a cause it cannot place | an error from `discover`, cause intact |
+
+It is a separate variant rather than a kind field on `Launch` because `Error` is
+`#[non_exhaustive]` and its variants are not: adding a field to `Launch` would break every host
+that builds or destructures `Error::Launch { program, message }`, while a new variant breaks none.
+It also makes the safe reading the default. A launcher that does not classify keeps returning
+`Launch`, and a probe passes that failure to the host instead of telling a user to install software
+they already have. The cost is a behaviour change for a launcher that returned `Launch` for a
+missing program and relied on the 0.8.0 reading: its `discover` now returns an error until it
+returns `Error::program_not_found`. The tests of `FakeLauncher` and `FakeClaudeCli` use the same
+split: an unqueued or unscripted launch is a `Launch`, and `missing_program()` and `without_program()`
+say "not installed" on purpose.
+
+`Error::is_program_not_found` reads the answer through a dispatch annotation like `cause()`. It is
+`false` for any error that carries a `cleanup_control()`, whatever its cause: the host owns a child
+and has to reconcile it, so a host that tests only this predicate can never drop a live child as
+"not installed". `cause()` still shows what the underlying error was.
+
+Only `--version` (and the ACP and Codex equivalents) uses the distinction. Claude's `--help` and
+`auth status` probes, which only refine what `--version` already established, still read any launch
+failure as "did not start" and degrade to an unknown gate or account. ACP's floor check before an
+open skips on either kind and leaves the agent launch to report the launcher's own error.
+
 ## Discovery receipts are a seam, not a cache
 
 `Harness::probe` may not memoise. The host decides freshness. A host that has just filled a picker
