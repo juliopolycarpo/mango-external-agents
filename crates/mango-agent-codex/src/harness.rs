@@ -244,9 +244,10 @@ impl CodexHarness {
     ) -> Result<(Discovery, Option<CodexAccount>)> {
         let version = match read_version(host, &self.executable).await? {
             VersionProbe::Started(version) => version,
-            // A typed launch failure means the executable was unavailable to the launcher.
-            // Host policy, resource and cancellation refusals are different facts and stay typed.
-            VersionProbe::NotStarted(error) if matches!(error.cause(), Error::Launch { .. }) => {
+            // Only a launcher that says the program does not exist means "not installed". A CLI
+            // that is present and cannot be executed (`Error::Launch`), and host policy, resource
+            // and cancellation refusals, are different facts and reach the host as typed errors.
+            VersionProbe::NotStarted(error) if error.is_program_not_found() => {
                 return Ok((Discovery::not_installed(), None));
             }
             VersionProbe::NotStarted(error) => return Err(error),

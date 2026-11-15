@@ -7052,7 +7052,7 @@ async fn a_turn_that_repeats_the_sessions_own_level_is_the_turn_it_always_was() 
 /// renders as "install it", and a failure would be what it renders as "something broke".
 #[tokio::test]
 async fn a_machine_with_no_codex_on_it_discovers_nothing_rather_than_failing() {
-    let launcher = Arc::new(FakeLauncher::new());
+    let launcher = Arc::new(FakeLauncher::missing_program());
     let host = HostContext::builder()
         .launcher(launcher)
         .cwd(workspace_path())
