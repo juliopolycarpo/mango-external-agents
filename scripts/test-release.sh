@@ -203,6 +203,30 @@ check_release_workflow() {
     echo "expected the publish step in $file to set CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: allow beside 'cargo publish -p', received no such env entry on that step" >&2
     return 1
   fi
+  # A cache saved on a tag ref is restorable by that tag alone, so a release job that saves one
+  # only fills the quota. Both jobs restore the cache ci.yml's `rust` job saves on main and save
+  # nothing. rust-cache hashes every installed toolchain into its key, so in the verify job the
+  # step has to run before the minimum toolchain is added or the key never matches main's.
+  local job cache_steps unshared cache_line
+  for job in verify crates; do
+    cache_steps=$(workflow_job "$file" "$job" | awk '
+      /^[[:space:]]+- / { if (cache) print shared "," unsaved; cache = 0 }
+      /^[[:space:]]+- uses:[[:space:]]*Swatinem\/rust-cache@/ { cache = 1; shared = "no-shared-key"; unsaved = "saves" }
+      cache && /^[[:space:]]+shared-key:[[:space:]]*rust[[:space:]]*$/ { shared = "shared" }
+      cache && /^[[:space:]]+save-if:[[:space:]]*false[[:space:]]*$/ { unsaved = "restore-only" }
+      END { if (cache) print shared "," unsaved }')
+    unshared=$(grep -v '^shared,restore-only$' <<<"$cache_steps" || true)
+    if [ -z "$cache_steps" ] || [ -n "$unshared" ]; then
+      echo "expected every rust-cache step of the release $job job in $file to set 'shared-key: rust' and 'save-if: false', received: ${cache_steps:-no rust-cache step}" >&2
+      return 1
+    fi
+  done
+  cache_line=$(grep -nE '^[[:space:]]+- uses:[[:space:]]*Swatinem/rust-cache@' <<<"$verify" | head -n 1)
+  install_line=$(grep -nF -- 'rustup toolchain install' <<<"$verify" | head -n 1)
+  if [ "${cache_line%%:*}" -ge "${install_line%%:*}" ]; then
+    echo "expected the release verify job in $file to restore the Rust cache before installing the minimum toolchain, received the cache step at verify line ${cache_line%%:*} and the install at line ${install_line%%:*}" >&2
+    return 1
+  fi
   found=$(grep -v '^[[:space:]]*#' "$file" | grep -E 'RUSTUP_TOOLCHAIN.*GITHUB_ENV|^[[:space:]]*RUSTUP_TOOLCHAIN:' || true)
   if [ -n "$found" ]; then
     echo "expected $file to leave the pinned toolchain selected for every other step, received RUSTUP_TOOLCHAIN set job-wide in: $found" >&2
@@ -256,6 +280,14 @@ sed '/CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: allow/d' "$release_workflow" > "$
 expect_workflow_refusal 'to set CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: allow beside'
 sed 's/CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: allow/CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: deny/' "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal 'to set CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: allow beside'
+sed '/save-if: false/d' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal "to set 'shared-key: rust' and 'save-if: false', received: shared,saves"
+sed 's/shared-key: rust$/shared-key: release/' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal "to set 'shared-key: rust' and 'save-if: false', received: no-shared-key,restore-only"
+# Move the minimum toolchain install above the cache step of the verify job.
+awk '/Swatinem\/rust-cache@/ && !moved { print "      - name: Install the declared minimum toolchain"; print "        run: rustup toolchain install \"$(scripts/check-features.sh --print-toolchain)\" --profile minimal"; moved = 1 } { print }' \
+  "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'to restore the Rust cache before installing the minimum toolchain'
 rm -rf "$workflow_dir"
 trap - EXIT
 echo 'release workflow checks passed'
