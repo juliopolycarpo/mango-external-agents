@@ -52,3 +52,14 @@ missing_docs = "warn"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 unwrap_used = "warn"
+
+# Line tables keep file:line in panics and backtraces; dependencies drop their debug info. Profiles
+# apply to this workspace only, never to a host that depends on the crates. Measured on Linux
+# x86_64 with `cargo build --workspace --all-targets --all-features --locked` from an empty target
+# directory: 57.9 s to 51.0 s, and `target/` from 7.5 GB to 3.3 GB. `profile.test` inherits this.
+# For a stepping debugger, run with `CARGO_PROFILE_DEV_DEBUG=true`.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
