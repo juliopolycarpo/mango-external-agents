@@ -35,7 +35,14 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup show active-toolchain
+      # Only main saves. A pull request's cache is visible to that pull request alone, so a save
+      # there stores one more copy per open pull request and is restored by nothing else. `rust` is
+      # the key the vendor-drift lanes restore; they build a subset of this job's
+      # dependency tree and save nothing.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: rust
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-hack,cargo-nextest
@@ -112,6 +119,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: msrv
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # The driver runs the feature matrix through cargo-hack, which any toolchain can host.
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
@@ -149,6 +157,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: msrv-windows
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo +"$MSRV_TOOLCHAIN" check --workspace --all-features --locked
 
   gate:
