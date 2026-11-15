@@ -87,6 +87,7 @@ report_section() {
   {
     printf '### %s\n\n%s\n' "$url" "$sentence"
     if [ -n "$text" ]; then
+      # shellcheck disable=SC2016 # the backticks are literal Markdown fence characters, not command substitution
       printf '\n```text\n%s\n```\n' "$text"
     fi
     printf '\n'
@@ -181,6 +182,7 @@ report_stale_entries() {
     printf '### Reviewed allowlist\n\n'
     printf 'Entries that no watched page carries any more. Remove or update them:\n\n'
     # Numbered like the page lines so that none of them can open or close the fence.
+    # shellcheck disable=SC2016 # the backticks are literal Markdown fence characters, not command substitution
     printf '```text\n%s\n```\n\n' "$(printf '%s\n' "$stale" | awk '{ print NR ":" $0 }')"
   } >> "$report_file"
 }
