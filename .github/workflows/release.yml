@@ -145,6 +145,10 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
           PENDING: ${{ steps.pending.outputs.list }}
+          # `.cargo/config.toml` holds new crate versions for three days (Cargo 1.100+). Each
+          # crate is verified against crates.io, where the sibling published a minute earlier is
+          # not in Cargo.lock, so the hold would refuse it ("is too new") and strand the release.
+          CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: allow
         # cargo waits for each published crate to be resolvable before returning,
         # so the next crate in the list can depend on it without a sleep.
         run: |

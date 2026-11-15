@@ -8,6 +8,8 @@ script=$PWD/scripts/fresh-receipt.sh
 work=$(mktemp -d "${TMPDIR:-/tmp}/fresh-receipt-test.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+# The receipt records this variable; a caller's own override would change what the cases expect.
+unset CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE
 
 fail() { echo "$*" >&2; exit 1; }
 sha256_stdin() {
@@ -26,10 +28,24 @@ resolved_hash=$(sha256_stdin < "$repo/Cargo.lock")
 committed_hash=$(git -C "$repo" show HEAD:Cargo.lock | sha256_stdin)
 printf '    Locking 2 packages to highest Rust 1.97 compatible versions\n    Updating foo v1.0.0 -> v1.1.0 (available: v1.2.0, requires Rust 1.98)\n' > "$work/update.log"
 
-# run_case <name> <steps-json>: snapshot (when the resolution is claimed to have succeeded) and finish.
+# Output Cargo 1.100 printed for `cargo update --dry-run --verbose` with the repository's three-day
+# hold and no opt-out, kept verbatim: the summary line carries the hold date, and a version inside
+# the window is reported as "published N days ago", including a downgrade of a locked entry. None of
+# it is a Rust-version hold, so none of it may land in held_back_by_rust_version.
+publish_age_log=$work/update-publish-age.log
+cooldown_policy_line='     Locking 4 packages to highest Rust 1.97 compatible versions as of 3 days ago'
+cooldown_available_line='   Unchanged jiff v0.2.43 (available: v0.2.44, published 7 hours ago)'
+cooldown_downgrade_line=' Downgrading rustls-webpki v0.103.17 -> v0.103.16 (available: v0.103.17, published 2 days ago)'
+printf '%s\n%s\n%s\n' "$cooldown_policy_line" "$cooldown_available_line" "$cooldown_downgrade_line" > "$publish_age_log"
+# The same line for a single locked package, which Cargo spells in the singular.
+singular_policy_log=$work/update-singular.log
+printf '     Locking 1 package to highest Rust 1.97 compatible version as of 24 hours ago\n' > "$singular_policy_log"
+
+# run_case <name> <steps-json> [update-log]: snapshot (when the resolution is claimed to have
+# succeeded) and finish.
 run_case() {
   local name=$1 steps=$2 dir=$work/$1
-  export RECEIPT_DIR=$dir UPDATE_LOG=$work/update.log FRESH_ROOT=$repo STEPS_JSON=$steps
+  export RECEIPT_DIR=$dir UPDATE_LOG=${3:-$work/update.log} FRESH_ROOT=$repo STEPS_JSON=$steps
   export SOURCE_SHA=aaaa HEAD_SHA=bbbb EVENT_NAME=workflow_dispatch REF=refs/heads/x RUN_ID=1 RUN_ATTEMPT=1 REPOSITORY=o/r
   if [ "$(jq -r '.resolve.outcome' <<< "$steps")" = success ]; then
     "$script" snapshot
@@ -58,6 +74,17 @@ cmp "$repo/Cargo.lock" "$work/passed/Cargo.lock" || fail "case passed: expected 
 [ "$(cut -d' ' -f1 "$work/passed/Cargo.lock.sha256")" = "$resolved_hash" ] || fail "case passed: expected Cargo.lock.sha256 to hold $resolved_hash"
 [ -s "$work/passed/rustc-Vv.txt" ] || fail "case passed: expected a non-empty rustc-Vv.txt"
 [ -f "$work/passed/cargo-update.log" ] || fail "case passed: expected cargo-update.log to be kept"
+
+# The hold's own output: the policy line is still found, nothing is reported as a Rust-version hold,
+# and the receipt records the resolver override the job ran with (and null when none was set).
+run_case publish_age_hold "$passed" "$publish_age_log"
+expect publish_age_hold .resolver.log_line 'Locking 4 packages to highest Rust 1.97 compatible versions as of 3 days ago'
+expect publish_age_hold '.resolver.held_back_by_rust_version | length' 0
+expect publish_age_hold .resolver.incompatible_publish_age_env null
+run_case singular_policy "$passed" "$singular_policy_log"
+expect singular_policy .resolver.log_line 'Locking 1 package to highest Rust 1.97 compatible version as of 24 hours ago'
+CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow run_case publish_age_allow "$passed"
+expect publish_age_allow .resolver.incompatible_publish_age_env allow
 
 # A later gate fails: the lock is still kept, and the result says the gate failed, not the resolution.
 failed='{"resolve":{"outcome":"success"},"gate_clippy":{"outcome":"failure"},"gate_nextest":{"outcome":"skipped"}}'

@@ -57,11 +57,15 @@ ordinary documentation PR.
    published release declares, update only those four lock entries with that compiler, and test
    it. Update the literal published pin in `docs/adopt.md` in that same follow-up.
    `scripts/check-standalone.sh` fails if the consumer's `rust-version` differs from the one the
-   pinned crates declare:
+   pinned crates declare.
+
+   The new pins name versions published minutes ago, and `.cargo/config.toml` holds crate versions
+   younger than three days, so the update runs with the hold lifted:
 
    ```sh
    export RUSTUP_TOOLCHAIN=$(scripts/check-features.sh --print-toolchain)
-   cargo update --manifest-path tests/standalone-current/Cargo.toml \
+   CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow \
+     cargo update --manifest-path tests/standalone-current/Cargo.toml \
      -p mango-external-agents -p mango-agent-acp -p mango-agent-claude -p mango-agent-codex
    scripts/check-standalone.sh --test-only current
    ```
@@ -196,14 +200,16 @@ The repository owner sets these up once.
   ruleset names it.
 
 Trusted publishing can only be configured for a crate that already exists. The first version of
-each crate is therefore published from a maintainer's machine, in dependency order:
+each crate is therefore published from a maintainer's machine, in dependency order. The override
+is the one the workflow's publish step sets: each crate is verified against the sibling published
+a moment earlier, which the three-day hold in `.cargo/config.toml` would refuse:
 
 ```sh
 cargo login
-cargo publish -p mango-external-agents --locked
-cargo publish -p mango-agent-claude --locked
-cargo publish -p mango-agent-codex --locked
-cargo publish -p mango-agent-acp --locked
+CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo publish -p mango-external-agents --locked
+CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo publish -p mango-agent-claude --locked
+CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo publish -p mango-agent-codex --locked
+CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo publish -p mango-agent-acp --locked
 ```
 
 After that, configure trusted publishing on all four crates and let the workflow handle every
