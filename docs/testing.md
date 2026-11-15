@@ -112,3 +112,32 @@ A finding that is intentional gets `# shellcheck disable=SCxxxx # reason` above 
 a blanket exclusion in the gate. A directive cannot sit between the lines of a pipeline: put it
 before the whole command. `scripts/test-check-shellcheck.sh` covers the gate with a named fake
 shellcheck and, when the real tool is installed, with a script that has a finding.
+
+## CI caches
+
+Only runs on `refs/heads/main` save a Rust cache: the `rust` job (`shared-key: rust`), the `msrv` and
+`msrv-windows` jobs and the `Fresh dependencies` lane (`key: fresh`) set
+`save-if: ${{ github.ref == 'refs/heads/main' }}`. The vendor-drift and release jobs restore
+the `rust` cache and save nothing (`save-if: false`). A cache on a `refs/pull/*` ref belongs to
+that pull request and is left alone.
+
+A Swatinem/rust-cache key is `v0-rust-<name>-<os>-<arch>-<environment hash>-<lockfile hash>`, with
+`<name>` the `shared-key` or the `key` plus the job id. A toolchain, `.cargo/config.toml` or
+`Cargo.lock` change saves a new generation under a new hash and nothing restores the old one again.
+`scripts/prune-rust-caches.py` removes them. A family is the key without its two trailing hashes
+(`v0-rust-rust-Windows_NT-x64`); on `refs/heads/main` the script keeps the newest entry of each
+family and selects the older ones. It never selects an entry on another ref, a key outside the
+grammar, or entries tied for the newest `created_at`.
+
+```sh
+scripts/prune-rust-caches.py --repo juliopolycarpo/mango-external-agents           # dry run
+scripts/prune-rust-caches.py --repo juliopolycarpo/mango-external-agents --delete  # deletes
+```
+
+The default is a dry run that prints each family with the entries it keeps and deletes and their
+sizes. `--delete` calls `gh api --method DELETE` for exactly the selected ids; it needs a token with
+`actions: write` and exits 1 if a listing is malformed or any delete fails. The `Rust cache cleanup`
+workflow runs it with `--delete` after each successful `CI` push run on `main`, and on manual
+dispatch with a `dry-run` input that defaults to true.
+`scripts/test-prune-rust-caches.sh` covers the policy with a named fake `gh`
+(`scripts/test-fixtures/fake-gh-cache-cli.sh`).

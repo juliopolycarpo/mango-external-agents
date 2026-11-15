@@ -43,7 +43,7 @@ It is a library, not a daemon: no listener, no service, no telemetry, no login h
 | `examples/hub-host/`            | Unpublished reference host: the retry, reconciliation and stream-ownership loop over an injected Hub port               |
 | `fixtures/<vendor>/`            | Captured contracts and transcripts, replayed by the fakes                                                               |
 | `docs/`                         | Compliance posture, host adoption guide, public contracts, the vendor field inventory, one guide per harness, releasing |
-| `scripts/`                      | Shell: check, fix, changelog, lockstep versions, TLS rule, Codex vendoring                                              |
+| `scripts/`                      | Shell: check, fix, changelog, lockstep versions, TLS rule, Codex vendoring, Rust cache pruning                          |
 
 ## Global Rules
 

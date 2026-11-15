@@ -45,6 +45,7 @@ run scripts/test-check-powerset.sh
 run scripts/test-run-without-self-dev-dependency.sh
 run scripts/test-check-script-tests.sh
 run scripts/test-check-shellcheck.sh
+run scripts/test-prune-rust-caches.sh
 run scripts/check-script-tests.sh
 # CI's Policy job installs shellcheck and runs the same gate; here it is optional like cargo-hack.
 if command -v shellcheck >/dev/null 2>&1; then

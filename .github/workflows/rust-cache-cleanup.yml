@@ -1,0 +1,59 @@
+name: Rust cache cleanup
+
+# Swatinem/rust-cache saves a new generation under a new key whenever the toolchain,
+# .cargo/config.toml or Cargo.lock changes, and nothing restores the old ones. Only refs/heads/main
+# saves (see ci.yml and fresh-dependencies.yml), so this prunes that ref: it keeps the newest cache of
+# each key family and deletes the older ones. Caches on pull request refs and keys outside the
+# rust-cache grammar are never touched. scripts/prune-rust-caches.py holds the policy.
+#
+# It runs after a CI run on main succeeds, so the generation that run saved is the one kept. A
+# manual run is a dry run unless `dry-run` is unchecked.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: List what would be deleted and delete nothing
+        type: boolean
+        default: true
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: rust-cache-cleanup
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    name: Prune superseded Rust caches
+    # `branches: [main]` matches a fork's branch named main too, so the run must be a push or a
+    # dispatch on this repository, not a pull request.
+    if: >-
+      github.event_name == 'workflow_dispatch' || (
+      github.event.workflow_run.conclusion == 'success' &&
+      contains(fromJSON('["push", "workflow_dispatch"]'), github.event.workflow_run.event) &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prune
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # A workflow_run event carries no inputs: it always deletes.
+          DELETE: ${{ github.event_name == 'workflow_run' || !inputs.dry-run }}
+        run: |
+          if [ "$DELETE" = true ]; then
+            scripts/prune-rust-caches.py --repo "$GITHUB_REPOSITORY" --delete
+          else
+            scripts/prune-rust-caches.py --repo "$GITHUB_REPOSITORY"
+          fi
