@@ -4,7 +4,175 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
-## [0.7.1] - 2026-10-15
+## [0.8.0] - 2026-11-15
+
+### 🚀 Features
+
+- **(mea)** Record a named vendor CLI version in an ACP capture (#481)
+- **(mea)** Report retained Claude members that no review has seen (#421)
+- **(mea)** Report the Claude members a capture replaced or had not seen (#420)
+- **(mea)** Choose the model for a Claude transcript capture (#409)
+- **(mea)** Record a Claude schema-turn transcript through capture (#392)
+- **(mea)** Pass a JSON schema to a Claude turn and print the answer (#387)
+- **(claude)** Surface the --json-schema answer as a structured output event (#381)
+- **(core)** Add an event for a turn's validated structured answer (#380)
+- **(mea)** Pick the Codex model for turn and capture (#375)
+- **(mea)** Pass a Unix socket path to turn (#373)
+- **(codex)** Attach to a running app-server over its Unix socket (#370)
+- [**breaking**] **(claude)** Pass an opt-in JSON schema for structured output (#369)
+- **(mea)** Record the Codex CLI help surface in the public contract (#368)
+- **(codex)** Export a scoped version-answering test launcher (#270)
+- [**breaking**] **(codex)** Preserve variant evidence and child attribution (#210)
+
+### 🐛 Bug Fixes
+
+- **(claude)** Singular count nouns in refused-launch shapes (#483)
+- **(mea)** Declare tool_use_result a user-chosen map in the drift report (#482)
+- **(mea)** Replace numbers and booleans in recorded tool data (#472)
+- **(claude)** Count a known flag name that is another flag's value in a refused launch (#468)
+- **(mea)** Replace structural-named strings inside a recorded tool_input (#463)
+- **(claude)** Name only the flags the library emits in a refused fake launch (#455)
+- **(mea)** Declare who chose the keys under a reviewed Claude member (#448)
+- **(mea)** Keep the plain Vertex publisher model id in a Claude transcript (#444)
+- **(claude)** Name a refused fake launch by flag shape, never by argv (#439)
+- **(mea)** Tell the operator a Claude capture keeps the answer verbatim (#418)
+- **(mea)** Keep only structural members of the Claude init record (#417)
+- **(mea)** Describe credential_expires_at as the string Claude Code emits (#413)
+- **(mea)** Redact account-shaped model ids in a Claude transcript (#412)
+- **(mea)** Use one failure formatter so a vendor message is not dropped (#411)
+- **(claude)** Tighten the fake Claude CLI and extend the feature powerset (#410)
+- **(fixtures)** Keep recorder diagnostics out of the packaged crates (#408)
+- **(mea)** Redact account-shaped members in a recorded Claude transcript (#401)
+- **(mea)** Print the vendor message in the remaining failure reports (#405)
+- **(fixtures)** Package and replay a recorded Claude transcript (#402)
+- **(mea)** Carry the vendor message into a turn's failure summary (#391)
+- **(claude)** End a schema turn without an answer as an error (#386)
+- **(core)** End the process group when runtime shutdown drops its cleanup (#360)
+- **(core)** Release oversized stderr tail allocations (#359)
+- **(core)** Reclaim severely stripped text buffers (#358)
+- [**breaking**] **(codex)** Decode observed reviewers independently (#353)
+- **(claude)** Preserve probe presence and host refusals (#352)
+- **(ci)** Check resolved ACP schema identity (#350)
+- **(claude)** Refuse malformed HTTP MCP servers (#351)
+- [**breaking**] **(codex)** Decode observed approval policies independently (#349)
+- **(release)** Validate prerelease package versions (#341)
+- **(fixtures)** Ship captures needed by packaged crate tests (#335)
+- **(acp)** Withdraw permissions after stream overflow (#334)
+- **(acp)** Route unreadable updates to their admitted turn (#332)
+- **(acp)** Bind opening updates to their native session (#328)
+- **(acp)** Bind permission requests to the turn that received them (#323)
+- **(acp)** Preserve turn outcomes when activity cleanup fills the stream (#318)
+- **(acp)** Keep permission settlement owned through terminal draining (#287)
+- **(codex)** Commit interaction announcement bookkeeping atomically (#285)
+- **(codex)** Retain question outcomes through publication (#283)
+- **(codex)** Retain approval settlements through publication (#281)
+- **(core)** Omit unknown question labels from diagnostics (#279)
+- **(core)** Reject ambiguous approval choices before brokering (#278)
+- **(mea)** Retain bounded cleanup ownership across captures (#274)
+- **(mea)** Retain cleanup failures when the turn also fails (#225)
+- **(claude)** Fail turns and taint refused transcripts (#224)
+- **(codex)** Preserve version probe outcomes and host refusals (#223)
+- **(codex)** Release abandoned quota read registrations (#222)
+- **(claude)** Bound and release nested transcript storage (#221)
+- **(core)** Elect one final stream sender before terminal publication (#220)
+- **(core)** Preserve fake interaction ownership when answering (#219)
+- **(core)** Publish fake announcements atomically with attachment (#218)
+- **(examples)** Preserve retry growth and handle jitter extremes (#216)
+- **(ci)** Fail TLS policy checks on graph inspection errors (#215)
+- **(core)** Preserve session page truncation across normalization (#214)
+- [**breaking**] **(codex)** Require explicit gateway readiness and qualify vendor pins (#212)
+- [**breaking**] **(codex)** Preserve GCP sign-in and tolerate future account kinds (#239)
+- **(acp)** Retain typed cleanup failures across shared waiters (#211)
+- **(core)** Distinguish process teardown failures from launch failures (#209)
+- **(deps)** Require Tokio 1.53.3 for I/O safety (#206)
+- **(acp)** Repair Goose metadata and Codex source citations (#202)
+- **(deps)** Reject distrusted certificate intermediates (#203)
+
+### ⚡ Performance
+
+- **(core)** Strip dirty text without String::retain (#504)
+- **(codex)** Encode images into the final data URL buffer (#217)
+- **(core)** Normalize discovery permissions during intersection (#241)
+- **(codex)** Avoid unused activity construction on completion (#234)
+
+### ♻️ Refactor
+
+- **(ci)** Serve the MSRV feature check and the powerset from one driver (#440)
+- **(claude)** Share the fake Claude CLI behind a testing feature (#393)
+- [**breaking**] **(core)** Validate HTTP MCP endpoints with one core grammar (#291)
+- [**breaking**] **(core)** Compare vendor versions with one dotted-number module (#302)
+- **(claude)** Generate UUIDs with ring and drop uuid (#303)
+
+### 📚 Documentation
+
+- **(ci)** Record why the ACP adapter captures are not a scheduled lane (#479)
+- **(claude)** Record the first live --model run and pin its shape (#447)
+- **(acp)** State which vendor binary the claude-agent-acp and codex-acp profiles run (#445)
+- Record why the per-crate test command keeps --all-features (#441)
+- Assess ACP convergence for the Claude and Codex harnesses (#435)
+- Run the working-loop test command with --all-features (#403)
+- **(codex)** State when the app-server refuses a socket's parent directory (#378)
+- **(core)** Retain ring for request fingerprints (#346)
+- **(acp)** Clarify session facts and HTTP transport policy (#226)
+- **(docs)** Refresh guide navigation and bug template (#208)
+- **(release)** Maintain release and adoption procedures (#207)
+- **(docs)** Correct harness facts and evidence dates (#205)
+- **(core)** Align public contracts and lifecycle guidance with source (#204)
+
+### 🧪 Testing
+
+- **(fixtures)** Capture the claude-agent-acp and codex-acp handshakes (#459)
+- **(fixtures)** Pin the Claude recorder's output names to the packaging script (#446)
+- **(mea)** Cover the call sites of the Claude recorder's stderr notices (#437)
+- **(claude)** Pin emit_run_end and resume after a missing structured answer (#390)
+- **(codex)** Replay a real subagent attribution frame (#376)
+- **(codex)** Correlate native approval responses (#355)
+- **(acp)** Synchronize permission holds with response owners (#327)
+- **(claude)** Create scratch roots that pass under any umask (#298)
+- **(core)** Gate writes in the JSON-RPC close-race test (#305)
+- **(acp)** Replace expiry scheduler spins with causal waits (#244)
+- **(acp)** Qualify expiry answer refusal with a live sibling (#213)
+- **(mea)** Add named Codex attribution capture (#236)
+- **(consumer)** Pin the registry consumer at 0.7.1 (#199)
+
+### ⬆️ Dependencies
+
+- **(deps)** Hold new crate versions for three days before locking them (#505)
+- **(deps)** Fail cargo-deny on a new duplicate or an unused licence (#301)
+- **(deps)** Refresh the lockfile and require win32job 2.1.0 (#290)
+
+### 👷 CI
+
+- Run the feature powerset in its own parallel job (#510)
+- Prune superseded Rust caches on main (#508)
+- Install the pinned toolchain before the release cache restore (#507)
+- Restore main's Rust cache in the release jobs and save none (#506)
+- Save rust-cache from main only and share it with vendor-drift (#502)
+- Silence SC2016 on the literal backticks the vendor docs scripts print (#496)
+- Run shellcheck over the repository scripts (#486)
+- Carry the matching page and line in the ACP docs watch issue body (#484)
+- Prove the script tests named in ci.yml can run (#474)
+- Let the ACP docs watch accept a reviewed mention (#469)
+- Run the feature-lane script tests in CI (#464)
+- Watch vendor docs for an ACP page or command (#458)
+- **(release)** Install cargo-hack before release verification (#348)
+- **(deps)** Bump the actions group with 5 updates (#345)
+- **(deps)** Schedule reviewed GitHub Actions updates (#292)
+
+### 🏗️ Build
+
+- **(build)** Keep only line tables in dev and test debug info (#509)
+- **(build)** Pin Rust 1.100.0 (#501)
+- [**breaking**] **(build)** Raise the minimum Rust version to 1.98 (#503)
+- Run gated tests from the bare per-crate command (#450)
+- **(claude)** Pin Claude Code at 2.1.322 (#356)
+- **(codex)** Pin Codex at 0.167.1 (#357)
+- **(codex)** Project consumed schema semantics (#354)
+- **(acp)** Pin agent-client-protocol-schema at 1.17.0 (#299)
+- Declare third-party dependencies once in the workspace (#300)
+- **(acp)** Declare async-trait once and refuse a repeated dev-dependency (#297)
+
+## [0.7.1] - 2026-10-16
 
 ### 🚀 Features
 
