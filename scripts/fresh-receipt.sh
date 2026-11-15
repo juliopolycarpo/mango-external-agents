@@ -15,7 +15,9 @@
 #
 # Environment: RECEIPT_DIR (required); UPDATE_LOG (cargo update output); finish also reads
 # STEPS_JSON (the `steps` context as JSON), SOURCE_SHA, HEAD_SHA, EVENT_NAME, REF, RUN_ID,
-# RUN_ATTEMPT, REPOSITORY and MSRV_TOOLCHAIN, and appends a summary to GITHUB_STEP_SUMMARY.
+# RUN_ATTEMPT, REPOSITORY and MSRV_TOOLCHAIN. It records CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS
+# and CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE when set (the workflow sets the latter to `allow`) and
+# appends a summary to GITHUB_STEP_SUMMARY.
 # FRESH_ROOT overrides the directory holding Cargo.lock (default: the repository root; the test
 # uses a scratch repository).
 #
@@ -86,7 +88,7 @@ finish() {
   toolchain_report > "$RECEIPT_DIR/rustc-Vv.txt" 2>&1 || true
   # The resolver's own account of which Rust version it resolved for, and what it held back.
   local policy held
-  policy=$(grep -E '^\s*Locking [0-9]+ packages to ' "${UPDATE_LOG:-/dev/null}" 2>/dev/null | head -n 1 | sed 's/^\s*//' || true)
+  policy=$(grep -E '^\s*Locking [0-9]+ packages? to ' "${UPDATE_LOG:-/dev/null}" 2>/dev/null | head -n 1 | sed 's/^\s*//' || true)
   held=$(grep -E 'requires Rust' "${UPDATE_LOG:-/dev/null}" 2>/dev/null | sed 's/^\s*//' || true)
 
   jq -n \
@@ -99,6 +101,7 @@ finish() {
     --arg policy "$policy" \
     --arg held "$held" \
     --arg incompatible "${CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS:-}" \
+    --arg publish_age "${CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE:-}" \
     --arg source_sha "${SOURCE_SHA:-}" \
     --arg head_sha "${HEAD_SHA:-}" \
     --arg event "${EVENT_NAME:-}" \
@@ -130,7 +133,8 @@ finish() {
         resolver: {
           log_line: (if $policy == "" then null else $policy end),
           held_back_by_rust_version: ($held | split("\n") | map(select(. != ""))),
-          incompatible_rust_versions_env: (if $incompatible == "" then null else $incompatible end)
+          incompatible_rust_versions_env: (if $incompatible == "" then null else $incompatible end),
+          incompatible_publish_age_env: (if $publish_age == "" then null else $publish_age end)
         },
         source: {
           repository: $repository,

@@ -190,6 +190,19 @@ check_release_workflow() {
     echo "expected the publish job (crates) in $file to need the verify job, received no 'needs: verify'" >&2
     return 1
   fi
+  # Each `cargo publish -p` verifies the crate against crates.io, where the sibling published
+  # moments earlier is younger than the three-day hold in .cargo/config.toml and not in Cargo.lock.
+  # The override has to sit on the step that publishes, not on the verify job: the workspace dry
+  # run there stages the siblings locally and needs none.
+  found=$(workflow_job "$file" crates | awk '
+    /^[[:space:]]+- (id|name):/ { step = $0 }
+    /^[[:space:]]+CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE:[[:space:]]*allow[[:space:]]*$/ { held = step }
+    /cargo publish -p/ { published = step }
+    END { if (published != "" && held == published) print held }')
+  if [ -z "$found" ]; then
+    echo "expected the publish step in $file to set CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: allow beside 'cargo publish -p', received no such env entry on that step" >&2
+    return 1
+  fi
   found=$(grep -v '^[[:space:]]*#' "$file" | grep -E 'RUSTUP_TOOLCHAIN.*GITHUB_ENV|^[[:space:]]*RUSTUP_TOOLCHAIN:' || true)
   if [ -n "$found" ]; then
     echo "expected $file to leave the pinned toolchain selected for every other step, received RUSTUP_TOOLCHAIN set job-wide in: $found" >&2
@@ -239,6 +252,10 @@ expect_workflow_refusal 'to install shellcheck at an exact version'
 awk '/^[[:space:]]+tool:/ { held = $0; next } { print } /- run: scripts\/check[.]sh$/ { print held }' \
   "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal 'cargo-hack installation before scripts/check.sh'
+sed '/CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: allow/d' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'to set CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: allow beside'
+sed 's/CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: allow/CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: deny/' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'to set CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: allow beside'
 rm -rf "$workflow_dir"
 trap - EXIT
 echo 'release workflow checks passed'

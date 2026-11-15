@@ -1,0 +1,15 @@
+# Dependency cooldown: when Cargo 1.100 or newer resolves or updates the lockfile, it skips crate
+# versions that crates.io published less than three days ago, so a release gets a few days to be
+# yanked or noticed before this repository can lock it. Builds keep the entries already in
+# Cargo.lock, `--locked` builds do not resolve, and `cargo install` ignores the setting. Cargo 1.97
+# and older ignore the key silently; 1.98 and 1.99 print "ignoring
+# `registry.global-min-publish-age` without `-Zmin-publish-age`" on every command and ignore it.
+#
+# `cargo update` (plain or `-p <crate>`) re-resolves its targets without the lock. Inside the window
+# it downgrades a locked release that is newer than three days (a security fix included) and fails
+# with "is too new" on an exact pin (`=x.y.z`) or a sibling crate published in it. Lift the hold
+# for a single command:
+#   CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update
+# The weekly `Fresh dependencies` workflow and the release publish step set it themselves.
+[registry]
+global-min-publish-age = "3 days"

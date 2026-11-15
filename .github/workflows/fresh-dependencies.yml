@@ -16,6 +16,12 @@ name: Fresh dependencies
 # `rust-version` fits the declared minimum and falls back only when none does. So this lane tests
 # the graph a host that honours `rust-version` would get; a release that raised the minimum is held
 # back and listed in the summary rather than built.
+#
+# The repository's `.cargo/config.toml` holds new crate versions for three days (Cargo 1.100+), and
+# a host has no such file, so the job sets `CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow`: the lane
+# resolves the newest release the day it appears, which is what it exists to catch. With the hold
+# it would also fail to resolve whenever an exact pin such as the ACP schema's names a release
+# younger than three days. The receipt records the value.
 
 on:
   schedule:
@@ -48,6 +54,8 @@ jobs:
     name: Fresh resolution (ubuntu-latest)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: allow
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -74,7 +82,7 @@ jobs:
             echo '### Packages that moved from the committed lock'
             echo
             echo '```'
-            grep -E '^\s*(Updating|Adding|Removing) ' "$UPDATE_LOG" | grep -v 'crates.io index' || echo 'none'
+            grep -E '^\s*(Updating|Adding|Removing|Downgrading) ' "$UPDATE_LOG" | grep -v 'crates.io index' || echo 'none'
             echo '```'
             echo
             echo '### Held back by the minimum Rust version'

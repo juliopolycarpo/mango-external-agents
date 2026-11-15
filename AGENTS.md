@@ -81,6 +81,13 @@ It is a library, not a daemon: no listener, no service, no telemetry, no login h
   its own features through `scripts/check-features.sh` (needs that toolchain installed). A
   workspace-wide `--no-default-features` build is not bare-core coverage: Cargo unifies the other
   members' features into it.
+- **Dependency cooldown.** `.cargo/config.toml` makes Cargo 1.100+ skip crate versions published
+  less than three days ago when it resolves the lockfile; older Cargo ignores the key (1.98 and 1.99
+  warn about it). `cargo update`, plain or `-p`, ignores the lock for what it targets, so inside
+  that window it downgrades a locked release younger than three days (a security fix included) and
+  fails on an exact `=` pin or a just-published sibling crate. Run that one command with
+  `CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow`. The `Fresh dependencies` lane and the release
+  publish step set it themselves.
 - Every new function gets a test. A bug fix gets a regression test that fails first with the
   expected shape. Mock external I/O with named fake classes, not inline stubs.
 - Error messages include the received value and the expected shape.

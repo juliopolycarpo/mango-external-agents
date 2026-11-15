@@ -3,7 +3,8 @@
 #
 # Cargo is deliberately absent. The committed Cargo.lock changes only by a reviewed commit, and
 # the weekly `Fresh dependencies` workflow already resolves the newest compatible tree and reports
-# what it would break.
+# what it would break. `.cargo/config.toml` holds new crate versions for three days when a
+# maintainer resolves the lock locally; that workflow opts out, since a host has no such hold.
 #
 # The title is `ci(deps): bump …`, which scripts/check-pr-title.sh accepts: `ci` is a type
 # cliff.toml parses and `deps` is a scope AGENTS.md lists.
