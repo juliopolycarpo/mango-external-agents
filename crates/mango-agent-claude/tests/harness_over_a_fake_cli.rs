@@ -946,21 +946,8 @@ mod discovery {
 
     #[tokio::test]
     async fn a_cli_that_is_not_there_is_not_installed_rather_than_an_error() {
-        // The fake answers nothing, because a launcher that cannot spawn returns no output.
-        struct NothingLauncher;
-        #[async_trait::async_trait]
-        impl mango_external_agents::ProcessLauncher for NothingLauncher {
-            async fn spawn(
-                &self,
-                spec: mango_external_agents::LaunchSpec,
-            ) -> mango_external_agents::Result<mango_external_agents::ManagedProcess> {
-                Err(Error::Launch {
-                    program: spec.program().unwrap_or_default().to_owned(),
-                    message: String::from("No such file or directory"),
-                })
-            }
-        }
-        let context = host_under(Arc::new(NothingLauncher), Limits::default());
+        let launcher = Arc::new(FakeClaudeCli::new().without_program());
+        let context = host_under(launcher, Limits::default());
 
         let discovery = ClaudeHarness::new()
             .discover(&context)
@@ -968,6 +955,87 @@ mod discovery {
             .expect("expected a discovery rather than an error");
         assert_eq!(discovery.gate, GateVerdict::NotInstalled);
         assert_eq!(discovery.auth, AuthState::Unknown);
+    }
+
+    /// The issue's case: the CLI is on `PATH` and the launcher could not execute it. Reporting
+    /// that as not installed tells a user to install software they already have.
+    #[tokio::test]
+    async fn a_cli_that_cannot_be_executed_is_an_error_not_a_missing_cli() {
+        let launcher = Arc::new(
+            FakeClaudeCli::new().unstartable("a launcher failure (PermissionDenied, os error 13)"),
+        );
+        let context = host_under(launcher, Limits::default());
+
+        let result = ClaudeHarness::new().discover(&context).await;
+        let error = result.expect_err(
+            "expected the launch failure to reach the host | received: a discovery (not installed)",
+        );
+        assert!(
+            matches!(error.cause(), Error::Launch { message, .. }
+                if message == "a launcher failure (PermissionDenied, os error 13)"),
+            "expected Error::Launch naming PermissionDenied (os error 13) | received: {error:?}"
+        );
+    }
+
+    /// `--help` and `auth status` only refine what `--version` established, so a launch failure
+    /// there degrades the answer rather than ending discovery, as it did before the launcher could
+    /// say why. A missing program reads the same.
+    #[tokio::test]
+    async fn a_secondary_probe_that_cannot_launch_degrades_discovery_for_either_failure() {
+        for (label, cli) in [
+            (
+                "--help missing",
+                FakeClaudeCli::new().without_program_for("--help"),
+            ),
+            (
+                "--help unstartable",
+                FakeClaudeCli::new()
+                    .unstartable_for("--help", "a launcher failure (Uncategorized, os error 24)"),
+            ),
+        ] {
+            let context = host(Arc::new(cli));
+            let discovery = ClaudeHarness::new()
+                .discover(&context)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("expected a degraded discovery for {label} | received: {error:?}")
+                });
+            assert_eq!(
+                discovery.gate,
+                GateVerdict::Unknown,
+                "expected an unreadable help surface to leave the gate unknown for {label}"
+            );
+        }
+
+        for (label, cli) in [
+            (
+                "auth status missing",
+                FakeClaudeCli::new().without_program_for("status"),
+            ),
+            (
+                "auth status unstartable",
+                FakeClaudeCli::new()
+                    .unstartable_for("status", "a launcher failure (Uncategorized, os error 24)"),
+            ),
+        ] {
+            let context = host(Arc::new(cli));
+            let discovery = ClaudeHarness::new()
+                .discover(&context)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("expected a degraded discovery for {label} | received: {error:?}")
+                });
+            assert_eq!(
+                discovery.auth,
+                AuthState::Unknown,
+                "expected an unreadable auth probe to leave the account unknown for {label}"
+            );
+            assert_ne!(
+                discovery.gate,
+                GateVerdict::NotInstalled,
+                "expected a CLI whose --version ran not to be reported as not installed for {label}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1030,13 +1098,84 @@ mod discovery {
 mod opening_a_session {
     use super::*;
 
+    /// A receipt is a record of an earlier probe, so "not installed" on it is not enough to refuse
+    /// an open with a missing-program error: only a launcher can say that, and this crate must not
+    /// invent it. The open probes again. Here the CLI has been installed since, so it proceeds.
     #[tokio::test]
-    async fn a_not_installed_receipt_keeps_the_no_cli_refusal_without_probing() {
+    async fn a_stale_not_installed_receipt_is_probed_again_and_the_open_proceeds() {
         let launcher = Arc::new(FakeClaudeCli::new());
         let harness = ClaudeHarness::new();
         let host = host(Arc::clone(&launcher));
         let request = OpenSession::new("chat-1");
-        let receipt = DiscoveryReceipt::new(
+        let receipt = not_installed_receipt(&harness, &host, &request);
+
+        let session = harness
+            .open_session(&host, request.with_discovery(receipt))
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("{error:?}"));
+        assert_eq!(
+            session,
+            Ok(()),
+            "expected a CLI installed since a not-installed receipt to open"
+        );
+        assert!(
+            launcher
+                .launches()
+                .iter()
+                .any(|launch| launch.argv.iter().any(|argument| argument == "--version")),
+            "expected the open to probe --version again | received: {:?}",
+            launcher.launches()
+        );
+    }
+
+    /// Still missing: the error is the launcher's own answer to this open's probe, with the name
+    /// it was asked for. A custom executable is not renamed to `claude`, which is how this tells
+    /// the launcher's error from one this crate built from the receipt.
+    #[tokio::test]
+    async fn a_not_installed_receipt_over_a_custom_executable_returns_the_launchers_error() {
+        let launcher = Arc::new(FakeClaudeCli::new().without_program());
+        let harness = ClaudeHarness::new().with_executable("/opt/claude/bin/claude");
+        let host = host(Arc::clone(&launcher));
+        let request = OpenSession::new("chat-1");
+        let receipt = not_installed_receipt(&harness, &host, &request);
+
+        let error = harness
+            .open_session(&host, request.with_discovery(receipt))
+            .await
+            .map(|_| ())
+            .expect_err("expected a refusal for a CLI that is still missing");
+        assert!(
+            matches!(error.cause(), Error::ProgramNotFound { program }
+                if program == "/opt/claude/bin/claude"),
+            "expected the launcher's Error::ProgramNotFound naming /opt/claude/bin/claude | \
+             received: {error:?}"
+        );
+    }
+
+    /// Without a receipt the same custom executable gives the same error.
+    #[tokio::test]
+    async fn opening_a_custom_executable_that_is_missing_names_that_executable() {
+        let launcher = Arc::new(FakeClaudeCli::new().without_program());
+        let error = ClaudeHarness::new()
+            .with_executable("/opt/claude/bin/claude")
+            .open_session(&host(Arc::clone(&launcher)), OpenSession::new("chat-1"))
+            .await
+            .map(|_| ())
+            .expect_err("expected a refusal for a CLI that is not installed");
+        assert!(
+            matches!(error.cause(), Error::ProgramNotFound { program }
+                if program == "/opt/claude/bin/claude"),
+            "expected Error::ProgramNotFound naming /opt/claude/bin/claude | received: {error:?}"
+        );
+    }
+
+    fn not_installed_receipt(
+        harness: &ClaudeHarness,
+        host: &HostContext,
+        request: &OpenSession,
+    ) -> DiscoveryReceipt {
+        DiscoveryReceipt::new(
             HarnessId::claude(),
             mango_external_agents::Discovery::not_installed(),
             host.now(),
@@ -1046,25 +1185,49 @@ mod opening_a_session {
         .with_authorization_fingerprint("same-authorization")
         .bind_to_open(
             harness.descriptor(),
-            &host,
-            &request,
+            host,
+            request,
             DiscoveryReceiptMeasurements::new()
                 .with_executable_fingerprint("no-cli")
                 .with_environment_fingerprint("same-environment")
                 .with_authorization_fingerprint("same-authorization"),
         )
-        .expect("expected current receipt evidence to match");
+        .expect("expected current receipt evidence to match")
+    }
 
-        let error = harness
-            .open_session(&host, request.with_discovery(receipt))
+    /// Without a receipt the open path probes `--version` again. A missing program comes back as
+    /// the launcher's own typed answer, not as "a CLI that reported no version".
+    #[tokio::test]
+    async fn opening_without_a_receipt_reports_a_missing_program_as_such() {
+        let launcher = Arc::new(FakeClaudeCli::new().without_program());
+        let error = ClaudeHarness::new()
+            .open_session(&host(Arc::clone(&launcher)), OpenSession::new("chat-1"))
             .await
             .map(|_| ())
-            .expect_err("expected a no-CLI refusal");
+            .expect_err("expected a refusal for a CLI that is not installed");
         assert!(
-            matches!(error.cause(), Error::Launch { .. }),
-            "expected the no-CLI launch refusal, received {error:?}"
+            error.is_program_not_found(),
+            "expected Error::ProgramNotFound | received: {error:?}"
         );
-        assert!(launcher.launches().is_empty(), "expected no vendor probe");
+    }
+
+    /// The second probe used to replace the launcher's error with "a CLI that reported no
+    /// version", which dropped the OS error a second time.
+    #[tokio::test]
+    async fn opening_without_a_receipt_keeps_the_os_error_of_a_cli_that_cannot_be_executed() {
+        let launcher = Arc::new(
+            FakeClaudeCli::new().unstartable("a launcher failure (PermissionDenied, os error 13)"),
+        );
+        let error = ClaudeHarness::new()
+            .open_session(&host(Arc::clone(&launcher)), OpenSession::new("chat-1"))
+            .await
+            .map(|_| ())
+            .expect_err("expected the launch failure to refuse the open");
+        assert!(
+            matches!(error.cause(), Error::Launch { message, .. }
+                if message == "a launcher failure (PermissionDenied, os error 13)"),
+            "expected Error::Launch naming PermissionDenied (os error 13) | received: {error:?}"
+        );
     }
 
     /// What a receipt is worth, as a number rather than as a claim.
