@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.9.0] - 2026-11-15
+
+### 🚀 Features
+
+- [**breaking**] **(core)** Tell a missing program from any other launch failure (#514)
+
+### 🧪 Testing
+
+- **(release)** Pin the registry consumer at 0.8.0 (#512)
+
 ## [0.8.0] - 2026-11-15
 
 ### 🚀 Features
