@@ -91,7 +91,7 @@ Naming a test in `ci.yml` is not enough. `scripts/ci-script-steps.py` parses the
 - its `run:` block reaches it: the block is split into commands at newlines, `;`, `&&`, `||`, `|`
   and `&`, and the test command is joined to its neighbours only by a newline or `;`, sits in no
   `if`, loop, `case`, function, group or subshell, follows no `exit` that can end the block and no
-  `set +e`, and is not followed by `|| true`, `|| :`, `|| exit 0` or another `||` handler;
+  `set +e`, and is not followed by a `||` handler other than an `exit` with a failing status;
 - its step runs under no `shell:`, or `bash` or `sh`, the shells that stop at a failing command;
   the step, the job's `defaults.run` and the workflow's `defaults.run` are all read;
 - the workflow triggers on `pull_request` and has a `gate` job.

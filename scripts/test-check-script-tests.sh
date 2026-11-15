@@ -309,6 +309,21 @@ block_fail 'a command after a conditional exit 0' $'[ -n "$SKIP" ] && exit 0\nsc
 block_fail 'a name in a here-document' $'cat <<EOF\nscripts/test-beta.py\nEOF' 'it appears in a here-document'
 block_fail 'a name in a command substitution' 'echo $(scripts/test-beta.py)' '`echo $(scripts/test-beta.py)` names it but does not start with it as a command'
 
+# Shell forms that look harmless but let a failing test exit the step with status 0, or never run it.
+block_pass 'a command after an arithmetic command' $'(( n = 1 ))\nscripts/test-beta.py'
+block_fail 'a failing exit handler that runs in the background' 'scripts/test-beta.py || exit 1 &' "its failure is handled by \`|| exit 1\`, $not_followed"
+block_fail 'a failing exit handler that is piped' 'scripts/test-beta.py || exit 1 | cat' "its failure is handled by \`|| exit 1\`, $not_followed"
+block_fail 'a name in a here-document with a backslash-quoted delimiter' $'cat <<\\EOF\nscripts/test-beta.py\nEOF' 'it appears in a here-document'
+block_fail 'a here-document body between a || and the command' $'true <<EOF ||\nx\nEOF\nscripts/test-beta.py' "it is joined to the command before it by \`||\`, $not_followed"
+block_fail 'a quoted ) inside a subshell' $'(\necho "a)"\nscripts/test-beta.py\n) || true' "it is inside a shell \`(\` block, $not_followed"
+block_fail 'a || handler that exits with a multiple of 256' 'scripts/test-beta.py || exit 256' "its failure is handled by \`|| exit 256\`, $not_followed"
+block_fail 'a command after a conditional exit 256' $'[ -n "$SKIP" ] && exit 256\nscripts/test-beta.py' 'it follows `exit 256`, which a condition can reach to end the run block early'
+block_fail 'a command after a conditional bare exit' $'[ -n "$SKIP" ] && exit\nscripts/test-beta.py' 'it follows `exit`, which a condition can reach to end the run block early'
+block_pass 'a command after a bare exit that handles a failure' $'true || exit\nscripts/test-beta.py'
+block_fail 'a command after eval set +e' $'eval \'set +e\'\nscripts/test-beta.py' $'it follows `eval \'set +e\'`, which turns off errexit'
+block_fail 'a command after command set +e' $'command set +e\nscripts/test-beta.py' 'it follows `command set +e`, which turns off errexit'
+block_fail 'a command after builtin set +e' $'builtin set +e\nscripts/test-beta.py' 'it follows `builtin set +e`, which turns off errexit'
+
 # The shell has to stop at a failing command, wherever it is declared.
 shell_pass() {
   shell_name=$2

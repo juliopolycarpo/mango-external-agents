@@ -13,7 +13,7 @@ as run only when every one of these holds:
   newlines, `;`, `&&`, `||`, `|` and `&` (quotes, `$(...)`, comments and here-documents respected)
   and a test command counts only when it is joined to its neighbours by a newline or `;`, sits in no
   `if`, loop, `case`, function, group or subshell, follows no `exit` that can end the block and no
-  `set +e`, and is not followed by `|| true`, `|| :`, `|| exit 0` or any other `||` handler;
+  `set +e`, and is not followed by a `||` handler other than an `exit` with a failing status;
 - the step runs under no `shell:` or under `bash` or `sh`, the shells that stop at a failing
   command, whether set on the step or by `defaults.run`;
 - the workflow triggers on `pull_request`, and has a `gate` job.
@@ -31,6 +31,7 @@ block, and anything a command does after it starts (a test script that exits 0 o
 Usage: ci-script-steps.py WORKFLOW
 """
 import re
+import shlex
 import sys
 
 try:
@@ -52,7 +53,8 @@ OS_TEST = re.compile(r"^matrix\.os\s*==\s*'([^']+)'$")
 
 # The operators that join two commands without conditioning one on the other.
 SEQUENTIAL = (None, "\n", ";", ";;", ";&")
-HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+# The delimiter may be quoted or backslash-quoted (`<<\EOF`); either way the body is still a body.
+HEREDOC = re.compile(r"<<-?\s*\\?(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 # Words that open or continue a shell construct at the start of a command.
 CONTINUATION = re.compile(r"^(?:then|else|do|elif)(?:\s+|$)(.*)$", re.S)
 CONDITION_OPENER = re.compile(r"^(if|while|until)(?:\s+|$)(.*)$", re.S)
@@ -65,7 +67,7 @@ FUNCTION_HEAD = re.compile(
 # A `case` arm's pattern list, `a|b)`, ahead of its command.
 CASE_ARM = re.compile(r"^\(?[^()\s]+(?:\|[^()\s]+)*\)\s*(.*)$", re.S)
 EXIT = re.compile(r"^exit(?:\s|$)")
-FAILING_EXIT = re.compile(r"^exit(?:\s+[1-9][0-9]*)?\s*(?:$|[>&])")
+EXIT_STATUS = re.compile(r"^exit(?:\s+([0-9]+))?\s*(?:$|[>&])")
 SWALLOWING_HANDLER = re.compile(r"^(?:true|:|exit\s+0)(?:\s|$)")
 
 
@@ -308,6 +310,49 @@ def split_commands(run):
     return entries
 
 
+def is_failing_exit(command):
+    """True for a bare `exit` or `exit N` whose status is not 0 once the shell wraps it mod 256."""
+    match = EXIT_STATUS.match(command)
+    return bool(match) and (match.group(1) is None or int(match.group(1)) % 256 != 0)
+
+
+def is_bare_exit(command):
+    """True for an `exit` without a status, which exits with the status of the last command."""
+    match = EXIT_STATUS.match(command)
+    return bool(match) and match.group(1) is None
+
+
+def operator_before(entries, index):
+    """The operator that ended the last command before entries[index], or None at the start.
+
+    A here-document body sits between the line's operator and the next command but is not a
+    command: skipping it keeps `true <<EOF ||` joined to the command after the terminator.
+    """
+    for previous in range(index - 1, -1, -1):
+        if not entries[previous][2]:
+            return entries[previous][1]
+    return None
+
+
+def unquoted_parentheses(command):
+    """The (index, char) of each `(` and `)` outside quotes and not escaped by a backslash."""
+    found, quote, i = [], None, 0
+    while i < len(command):
+        char = command[i]
+        if quote == "'":
+            quote = None if char == "'" else quote
+        elif char == "\\":
+            i += 1
+        elif quote == '"':
+            quote = None if char == '"' else quote
+        elif char in "'\"":
+            quote = char
+        elif char in "()":
+            found.append((i, char))
+        i += 1
+    return found
+
+
 def enter_constructs(command, stack):
     """Strips leading shell keywords off a command, keeping `stack` of the open constructs.
 
@@ -341,7 +386,8 @@ def enter_constructs(command, stack):
             if stack:
                 stack.pop()
             command = command[1:].strip()
-        elif command.startswith("("):
+        elif command.startswith("(") and not command.startswith("(("):
+            # `((` opens an arithmetic command, which is a command, not a subshell.
             stack.append("(")
             command = command[1:].strip()
         elif command.startswith(")"):
@@ -349,15 +395,32 @@ def enter_constructs(command, stack):
                 stack.pop()
             command = command[1:].strip()
         else:
-            closes = bool(stack) and stack[-1] == "(" and command.count(")") > command.count("(")
+            # A parenthesis inside quotes does not close the subshell.
+            parentheses = unquoted_parentheses(command)
+            opens = sum(char == "(" for _, char in parentheses)
+            closes = bool(stack) and stack[-1] == "(" and len(parentheses) - opens > opens
             if closes:
-                command = command[: command.rindex(")")]
+                command = command[: max(i for i, char in parentheses if char == ")")]
             return command.strip(), can_run, closes
 
 
 def errexit_change(command):
-    """'off' for `set +e`, `set +eu`, `set +o errexit`; 'on' for the `-` forms; else None."""
-    words = command.split()
+    """'off' for `set +e`, `set +eu`, `set +o errexit`; 'on' for the `-` forms; else None.
+
+    `command` and `builtin` before `set` change nothing; `eval` runs its arguments as commands, so
+    the last change among them counts.
+    """
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        words = command.split()
+    while words and words[0] in ("command", "builtin"):
+        words = words[1:]
+    if words and words[0] == "eval":
+        changes = [
+            errexit_change(part) for part in re.split(r"[;&|\n]+", " ".join(words[1:])) if part.strip()
+        ]
+        return next((change for change in reversed(changes) if change), None)
     if not words or words[0] != "set":
         return None
     change = None
@@ -377,17 +440,19 @@ def command_blocker(entries, index, stack, ended_by, errexit_off):
         return f"it is inside a shell `{stack[-1]}` block, which the check does not follow"
     if errexit_off:
         return f"it follows `{errexit_off}`, which turns off errexit"
-    before = entries[index - 1][1] if index else None
+    before = operator_before(entries, index)
     if before not in SEQUENTIAL:
         return f"it is joined to the command before it by `{before}`, which the check does not follow"
     after = entries[index][1]
     if after in SEQUENTIAL:
         return None
     if after == "||" and index + 1 < len(entries):
-        handler = entries[index + 1][0]
+        handler, after_handler = entries[index + 1][:2]
         if SWALLOWING_HANDLER.match(handler):
             return "its line ends with `|| true`, `|| :` or `|| exit 0`"
-        if FAILING_EXIT.match(handler):
+        # `|| exit 1 &` backgrounds the exit and `|| exit 1 | cat` runs it in a pipeline subshell:
+        # neither ends the block, so the handler counts only when a sequential operator follows it.
+        if is_failing_exit(handler) and after_handler in SEQUENTIAL:
             return None
         return f"its failure is handled by `|| {handler}`, which the check does not follow"
     return f"it is joined to the command after it by `{after}`, which the check does not follow"
@@ -406,7 +471,7 @@ def run_findings(run):
                 yield name, "it appears in a here-document"
             continue
         command, can_run, closes = enter_constructs(text, stack)
-        before = entries[index - 1][1] if index else None
+        before = operator_before(entries, index)
         unconditional = not stack and before in SEQUENTIAL and after in SEQUENTIAL
         match = COMMAND.match(command) if can_run else None
         if match:
@@ -422,7 +487,9 @@ def run_findings(run):
         if EXIT.match(command) and not ended_by:
             if unconditional:
                 ended_by = f"it follows `{command}` on an earlier line of the same run block"
-            elif not FAILING_EXIT.match(command) and not (before == "||" and command == "exit"):
+            elif not is_failing_exit(command) or (is_bare_exit(command) and before != "||"):
+                # A bare `exit` reuses the status of the command before it: failing after `||`,
+                # but 0 after `&&` or inside a taken `then`, where it ends the block as a success.
                 ended_by = f"it follows `{command}`, which a condition can reach to end the run block early"
 
 
