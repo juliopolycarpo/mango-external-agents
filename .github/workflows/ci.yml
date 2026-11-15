@@ -95,7 +95,7 @@ jobs:
       - run: dprint check
 
   msrv:
-    name: MSRV (1.97)
+    name: MSRV (1.98)
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -134,7 +134,7 @@ jobs:
   # `windows` behind the core's `launcher-tokio`. A workspace `check` at the minimum reaches all of
   # them; the per-package feature matrix runs once on Linux above.
   msrv-windows:
-    name: MSRV (1.97, windows-latest)
+    name: MSRV (1.98, windows-latest)
     runs-on: windows-latest
     timeout-minutes: 25
     steps:

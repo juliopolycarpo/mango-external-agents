@@ -40,7 +40,7 @@ core_crate=mango-external-agents
 
 usage="usage: scripts/check-features.sh (powerset|msrv) [cargo args...] | --print-toolchain"
 
-# The declared minimum Rust, as a full toolchain name (`1.97` in Cargo.toml is `1.97.0`).
+# The declared minimum Rust, as a full toolchain name (`1.98` in Cargo.toml is `1.98.0`).
 msrv_toolchain() {
   local rust_version
   rust_version=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^rust-version = "\([0-9][0-9]*\.[0-9][0-9]*\)"/\1/p;}' Cargo.toml)
