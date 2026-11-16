@@ -65,6 +65,9 @@ else
   echo "warning: cargo-hack not found on PATH; skipped the depth-2 feature powerset that CI runs (cargo install cargo-hack --locked)" >&2
 fi
 run cargo nextest run --workspace --all-features --locked
+# The run above links `mango-agent-acp`, which turns on `serde_json/preserve_order` for the whole
+# workspace. One package alone is built without it, where the byte-pinning tests see a sorted `Map`.
+run cargo nextest run -p mango-agent-claude --locked
 run cargo test --doc --workspace --all-features --locked
 RUSTDOCFLAGS="-D warnings" run cargo doc --no-deps --workspace --all-features --locked
 run cargo deny check -D unmatched-skip -D unnecessary-skip

@@ -16,11 +16,13 @@
 //!
 //! <https://code.claude.com/docs/en/mcp.md>
 
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use mango_external_agents::{Error, McpServer, McpTransport, Result, http_endpoint};
-use serde_json::{Map, Value, json};
+use serde::Serialize;
+use serde::ser::{SerializeMap, Serializer};
 
 trait FileWriter {
     fn write_new(&self, path: &Path, contents: &[u8]) -> std::io::Result<()>;
@@ -178,11 +180,10 @@ impl ConfigFile {
     }
 
     /// Writes the document into the directory this value already owns.
-    fn populate(&self, document: &Value, writer: &impl FileWriter) -> Result<()> {
+    fn populate(&self, document: &str, writer: &impl FileWriter) -> Result<()> {
         let path = self.path();
-        let contents = document.to_string();
         writer
-            .write_new(path, contents.as_bytes())
+            .write_new(path, document.as_bytes())
             .map_err(|error| scratch_failure("write the MCP configuration", &error))?;
         Ok(())
     }
@@ -403,14 +404,62 @@ pub(crate) async fn release_off_worker<T: Send + 'static>(value: Option<T>) {
 
 /// The `mcpServers` document, as the vendor's own configuration files spell it.
 ///
+/// Typed structs rather than `json!` and a `Map`: a `serde_json::Map` sorts its keys unless some
+/// crate in the build turns on `preserve_order`. The file therefore writes the servers in the order
+/// the host listed them and each entry's members in declaration order, in every build.
+#[derive(Serialize)]
+struct Document<'a> {
+    #[serde(rename = "mcpServers")]
+    mcp_servers: ServerList<'a>,
+}
+
+/// Servers by name, in the order the host listed them.
+struct ServerList<'a>(Vec<(&'a str, Entry<'a>)>);
+
+impl Serialize for ServerList<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (name, entry) in &self.0 {
+            map.serialize_entry(name, entry)?;
+        }
+        map.end()
+    }
+}
+
+/// One server's entry.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum Entry<'a> {
+    /// No `type` key: the vendor reads an entry without one as a stdio server, which is what
+    /// this is. Empty `args` and `env` are omitted rather than written as empty containers.
+    Stdio {
+        command: &'a str,
+        #[serde(skip_serializing_if = "<[String]>::is_empty")]
+        args: &'a [String],
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        env: &'a BTreeMap<String, String>,
+    },
+    /// `type` is mandatory here: the vendor documents an entry with a `url` and no `type` as a
+    /// configuration error it reports and skips.
+    Http {
+        r#type: &'static str,
+        url: &'a str,
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        headers: &'a BTreeMap<String, String>,
+    },
+}
+
+/// The document's compact text.
+///
 /// # Errors
 ///
 /// [`Error::HostConfiguration`] for a transport kind this harness does not map. [`McpTransport`]
 /// is `#[non_exhaustive]`, so the core can grow one — and a server written into the file under a
 /// guessed shape would be a server the vendor cannot reach, reported as though it had been
 /// configured.
-fn document_for(servers: &[McpServer]) -> Result<Value> {
-    let mut configured = Map::new();
+fn document_for(servers: &[McpServer]) -> Result<String> {
+    let mut configured = Vec::with_capacity(servers.len());
+    let mut names = HashSet::with_capacity(servers.len());
     for (index, server) in servers.iter().enumerate() {
         if let McpTransport::Http { url, headers } = &server.transport
             && (!http_endpoint::is_http_url(url)
@@ -432,11 +481,11 @@ fn document_for(servers: &[McpServer]) -> Result<Value> {
             received: format!("an unmapped transport on the server at index {index}"),
         })?;
         // The vendor's `mcpServers` is a map, so a repeated name can only keep one entry — and
-        // `insert` would keep the last quietly. That is the same drop this module refuses an
+        // a map would keep the last quietly. That is the same drop this module refuses an
         // unusable transport for: a turn that runs without the tools somebody configured, reported
         // as though it had been set up. Which of the two the host meant is not this harness's guess
         // to make.
-        if configured.insert(server.name.clone(), entry).is_some() {
+        if !names.insert(server.name.as_str()) {
             let count = servers
                 .iter()
                 .filter(|other| other.name == server.name)
@@ -446,36 +495,25 @@ fn document_for(servers: &[McpServer]) -> Result<Value> {
                 received: format!("{count} servers sharing the name at index {index}"),
             });
         }
+        configured.push((server.name.as_str(), entry));
     }
-    Ok(json!({ "mcpServers": Value::Object(configured) }))
+    serde_json::to_string(&Document {
+        mcp_servers: ServerList(configured),
+    })
+    .map_err(|error| Error::HostConfiguration {
+        expected: "an MCP configuration that serialises as JSON",
+        received: error.to_string(),
+    })
 }
 
-fn entry_for(transport: &McpTransport) -> Option<Value> {
+fn entry_for(transport: &McpTransport) -> Option<Entry<'_>> {
     Some(match transport {
-        // No `type` key: the vendor reads an entry without one as a stdio server, which is what
-        // this is. Empty `args` and `env` are omitted rather than written as empty containers.
-        McpTransport::Stdio { command, args, env } => {
-            let mut entry = Map::new();
-            entry.insert(String::from("command"), json!(command));
-            if !args.is_empty() {
-                entry.insert(String::from("args"), json!(args));
-            }
-            if !env.is_empty() {
-                entry.insert(String::from("env"), json!(env));
-            }
-            Value::Object(entry)
-        }
-        // `type` is mandatory here: the vendor documents an entry with a `url` and no `type` as a
-        // configuration error it reports and skips.
-        McpTransport::Http { url, headers } => {
-            let mut entry = Map::new();
-            entry.insert(String::from("type"), json!("http"));
-            entry.insert(String::from("url"), json!(url));
-            if !headers.is_empty() {
-                entry.insert(String::from("headers"), json!(headers));
-            }
-            Value::Object(entry)
-        }
+        McpTransport::Stdio { command, args, env } => Entry::Stdio { command, args, env },
+        McpTransport::Http { url, headers } => Entry::Http {
+            r#type: "http",
+            url,
+            headers,
+        },
         _ => return None,
     })
 }
@@ -693,6 +731,12 @@ mod tests {
         ]
     }
 
+    /// The document as a tree, for the tests that care about its content and not its member order.
+    fn parsed_document(servers: &[McpServer]) -> serde_json::Value {
+        let text = document_for(servers).expect("expected a document");
+        serde_json::from_str(&text).expect("expected the document to be JSON")
+    }
+
     #[test]
     fn refuses_two_servers_that_claim_the_same_name() {
         let mut servers = servers();
@@ -774,7 +818,7 @@ mod tests {
     #[test]
     fn writes_the_shape_the_vendors_own_configuration_files_use() {
         assert_eq!(
-            document_for(&servers()).expect("expected a document"),
+            parsed_document(&servers()),
             json!({
                 "mcpServers": {
                     "docs": {
@@ -794,12 +838,63 @@ mod tests {
 
     #[test]
     fn a_stdio_entry_carries_no_type_and_no_empty_containers() {
-        let document =
-            document_for(&[McpServer::stdio("bare", "bare-mcp")]).expect("expected a document");
+        let document = parsed_document(&[McpServer::stdio("bare", "bare-mcp")]);
         assert_eq!(
             document["mcpServers"]["bare"],
             json!({ "command": "bare-mcp" })
         );
+    }
+
+    /// The file's bytes, which the vendor reads as JSON and so does not care about member order,
+    /// but which a fixture or a capture of the file does. Servers go out in the order the host
+    /// listed them (here not the sorted order), and each entry's members in declaration order, in a
+    /// build with or without `serde_json/preserve_order`. `cargo nextest run --workspace` runs this
+    /// with the feature on (`mango-agent-acp` turns it on), and `cargo nextest run -p
+    /// mango-agent-claude`, the lane `scripts/check.sh` and CI add, runs it without.
+    #[tokio::test]
+    async fn the_file_keeps_one_member_order_in_every_build() {
+        let scratch = tempdir();
+        let listed = vec![
+            McpServer {
+                name: String::from("zeta"),
+                transport: McpTransport::Http {
+                    url: String::from("https://mcp.example.com/mcp"),
+                    headers: [(String::from("Authorization"), String::from("Bearer t"))]
+                        .into_iter()
+                        .collect(),
+                },
+            },
+            McpServer {
+                name: String::from("alpha"),
+                transport: McpTransport::Stdio {
+                    command: String::from("npx"),
+                    args: vec![String::from("-y"), String::from("docs-mcp")],
+                    env: [(String::from("DOCS_TOKEN"), String::from("s3cret"))]
+                        .into_iter()
+                        .collect(),
+                },
+            },
+            McpServer::stdio("mid", "bare-mcp"),
+        ];
+        let file = ConfigFile::write(&listed, &scratch)
+            .await
+            .expect("expected a file")
+            .expect("expected servers to produce one");
+
+        let written = std::fs::read_to_string(file.path()).expect("expected the file to exist");
+        let expected = concat!(
+            r#"{"mcpServers":{"#,
+            r#""zeta":{"type":"http","url":"https://mcp.example.com/mcp","headers":{"Authorization":"Bearer t"}},"#,
+            r#""alpha":{"command":"npx","args":["-y","docs-mcp"],"env":{"DOCS_TOKEN":"s3cret"}},"#,
+            r#""mid":{"command":"bare-mcp"}"#,
+            r#"}}"#,
+        );
+        assert_eq!(
+            written, expected,
+            "expected these exact bytes in the --mcp-config file | received {written}"
+        );
+        drop(file);
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     #[tokio::test]

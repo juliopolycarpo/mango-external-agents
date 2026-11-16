@@ -27,7 +27,7 @@ use mango_external_agents::{
     Resumability, SessionLifecycle, SessionState as CoreSessionState, SessionStatus, StdioSpec,
     StopOutcome, StructureClose, TurnRequest, TurnStream, VendorError, event, transports::stdio,
 };
-use serde_json::json;
+use serde::Serialize;
 
 use crate::argv::TurnArgv;
 use crate::cli_surface::CliSurface;
@@ -2071,7 +2071,7 @@ async fn pump(
     // cancellation paths that own this attempt.
     let prompt = await_prompt_io(
         async {
-            sender.send(prompt_line(&input)).await?;
+            sender.send(prompt_line(&input)?).await?;
             sender.close().await
         },
         "Claude prompt input",
@@ -2613,12 +2613,41 @@ fn mark_unconfirmed_resume_nonresumable(state: &mut Mutable, end: &TurnEnd) {
 }
 
 /// One user message, as `--input-format stream-json` takes it.
-fn prompt_line(input: &str) -> String {
-    json!({
-        "type": "user",
-        "message": { "role": "user", "content": [{ "type": "text", "text": input }] }
+///
+/// Typed structs rather than `json!`: a `serde_json::Map` sorts its keys unless some crate in the
+/// build turns on `preserve_order`, so the declared field order is what keeps the bytes the same
+/// in every build.
+fn prompt_line(input: &str) -> Result<String> {
+    #[derive(Serialize)]
+    struct UserLine<'a> {
+        r#type: &'static str,
+        message: UserMessage<'a>,
+    }
+    #[derive(Serialize)]
+    struct UserMessage<'a> {
+        role: &'static str,
+        content: [TextBlock<'a>; 1],
+    }
+    #[derive(Serialize)]
+    struct TextBlock<'a> {
+        r#type: &'static str,
+        text: &'a str,
+    }
+    let line = UserLine {
+        r#type: "user",
+        message: UserMessage {
+            role: "user",
+            content: [TextBlock {
+                r#type: "text",
+                text: input,
+            }],
+        },
+    };
+    // Plain strings and sequences cannot fail to serialise; the arm keeps a failure typed anyway.
+    serde_json::to_string(&line).map_err(|error| Error::Protocol {
+        expected: String::from("a stream-json user message that serialises"),
+        received: error.to_string(),
     })
-    .to_string()
 }
 
 /// What to say about a process that ended without a `result` record.
@@ -3602,7 +3631,7 @@ mod tests {
 
     #[test]
     fn the_prompt_travels_as_one_stream_json_user_message() {
-        let line = prompt_line("read note.txt");
+        let line = prompt_line("read note.txt").expect("expected a line");
         let parsed: serde_json::Value = serde_json::from_str(&line).expect("expected valid JSON");
         assert_eq!(parsed["type"], "user");
         assert_eq!(parsed["message"]["role"], "user");
@@ -3611,9 +3640,25 @@ mod tests {
         assert!(!line.contains('\n'), "expected one line, received {line:?}");
     }
 
+    /// The stream-json line goes out with its members in declaration order, whether or not
+    /// `serde_json/preserve_order` is on in the build (a sorted map would write `message` first).
+    /// `cargo nextest run --workspace` runs this with the feature on (`mango-agent-acp` turns it
+    /// on), and `cargo nextest run -p mango-agent-claude`, the lane `scripts/check.sh` and CI add,
+    /// runs it without.
+    #[test]
+    fn the_prompt_line_keeps_one_member_order_in_every_build() {
+        let line = prompt_line("read note.txt").expect("expected a line");
+        let expected = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"read note.txt"}]}}"#;
+        assert_eq!(
+            line, expected,
+            "expected these exact bytes on stdin | received {line}"
+        );
+    }
+
     #[test]
     fn a_prompt_that_contains_json_is_still_one_line() {
-        let line = prompt_line("send {\"type\":\"result\"}\nand a newline");
+        let line =
+            prompt_line("send {\"type\":\"result\"}\nand a newline").expect("expected a line");
         assert!(
             !line.contains('\n'),
             "expected the newline to be escaped, received {line:?}"
