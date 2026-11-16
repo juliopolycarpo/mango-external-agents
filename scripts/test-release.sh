@@ -132,7 +132,7 @@ echo 'release tag signature checks passed'
 # a release workflow change can only be exercised by a real tag, so its shape is pinned here. The
 # verify job installs the toolchain the script itself names (no version literal to drift from
 # `rust-version`), runs `scripts/check-features.sh msrv --locked`, and never selects the minimum for
-# the other steps: `check.sh` and `check-publish.sh` stay on the pinned toolchain. Comment lines are
+# the other steps: `check-publish.sh` stays on the pinned toolchain. Comment lines are
 # ignored so a note cannot satisfy a check. Every refusal names the behaviour, the file and what
 # the file holds instead. RELEASE_WORKFLOW points the check at another file.
 release_workflow=${RELEASE_WORKFLOW:-$PWD/.github/workflows/release.yml}
@@ -162,27 +162,55 @@ check_release_workflow() {
     echo "expected the minimum toolchain to be installed before the isolated feature check in $file, received the install at verify line ${install_line%%:*} and the check at line ${check_line%%:*}" >&2
     return 1
   fi
-  # Missing cargo-hack makes check.sh skip its powerset instead of failing the release.
-  install_line=$(grep -nE '^[[:space:]]+tool:[[:space:]]*([^,]+,)*cargo-hack(,|[[:space:]]*$)' <<<"$verify" | head -n 1 || true)
-  if [ -z "$install_line" ]; then
-    echo "expected the release verify job in $file to install cargo-hack for the stable feature powerset, received no cargo-hack tool entry" >&2
+  # The isolated feature check drives cargo-hack, and the publication gate runs the extracted
+  # packages' tests under cargo-nextest; each has to be installed before the step that needs it.
+  local tool
+  for tool in cargo-hack cargo-nextest; do
+    install_line=$(grep -nE "^[[:space:]]+tool:[[:space:]]*([^,]+,)*$tool(,|[[:space:]]*\$)" <<<"$verify" | head -n 1 || true)
+    if [ -z "$install_line" ]; then
+      echo "expected the release verify job in $file to install $tool before the steps that run it, received no $tool tool entry" >&2
+      return 1
+    fi
+    check_line=$(grep -nF -- 'scripts/check-publish.sh --list' <<<"$verify" | head -n 1 || true)
+    if [ -z "$check_line" ] || [ "${install_line%%:*}" -ge "${check_line%%:*}" ]; then
+      echo "expected $tool installation before the publication gate in $file, received install at verify line ${install_line%%:*} and the gate at line ${check_line%%:*}" >&2
+      return 1
+    fi
+  done
+  # The CI workflow already ran everything scripts/check.sh does, on the push that put this commit
+  # on main, so the release asks GitHub whether that run passed instead of running it again. The
+  # question has to come before anything is built, has to read the actions API, and has to be able
+  # to stop the release: a step that is conditional or may fail asks nothing.
+  if grep -qE 'scripts/check[.]sh([[:space:]]|$)' <<<"$verify"; then
+    echo "expected the release verify job in $file not to run scripts/check.sh again, received a step that does" >&2
     return 1
   fi
-  check_line=$(grep -nE '^[[:space:]]+- run: scripts/check[.]sh[[:space:]]*$' <<<"$verify" | head -n 1 || true)
-  if [ -z "$check_line" ] || [ "${install_line%%:*}" -ge "${check_line%%:*}" ]; then
-    echo "expected cargo-hack installation before scripts/check.sh in $file, received install at verify line ${install_line%%:*} and check at line ${check_line%%:*}" >&2
+  # shellcheck disable=SC2016 # the workflow line holds the literal $REPOSITORY and $RELEASE_COMMIT
+  check_line=$(grep -nF -- 'scripts/check-release-ci.sh "$REPOSITORY" "$RELEASE_COMMIT"' <<<"$verify" | head -n 1 || true)
+  if [ -z "$check_line" ]; then
+    echo "expected the release verify job in $file to run scripts/check-release-ci.sh \"\$REPOSITORY\" \"\$RELEASE_COMMIT\" so a commit whose CI did not pass is not published, received no such step" >&2
     return 1
   fi
-  # A hosted runner image carries its own shellcheck, so without the pinned install check.sh would
-  # lint the release with whatever version the image has.
-  found=$(grep -nE '^[[:space:]]+tool:[[:space:]]*([^,]+,)*shellcheck@[0-9]+[.][0-9]+[.][0-9]+(,|[[:space:]]*$)' <<<"$verify" | head -n 1 || true)
-  if [ -z "$found" ]; then
-    echo "expected the release verify job in $file to install shellcheck at an exact version before scripts/check.sh, received no shellcheck@<version> tool entry" >&2
+  found=$(grep -nF -- 'scripts/check-publish.sh --list' <<<"$verify" | head -n 1 || true)
+  if [ -z "$found" ] || [ "${check_line%%:*}" -ge "${found%%:*}" ]; then
+    echo "expected the CI check before the publication gate in $file, received the CI check at verify line ${check_line%%:*} and the gate at line ${found%%:*}" >&2
     return 1
   fi
-  # check_line is still the line of `scripts/check.sh` in the verify job.
-  if [ "${found%%:*}" -ge "${check_line%%:*}" ]; then
-    echo "expected the release verify job in $file to install shellcheck at an exact version before scripts/check.sh, received the install at verify line ${found%%:*} and the check at line ${check_line%%:*}" >&2
+  found=$(awk -v at="${check_line%%:*}" '
+    { line[NR] = $0 }
+    END {
+      first = at
+      while (first > 1 && line[first] !~ /^      - /) first--
+      last = at
+      while (last < NR && line[last + 1] !~ /^      - /) last++
+      for (n = first; n <= last; n++) if (line[n] ~ /^[[:space:]]+(if|continue-on-error):/) print line[n]
+    }' <<<"$verify")
+  if [ -n "$found" ]; then
+    echo "expected the CI check step in $file to run unconditionally and to fail the job, received: $found" >&2
+    return 1
+  fi
+  if ! workflow_job "$file" verify | awk '/^    permissions:/ { in_block = 1; next } in_block && /^      actions:[[:space:]]*read[[:space:]]*$/ { ok = 1 } in_block && /^    [^ ]/ { in_block = 0 } END { exit !ok }'; then
+    echo "expected the release verify job in $file to grant 'actions: read' so the CI runs can be listed, received no such permission" >&2
     return 1
   fi
   found=$(workflow_job "$file" crates | grep -E '^[[:space:]]+needs:[[:space:]]*verify[[:space:]]*$' || true)
@@ -272,17 +300,34 @@ expect_workflow_refusal 'to need the verify job'
 # shellcheck disable=SC2016 # the workflow line must contain the literal $GITHUB_ENV
 { cat "$release_workflow"; printf '      - run: echo "RUSTUP_TOOLCHAIN=1.97.0" >> "$GITHUB_ENV"\n'; } > "$workflow_dir/release.yml"
 expect_workflow_refusal 'to leave the pinned toolchain selected for every other step'
-sed 's/cargo-hack,//' "$release_workflow" > "$workflow_dir/release.yml"
-expect_workflow_refusal 'to install cargo-hack for the stable feature powerset'
+sed 's/,cargo-hack//' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'to install cargo-hack before the steps that run it'
 sed 's/cargo-hack/cargo-hacker/' "$release_workflow" > "$workflow_dir/release.yml"
-expect_workflow_refusal 'to install cargo-hack for the stable feature powerset'
-sed 's/,shellcheck@[0-9.]*//' "$release_workflow" > "$workflow_dir/release.yml"
-expect_workflow_refusal 'to install shellcheck at an exact version'
-sed 's/shellcheck@[0-9.]*/shellcheck/' "$release_workflow" > "$workflow_dir/release.yml"
-expect_workflow_refusal 'to install shellcheck at an exact version'
-awk '/^[[:space:]]+tool:/ { held = $0; next } { print } /- run: scripts\/check[.]sh$/ { print held }' \
+expect_workflow_refusal 'to install cargo-hack before the steps that run it'
+sed 's/cargo-nextest,//' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'to install cargo-nextest before the steps that run it'
+awk '/^[[:space:]]+tool:/ { held = $0; next } { print } /run: scripts\/check-publish[.]sh --list$/ { print held }' \
   "$release_workflow" > "$workflow_dir/release.yml"
-expect_workflow_refusal 'cargo-hack installation before scripts/check.sh'
+expect_workflow_refusal 'installation before the publication gate'
+# The full check lane must not come back: CI already ran it on this commit.
+awk '{ print } /run: scripts\/check-publish[.]sh --list$/ { print "      - run: scripts/check.sh" }' \
+  "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'not to run scripts/check.sh again'
+# The CI question is what replaced it, and it has to be asked, in time, and be able to stop the run.
+grep -v 'scripts/check-release-ci.sh' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'to run scripts/check-release-ci.sh'
+# shellcheck disable=SC2016 # the workflow line holds a literal $REPOSITORY
+sed 's#scripts/check-release-ci.sh "$REPOSITORY"#scripts/check-release-ci.sh --no-such-flag "$REPOSITORY"#' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'to run scripts/check-release-ci.sh'
+awk '/scripts\/check-release-ci[.]sh/ { held = $0; next } { print } /run: scripts\/check-publish[.]sh --list$/ { print held }' \
+  "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'the CI check before the publication gate'
+sed 's/^      - name: CI passed on main for this commit$/&\n        if: always()/' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'to run unconditionally and to fail the job, received:         if: always()'
+sed 's/^      - name: CI passed on main for this commit$/&\n        continue-on-error: true/' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'to run unconditionally and to fail the job, received:         continue-on-error: true'
+sed '/^      actions: read$/d' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal "to grant 'actions: read'"
 sed '/CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: allow/d' "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal 'to set CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: allow beside'
 sed 's/CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: allow/CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: deny/' "$release_workflow" > "$workflow_dir/release.yml"
