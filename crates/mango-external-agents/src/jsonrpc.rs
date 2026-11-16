@@ -3696,25 +3696,29 @@ impl Drop for Client {
 
 impl ClientState {
     fn frame<P: Serialize>(&self, id: Option<Value>, method: &str, params: P) -> Result<String> {
-        let mut frame = Map::new();
-        if self.options.include_version_header {
-            frame.insert(String::from("jsonrpc"), json!("2.0"));
-        }
-        if let Some(id) = id {
-            frame.insert(String::from("id"), id);
-        }
-        frame.insert(String::from("method"), json!(method));
-
-        let params = serde_json::to_value(params).map_err(|error| Error::Protocol {
+        let frame = CallFrame {
+            jsonrpc: self.version_member(),
+            id: id.as_ref(),
+            method,
+            params: &params,
+        };
+        let mut text = serde_json::to_string(&frame).map_err(|error| Error::Protocol {
             expected: String::from("serialisable JSON-RPC params"),
             received: error.to_string(),
         })?;
         // A dialect that validates strictly refuses a `params: null` it never declared, so an
-        // absent parameter is an absent member.
-        if !params.is_null() {
-            frame.insert(String::from("params"), params);
+        // absent parameter is an absent member. `params` is the last member and the only JSON
+        // value that ends in `null` is `null` itself, so this suffix is exactly that case.
+        if let Some(kept) = text.strip_suffix(NULL_PARAMS_TAIL).map(str::len) {
+            text.truncate(kept);
+            text.push('}');
         }
-        Ok(Value::Object(frame).to_string())
+        Ok(text)
+    }
+
+    /// The `jsonrpc` member's value, when this client writes one.
+    fn version_member(&self) -> Option<&'static str> {
+        self.options.include_version_header.then_some("2.0")
     }
 
     /// What a close returns when the reader did not let go within its bound of twice
@@ -4539,20 +4543,17 @@ impl ClientState {
             return;
         }
         replies.queue_within(limit, || {
-            let mut frame = Map::new();
-            if self.options.include_version_header {
-                frame.insert(String::from("jsonrpc"), json!("2.0"));
-            }
-            frame.insert(String::from("id"), id);
-            frame.insert(
-                String::from("error"),
-                json!({ "code": code, "message": message }),
-            );
+            let error = JsonRpcError {
+                code: i64::from(code),
+                message: message.to_owned(),
+                data: None,
+            };
+            let frame = ReplyFrame::refusing(self.version_member(), &id, &error).encode();
             let deadline = deadline_after(self.options.request_timeout);
             // Beside the queue's bounds, being bounded here: the peer's noise takes none of
             // the room they leave this side's own frames.
             self.outbox
-                .enqueue_aside(Value::Object(frame).to_string(), deadline)
+                .enqueue_aside(frame, deadline)
                 .ok()
                 .map(|ticket| ticket.ctl)
         });
@@ -5303,25 +5304,86 @@ async fn hand_off(
 
 /// The frame that answers the peer's question `raw_id` with `outcome`.
 fn reply_frame(state: &ClientState, raw_id: Value, outcome: ServerRequestOutcome) -> String {
-    let mut frame = Map::new();
-    if state.options.include_version_header {
-        frame.insert(String::from("jsonrpc"), json!("2.0"));
-    }
+    let jsonrpc = state.version_member();
     // The id goes back exactly as it arrived: a peer that numbered its request will not match a
     // stringified answer to it.
-    frame.insert(String::from("id"), raw_id);
-    match outcome {
-        ServerRequestOutcome::Answer(result) => {
-            frame.insert(String::from("result"), result);
-        }
-        ServerRequestOutcome::Failure(failure) => {
-            frame.insert(
-                String::from("error"),
-                serde_json::to_value(failure).unwrap_or(Value::Null),
-            );
+    match &outcome {
+        ServerRequestOutcome::Answer(result) => ReplyFrame::answering(jsonrpc, &raw_id, result),
+        ServerRequestOutcome::Failure(failure) => ReplyFrame::refusing(jsonrpc, &raw_id, failure),
+    }
+    .encode()
+}
+
+/// What a frame ends with when its params serialised to `null`.
+const NULL_PARAMS_TAIL: &str = r#","params":null}"#;
+
+/// A request or notification this side writes, with its members in the one order every build
+/// writes them: `jsonrpc`, `id`, `method`, `params`.
+///
+/// Serialised straight to text rather than through a `serde_json::Map`, whose order is sorted in
+/// one build and insertion order in another: any crate in the build that enables
+/// `serde_json/preserve_order` switches it for every crate, so the same client would otherwise
+/// write different bytes depending on what else the host links.
+#[derive(Serialize)]
+struct CallFrame<'a, P> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jsonrpc: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<&'a Value>,
+    method: &'a str,
+    params: &'a P,
+}
+
+/// A response this side writes, with its members in the one order every build writes them:
+/// `jsonrpc`, `id`, then `result` or `error`. See [`CallFrame`] for why it is not a `Map`.
+#[derive(Serialize)]
+struct ReplyFrame<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jsonrpc: Option<&'static str>,
+    id: &'a Value,
+    // A result of `null` is still a result, so only an absent one is skipped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a JsonRpcError>,
+}
+
+impl<'a> ReplyFrame<'a> {
+    fn answering(jsonrpc: Option<&'static str>, id: &'a Value, result: &'a Value) -> Self {
+        Self {
+            jsonrpc,
+            id,
+            result: Some(result),
+            error: None,
         }
     }
-    Value::Object(frame).to_string()
+
+    fn refusing(jsonrpc: Option<&'static str>, id: &'a Value, error: &'a JsonRpcError) -> Self {
+        Self {
+            jsonrpc,
+            id,
+            result: None,
+            error: Some(error),
+        }
+    }
+
+    /// The frame's text.
+    ///
+    /// Every member is a `Value`, a string or an integer, none of which fails to serialise to
+    /// text, so the fallback is never taken. It keeps the id and answers an internal error
+    /// instead of writing nothing.
+    fn encode(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| {
+            let jsonrpc = match self.jsonrpc {
+                Some(version) => format!(r#""jsonrpc":"{version}","#),
+                None => String::new(),
+            };
+            format!(
+                r#"{{{jsonrpc}"id":{},"error":{{"code":-32603,"message":"Internal error"}}}}"#,
+                self.id
+            )
+        })
+    }
 }
 
 /// What a question is refused with when its answer was too large to send.
@@ -5378,6 +5440,7 @@ mod tests {
     mod outbox_tests;
     mod request_lifecycle_tests;
     mod responder_tests;
+    mod wire_bytes_tests;
     mod wire_options_tests;
     mod write_failure_tests;
 
