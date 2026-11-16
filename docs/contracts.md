@@ -272,8 +272,8 @@ timed. Keeping `ring` costs a consumer without the `websocket` feature its build
 assembly, 8.4 to 21.1 s) on the critical path of a cold release build. Swapping it for `sha2`,
 `hmac` and `getrandom` moved the library crates' cold build from a median of 45.1 to 37.3 s (5
 pairs, 4 faster) and the core alone from 27.9 to 22.6 s (4 pairs, 3 faster); the wall ranges
-overlap, since other builds shared the host. `mango-external-agents` started compiling at 20.9 s
-instead of 8.7 s in all five consumer pairs. A host that already links `ring` through rustls,
+overlap, since other builds shared the host. `mango-external-agents` started compiling at 8.7 s
+instead of 20.9 s in all five consumer pairs. A host that already links `ring` through rustls,
 such as one using `websocket`, gets none of that saving, so `ring` stays.
 
 ## Launch failures: a missing program is its own answer
