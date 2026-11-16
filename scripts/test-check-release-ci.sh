@@ -189,7 +189,13 @@ expect_refusal 'a malformed runs body' 2 'expected a JSON list of workflow runs'
 write_runs "$(green_run)"
 printf '{"unexpected": true}' > "$FAKE_CI_JOBS"
 run_check
-expect_refusal 'a jobs body without a list' 1 'to list every one of its jobs'
+expect_refusal 'a jobs body without a list' 2 'expected a JSON job list with total_count and jobs for run 9001'
+printf '{"total_count": 4}' > "$FAKE_CI_JOBS"
+run_check
+expect_refusal 'a jobs body with a count and no list' 2 'expected a JSON job list with total_count and jobs for run 9001'
+printf '{"jobs": []}' > "$FAKE_CI_JOBS"
+run_check
+expect_refusal 'a jobs body with a list and no count' 2 'expected a JSON job list with total_count and jobs for run 9001'
 printf 'not json' > "$FAKE_CI_JOBS"
 run_check
 expect_refusal 'a malformed jobs body' 2 'expected a JSON job list for run 9001'

@@ -89,11 +89,16 @@ EOF
     printf 'expected to read the jobs of run %s of %s, could not read them\n' "$run_id" "$repository" >&2
     return 2
   fi
-  if ! total=$(jq -r '.total_count' <<<"$jobs") || ! listed=$(jq -r '.jobs | length' <<<"$jobs"); then
+  if ! total=$(jq -r '.total_count' <<<"$jobs") || ! listed=$(jq -r 'if (.jobs | type) == "array" then .jobs | length else "null" end' <<<"$jobs"); then
     printf 'expected a JSON job list for run %s, received: %s\n' "$run_id" "${jobs:0:200}" >&2
     return 2
   fi
-  if [ "$total" = 'null' ] || [ "$listed" = 'null' ] || [ "$total" != "$listed" ] || [ "$listed" -eq 0 ]; then
+  # A body without a `jobs` list is not a job listing at all: an API error, not a CI refusal.
+  if [ "$total" = 'null' ] || [ "$listed" = 'null' ] || ! [[ "$total$listed" =~ ^[0-9]+$ ]]; then
+    printf 'expected a JSON job list with total_count and jobs for run %s, received: %s\n' "$run_id" "${jobs:0:200}" >&2
+    return 2
+  fi
+  if [ "$total" != "$listed" ] || [ "$listed" -eq 0 ]; then
     printf 'expected run %s to list every one of its jobs, received %s of %s (a page holds %s)\n' \
       "$run_id" "$listed" "$total" "$PAGE_SIZE" >&2
     return 1
