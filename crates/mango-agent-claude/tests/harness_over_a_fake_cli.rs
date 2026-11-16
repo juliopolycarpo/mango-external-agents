@@ -2452,7 +2452,7 @@ mod a_turn {
     /// not an activity, and the answer arrives after the turn started and before `Completed`.
     #[tokio::test]
     async fn a_schema_turn_yields_its_answer_between_the_start_and_the_completion() {
-        // Already in the compact, key-sorted form the harness re-serialises a schema to.
+        // Already compact, so the argv carries it as written.
         let schema = r#"{"properties":{"word":{"type":"string"}},"type":"object"}"#;
         let launcher = Arc::new(
             FakeClaudeCli::new()
