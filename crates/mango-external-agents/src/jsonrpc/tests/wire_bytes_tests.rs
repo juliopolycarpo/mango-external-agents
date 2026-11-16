@@ -221,3 +221,152 @@ async fn the_cancel_for_a_request_given_up_keeps_one_member_order() {
         client.close().await.expect("expected a clean close");
     }
 }
+
+/// Params that hold text the caller wrote by hand. serde_json copies a `RawValue` into the output
+/// as it is, so a frame has to be sure it is still one line.
+#[derive(Serialize)]
+struct NoteParams {
+    note: Box<serde_json::value::RawValue>,
+}
+
+/// A `RawValue` with the line breaks, tab and indentation of a pretty-printed document goes out
+/// compact and on one line: the stdio link writes a frame as one line and the peer reads it as
+/// one message.
+#[tokio::test]
+async fn a_raw_value_with_line_breaks_in_params_is_written_compact_on_one_line() {
+    for versioned in [true, false] {
+        let (link, client) = connect_answering(
+            versioned,
+            WireOptions::new(),
+            ServerRequestOutcome::Answer(json!("yes")),
+        );
+        let note = serde_json::value::RawValue::from_string(String::from(
+            "{\n  \"a\": 1,\r\n\t\"b\": [2,\n 3]\n}",
+        ))
+        .expect("expected valid JSON");
+        let written = client
+            .submit_notification("session/update", NoteParams { note })
+            .expect("expected the notification queued");
+        within("the notification written", written)
+            .await
+            .expect("expected the notification written");
+
+        let v = version(versioned);
+        let sent = link.sent();
+        assert!(
+            sent.iter().all(|frame| !frame.contains(['\n', '\r'])),
+            "expected frames with no raw line break (versioned: {versioned}) | received {sent:?}"
+        );
+        assert_written(
+            &link,
+            &[format!(
+                r#"{{{v}"method":"session/update","params":{{"note":{{"a":1,"b":[2,3]}}}}}}"#
+            )],
+            &format!("a raw value in params (versioned: {versioned})"),
+        );
+        client.close().await.expect("expected a clean close");
+    }
+}
+
+/// The member that is dropped when params serialise to `null` is told apart from params that
+/// merely contain, or end in, the same text.
+#[tokio::test]
+async fn only_params_that_are_null_are_left_out_of_a_frame() {
+    let (link, client) = connect_answering(
+        true,
+        WireOptions::new(),
+        ServerRequestOutcome::Answer(json!("yes")),
+    );
+    for params in [
+        json!({ "params": null }),
+        json!([null]),
+        json!(",\"params\":null}"),
+        json!(null),
+    ] {
+        // The frame is queued whether or not the handle is kept.
+        drop(
+            client
+                .submit_notification("m", params)
+                .expect("expected the notification queued"),
+        );
+    }
+    let nan = client
+        .submit_notification("m", f64::NAN)
+        .expect("expected the notification queued");
+    within("the last notification written", nan)
+        .await
+        .expect("expected the notification written");
+
+    let expected: Vec<String> = [
+        r#"{"jsonrpc":"2.0","method":"m","params":{"params":null}}"#,
+        r#"{"jsonrpc":"2.0","method":"m","params":[null]}"#,
+        r#"{"jsonrpc":"2.0","method":"m","params":",\"params\":null}"}"#,
+        r#"{"jsonrpc":"2.0","method":"m"}"#,
+        // A float that JSON cannot write is `null`, which is no params.
+        r#"{"jsonrpc":"2.0","method":"m"}"#,
+    ]
+    .map(String::from)
+    .to_vec();
+    assert_written(&link, &expected, "params that are, hold or end in null");
+    client.close().await.expect("expected a clean close");
+}
+
+/// An answer of `null` is still an answer: its `result` stays, unlike a call's `params`.
+#[tokio::test]
+async fn an_answer_of_null_keeps_its_result_member() {
+    let (link, client) = connect_answering(
+        true,
+        WireOptions::new(),
+        ServerRequestOutcome::Answer(Value::Null),
+    );
+    link.push_line(r#"{"jsonrpc":"2.0","id":7,"method":"ask","params":{}}"#);
+    sent(&link, 1).await;
+
+    assert_written(
+        &link,
+        &[String::from(r#"{"jsonrpc":"2.0","id":7,"result":null}"#)],
+        "an answer of null",
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// Params that cannot be written.
+struct RefusesToSerialise;
+
+impl Serialize for RefusesToSerialise {
+    fn serialize<S: serde::Serializer>(&self, _: S) -> std::result::Result<S::Ok, S::Error> {
+        Err(serde::ser::Error::custom("refused by the test"))
+    }
+}
+
+/// Params that fail to serialise are an error naming the expected shape, from the call that made
+/// them, and nothing reaches the link.
+#[tokio::test]
+async fn params_that_fail_to_serialise_queue_nothing() {
+    let (link, client) = connect_answering(
+        true,
+        WireOptions::new(),
+        ServerRequestOutcome::Answer(json!("yes")),
+    );
+    let request = client
+        .submit_request("m", RefusesToSerialise, RequestOptions::new())
+        .err();
+    let notification = client.submit_notification("m", RefusesToSerialise).err();
+
+    for (what, error) in [("request", request), ("notification", notification)] {
+        match error {
+            Some(Error::Protocol { expected, received }) => {
+                assert_eq!(
+                    (expected.as_str(), received.contains("refused by the test")),
+                    ("serialisable JSON-RPC params", true),
+                    "expected the {what} to name the params and the cause | received {received:?}"
+                );
+            }
+            other => panic!(
+                "expected Error::Protocol for a {what} whose params fail to serialise | received {other:?}"
+            ),
+        }
+    }
+    assert_written(&link, &[], "params that fail to serialise");
+    client.close().await.expect("expected a clean close");
+}

@@ -3696,16 +3696,32 @@ impl Drop for Client {
 
 impl ClientState {
     fn frame<P: Serialize>(&self, id: Option<Value>, method: &str, params: P) -> Result<String> {
+        let text = self.call_text(id.as_ref(), method, &params)?;
+        // Compact serde_json output holds no raw line break: a string escapes its own. One that
+        // shows up was copied in verbatim, which is what a `RawValue` does (and ACP turns that
+        // feature on for the whole build). The stdio link writes a frame as one line, so such
+        // params are read into a tree and written again, as every params value once was.
+        if !text.contains(['\n', '\r']) {
+            return Ok(text);
+        }
+        let tree = serde_json::to_value(&params).map_err(|error| params_error(&error))?;
+        self.call_text(id.as_ref(), method, &tree)
+    }
+
+    /// The text of a call frame, with params that serialise to `null` left out.
+    fn call_text<P: Serialize>(
+        &self,
+        id: Option<&Value>,
+        method: &str,
+        params: &P,
+    ) -> Result<String> {
         let frame = CallFrame {
             jsonrpc: self.version_member(),
-            id: id.as_ref(),
+            id,
             method,
-            params: &params,
+            params,
         };
-        let mut text = serde_json::to_string(&frame).map_err(|error| Error::Protocol {
-            expected: String::from("serialisable JSON-RPC params"),
-            received: error.to_string(),
-        })?;
+        let mut text = serde_json::to_string(&frame).map_err(|error| params_error(&error))?;
         // A dialect that validates strictly refuses a `params: null` it never declared, so an
         // absent parameter is an absent member. `params` is the last member and the only JSON
         // value that ends in `null` is `null` itself, so this suffix is exactly that case.
@@ -5314,6 +5330,14 @@ fn reply_frame(state: &ClientState, raw_id: Value, outcome: ServerRequestOutcome
     .encode()
 }
 
+/// The error for params that could not be written.
+fn params_error(error: &serde_json::Error) -> Error {
+    Error::Protocol {
+        expected: String::from("serialisable JSON-RPC params"),
+        received: error.to_string(),
+    }
+}
+
 /// What a frame ends with when its params serialised to `null`.
 const NULL_PARAMS_TAIL: &str = r#","params":null}"#;
 
@@ -5324,6 +5348,12 @@ const NULL_PARAMS_TAIL: &str = r#","params":null}"#;
 /// one build and insertion order in another: any crate in the build that enables
 /// `serde_json/preserve_order` switches it for every crate, so the same client would otherwise
 /// write different bytes depending on what else the host links.
+///
+/// The envelope, `Value` params and ordinary typed structs write the bytes they always wrote in a
+/// build with `preserve_order`. Params are no longer read into a `Value` first, so three shapes
+/// differ from that: an `f32` field prints its shortest form (`1.1`, not `1.100000023841858`), a
+/// `u128` above `u64::MAX` is written where it used to fail, and a `#[serde(flatten)]` map key
+/// that collides with a named field is written twice where the tree kept one.
 #[derive(Serialize)]
 struct CallFrame<'a, P> {
     #[serde(skip_serializing_if = "Option::is_none")]
