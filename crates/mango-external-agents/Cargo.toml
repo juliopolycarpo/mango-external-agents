@@ -108,5 +108,9 @@ required-features = ["stdio"]
 name = "discovery"
 harness = false
 
+[[bench]]
+name = "fingerprint"
+harness = false
+
 [package.metadata.docs.rs]
 all-features = true
