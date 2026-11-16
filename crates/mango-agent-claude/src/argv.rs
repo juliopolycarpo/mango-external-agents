@@ -311,7 +311,10 @@ pub fn is_vendor_session_id(id: &str) -> bool {
 /// Mints the UUID a new session proposes with `--session-id`, and names its scratch directory.
 ///
 /// A version 4 UUID: 122 bits from the operating system's random source, through the `ring` the
-/// core already links for its own digest. The shape is the one [`is_vendor_session_id`] accepts:
+/// core already links for its own digest. The bits have to be unpredictable, not only unique: the
+/// id names the owner-only directory that holds the credential-bearing MCP artifact, so a guessable
+/// id would let another local user create that path first. A non-cryptographic source such as
+/// std's `RandomState` is not enough. The shape is the one [`is_vendor_session_id`] accepts:
 /// the CLI documents `--session-id` as taking a valid UUID and refuses anything else.
 ///
 /// Entropy failure returns a typed refusal without a weaker id. Artifact naming calls this before
