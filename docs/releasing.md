@@ -42,13 +42,25 @@ ordinary documentation PR.
    git push origin main "v$RELEASE_VERSION"
    ```
 
-4. Watch the `Release` workflow. It verifies the tag signature and that the manifests match the tag, runs `scripts/check.sh`,
-   runs the isolated minimum-Rust feature check (`scripts/check-features.sh msrv --locked`, on the
-   `rust-version` the script reads from `Cargo.toml`, one package at a time), publishes each crate
-   that is not on crates.io yet, and creates the GitHub release with git-cliff notes. The checks
-   run in the verify job, which the publish job needs, so a tag that fails the minimum-Rust check
-   publishes nothing. A full rerun is safe: a crate already on crates.io and a GitHub release that
-   already exists are skipped, and the existing release keeps its notes.
+4. Watch the `Release` workflow. It verifies the tag signature and that the manifests match the tag,
+   then asks GitHub whether the `CI` workflow passed on `main` for the tagged commit
+   (`scripts/check-release-ci.sh`). It does not run `scripts/check.sh` again: every line of that is a
+   step of `ci.yml`. The newest push run of that exact commit has to have completed with every job
+   green, `Gate` included. No run, a run still going, a failed, cancelled or skipped one, and an
+   API error all stop the release, because `Gate` is not a required status check on `main`
+   ([#498](https://github.com/juliopolycarpo/mango-external-agents/issues/498)): a commit can reach
+   `main` with CI red, so the run has to be read, not assumed. Tag only after CI has finished on
+   the merge commit, or rerun the workflow once it has. The verify job then runs
+   `cargo deny check advisories` afresh, because an advisory published between the CI run on `main`
+   and the tag is invisible to that run (bans, licences and sources depend only on the commit, so
+   CI's answer stands), the publication
+   gate (`scripts/check-publish.sh --list`), which CI does not run, and the isolated minimum-Rust
+   feature check (`scripts/check-features.sh msrv --locked`, on the `rust-version` the script reads
+   from `Cargo.toml`, one package at a time). The publish job publishes each crate that is not on
+   crates.io yet, and the last job creates the GitHub release with git-cliff notes. The checks run
+   in the verify job, which the publish job needs, so a tag that fails any of them publishes
+   nothing. A full rerun is safe: a crate already on crates.io and a GitHub release that already
+   exists are skipped, and the existing release keeps its notes.
 
 5. Bump the current registry consumer once the release is on crates.io. The consumer can only name
    a version the registry already has, so the release pull request cannot do this. In a follow-up
@@ -161,7 +173,7 @@ release.
 
 | Lane                                 | Covers                                                                                                                                                                             | Runs                                                                                                 |
 | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `scripts/check-features.sh powerset` | Clippy over every feature pair (depth 2) of the core and of the Claude, Codex and ACP crates, all targets, in a copy without the self dev-dependency, on the development toolchain | CI `powerset` job on Linux, macOS and Windows, `scripts/check.sh`, release verify job                |
+| `scripts/check-features.sh powerset` | Clippy over every feature pair (depth 2) of the core and of the Claude, Codex and ACP crates, all targets, in a copy without the self dev-dependency, on the development toolchain | CI `powerset` job on Linux, macOS and Windows, `scripts/check.sh`; a release needs that job green    |
 | `scripts/check-features.sh msrv`     | each package alone on the declared minimum Rust: bare, each feature alone, core with all features, bare core with all targets in that copy; library targets otherwise              | CI `msrv` job, fresh-dependencies lane, release verify job, `scripts/check-features.sh msrv` by hand |
 
 `scripts/check-features.sh` is the single driver. A lane fixes the toolchain and the target set; the
