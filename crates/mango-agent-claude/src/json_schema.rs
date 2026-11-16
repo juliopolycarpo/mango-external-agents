@@ -67,8 +67,10 @@ const fn plain_argument_units(arguments: &[&str]) -> usize {
 /// The count is [`windows_argument_units`]: every `"` becomes `\"` and the backslashes before it are
 /// doubled, and a batch-file launcher also turns every `%` into 8 units. A compact schema dense in
 /// quotes or percent signs therefore grows well past its byte length, so the bound is on the
-/// escaped length. A host with a larger schema needs a surface the vendor documents for it; none
-/// is documented for `--json-schema` today.
+/// escaped length. The text is counted as the host wrote it: a `\u00e9` escape is 6 units where the
+/// character is 1, so a host whose JSON encoder escapes non-ASCII should turn that off. A host with
+/// a larger schema needs a surface the vendor documents for it; none is documented for
+/// `--json-schema` today.
 pub const MAX_JSON_SCHEMA_ARGUMENT_UNITS: usize = BATCH_COMMAND_LINE_LIMIT_UNITS
     - BATCH_OVERHEAD_UNITS
     - plain_argument_units(&crate::argv::FIXED_FLAGS)
@@ -646,6 +648,26 @@ mod tests {
         assert_eq!(
             argument, expected,
             "expected these exact bytes for --json-schema | received {argument}"
+        );
+    }
+
+    /// The cap counts the text as the host wrote it: an escaped `\u00e9` takes 6 units on the line
+    /// where the character takes 1, so a schema of escapes is refused once they no longer fit.
+    #[test]
+    fn counts_escapes_as_the_host_wrote_them() {
+        let escapes = |count: usize| format!("{{\"d\":\"{}\"}}", "\\u00e9".repeat(count));
+        // `{"d":""}` takes 14 units quoted and escaped, and each escape takes 6.
+        let fitting = (MAX_JSON_SCHEMA_ARGUMENT_UNITS - 14) / 6;
+        let argument = compact(&escapes(fitting)).expect("expected the escapes that fit to pass");
+        assert_eq!(
+            windows_argument_units(&argument),
+            14 + 6 * fitting,
+            "expected 6 units per escape on the line | received {argument:.40}"
+        );
+        let received = refusal_received(&escapes(fitting + 1));
+        assert!(
+            received.contains(&format!("{} UTF-16 code units", 14 + 6 * (fitting + 1))),
+            "expected the refusal to count the escapes as written | received {received:?}"
         );
     }
 

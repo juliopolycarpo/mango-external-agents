@@ -1000,7 +1000,11 @@ What the harness checks, all before anything is spawned:
   turns every `"` into `\"` and doubles the backslashes before it, so a quote-dense schema
   grows. When the launcher runs a `.bat` or `.cmd` shim (an npm `claude.cmd`), Rust also writes
   each `%` as `%%cd:~,%`, 8 units for 1. The count takes the larger figure for both, so it is an
-  upper bound whichever program the host launches.
+  upper bound whichever program the host launches. The cap counts the text as the host wrote it,
+  not decoded: an escaped `\u00e9` takes 6 units where the character takes 1. A host whose JSON
+  encoder escapes non-ASCII by default (Python's `json.dumps`) should turn that off
+  (`ensure_ascii=False`), since a schema heavy in escapes that fit the cap before the harness
+  stopped re-serialising it can now be refused.
 - The bound is a conservative worst case for a batch-shim launch. A `.cmd` launch runs through
   `cmd.exe /e:ON /v:OFF /d /c "…"`, and `cmd.exe` rejects a line past 8,191 characters, well
   under the 32,767 units CreateProcess takes. The whole turn line is therefore counted against
