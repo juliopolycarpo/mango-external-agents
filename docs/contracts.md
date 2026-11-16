@@ -255,6 +255,27 @@ comparison on a CPU without SHA-NI: the pure Rust replacement exceeded the propo
 regression limit, so ring is retained. Processors with SHA extensions were not measured. No complete
 frozen receipt is available to reconstruct those figures. The TLS provider policy is independent.
 
+**Re-measured 2026-11-16, decision unchanged.** `cargo bench -p mango-external-agents --bench
+fingerprint` compares `ring` with `sha2` 0.11.1 (portable backend) on a Xeon E5-2680 v4 without
+SHA-NI, rustc 1.100.0. Medians of six alternated runs at `BENCH_SAMPLES=15`, on a loaded shared
+host (1-minute load 30 to 96); the ratio is steadier than the absolute times:
+
+| Request                             | `ring` (ms) | `sha2` (ms) | Delta                |
+| ----------------------------------- | ----------- | ----------- | -------------------- |
+| one 1 KiB attachment                | 0.0062      | 0.0075      | +22%, ranges overlap |
+| one 1 MiB attachment                | 4.09        | 7.72        | +89%                 |
+| four 2 MiB attachments (turn limit) | 33.7        | 59.5        | +77%                 |
+| one 64 MiB attachment               | 240         | 419         | +75%                 |
+
+`sha2` does select SHA-NI at run time (the instruction is in its binary), but that path was not
+timed. Keeping `ring` costs a consumer without the `websocket` feature its build script (C and
+assembly, 8.4 to 21.1 s) on the critical path of a cold release build. Swapping it for `sha2`,
+`hmac` and `getrandom` moved the library crates' cold build from a median of 45.1 to 37.3 s (5
+pairs, 4 faster) and the core alone from 27.9 to 22.6 s (4 pairs, 3 faster); the wall ranges
+overlap, since other builds shared the host. `mango-external-agents` started compiling at 20.9 s
+instead of 8.7 s in all five consumer pairs. A host that already links `ring` through rustls,
+such as one using `websocket`, gets none of that saving, so `ring` stays.
+
 ## Launch failures: a missing program is its own answer
 
 A version probe has to tell "the CLI is not installed" from "the CLI is there and could not be
