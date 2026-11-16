@@ -4,6 +4,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.9.1] - 2026-11-16
+
+### 🐛 Bug Fixes
+
+- **(claude)** Write the stdin prompt, schema argument and MCP file in one member order (#521)
+- **(core)** Write JSON-RPC frames in one member order in every build (#518)
+
+### ⚡ Performance
+
+- **(core)** Compile a JSON-RPC call once, not once per params type (#524)
+
+### 🧪 Testing
+
+- **(core)** Link one integration binary per crate (#525)
+- **(core)** Pin the request fingerprint and account HMAC bytes, and bench the digest (#519)
+- **(release)** Pin the registry consumer at 0.9.0 (#516)
+
+### 👷 CI
+
+- **(release)** Require a passing main CI run instead of rerunning check.sh (#526)
+
 ## [0.9.0] - 2026-11-15
 
 ### 🚀 Features
