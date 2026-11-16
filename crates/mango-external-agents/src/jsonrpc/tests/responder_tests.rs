@@ -292,7 +292,9 @@ async fn a_question_is_not_handed_over_by_a_client_that_was_not_asked_to() {
     );
     let expected = (
         vec![String::from("request:park")],
-        vec![json!({ "jsonrpc": "2.0", "id": 1, "result": "from on_request" }).to_string()],
+        vec![String::from(
+            r#"{"jsonrpc":"2.0","id":1,"result":"from on_request"}"#,
+        )],
         0,
     );
     assert_eq!(
@@ -478,16 +480,11 @@ async fn a_question_past_the_cap_is_answered_on_the_spot_by_the_handler() {
             String::from("past-cap:refuse"),
         ],
         vec![
-            json!({ "jsonrpc": "2.0", "id": 2, "result": { "outcome": "cancelled" } }).to_string(),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 3,
-                "error": {
-                    "code": -32000,
-                    "message": "expected at most 1 questions in flight, received one more",
-                },
-            })
-            .to_string(),
+            String::from(r#"{"jsonrpc":"2.0","id":2,"result":{"outcome":"cancelled"}}"#),
+            String::from(concat!(
+                r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32000,"#,
+                r#""message":"expected at most 1 questions in flight, received one more"}}"#,
+            )),
         ],
         1,
         0,
@@ -555,7 +552,7 @@ async fn an_answer_too_large_hands_the_responder_back_for_a_smaller_one() {
     let expected = (
         Some(true),
         true,
-        vec![json!({ "jsonrpc": "2.0", "id": 5, "result": "small" }).to_string()],
+        vec![String::from(r#"{"jsonrpc":"2.0","id":5,"result":"small"}"#)],
         false,
         256,
     );
@@ -615,14 +612,10 @@ async fn a_responder_dropped_unanswered_tells_the_peer_and_frees_what_it_held() 
     .await;
     let observed = (connected.link.sent(), slots(&connected.client));
     let expected = (
-        vec![
-            json!({
-                "jsonrpc": "2.0",
-                "id": 6,
-                "error": { "code": -32603, "message": "the request was let go without an answer" },
-            })
-            .to_string(),
-        ],
+        vec![String::from(concat!(
+            r#"{"jsonrpc":"2.0","id":6,"error":{"code":-32603,"#,
+            r#""message":"the request was let go without an answer"}}"#,
+        ))],
         1,
     );
     assert_eq!(
@@ -727,14 +720,10 @@ async fn a_handler_without_the_hand_off_is_asked_through_on_request() {
 
     sent(&link, 1).await;
     let written = link.sent();
-    let expected = vec![
-        json!({
-            "jsonrpc": "2.0",
-            "id": 3,
-            "error": { "code": -32603, "message": "the answer was too large to send" },
-        })
-        .to_string(),
-    ];
+    let expected = vec![String::from(concat!(
+        r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32603,"#,
+        r#""message":"the answer was too large to send"}}"#,
+    ))];
     assert_eq!(
         written, expected,
         "expected on_request asked and its oversized answer replaced by the refusal: {expected:?} | received {written:?}"
@@ -761,7 +750,7 @@ async fn a_handler_without_the_hand_off_has_its_answer_written() {
     sent(&link, 1).await;
     let observed = (link.sent(), slots(&client), client.state.outbox.held());
     let expected = (
-        vec![json!({ "jsonrpc": "2.0", "id": 3, "result": "yes" }).to_string()],
+        vec![String::from(r#"{"jsonrpc":"2.0","id":3,"result":"yes"}"#)],
         256,
         (0, 0),
     );
@@ -1376,14 +1365,9 @@ async fn a_handler_that_answers_nothing_refuses_every_question_as_not_found() {
 
         sent(&link, 1).await;
         let written = link.sent();
-        let expected = vec![
-            json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "error": { "code": -32601, "message": "Method not found" },
-            })
-            .to_string(),
-        ];
+        let expected = vec![String::from(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#,
+        )];
         assert_eq!(
             written, expected,
             "expected the question refused as a method not found: {expected:?} | received {written:?}"
@@ -1748,7 +1732,9 @@ async fn a_request_delivered_by_the_reader_can_be_awaited_inside_a_hand_off() {
     let observed = (wire(&connected.link), written.last().cloned());
     let expected = (
         vec![String::from("back"), String::from("result:5")],
-        Some(json!({ "jsonrpc": "2.0", "id": 5, "result": { "got": "pong" } }).to_string()),
+        Some(String::from(
+            r#"{"jsonrpc":"2.0","id":5,"result":{"got":"pong"}}"#,
+        )),
     );
     assert_eq!(
         observed, expected,
@@ -1827,8 +1813,8 @@ async fn questions_with_the_same_id_are_answered_each_on_its_own() {
     let expected = (
         0,
         vec![
-            json!({ "jsonrpc": "2.0", "id": 7, "result": "first" }).to_string(),
-            json!({ "jsonrpc": "2.0", "id": 7, "result": "second" }).to_string(),
+            String::from(r#"{"jsonrpc":"2.0","id":7,"result":"first"}"#),
+            String::from(r#"{"jsonrpc":"2.0","id":7,"result":"second"}"#),
         ],
         2,
     );
