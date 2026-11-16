@@ -30,9 +30,9 @@ use super::{ConnectionHandle, SessionId, SessionState, TurnHandle, drive};
 #[allow(
     dead_code,
     unreachable_pub,
-    reason = "shared by path with tests/session.rs, which uses the parts this module does not"
+    reason = "shared by path with tests/it/session.rs, which uses the parts this module does not"
 )]
-#[path = "../../tests/session/stalling.rs"]
+#[path = "../../tests/it/session/stalling.rs"]
 mod stalling;
 
 use stalling::{Reap, Stalls, assert_reaches};

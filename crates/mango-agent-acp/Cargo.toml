@@ -27,8 +27,8 @@ testing = ["mango-external-agents/testing"]
 # Driven end to end against the fake agent, which only exists under `testing`. Declared so the
 # `--no-default-features` lane skips the target instead of failing to resolve the import.
 [[test]]
-name = "session"
-path = "tests/session.rs"
+name = "it"
+path = "tests/it/main.rs"
 required-features = ["testing"]
 
 [dependencies]

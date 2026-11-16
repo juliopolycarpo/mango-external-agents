@@ -2,7 +2,7 @@
 //! that never answered is reported as.
 //!
 //! Every other path of the `CleanupRequired` contract is driven through the `Session` API from
-//! `tests/cleanup_required.rs`. A drop cannot be: the stop runs detached and its outcome goes to
+//! `tests/it/cleanup_required.rs`. A drop cannot be: the stop runs detached and its outcome goes to
 //! the teardown the session retains, so this reads it through a probe that outlives the session.
 
 use std::sync::Arc;

@@ -3,7 +3,7 @@
 //!
 //! The close rows that include the removal of the MCP artifact are driven here, because only the
 //! crate can hand a session a remover that stalls. The rest of the worst cases are driven from
-//! `tests/deadlines.rs`.
+//! `tests/it/deadlines.rs`.
 
 use crate::test_support as support;
 

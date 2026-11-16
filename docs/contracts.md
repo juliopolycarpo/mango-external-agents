@@ -353,7 +353,7 @@ advertised. Neither service reads a credential.
 
 `#[non_exhaustive]` blocks struct-literal construction outside this crate, which is a real cost. It
 is applied only where the expected growth justifies it, and every protected type has a constructor
-or builder that keeps the cost at zero. `crates/mango-external-agents/tests/downstream_contract.rs`
+or builder that keeps the cost at zero. `crates/mango-external-agents/tests/it/downstream_contract.rs`
 is compiled as its own crate — the only place the attribute means anything — and proves every one
 of them is still reachable.
 
