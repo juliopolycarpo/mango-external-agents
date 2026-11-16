@@ -140,9 +140,26 @@ workflow_job() {
   awk -v job="  $2:" '$0 == job { found = 1; next } found && /^  [A-Za-z0-9_-]+:/ { found = 0 } found' "$1" |
     grep -v '^[[:space:]]*#' || true
 }
+# step_escape_hatches JOB_TEXT LINE -> the lines of the workflow step holding LINE that could let it
+# fail without failing the job: an `if:` condition, `continue-on-error`, or a `|| true` that
+# swallows a command's status. A step starts at its `      - ` item line and ends before the next.
+step_escape_hatches() {
+  awk -v at="$2" '
+    { line[NR] = $0 }
+    END {
+      first = at
+      while (first > 1 && line[first] !~ /^      - /) first--
+      last = at
+      while (last < NR && line[last + 1] !~ /^      - /) last++
+      for (n = first; n <= last; n++) {
+        if (line[n] ~ /^[[:space:]]+(- )?(if|continue-on-error):/) print line[n]
+        else if (line[n] ~ /\|\|[[:space:]]*(true|:)([[:space:]]|$)/) print line[n]
+      }
+    }' <<<"$1"
+}
 check_release_workflow() {
   local file=$1
-  local verify check_line install_line found
+  local verify check_line install_line found marker
   verify=$(workflow_job "$file" verify)
   if ! grep -qF -- 'scripts/check-features.sh msrv --locked' <<<"$verify"; then
     echo "expected the release verify job in $file to run the isolated minimum-Rust feature check 'scripts/check-features.sh msrv --locked' before publishing, received no such step" >&2
@@ -206,19 +223,22 @@ check_release_workflow() {
     echo "expected the CI check before the publication gate in $file, received the CI check at verify line ${check_line%%:*} and the gate at line ${found%%:*}" >&2
     return 1
   fi
-  found=$(awk -v at="${check_line%%:*}" '
-    { line[NR] = $0 }
-    END {
-      first = at
-      while (first > 1 && line[first] !~ /^      - /) first--
-      last = at
-      while (last < NR && line[last + 1] !~ /^      - /) last++
-      for (n = first; n <= last; n++) if (line[n] ~ /^[[:space:]]+(if|continue-on-error):/) print line[n]
-    }' <<<"$verify")
+  found=$(step_escape_hatches "$verify" "${check_line%%:*}")
   if [ -n "$found" ]; then
     echo "expected the CI check step in $file to run unconditionally and to fail the job, received: $found" >&2
     return 1
   fi
+  # The advisory step and the install of the tool it needs get the same pin: a step that is skipped
+  # or whose failure is swallowed would leave the release without the fresh advisory check.
+  for marker in 'cargo deny check advisories' 'cargo-deny'; do
+    check_line=$(grep -nF -- "$marker" <<<"$verify" | head -n 1 || true)
+    [ -n "$check_line" ] || continue # absence is refused by the install and step checks above
+    found=$(step_escape_hatches "$verify" "${check_line%%:*}")
+    if [ -n "$found" ]; then
+      echo "expected the step holding '$marker' in $file to run unconditionally and to fail the job, received: $found" >&2
+      return 1
+    fi
+  done
   if ! workflow_job "$file" verify | awk '/^    permissions:/ { in_block = 1; next } in_block && /^      actions:[[:space:]]*read[[:space:]]*$/ { ok = 1 } in_block && /^    [^ ]/ { in_block = 0 } END { exit !ok }'; then
     echo "expected the release verify job in $file to grant 'actions: read' so the CI runs can be listed, received no such permission" >&2
     return 1
@@ -329,6 +349,19 @@ expect_workflow_refusal "to run 'cargo deny check advisories' on the tag"
 awk '/^[[:space:]]+tool:/ { held = $0; next } { print } /run: cargo deny check advisories$/ { print held }' \
   "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal 'installation before the advisory check'
+# Neither the advisory step nor the cargo-deny install may be skipped or have its failure swallowed.
+sed 's/^        run: cargo deny check advisories$/&\n        continue-on-error: true/' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal "step holding 'cargo deny check advisories' in $workflow_dir/release.yml to run unconditionally and to fail the job, received:         continue-on-error: true"
+sed 's/^      - name: No open advisories at release time$/&\n        if: always()/' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal "step holding 'cargo deny check advisories' in $workflow_dir/release.yml to run unconditionally and to fail the job, received:         if: always()"
+sed 's/^        run: cargo deny check advisories$/& || true/' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal "step holding 'cargo deny check advisories' in $workflow_dir/release.yml to run unconditionally and to fail the job, received:         run: cargo deny check advisories || true"
+sed 's/^          tool: cargo-nextest,cargo-hack,cargo-deny$/&\n        continue-on-error: true/' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal "step holding 'cargo-deny' in $workflow_dir/release.yml to run unconditionally and to fail the job, received:         continue-on-error: true"
+sed 's/^          tool: cargo-nextest,cargo-hack,cargo-deny$/&\n        if: always()/' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal "step holding 'cargo-deny' in $workflow_dir/release.yml to run unconditionally and to fail the job, received:         if: always()"
+sed 's/^        run: cargo deny check advisories$/        run: cargo deny check advisories || :/' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal "to run unconditionally and to fail the job, received:         run: cargo deny check advisories || :"
 # The full check lane must not come back: CI already ran it on this commit.
 awk '{ print } /run: scripts\/check-publish[.]sh --list$/ { print "      - run: scripts/check.sh" }' \
   "$release_workflow" > "$workflow_dir/release.yml"
