@@ -100,11 +100,16 @@ jobs:
         run: rustup toolchain install "$(scripts/check-features.sh --print-toolchain)" --profile minimal
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
-          tool: cargo-nextest,cargo-hack
+          tool: cargo-nextest,cargo-hack,cargo-deny
       - name: Manifests match the tag
         env:
           VERSION: ${{ steps.resolve.outputs.version }}
         run: scripts/check-versions.sh "$VERSION"
+      # The one thing the CI run checked above cannot answer: its `cargo deny` read the advisory
+      # database when it ran on main, and an advisory published since then is only seen here. Bans,
+      # licences and sources are fixed by the commit, so CI's answer for them stands.
+      - name: No open advisories at release time
+        run: cargo deny check advisories
       # The same gate a maintainer runs before the tag exists. It wraps the workspace dry run and
       # adds what that cannot answer: that the publishable set is still exactly $CRATES, and that
       # every tarball carries its README and licence and no build, scratch or environment path.

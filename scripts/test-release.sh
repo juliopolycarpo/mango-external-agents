@@ -164,16 +164,26 @@ check_release_workflow() {
   fi
   # The isolated feature check drives cargo-hack, and the publication gate runs the extracted
   # packages' tests under cargo-nextest; each has to be installed before the step that needs it.
-  local tool
-  for tool in cargo-hack cargo-nextest; do
+  # cargo-deny serves the advisory check below, which has to run on the tag: an advisory published
+  # between the CI run on main and the tag is invisible to that run.
+  local tool step_marker step_name
+  for tool in cargo-hack cargo-nextest cargo-deny; do
+    case "$tool" in
+      cargo-deny) step_marker='cargo deny check advisories'; step_name='the advisory check' ;;
+      *) step_marker='scripts/check-publish.sh --list'; step_name='the publication gate' ;;
+    esac
     install_line=$(grep -nE "^[[:space:]]+tool:[[:space:]]*([^,]+,)*$tool(,|[[:space:]]*\$)" <<<"$verify" | head -n 1 || true)
     if [ -z "$install_line" ]; then
       echo "expected the release verify job in $file to install $tool before the steps that run it, received no $tool tool entry" >&2
       return 1
     fi
-    check_line=$(grep -nF -- 'scripts/check-publish.sh --list' <<<"$verify" | head -n 1 || true)
-    if [ -z "$check_line" ] || [ "${install_line%%:*}" -ge "${check_line%%:*}" ]; then
-      echo "expected $tool installation before the publication gate in $file, received install at verify line ${install_line%%:*} and the gate at line ${check_line%%:*}" >&2
+    check_line=$(grep -nF -- "$step_marker" <<<"$verify" | head -n 1 || true)
+    if [ -z "$check_line" ]; then
+      echo "expected the release verify job in $file to run '$step_marker' on the tag, received no such step" >&2
+      return 1
+    fi
+    if [ "${install_line%%:*}" -ge "${check_line%%:*}" ]; then
+      echo "expected $tool installation before $step_name in $file, received install at verify line ${install_line%%:*} and the step at line ${check_line%%:*}" >&2
       return 1
     fi
   done
@@ -309,6 +319,16 @@ expect_workflow_refusal 'to install cargo-nextest before the steps that run it'
 awk '/^[[:space:]]+tool:/ { held = $0; next } { print } /run: scripts\/check-publish[.]sh --list$/ { print held }' \
   "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal 'installation before the publication gate'
+# The advisory check runs on the tag, with cargo-deny installed first.
+sed 's/,cargo-deny$//' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'to install cargo-deny before the steps that run it'
+grep -v 'cargo deny check advisories' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal "to run 'cargo deny check advisories' on the tag"
+sed 's/run: cargo deny check advisories$/run: cargo deny check licenses/' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal "to run 'cargo deny check advisories' on the tag"
+awk '/^[[:space:]]+tool:/ { held = $0; next } { print } /run: cargo deny check advisories$/ { print held }' \
+  "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'installation before the advisory check'
 # The full check lane must not come back: CI already ran it on this commit.
 awk '{ print } /run: scripts\/check-publish[.]sh --list$/ { print "      - run: scripts/check.sh" }' \
   "$release_workflow" > "$workflow_dir/release.yml"

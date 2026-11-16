@@ -50,7 +50,10 @@ ordinary documentation PR.
    API error all stop the release, because `Gate` is not a required status check on `main`
    ([#498](https://github.com/juliopolycarpo/mango-external-agents/issues/498)): a commit can reach
    `main` with CI red, so the run has to be read, not assumed. Tag only after CI has finished on
-   the merge commit, or rerun the workflow once it has. The verify job then runs the publication
+   the merge commit, or rerun the workflow once it has. The verify job then runs
+   `cargo deny check advisories` afresh, because an advisory published between the CI run on `main`
+   and the tag is invisible to that run (bans, licences and sources depend only on the commit, so
+   CI's answer stands), the publication
    gate (`scripts/check-publish.sh --list`), which CI does not run, and the isolated minimum-Rust
    feature check (`scripts/check-features.sh msrv --locked`, on the `rust-version` the script reads
    from `Cargo.toml`, one package at a time). The publish job publishes each crate that is not on
