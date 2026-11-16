@@ -3523,6 +3523,13 @@ impl Client {
         &self.state.options.peer_name
     }
 
+    /// The generic shell of every call: the only part that depends on the params type.
+    ///
+    /// It refuses what can be refused before a frame exists, builds the frame, and hands the
+    /// finished text to [`Client::send_call`], which is not generic. Everything after the
+    /// serialisation is then compiled once, not once per params type of every harness crate.
+    ///
+    /// The deadline is taken first, so the time the params take to serialise counts against it.
     async fn call<P>(
         &self,
         method: &str,
@@ -3535,35 +3542,21 @@ impl Client {
     where
         P: Serialize + Send,
     {
-        let Some(timeout) = timeout else {
-            // No deadline on the answer. The frame's write is bounded where it is made.
-            return self
-                .call_unbounded(method, params, write_started, ordered, counted)
-                .await;
-        };
-        // The deadline covers the whole call, the wait for the link included.
-        tokio::time::timeout(
-            timeout,
-            self.call_unbounded(method, params, write_started, ordered, counted),
-        )
-        .await
-        .map_err(|_| Error::Timeout {
-            operation: String::from("a JSON-RPC request"),
-            after: timeout,
-        })?
+        // The deadline covers the whole call, the wait for the link and the serialisation of the
+        // params included, so it starts before either.
+        let deadline = timeout.map(|timeout| (tokio::time::Instant::now() + timeout, timeout));
+        let id = self.admit_call(ordered)?;
+        // Built before the map is touched: a frame this refuses would otherwise leave a waiter
+        // behind for a caller that is returning the failure here.
+        let frame = self
+            .state
+            .frame(Some(Value::String(id.clone())), method, params)?;
+        self.send_call(id, frame, deadline, write_started, ordered, counted)
+            .await
     }
 
-    async fn call_unbounded<P>(
-        &self,
-        method: &str,
-        params: P,
-        write_started: Option<&AtomicBool>,
-        ordered: bool,
-        counted: bool,
-    ) -> Result<Value>
-    where
-        P: Serialize + Send,
-    {
+    /// Refuses a call that cannot be made, then takes its id.
+    fn admit_call(&self, ordered: bool) -> Result<String> {
         if self.is_closed() {
             return Err(Error::Closed { subject: "link" });
         }
@@ -3574,24 +3567,55 @@ impl Client {
         if ordered && self.state.on_own_worker() {
             return Err(reentrant_ordered_request());
         }
-        let id = self
+        Ok(self
             .state
             .next_id
             .fetch_add(1, Ordering::Relaxed)
-            .to_string();
-        // Built before the map is touched: a frame this refuses would otherwise leave a waiter
-        // behind for a caller that is returning the failure here.
-        let frame = self
-            .state
-            .frame(Some(Value::String(id.clone())), method, params)?;
+            .to_string())
+    }
 
+    async fn send_call(
+        &self,
+        id: String,
+        frame: String,
+        deadline: Option<(tokio::time::Instant, Duration)>,
+        write_started: Option<&AtomicBool>,
+        ordered: bool,
+        counted: bool,
+    ) -> Result<Value> {
+        let Some((deadline, timeout)) = deadline else {
+            // No deadline on the answer. The frame's write is bounded where it is made.
+            return self
+                .send_call_unbounded(id, frame, write_started, ordered, counted)
+                .await;
+        };
+        tokio::time::timeout_at(
+            deadline,
+            self.send_call_unbounded(id, frame, write_started, ordered, counted),
+        )
+        .await
+        .map_err(|_| Error::Timeout {
+            operation: String::from("a JSON-RPC request"),
+            after: timeout,
+        })?
+    }
+
+    async fn send_call_unbounded(
+        &self,
+        id: String,
+        frame: String,
+        write_started: Option<&AtomicBool>,
+        ordered: bool,
+        counted: bool,
+    ) -> Result<Value> {
         let (answer, waiting) = oneshot::channel();
         let claim = self.state.call_claim();
         {
             let mut pending = self.state.pending.lock().await;
-            // Read again, holding the map, because the check above is not the same instant as this
-            // insert. `close` stores the flag and then drains under this lock; a call checks under
-            // this lock and then inserts. If the read here says open, the store had not landed, and
+            // Read again, holding the map, because the check in `admit_call` is not the same
+            // instant as this insert. `close` stores the flag and then drains under this lock; a
+            // call checks under this lock and then inserts. If the read here says open, the store
+            // had not landed, and
             // the drain that follows it needs the lock this call holds until the entry is in — so
             // it sees the entry. If it says closed, the call returns. Nothing else can happen, and
             // in particular no entry can land after the drain that was supposed to fail it, which
@@ -6609,6 +6633,90 @@ mod tests {
             .await
             .expect("expected a dropped notification to be fine");
         assert!(link.sent().is_empty());
+    }
+
+    /// The ids a peer sees are 1, 2, 3, ... in the order calls are admitted, and a call refused
+    /// before it has a frame does not spend one.
+    #[tokio::test]
+    async fn admitting_a_call_takes_the_next_id_and_a_refusal_takes_none() {
+        let link = ScriptedLink::new();
+        let client = client(link.clone(), RecordingHandler::arc(None));
+
+        let first = client
+            .admit_call(false)
+            .expect("expected an open client to admit");
+        let second = client
+            .admit_call(false)
+            .expect("expected an open client to admit");
+        assert_eq!(
+            (first.as_str(), second.as_str()),
+            ("1", "2"),
+            "expected consecutive ids from an open client"
+        );
+
+        client.close().await.expect("expected a clean close");
+        let refused = client.admit_call(false);
+        assert!(
+            matches!(refused, Err(Error::Closed { subject: "link" })),
+            "expected a closed link, received {refused:?}"
+        );
+        assert_eq!(
+            client.state.next_id.load(Ordering::Relaxed),
+            3,
+            "expected the refusal to leave the id counter at 3"
+        );
+    }
+
+    /// Params whose serialisation takes `taken` of the paused clock, the way a large payload takes
+    /// wall time.
+    struct SlowToSerialize {
+        taken: Duration,
+    }
+
+    impl serde::Serialize for SlowToSerialize {
+        fn serialize<S: serde::Serializer>(
+            &self,
+            serializer: S,
+        ) -> std::result::Result<S::Ok, S::Error> {
+            // `tokio::time::advance` is async only because it yields once afterwards; the clock
+            // moves on the first poll, so one poll with a no-op waker is enough from sync code.
+            let mut advance = std::pin::pin!(tokio::time::advance(self.taken));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            while advance.as_mut().poll(&mut context).is_pending() {}
+            serializer.serialize_unit()
+        }
+    }
+
+    /// The deadline of a call starts before its params are serialised, so a slow serialisation
+    /// spends the budget instead of getting a fresh one.
+    #[tokio::test(start_paused = true)]
+    async fn the_time_params_take_to_serialise_counts_against_the_deadline() {
+        let link = ScriptedLink::new();
+        let client = client(link.clone(), RecordingHandler::arc(None));
+        let deadline = Duration::from_secs(1);
+        let taken = Duration::from_secs(2);
+
+        let started = tokio::time::Instant::now();
+        let refused = client
+            .request_with_timeout::<_, Value>("thread/start", SlowToSerialize { taken }, deadline)
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(refused, Err(Error::Timeout { after, .. }) if after == deadline),
+            "expected a timeout after {deadline:?}, received {refused:?}"
+        );
+        assert_eq!(
+            elapsed, taken,
+            "expected the call to fail as soon as its serialisation had spent the deadline, \
+             received {elapsed:?} for params that took {taken:?}"
+        );
+        tokio::task::yield_now().await;
+        let waiting = client.state.pending.lock().await.len();
+        assert_eq!(
+            waiting, 0,
+            "expected nothing left waiting, received {waiting}"
+        );
     }
 
     /// A host that stopped reading its turn stream. A bounded channel with no room left parks the
