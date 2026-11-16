@@ -1344,7 +1344,7 @@ mod tests {
 ///
 /// The stand-in refuses the WebSocket upgrade, so a run crosses a real socket and the harness's
 /// real connect and upgrade, and ends in a refusal whose words the test can name. A full replayed
-/// turn lives in `crates/mango-agent-codex/tests/unix_socket.rs`, which owns the recorded
+/// turn lives in `crates/mango-agent-codex/tests/it/unix_socket.rs`, which owns the recorded
 /// conversation and the WebSocket server that speaks it.
 #[cfg(all(test, unix))]
 mod unix_socket_tests {

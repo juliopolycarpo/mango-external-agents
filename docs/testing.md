@@ -13,6 +13,26 @@ matches `--all-features`. The counts are identical with and without the flag:
 | `cargo nextest run -p <crate>`                | 1271 |    656 |   743 | 631 |
 | `cargo nextest run -p <crate> --all-features` | 1271 |    656 |   743 | 631 |
 
+## One integration binary per crate
+
+Each crate's integration tests are modules of one binary, `tests/it/main.rs`, with a module per
+file (`tests/it/<name>.rs`, and `tests/it/<name>/` for a module's own submodules). A target of its
+own costs a link of the whole dependency tree and about a hundred megabytes in `target/`, so this
+replaces 33 test binaries with 7. Add a test file as a module of that crate's `main.rs`; do not add
+a `tests/<name>.rs` beside it.
+
+- A test is named `<module>::<path>` under the binary `it`, so a filter that named a file now names
+  its module: `cargo nextest run -p mango-agent-claude -E 'test(cleanup_required::)'`.
+- A module that needs a feature is gated in `main.rs` with `#[cfg(feature = "...")]`, so the
+  reduced-feature lanes still compile the others. `mango-agent-acp` needs `testing` for all of its
+  modules, so its target declares `required-features` instead.
+- `mango-agent-acp/tests/smoke.rs` stays a binary of its own: a profile's verification evidence
+  names that file, and it only runs on request.
+- The tradeoff is that one compile error in a module blocks every module of that crate, and a
+  change to one file recompiles the whole binary.
+- `nextest` still runs each test in its own process, so tests do not share statics. `cargo test`
+  runs a binary's tests as threads of one process; do not rely on that.
+
 ## The entry
 
 ```toml

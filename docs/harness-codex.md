@@ -549,7 +549,7 @@ overruns its own bound could spend, the overflow row's 41 s (a turn whose commit
 interrupted, and behind an overflow the held commit's wait comes first and leaves the turn claimed,
 so the teardown that follows spends no interrupt stage with the existing fakes), and the
 connection-loss row's 46 s, driven to 34 s as above. The cancel rows are asserted as sums only; the
-stages they are made of are exercised in `tests/cancel_deadlines.rs`.
+stages they are made of are exercised in `tests/it/cancel_deadlines.rs`.
 
 A cancel's first `rt` is the pending
 start and its second the interrupt. In the failed case the third `rt` is the steer hold, paid only
@@ -1371,7 +1371,7 @@ command on a machine with a working login. The transcript shows the parent turn 
 child in a nonempty `agentThreadId`, the child thread running its own turn, a
 `collabAgentToolCall`, and a second `subAgentActivity` (`kind: completed`, item id
 `subagent-completed-...`) before the parent's `turn/completed`.
-`tests/replay/subagent.rs` replays those bytes through `CodexHarness`: the child id becomes
+`tests/it/replay/subagent.rs` replays those bytes through `CodexHarness`: the child id becomes
 `Activity::subagent_id` on both subagent items; the parent turn stays the host's and ends once,
 since the child thread's own `turn/completed` does not end it; and no approval, question, broker
 call, or response frame follows. `ThreadItem::SubAgentActivity` models only `id`, `agentThreadId`

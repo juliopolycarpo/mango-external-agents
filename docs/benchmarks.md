@@ -150,7 +150,7 @@ instead of criterion or divan:
   `scripts/check.sh` and CI's Policy lane when they differ, `scripts/test-bench-runner.sh` fails if
   a tracked copy is missing from that list, and `scripts/bench.sh` runs the check first. The
   runner's own tests, such as the `BENCH_SAMPLES` validation, run under `cargo nextest` through
-  `examples/hub-host/tests/bench_runner.rs`, since a bench target cannot run `#[test]`s.
+  `examples/hub-host/tests/it/bench_runner.rs`, since a bench target cannot run `#[test]`s.
 
 Allocation counts are not measured. A counting global allocator needs `unsafe`, which the
 workspace forbids. To find allocations, use a profiler on the bench binary, for example

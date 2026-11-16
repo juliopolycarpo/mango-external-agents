@@ -868,7 +868,7 @@ So a host that discovers and then opens without vouching for the result pays **s
 its first token, and one that passes a receipt pays four. `open_session` deliberately does not
 cache: the harness cannot know the executable, the environment or the account did not move between
 the two calls, and guessing is exactly what the receipt replaces. The numbers are asserted as exact
-counts in `tests/harness_over_a_fake_cli.rs`, so probe creep fails a test rather than quietly
+counts in `tests/it/harness_over_a_fake_cli.rs`, so probe creep fails a test rather than quietly
 slowing a first token.
 
 `auth status` returns more personal data than any other vendor's status call — `email`, `orgId`,

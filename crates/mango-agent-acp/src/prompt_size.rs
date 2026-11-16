@@ -62,7 +62,7 @@ pub(crate) fn refuse_oversized_prompt(
 /// with an empty prompt. The blocks are then counted as they serialise, into a sink that keeps
 /// nothing, so no second copy of an attachment is built.
 ///
-/// The session-level boundary test in `tests/session/prompt_frame.rs` compares this count with
+/// The session-level boundary test in `tests/it/session/prompt_frame.rs` compares this count with
 /// the frame that really reached the agent.
 ///
 /// # Errors
@@ -128,7 +128,7 @@ mod tests {
     }
 
     /// The frame the connection writes, built the long way: the whole request into one value,
-    /// inside the envelope, under a one-character id. `tests/session/prompt_frame.rs` holds the
+    /// inside the envelope, under a one-character id. `tests/it/session/prompt_frame.rs` holds the
     /// same count against the bytes that really reach an agent.
     fn frame_by_serialising(prompt: Vec<ContentBlock>) -> String {
         let request = PromptRequest::new(session_id(), prompt);
