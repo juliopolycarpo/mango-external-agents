@@ -848,7 +848,9 @@ mod tests {
     /// The file's bytes, which the vendor reads as JSON and so does not care about member order,
     /// but which a fixture or a capture of the file does. Servers go out in the order the host
     /// listed them (here not the sorted order), and each entry's members in declaration order, in a
-    /// build with or without `serde_json/preserve_order`.
+    /// build with or without `serde_json/preserve_order`. `cargo nextest run --workspace` runs this
+    /// with the feature on (`mango-agent-acp` turns it on), and `cargo nextest run -p
+    /// mango-agent-claude`, the lane `scripts/check.sh` and CI add, runs it without.
     #[tokio::test]
     async fn the_file_keeps_one_member_order_in_every_build() {
         let scratch = tempdir();

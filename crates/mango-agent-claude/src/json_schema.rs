@@ -620,6 +620,9 @@ mod tests {
 
     /// The argument keeps the members in the order the host wrote them, in a build with or without
     /// `serde_json/preserve_order` (a sorted map would write `properties` before `type`).
+    /// `cargo nextest run --workspace` runs this with the feature on (`mango-agent-acp` turns it
+    /// on), and `cargo nextest run -p mango-agent-claude`, the lane `scripts/check.sh` and CI add,
+    /// runs it without.
     #[test]
     fn the_argument_keeps_the_hosts_member_order_in_every_build() {
         let raw = r#"{

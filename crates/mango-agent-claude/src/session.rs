@@ -3642,6 +3642,9 @@ mod tests {
 
     /// The stream-json line goes out with its members in declaration order, whether or not
     /// `serde_json/preserve_order` is on in the build (a sorted map would write `message` first).
+    /// `cargo nextest run --workspace` runs this with the feature on (`mango-agent-acp` turns it
+    /// on), and `cargo nextest run -p mango-agent-claude`, the lane `scripts/check.sh` and CI add,
+    /// runs it without.
     #[test]
     fn the_prompt_line_keeps_one_member_order_in_every_build() {
         let line = prompt_line("read note.txt").expect("expected a line");
