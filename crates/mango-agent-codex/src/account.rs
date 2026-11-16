@@ -195,6 +195,24 @@ mod tests {
         );
     }
 
+    /// Keys longer than the 64-byte SHA-256 block are hashed before use (RFC 2104), and a
+    /// non-ASCII address is digested as its UTF-8 bytes. Both paths differ between HMAC
+    /// implementations if one gets them wrong, and a stored fingerprint must not move.
+    #[test]
+    fn the_fingerprint_is_pinned_for_a_key_longer_than_one_block_and_a_non_ascii_address() {
+        let long_key = AccountFingerprintKey::new([0x5a_u8; 100]).expect("expected a key");
+        assert_eq!(
+            long_key.fingerprint("user@example.com").as_str(),
+            "4163d182390a381e652f7ff6c3f5d024",
+            "fingerprint under a 100-byte key"
+        );
+        assert_eq!(
+            key().fingerprint("jos\u{e9}@exämple.com").as_str(),
+            "1bfc22cb1ab46a036af944d264365d33",
+            "fingerprint of a non-ASCII address"
+        );
+    }
+
     #[test]
     fn a_different_key_gives_the_same_address_a_different_fingerprint() {
         let other = AccountFingerprintKey::new(b"another-host").expect("expected a key");

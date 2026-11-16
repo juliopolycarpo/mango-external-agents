@@ -198,3 +198,52 @@ fn a_byte_moved_across_the_attachment_boundary_changes_the_fingerprint() {
         fingerprint_of(vec![adjacent("", "", b"x"), adjacent("yz", "", b"")])
     );
 }
+
+/// Lowercase hex of a fingerprint's 32 bytes, the form a host persists it in.
+fn fingerprint_hex(fingerprint: &RequestFingerprint) -> String {
+    fingerprint
+        .0
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The fingerprint is persisted and compared after a host restart, so its bytes must not move
+/// when the SHA-256 implementation behind it changes. These values were computed by the
+/// implementation that shipped in 0.9.0 and pin the whole framing: the JSON head, the
+/// length-framed attachment fields, and contents that span many SHA-256 blocks.
+#[test]
+fn fingerprint_bytes_are_pinned_to_the_values_the_shipped_digest_produced() {
+    let prompt_only = RequestFingerprint::of(&TurnRequest::new("turn", "hello")).expect("digest");
+    assert_eq!(
+        fingerprint_hex(&prompt_only),
+        "4cfcacc07e73a4d8bc5e85107dcb4589176b23b04ae5270d2e47a4fff58e75fe",
+        "fingerprint of a prompt-only request"
+    );
+
+    // 200_000 bytes cover thousands of 64-byte blocks and every residue of the final block.
+    let large: Vec<u8> = (0..200_000_u32).map(|index| (index % 251) as u8).collect();
+    let rich = TurnRequest::new("turn", "naïve prompt — with \"quotes\"")
+        .with_configuration(ConfigurationPatch::new().model(ConfigurationChange::Reset))
+        .with_attachments(vec![
+            Attachment {
+                id: "file-1".into(),
+                name: "notes.txt".into(),
+                mime_type: "text/plain".into(),
+                kind: AttachmentKind::Text,
+                bytes: b"content".to_vec(),
+            },
+            Attachment {
+                id: "file-2".into(),
+                name: "blob.bin".into(),
+                mime_type: "application/octet-stream".into(),
+                kind: AttachmentKind::Data,
+                bytes: large,
+            },
+        ]);
+    assert_eq!(
+        fingerprint_hex(&RequestFingerprint::of(&rich).expect("digest")),
+        "9fe359cf63a0d603eccbfa1f5474f86da9c19a7c2d01e87e097edc0737b7ec82",
+        "fingerprint of a request with configuration and two attachments"
+    );
+}
