@@ -575,6 +575,14 @@ final output. `Reducer::with_update_interval` changes the interval; `Duration::Z
 update. This bounds how often one call reaches a host, not how large one update is: each is still
 bounded by the core's `TextLimit::Detail`.
 
+A turn may hold at most 1,024 tool calls open at once (`reducer::MAX_OPEN_CALLS`, the same figure as
+the default `Limits::turn_channel_capacity`). The agent decides how many calls it starts before
+finishing any, so the cap is not left to it. A call already over when announced is not open and does
+not count; a repeat for an open call is an update. The call past the cap is not forwarded and not
+tracked: the client fails the turn as `acp-activity-overflow`, naming the limit and the count
+reached, after closing every call the host was told about as failed, the same settlement as for an
+event the core refuses. The cap is a constant, not a `Limits` field.
+
 A held field that is over the size the core publishes (a text body or a diff body over
 `TextLimit::Detail`, a title over `TextLimit::Title`, or a diff past the core's row or total-size
 limits) is bounded when it is held, through the core's own bounding, which sanitises before it cuts;
@@ -1208,7 +1216,7 @@ reading: the harness never waits for one.
 The figures are asserted on a paused clock, with the limits set to 3 s, 7 s and 101 s so that no
 term can stand in for another. `crates/mango-agent-acp/src/deadlines/tests.rs` holds every
 default to this table, the formulas to distinct limits and `Duration::MAX` to saturation.
-`crates/mango-agent-acp/tests/session/deadlines.rs` drives the stages against the real session,
+`crates/mango-agent-acp/tests/it/session/deadlines.rs` drives the stages against the real session,
 with the agent's input blocked and its child ignoring the interrupt and slow to be killed and
 reaped: the process stop (against the core function the reaper calls), the teardown and the
 dropped-session row (to the turn's terminal), `cancel_to_terminal`, `close` and

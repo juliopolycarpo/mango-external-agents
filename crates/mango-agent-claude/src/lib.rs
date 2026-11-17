@@ -47,7 +47,7 @@ extern crate self as mango_agent_claude;
 /// The test helpers the integration tests share (the host, the scratch roots, the `ControlTap`),
 /// compiled once for the unit tests that need them too.
 #[cfg(test)]
-#[path = "../tests/support/mod.rs"]
+#[path = "../tests/it/support/mod.rs"]
 mod test_support;
 
 #[cfg(test)]

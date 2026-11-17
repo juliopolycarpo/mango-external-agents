@@ -258,7 +258,7 @@ bytes, and that is the point of keeping them:
   2026-11-14 with model `gpt-5.6-terra`, recorded by `mea capture --harness codex --transcripts
   --scenario subagent --model gpt-5.6-terra`. `mea` qualified it: it holds `subAgentActivity` items
   with a nonempty `agentThreadId`. Like the other transcripts it has no manifest; its `# capture`
-  header and `# model:` line state the build and model, and `tests/replay/subagent.rs` in
+  header and `# model:` line state the build and model, and `tests/it/replay/subagent.rs` in
   `mango-agent-codex` fails if the file loses them. It is one run on one `free` account.
 
 A historical fixture remains captured and never hand-edited. Keep it when it continues to prove a

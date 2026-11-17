@@ -3523,6 +3523,13 @@ impl Client {
         &self.state.options.peer_name
     }
 
+    /// The generic shell of every call: the only part that depends on the params type.
+    ///
+    /// It refuses what can be refused before a frame exists, builds the frame, and hands the
+    /// finished text to [`Client::send_call`], which is not generic. Everything after the
+    /// serialisation is then compiled once, not once per params type of every harness crate.
+    ///
+    /// The deadline is taken first, so the time the params take to serialise counts against it.
     async fn call<P>(
         &self,
         method: &str,
@@ -3535,35 +3542,21 @@ impl Client {
     where
         P: Serialize + Send,
     {
-        let Some(timeout) = timeout else {
-            // No deadline on the answer. The frame's write is bounded where it is made.
-            return self
-                .call_unbounded(method, params, write_started, ordered, counted)
-                .await;
-        };
-        // The deadline covers the whole call, the wait for the link included.
-        tokio::time::timeout(
-            timeout,
-            self.call_unbounded(method, params, write_started, ordered, counted),
-        )
-        .await
-        .map_err(|_| Error::Timeout {
-            operation: String::from("a JSON-RPC request"),
-            after: timeout,
-        })?
+        // The deadline covers the whole call, the wait for the link and the serialisation of the
+        // params included, so it starts before either.
+        let deadline = timeout.map(|timeout| (tokio::time::Instant::now() + timeout, timeout));
+        let id = self.admit_call(ordered)?;
+        // Built before the map is touched: a frame this refuses would otherwise leave a waiter
+        // behind for a caller that is returning the failure here.
+        let frame = self
+            .state
+            .frame(Some(Value::String(id.clone())), method, params)?;
+        self.send_call(id, frame, deadline, write_started, ordered, counted)
+            .await
     }
 
-    async fn call_unbounded<P>(
-        &self,
-        method: &str,
-        params: P,
-        write_started: Option<&AtomicBool>,
-        ordered: bool,
-        counted: bool,
-    ) -> Result<Value>
-    where
-        P: Serialize + Send,
-    {
+    /// Refuses a call that cannot be made, then takes its id.
+    fn admit_call(&self, ordered: bool) -> Result<String> {
         if self.is_closed() {
             return Err(Error::Closed { subject: "link" });
         }
@@ -3574,24 +3567,55 @@ impl Client {
         if ordered && self.state.on_own_worker() {
             return Err(reentrant_ordered_request());
         }
-        let id = self
+        Ok(self
             .state
             .next_id
             .fetch_add(1, Ordering::Relaxed)
-            .to_string();
-        // Built before the map is touched: a frame this refuses would otherwise leave a waiter
-        // behind for a caller that is returning the failure here.
-        let frame = self
-            .state
-            .frame(Some(Value::String(id.clone())), method, params)?;
+            .to_string())
+    }
 
+    async fn send_call(
+        &self,
+        id: String,
+        frame: String,
+        deadline: Option<(tokio::time::Instant, Duration)>,
+        write_started: Option<&AtomicBool>,
+        ordered: bool,
+        counted: bool,
+    ) -> Result<Value> {
+        let Some((deadline, timeout)) = deadline else {
+            // No deadline on the answer. The frame's write is bounded where it is made.
+            return self
+                .send_call_unbounded(id, frame, write_started, ordered, counted)
+                .await;
+        };
+        tokio::time::timeout_at(
+            deadline,
+            self.send_call_unbounded(id, frame, write_started, ordered, counted),
+        )
+        .await
+        .map_err(|_| Error::Timeout {
+            operation: String::from("a JSON-RPC request"),
+            after: timeout,
+        })?
+    }
+
+    async fn send_call_unbounded(
+        &self,
+        id: String,
+        frame: String,
+        write_started: Option<&AtomicBool>,
+        ordered: bool,
+        counted: bool,
+    ) -> Result<Value> {
         let (answer, waiting) = oneshot::channel();
         let claim = self.state.call_claim();
         {
             let mut pending = self.state.pending.lock().await;
-            // Read again, holding the map, because the check above is not the same instant as this
-            // insert. `close` stores the flag and then drains under this lock; a call checks under
-            // this lock and then inserts. If the read here says open, the store had not landed, and
+            // Read again, holding the map, because the check in `admit_call` is not the same
+            // instant as this insert. `close` stores the flag and then drains under this lock; a
+            // call checks under this lock and then inserts. If the read here says open, the store
+            // had not landed, and
             // the drain that follows it needs the lock this call holds until the entry is in — so
             // it sees the entry. If it says closed, the call returns. Nothing else can happen, and
             // in particular no entry can land after the drain that was supposed to fail it, which
@@ -3696,25 +3720,45 @@ impl Drop for Client {
 
 impl ClientState {
     fn frame<P: Serialize>(&self, id: Option<Value>, method: &str, params: P) -> Result<String> {
-        let mut frame = Map::new();
-        if self.options.include_version_header {
-            frame.insert(String::from("jsonrpc"), json!("2.0"));
+        let text = self.call_text(id.as_ref(), method, &params)?;
+        // Compact serde_json output holds no raw line break: a string escapes its own. One that
+        // shows up was copied in verbatim, which is what a `RawValue` does (and ACP turns that
+        // feature on for the whole build). The stdio link writes a frame as one line, so such
+        // params are read into a tree and written again, as every params value once was.
+        if !text.contains(['\n', '\r']) {
+            return Ok(text);
         }
-        if let Some(id) = id {
-            frame.insert(String::from("id"), id);
-        }
-        frame.insert(String::from("method"), json!(method));
+        let tree = serde_json::to_value(&params).map_err(|error| params_error(&error))?;
+        self.call_text(id.as_ref(), method, &tree)
+    }
 
-        let params = serde_json::to_value(params).map_err(|error| Error::Protocol {
-            expected: String::from("serialisable JSON-RPC params"),
-            received: error.to_string(),
-        })?;
+    /// The text of a call frame, with params that serialise to `null` left out.
+    fn call_text<P: Serialize>(
+        &self,
+        id: Option<&Value>,
+        method: &str,
+        params: &P,
+    ) -> Result<String> {
+        let frame = CallFrame {
+            jsonrpc: self.version_member(),
+            id,
+            method,
+            params,
+        };
+        let mut text = serde_json::to_string(&frame).map_err(|error| params_error(&error))?;
         // A dialect that validates strictly refuses a `params: null` it never declared, so an
-        // absent parameter is an absent member.
-        if !params.is_null() {
-            frame.insert(String::from("params"), params);
+        // absent parameter is an absent member. `params` is the last member and the only JSON
+        // value that ends in `null` is `null` itself, so this suffix is exactly that case.
+        if let Some(kept) = text.strip_suffix(NULL_PARAMS_TAIL).map(str::len) {
+            text.truncate(kept);
+            text.push('}');
         }
-        Ok(Value::Object(frame).to_string())
+        Ok(text)
+    }
+
+    /// The `jsonrpc` member's value, when this client writes one.
+    fn version_member(&self) -> Option<&'static str> {
+        self.options.include_version_header.then_some("2.0")
     }
 
     /// What a close returns when the reader did not let go within its bound of twice
@@ -4539,20 +4583,17 @@ impl ClientState {
             return;
         }
         replies.queue_within(limit, || {
-            let mut frame = Map::new();
-            if self.options.include_version_header {
-                frame.insert(String::from("jsonrpc"), json!("2.0"));
-            }
-            frame.insert(String::from("id"), id);
-            frame.insert(
-                String::from("error"),
-                json!({ "code": code, "message": message }),
-            );
+            let error = JsonRpcError {
+                code: i64::from(code),
+                message: message.to_owned(),
+                data: None,
+            };
+            let frame = ReplyFrame::refusing(self.version_member(), &id, &error).encode();
             let deadline = deadline_after(self.options.request_timeout);
             // Beside the queue's bounds, being bounded here: the peer's noise takes none of
             // the room they leave this side's own frames.
             self.outbox
-                .enqueue_aside(Value::Object(frame).to_string(), deadline)
+                .enqueue_aside(frame, deadline)
                 .ok()
                 .map(|ticket| ticket.ctl)
         });
@@ -5303,25 +5344,100 @@ async fn hand_off(
 
 /// The frame that answers the peer's question `raw_id` with `outcome`.
 fn reply_frame(state: &ClientState, raw_id: Value, outcome: ServerRequestOutcome) -> String {
-    let mut frame = Map::new();
-    if state.options.include_version_header {
-        frame.insert(String::from("jsonrpc"), json!("2.0"));
-    }
+    let jsonrpc = state.version_member();
     // The id goes back exactly as it arrived: a peer that numbered its request will not match a
     // stringified answer to it.
-    frame.insert(String::from("id"), raw_id);
-    match outcome {
-        ServerRequestOutcome::Answer(result) => {
-            frame.insert(String::from("result"), result);
-        }
-        ServerRequestOutcome::Failure(failure) => {
-            frame.insert(
-                String::from("error"),
-                serde_json::to_value(failure).unwrap_or(Value::Null),
-            );
+    match &outcome {
+        ServerRequestOutcome::Answer(result) => ReplyFrame::answering(jsonrpc, &raw_id, result),
+        ServerRequestOutcome::Failure(failure) => ReplyFrame::refusing(jsonrpc, &raw_id, failure),
+    }
+    .encode()
+}
+
+/// The error for params that could not be written.
+fn params_error(error: &serde_json::Error) -> Error {
+    Error::Protocol {
+        expected: String::from("serialisable JSON-RPC params"),
+        received: error.to_string(),
+    }
+}
+
+/// What a frame ends with when its params serialised to `null`.
+const NULL_PARAMS_TAIL: &str = r#","params":null}"#;
+
+/// A request or notification this side writes, with its members in the one order every build
+/// writes them: `jsonrpc`, `id`, `method`, `params`.
+///
+/// Serialised straight to text rather than through a `serde_json::Map`, whose order is sorted in
+/// one build and insertion order in another: any crate in the build that enables
+/// `serde_json/preserve_order` switches it for every crate, so the same client would otherwise
+/// write different bytes depending on what else the host links.
+///
+/// The envelope, `Value` params and ordinary typed structs write the bytes they always wrote in a
+/// build with `preserve_order`. Params are no longer read into a `Value` first, so three shapes
+/// differ from that: an `f32` field prints its shortest form (`1.1`, not `1.100000023841858`), a
+/// `u128` above `u64::MAX` is written where it used to fail, and a `#[serde(flatten)]` map key
+/// that collides with a named field is written twice where the tree kept one.
+#[derive(Serialize)]
+struct CallFrame<'a, P> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jsonrpc: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<&'a Value>,
+    method: &'a str,
+    params: &'a P,
+}
+
+/// A response this side writes, with its members in the one order every build writes them:
+/// `jsonrpc`, `id`, then `result` or `error`. See [`CallFrame`] for why it is not a `Map`.
+#[derive(Serialize)]
+struct ReplyFrame<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jsonrpc: Option<&'static str>,
+    id: &'a Value,
+    // A result of `null` is still a result, so only an absent one is skipped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a JsonRpcError>,
+}
+
+impl<'a> ReplyFrame<'a> {
+    fn answering(jsonrpc: Option<&'static str>, id: &'a Value, result: &'a Value) -> Self {
+        Self {
+            jsonrpc,
+            id,
+            result: Some(result),
+            error: None,
         }
     }
-    Value::Object(frame).to_string()
+
+    fn refusing(jsonrpc: Option<&'static str>, id: &'a Value, error: &'a JsonRpcError) -> Self {
+        Self {
+            jsonrpc,
+            id,
+            result: None,
+            error: Some(error),
+        }
+    }
+
+    /// The frame's text.
+    ///
+    /// Every member is a `Value`, a string or an integer, none of which fails to serialise to
+    /// text, so the fallback is never taken. It keeps the id and answers an internal error
+    /// instead of writing nothing.
+    fn encode(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| {
+            let jsonrpc = match self.jsonrpc {
+                Some(version) => format!(r#""jsonrpc":"{version}","#),
+                None => String::new(),
+            };
+            format!(
+                r#"{{{jsonrpc}"id":{},"error":{{"code":-32603,"message":"Internal error"}}}}"#,
+                self.id
+            )
+        })
+    }
 }
 
 /// What a question is refused with when its answer was too large to send.
@@ -5378,6 +5494,7 @@ mod tests {
     mod outbox_tests;
     mod request_lifecycle_tests;
     mod responder_tests;
+    mod wire_bytes_tests;
     mod wire_options_tests;
     mod write_failure_tests;
 
@@ -6516,6 +6633,90 @@ mod tests {
             .await
             .expect("expected a dropped notification to be fine");
         assert!(link.sent().is_empty());
+    }
+
+    /// The ids a peer sees are 1, 2, 3, ... in the order calls are admitted, and a call refused
+    /// before it has a frame does not spend one.
+    #[tokio::test]
+    async fn admitting_a_call_takes_the_next_id_and_a_refusal_takes_none() {
+        let link = ScriptedLink::new();
+        let client = client(link.clone(), RecordingHandler::arc(None));
+
+        let first = client
+            .admit_call(false)
+            .expect("expected an open client to admit");
+        let second = client
+            .admit_call(false)
+            .expect("expected an open client to admit");
+        assert_eq!(
+            (first.as_str(), second.as_str()),
+            ("1", "2"),
+            "expected consecutive ids from an open client"
+        );
+
+        client.close().await.expect("expected a clean close");
+        let refused = client.admit_call(false);
+        assert!(
+            matches!(refused, Err(Error::Closed { subject: "link" })),
+            "expected a closed link, received {refused:?}"
+        );
+        assert_eq!(
+            client.state.next_id.load(Ordering::Relaxed),
+            3,
+            "expected the refusal to leave the id counter at 3"
+        );
+    }
+
+    /// Params whose serialisation takes `taken` of the paused clock, the way a large payload takes
+    /// wall time.
+    struct SlowToSerialize {
+        taken: Duration,
+    }
+
+    impl serde::Serialize for SlowToSerialize {
+        fn serialize<S: serde::Serializer>(
+            &self,
+            serializer: S,
+        ) -> std::result::Result<S::Ok, S::Error> {
+            // `tokio::time::advance` is async only because it yields once afterwards; the clock
+            // moves on the first poll, so one poll with a no-op waker is enough from sync code.
+            let mut advance = std::pin::pin!(tokio::time::advance(self.taken));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            while advance.as_mut().poll(&mut context).is_pending() {}
+            serializer.serialize_unit()
+        }
+    }
+
+    /// The deadline of a call starts before its params are serialised, so a slow serialisation
+    /// spends the budget instead of getting a fresh one.
+    #[tokio::test(start_paused = true)]
+    async fn the_time_params_take_to_serialise_counts_against_the_deadline() {
+        let link = ScriptedLink::new();
+        let client = client(link.clone(), RecordingHandler::arc(None));
+        let deadline = Duration::from_secs(1);
+        let taken = Duration::from_secs(2);
+
+        let started = tokio::time::Instant::now();
+        let refused = client
+            .request_with_timeout::<_, Value>("thread/start", SlowToSerialize { taken }, deadline)
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(refused, Err(Error::Timeout { after, .. }) if after == deadline),
+            "expected a timeout after {deadline:?}, received {refused:?}"
+        );
+        assert_eq!(
+            elapsed, taken,
+            "expected the call to fail as soon as its serialisation had spent the deadline, \
+             received {elapsed:?} for params that took {taken:?}"
+        );
+        tokio::task::yield_now().await;
+        let waiting = client.state.pending.lock().await.len();
+        assert_eq!(
+            waiting, 0,
+            "expected nothing left waiting, received {waiting}"
+        );
     }
 
     /// A host that stopped reading its turn stream. A bounded channel with no room left parks the

@@ -1,8 +1,9 @@
 name: Release
 
 # Cut a release from a signed v* tag: verify GitHub reports the tag as signed,
-# verify the manifests agree with the tag, run the check lane and the isolated minimum-Rust
-# feature checks, publish the four crates to crates.io in dependency order
+# verify the manifests agree with the tag, require that the CI workflow passed on main for that
+# exact commit, run the publication gate and the isolated minimum-Rust feature checks, publish the
+# four crates to crates.io in dependency order
 # through crates.io trusted publishing (OIDC, no stored token), and create a
 # GitHub release with git-cliff notes. The publish job runs in the `release`
 # environment, whose deployment rule admits only v* tags.
@@ -41,6 +42,11 @@ jobs:
     name: Verify tag and manifests
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # `actions: read` lets the CI check list the workflow runs of this commit. A job's own
+    # `permissions` replaces the workflow's, so `contents: read` is restated.
+    permissions:
+      contents: read
+      actions: read
     outputs:
       version: ${{ steps.resolve.outputs.version }}
     steps:
@@ -66,6 +72,17 @@ jobs:
           VERSION: ${{ steps.resolve.outputs.version }}
           RELEASE_COMMIT: ${{ github.sha }}
         run: scripts/check-release-tag-signature.sh "$REPOSITORY" "$VERSION" "$RELEASE_COMMIT"
+      # scripts/check.sh is not run again here: every line of it is a step of ci.yml, which ran on
+      # the push that put this commit on main. `Gate` is not a required status check (issue #498),
+      # so a commit can reach main with CI red; this asks GitHub whether the CI run of this exact
+      # commit completed with every job green, and refuses when there is none, it is still
+      # running, or it failed or was cancelled. Rerun the release once CI has finished.
+      - name: CI passed on main for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: scripts/check-release-ci.sh "$REPOSITORY" "$RELEASE_COMMIT"
       # A cache saved on a tag ref can be restored by that tag alone, so this job saves none and
       # restores the one ci.yml's `rust` job saves on main. The key hashes every installed
       # toolchain, so the pinned one is installed first, as in that job, and the step runs before
@@ -83,24 +100,28 @@ jobs:
         run: rustup toolchain install "$(scripts/check-features.sh --print-toolchain)" --profile minimal
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
-          tool: cargo-nextest,cargo-hack,cargo-deny,dprint,git-cliff,shellcheck@0.11.0
+          tool: cargo-nextest,cargo-hack,cargo-deny
       - name: Manifests match the tag
         env:
           VERSION: ${{ steps.resolve.outputs.version }}
         run: scripts/check-versions.sh "$VERSION"
-      # scripts/check.sh parses ci.yml through scripts/check-script-tests.sh, which needs PyYAML.
-      - run: sudo apt-get install --yes --no-install-recommends python3-yaml
-      - run: scripts/check.sh
+      # The one thing the CI run checked above cannot answer: its `cargo deny` read the advisory
+      # database when it ran on main, and an advisory published since then is only seen here. Bans,
+      # licences and sources are fixed by the commit, so CI's answer for them stands.
+      - name: No open advisories at release time
+        run: cargo deny check advisories
       # The same gate a maintainer runs before the tag exists. It wraps the workspace dry run and
       # adds what that cannot answer: that the publishable set is still exactly $CRATES, and that
       # every tarball carries its README and licence and no build, scratch or environment path.
-      # Running the bare dry run here instead would let a tag pass a check the gate rejects.
+      # CI runs none of it. Running the bare dry run here instead would let a tag pass a check the
+      # gate rejects. It runs the extracted packages' tests, which is why cargo-nextest is installed.
       - name: Publication gate
         run: scripts/check-publish.sh --list
       # One package at a time, so no other member can switch a feature on for it: bare core, each
-      # public feature alone, all features, and the harness crates without defaults. check.sh above
-      # builds the whole workspace on the pinned toolchain, which proves neither the minimum nor
-      # isolation. A tag that fails here publishes nothing.
+      # public feature alone, all features, and the harness crates without defaults. The CI run
+      # checked above builds the whole workspace on the pinned toolchain, and its MSRV job runs this
+      # same script; it is kept here so a release does not rest on that job alone. A tag that fails
+      # here publishes nothing.
       - name: Isolated feature checks on the declared minimum
         run: scripts/check-features.sh msrv --locked
 

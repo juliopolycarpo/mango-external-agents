@@ -1,7 +1,7 @@
 //! The figures [`Deadlines`](super::Deadlines) reports, held to the guide's table, to their own
 //! formulas under limits that tell the terms apart, and to the stage values the harness enforces.
 //!
-//! The stages themselves are driven to their limits in `tests/session/deadlines.rs`; these tests
+//! The stages themselves are driven to their limits in `tests/it/session/deadlines.rs`; these tests
 //! pin the arithmetic and the one stage no session-level fake can reach, the wait for a turn
 //! slot another task holds.
 

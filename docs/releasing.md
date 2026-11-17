@@ -11,9 +11,14 @@ Use `RELEASE_VERSION` for the intended new version throughout the procedure. For
 set the full suffix too. These commands belong to the reviewed release process, not to an
 ordinary documentation PR.
 
-1. Make sure `main` is green and the changelog preview reads well:
+1. Make sure `main` is green and the changelog preview reads well. Green means the newest `ci.yml`
+   run for the push that put `main`'s tip there has completed with every job successful, `Gate`
+   included; a pull request run does not count. The script the release
+   uses to ask GitHub answers it, and exits 0 only for a pass:
 
    ```sh
+   git fetch origin
+   scripts/check-release-ci.sh juliopolycarpo/mango-external-agents "$(git rev-parse origin/main)"
    scripts/changelog.sh "v$RELEASE_VERSION"
    git diff CHANGELOG.md
    ```
@@ -31,24 +36,50 @@ ordinary documentation PR.
    scripts/check-versions.sh "$RELEASE_VERSION"
    ```
 
-3. Review and merge the release PR after the pre-publication requirements below pass.
-   On the resulting clean release commit, tag and push. The tag must be an annotated, signed tag: the `Release`
-   workflow refuses one that GitHub does not report as verified, so add your signing key to your
-   GitHub account as a signing key first. This checks that GitHub verified the signature, not which
-   maintainer made it.
+3. Review and squash-merge the release PR on GitHub after the pre-publication requirements below
+   pass. Do not merge locally and push `main`: the merge commit has to be the one GitHub made, and
+   its `ci.yml` push run starts only when that commit reaches `main`. Fast-forward to it, wait for
+   that run to pass, then tag that commit and push only the tag. The tag must be an annotated,
+   signed tag: the `Release` workflow refuses one that GitHub does not report as verified, so add
+   your signing key to your GitHub account as a signing key first. This checks that GitHub verified
+   the signature, not which maintainer made it.
 
    ```sh
-   git tag -s "v$RELEASE_VERSION" -m "v$RELEASE_VERSION"
-   git push origin main "v$RELEASE_VERSION"
+   git fetch origin
+   git switch main
+   git merge --ff-only origin/main
+   RELEASE_COMMIT=$(git rev-parse HEAD)
+   scripts/check-release-ci.sh juliopolycarpo/mango-external-agents "$RELEASE_COMMIT"
+   git tag -s "v$RELEASE_VERSION" -m "v$RELEASE_VERSION" "$RELEASE_COMMIT"
+   git push origin "v$RELEASE_VERSION"
    ```
 
-4. Watch the `Release` workflow. It verifies the tag signature and that the manifests match the tag, runs `scripts/check.sh`,
-   runs the isolated minimum-Rust feature check (`scripts/check-features.sh msrv --locked`, on the
-   `rust-version` the script reads from `Cargo.toml`, one package at a time), publishes each crate
-   that is not on crates.io yet, and creates the GitHub release with git-cliff notes. The checks
-   run in the verify job, which the publish job needs, so a tag that fails the minimum-Rust check
-   publishes nothing. A full rerun is safe: a crate already on crates.io and a GitHub release that
-   already exists are skipped, and the existing release keeps its notes.
+   The check exits 1 while the run is queued or in progress as well as when it failed. Watch it
+   with `gh run list --workflow ci.yml --branch main --commit "$RELEASE_COMMIT"` and `gh run watch`,
+   then run the check again; create the tag only after it exits 0. If another pull request landed on
+   `main` after the release PR, `HEAD` is not the release commit: take the release PR's merge commit
+   from `gh pr view <number> --json mergeCommit` as `RELEASE_COMMIT` instead.
+
+4. Watch the `Release` workflow. It verifies the tag signature and that the manifests match the tag,
+   then asks GitHub whether the `CI` workflow passed on `main` for the tagged commit
+   (`scripts/check-release-ci.sh`). It does not run `scripts/check.sh` again: every line of that is a
+   step of `ci.yml`. The newest push run of that exact commit has to have completed with every job
+   green, `Gate` included. No run, a run still going, a failed, cancelled or skipped one, and an
+   API error all stop the release, because `Gate` is not a required status check on `main`
+   ([#498](https://github.com/juliopolycarpo/mango-external-agents/issues/498)): a commit can reach
+   `main` with CI red, so the run has to be read, not assumed. Step 3 runs the same script before
+   the tag exists, so this is a second reading: a tag pushed before CI finished on its commit fails
+   here, and rerunning the workflow once the run has finished is enough. The verify job then runs
+   `cargo deny check advisories` afresh, because an advisory published between the CI run on `main`
+   and the tag is invisible to that run (bans, licences and sources depend only on the commit, so
+   CI's answer stands), the publication
+   gate (`scripts/check-publish.sh --list`), which CI does not run, and the isolated minimum-Rust
+   feature check (`scripts/check-features.sh msrv --locked`, on the `rust-version` the script reads
+   from `Cargo.toml`, one package at a time). The publish job publishes each crate that is not on
+   crates.io yet, and the last job creates the GitHub release with git-cliff notes. The checks run
+   in the verify job, which the publish job needs, so a tag that fails any of them publishes
+   nothing. A full rerun is safe: a crate already on crates.io and a GitHub release that already
+   exists are skipped, and the existing release keeps its notes.
 
 5. Bump the current registry consumer once the release is on crates.io. The consumer can only name
    a version the registry already has, so the release pull request cannot do this. In a follow-up
@@ -161,7 +192,7 @@ release.
 
 | Lane                                 | Covers                                                                                                                                                                             | Runs                                                                                                 |
 | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `scripts/check-features.sh powerset` | Clippy over every feature pair (depth 2) of the core and of the Claude, Codex and ACP crates, all targets, in a copy without the self dev-dependency, on the development toolchain | CI `powerset` job on Linux, macOS and Windows, `scripts/check.sh`, release verify job                |
+| `scripts/check-features.sh powerset` | Clippy over every feature pair (depth 2) of the core and of the Claude, Codex and ACP crates, all targets, in a copy without the self dev-dependency, on the development toolchain | CI `powerset` job on Linux, macOS and Windows, `scripts/check.sh`; a release needs that job green    |
 | `scripts/check-features.sh msrv`     | each package alone on the declared minimum Rust: bare, each feature alone, core with all features, bare core with all targets in that copy; library targets otherwise              | CI `msrv` job, fresh-dependencies lane, release verify job, `scripts/check-features.sh msrv` by hand |
 
 `scripts/check-features.sh` is the single driver. A lane fixes the toolchain and the target set; the

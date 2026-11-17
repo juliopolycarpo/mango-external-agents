@@ -113,7 +113,7 @@ impl Notification {
         // Decoded from a reference: a malformed frame still needs its params for routing, and
         // cloning them first copied every long delta and diff to decode a value that is then
         // dropped. `T::deserialize(&Value)` accepts what `from_value(Value)` accepts; a payload
-        // type added to the `match` below is added to `tests/notification_decode.rs` too.
+        // type added to the `match` below is added to `tests/it/notification_decode.rs` too.
         fn read<T: serde::de::DeserializeOwned>(
             params: &Value,
             method: &str,

@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use mango_external_agents::Limits;
+use mango_external_agents::error::{ErrorCode, VendorError};
 use mango_external_agents::event::{
     ActivityResult, ActivityStatus, ActivityUpdate, EventKind, StructureClose,
 };
@@ -47,7 +48,30 @@ pub const ACTIVITY_UPDATE_INTERVAL: Duration = Duration::from_secs(5);
 /// How many characters of an activity's most recent output one update carries.
 pub const ACTIVITY_UPDATE_DETAIL_MAX_CHARS: usize = 2_000;
 
+/// The most activities one turn may have open at once.
+///
+/// The app-server decides how many items a turn starts, and each open one holds an id and up to
+/// [`ACTIVITY_UPDATE_DETAIL_MAX_CHARS`] characters of output, so the count has to be bounded here
+/// rather than by what the vendor sends. The same figure as the default
+/// `Limits::turn_channel_capacity`, and far above what a real turn runs concurrently.
+///
+/// Past it the turn fails with [`ACTIVITY_OVERFLOW`]: the activity that would exceed it is not
+/// forwarded, and the reducer records the failure for the session to take with
+/// [`TurnReducer::take_activity_overflow`]. The session then fails the turn as it does for an event
+/// the core refuses: every activity already open is closed as failed, the failure is committed,
+/// and the native turn is interrupted, with admission held until the app-server reports it over.
+/// The alternative, forwarding the excess untracked, would hand the host a start that no
+/// completion or terminal close is ever owed for.
+pub(crate) const MAX_OPEN_ACTIVITIES: usize = 1_024;
+
+/// The code of the failure a turn ends with when it passes [`MAX_OPEN_ACTIVITIES`].
+pub(crate) const ACTIVITY_OVERFLOW: ErrorCode = ErrorCode::from_static("codex-activity-overflow");
+
 /// What one turn has announced so far, for the announcements that depend on it.
+///
+/// A reducer built with [`TurnReducer::new`] holds streamed message text without bound; a session
+/// builds it with a bound derived from its `Limits`, and a host driving the reducer directly over
+/// untrusted input does the same through [`TurnReducer::builder`].
 ///
 /// # Example
 ///
@@ -56,7 +80,10 @@ pub const ACTIVITY_UPDATE_DETAIL_MAX_CHARS: usize = 2_000;
 /// use mango_agent_codex::turn_reducer::TurnReducer;
 /// use serde_json::json;
 ///
-/// let mut turn = TurnReducer::new();
+/// // Bounded as a session does: no message's streamed text outgrows one decoded line.
+/// let mut turn = TurnReducer::builder()
+///     .max_message_bytes(2 * 1024 * 1024)
+///     .build();
 /// let delta = Notification::parse(
 ///     "item/commandExecution/outputDelta",
 ///     json!({"threadId": "t", "turnId": "u", "itemId": "never-started", "delta": "hi"}),
@@ -80,6 +107,9 @@ pub struct TurnReducer {
     max_message_bytes: Option<usize>,
     /// The vendor code of the last error report the server did not mean to retry.
     reported_code: Option<String>,
+    /// The failure for the first start refused past [`MAX_OPEN_ACTIVITIES`], until the session
+    /// takes it.
+    activity_overflow: Option<VendorError>,
 }
 
 impl std::fmt::Debug for TurnReducer {
@@ -199,8 +229,13 @@ impl TurnReducerBuilder {
 /// terminal has nothing left to close.
 #[derive(Debug, Default)]
 pub(crate) struct OpenStructures {
-    /// Call ids, oldest first, so the closes come out in a stable order.
-    activities: Vec<String>,
+    /// Open call ids, each with the sequence number it opened under.
+    ///
+    /// A map rather than a list so that opening and closing cost one lookup however many calls
+    /// are open; the sequence number is what puts the closes back in start order.
+    activities: HashMap<String, u64>,
+    /// The sequence number the next opened activity takes.
+    next_sequence: u64,
     /// Reasoning phases opened and not yet ended.
     reasoning: usize,
 }
@@ -242,11 +277,18 @@ impl OpenStructures {
     pub(crate) fn apply(&mut self, mark: Mark) {
         match mark {
             Mark::ActivityOpened(call_id) => {
-                if !self.activities.contains(&call_id) {
-                    self.activities.push(call_id);
+                // A repeat keeps its first position: the host was told of one call, not two.
+                let sequence = self.next_sequence;
+                if let std::collections::hash_map::Entry::Vacant(slot) =
+                    self.activities.entry(call_id)
+                {
+                    slot.insert(sequence);
+                    self.next_sequence = sequence.wrapping_add(1);
                 }
             }
-            Mark::ActivityClosed(call_id) => self.activities.retain(|open| *open != call_id),
+            Mark::ActivityClosed(call_id) => {
+                self.activities.remove(&call_id);
+            }
             Mark::ReasoningOpened => self.reasoning += 1,
             Mark::ReasoningClosed => self.reasoning = self.reasoning.saturating_sub(1),
         }
@@ -256,13 +298,17 @@ impl OpenStructures {
     ///
     /// Empty on the ordinary path, where every activity completed before the turn did.
     pub(crate) fn close_all(&mut self, status: ActivityStatus) -> Vec<StructureClose> {
-        let activities = std::mem::take(&mut self.activities);
+        let mut activities: Vec<(u64, String)> = std::mem::take(&mut self.activities)
+            .into_iter()
+            .map(|(call_id, sequence)| (sequence, call_id))
+            .collect();
+        activities.sort_unstable_by_key(|(sequence, _)| *sequence);
         let reasoning = std::mem::take(&mut self.reasoning);
         let mut closes = Vec::with_capacity(activities.len() + reasoning);
         closes.extend(
             activities
                 .into_iter()
-                .map(|call_id| StructureClose::activity(call_id, ActivityResult::new(status))),
+                .map(|(_, call_id)| StructureClose::activity(call_id, ActivityResult::new(status))),
         );
         closes.extend(std::iter::repeat_n(StructureClose::reasoning(), reasoning));
         closes
@@ -289,7 +335,11 @@ enum Progress<'a> {
 }
 
 impl TurnReducer {
-    /// A turn nothing has been announced for yet.
+    /// A turn nothing has been announced for yet, with no bound on streamed message text.
+    ///
+    /// Fit for a transcript the caller trusts, such as a recorded fixture replayed in a test. A
+    /// reducer reading a live vendor stream is built with [`Self::builder`] and
+    /// [`TurnReducerBuilder::max_message_bytes`], which is what a session does.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -394,8 +444,7 @@ impl TurnReducer {
         {
             self.remember_streamed(&delta.item_id, &delta.delta);
         }
-        self.observe(&outcome);
-        outcome
+        self.observe(outcome)
     }
 
     /// What a completed message adds to the text its deltas already delivered.
@@ -441,16 +490,34 @@ impl TurnReducer {
     }
 
     /// Tracks which activities are open, from what the pure reducer decided to emit.
-    fn observe(&mut self, outcome: &Outcome) {
-        let Outcome::Emit(events) = outcome else {
-            if matches!(outcome, Outcome::Finish { .. } | Outcome::Poison { .. }) {
-                self.activities.clear();
+    ///
+    /// Returns `outcome` unchanged unless it would open an activity past [`MAX_OPEN_ACTIVITIES`].
+    /// Then the outcome keeps only the events before the refused start, and the failure is recorded
+    /// for [`Self::take_activity_overflow`]. The turn is not finished here: the app-server has not
+    /// said it is over, so the session fails it and interrupts the native turn instead.
+    fn observe(&mut self, outcome: Outcome) -> Outcome {
+        let mut events = match outcome {
+            Outcome::Emit(events) => events,
+            other => {
+                if matches!(other, Outcome::Finish { .. } | Outcome::Poison { .. }) {
+                    self.activities.clear();
+                }
+                return other;
             }
-            return;
         };
-        for event in events {
-            match event {
+        for position in 0..events.len() {
+            match &events[position] {
                 EventKind::ActivityStarted { call_id, .. } => {
+                    // A repeated id replaces its entry, so only a new one can pass the bound.
+                    if self.activities.len() >= MAX_OPEN_ACTIVITIES
+                        && !self.activities.contains_key(call_id)
+                    {
+                        let received = self.activities.len() + 1;
+                        self.activity_overflow
+                            .get_or_insert_with(|| activity_overflow_failure(received));
+                        events.truncate(position);
+                        return Outcome::Emit(events);
+                    }
                     self.activities
                         .insert(call_id.clone(), OpenActivity::default());
                 }
@@ -460,6 +527,15 @@ impl TurnReducer {
                 _ => {}
             }
         }
+        Outcome::Emit(events)
+    }
+
+    /// The failure recorded when a start past [`MAX_OPEN_ACTIVITIES`] was refused, once.
+    ///
+    /// The session asks after it has published the events of a reduction, and fails the turn on
+    /// `Some`.
+    pub(crate) fn take_activity_overflow(&mut self) -> Option<VendorError> {
+        self.activity_overflow.take()
     }
 
     /// Folds one progress frame into its activity and emits an update when the window allows.
@@ -509,6 +585,19 @@ impl TurnReducer {
             update,
         }])
     }
+}
+
+/// The failure a turn ends with when the app-server opens more than [`MAX_OPEN_ACTIVITIES`].
+///
+/// Names the limit and the count the turn reached; neither is vendor text.
+fn activity_overflow_failure(received: usize) -> VendorError {
+    VendorError::new(
+        ACTIVITY_OVERFLOW,
+        format!(
+            "expected at most {MAX_OPEN_ACTIVITIES} concurrently open activities in one turn | \
+             received {received}"
+        ),
+    )
 }
 
 /// Where the last [`ACTIVITY_UPDATE_DETAIL_MAX_CHARS`] characters of `text` begin, or `None` when
@@ -572,8 +661,8 @@ impl OpenActivity {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTIVITY_UPDATE_DETAIL_MAX_CHARS, ACTIVITY_UPDATE_INTERVAL, Mark, OpenActivity,
-        OpenStructures, TurnReducer,
+        ACTIVITY_OVERFLOW, ACTIVITY_UPDATE_DETAIL_MAX_CHARS, ACTIVITY_UPDATE_INTERVAL,
+        MAX_OPEN_ACTIVITIES, Mark, OpenActivity, OpenStructures, TurnReducer,
     };
     use crate::protocol::notifications::{Notification, method};
     use crate::reducer::Outcome;
@@ -1478,6 +1567,155 @@ mod tests {
             super::last_window_start(&wide),
             Some(3),
             "expected the window to start after the three narrow characters, counted in bytes"
+        );
+    }
+
+    /// `item/started` for a command, which opens one activity under `item_id`.
+    fn command_started(item_id: &str) -> Notification {
+        Notification::parse(
+            method::ITEM_STARTED,
+            json!({"threadId": THREAD, "turnId": TURN, "item": {
+                "type": "commandExecution", "id": item_id, "command": "cargo build",
+                "status": "inProgress"}}),
+        )
+    }
+
+    /// `item/completed` for the command `command_started` opened.
+    fn command_completed(item_id: &str) -> Notification {
+        Notification::parse(
+            method::ITEM_COMPLETED,
+            json!({"threadId": THREAD, "turnId": TURN, "item": {
+                "type": "commandExecution", "id": item_id, "command": "cargo build",
+                "status": "completed", "exitCode": 0, "aggregatedOutput": ""}}),
+        )
+    }
+
+    /// Opens `count` commands, named `cmd-0` onwards, and returns the outcome of the last start.
+    fn open_commands(turn: &mut TurnReducer, count: usize) -> Outcome {
+        let at = tokio::time::Instant::now();
+        let mut last = Outcome::Ignore;
+        for index in 0..count {
+            last = reduce_at(turn, &command_started(&format!("cmd-{index}")), at);
+        }
+        last
+    }
+
+    #[test]
+    fn a_start_past_the_open_activity_bound_is_refused_and_recorded_for_the_session() {
+        let mut turn = TurnReducer::new();
+        let at_bound = open_commands(&mut turn, MAX_OPEN_ACTIVITIES);
+        assert!(
+            matches!(&at_bound, Outcome::Emit(events) if events.len() == 1),
+            "expected the start at the bound to be emitted | received {at_bound:?}"
+        );
+        assert!(
+            turn.take_activity_overflow().is_none(),
+            "expected no overflow at exactly {MAX_OPEN_ACTIVITIES} open activities"
+        );
+        let past = reduce_at(&mut turn, &command_started("one-too-many"), tokio_now());
+        // Not a Finish: the app-server has not said the turn is over, so the session must fail it
+        // and interrupt the native turn rather than treat it as ended.
+        assert_eq!(
+            past,
+            Outcome::Emit(Vec::new()),
+            "expected the refused start to forward nothing and not to finish the turn"
+        );
+        let failure = turn
+            .take_activity_overflow()
+            .expect("expected the start past the bound to record a failure");
+        assert_eq!(failure.code, ACTIVITY_OVERFLOW);
+        assert_eq!(failure.code.as_str(), "codex-activity-overflow");
+        assert!(
+            turn.take_activity_overflow().is_none(),
+            "expected the failure to be taken once"
+        );
+        let expected_message = format!(
+            "expected at most {MAX_OPEN_ACTIVITIES} concurrently open activities in one turn | \
+             received {}",
+            MAX_OPEN_ACTIVITIES + 1
+        );
+        assert_eq!(failure.message, expected_message);
+    }
+
+    #[test]
+    fn a_repeated_start_or_a_completion_makes_room_under_the_open_activity_bound() {
+        let mut turn = TurnReducer::new();
+        open_commands(&mut turn, MAX_OPEN_ACTIVITIES);
+        let at = tokio_now();
+        // The app-server repeating an id it already opened is not a new activity.
+        let repeated = reduce_at(&mut turn, &command_started("cmd-0"), at);
+        assert!(
+            matches!(repeated, Outcome::Emit(_)),
+            "expected a repeated id to stay within the bound | received {repeated:?}"
+        );
+        reduce_at(&mut turn, &command_completed("cmd-0"), at);
+        let replacement = reduce_at(&mut turn, &command_started("replacement"), at);
+        assert!(
+            matches!(replacement, Outcome::Emit(_)),
+            "expected a completed activity to free a slot | received {replacement:?}"
+        );
+    }
+
+    #[test]
+    fn many_activities_opened_and_closed_one_by_one_never_reach_the_bound() {
+        let mut turn = TurnReducer::new();
+        let at = tokio_now();
+        for index in 0..10_000 {
+            let id = format!("cmd-{index}");
+            let started = reduce_at(&mut turn, &command_started(&id), at);
+            assert!(
+                matches!(started, Outcome::Emit(_)),
+                "expected start {index} to be emitted | received {started:?}"
+            );
+            reduce_at(&mut turn, &command_completed(&id), at);
+        }
+        assert_eq!(
+            turn.activities.len(),
+            0,
+            "expected nothing left open after every activity completed"
+        );
+    }
+
+    fn tokio_now() -> tokio::time::Instant {
+        tokio::time::Instant::now()
+    }
+
+    /// Opening 100,000 activities and closing them in start order costs one lookup each. A list
+    /// scanned per open and per close takes minutes here; the bound is deliberately far above what
+    /// the lookups need so a slow host does not fail it.
+    #[test]
+    fn open_structures_open_and_close_in_linear_time_and_close_in_start_order() {
+        const CALLS: usize = 100_000;
+        let started = std::time::Instant::now();
+        let mut open = OpenStructures::default();
+        for index in 0..CALLS {
+            open.apply(Mark::ActivityOpened(format!("call-{index}")));
+        }
+        for index in 0..CALLS {
+            if index % 2 == 0 {
+                open.apply(Mark::ActivityClosed(format!("call-{index}")));
+            }
+        }
+        let closes = open.close_all(ActivityStatus::Cancelled);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "expected {CALLS} opens and closes within 5s | received {elapsed:?}"
+        );
+        let ids: Vec<&str> = closes
+            .iter()
+            .filter_map(|close| match close {
+                StructureClose::Activity { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let expected: Vec<String> = (0..CALLS)
+            .filter(|index| index % 2 == 1)
+            .map(|index| format!("call-{index}"))
+            .collect();
+        assert_eq!(
+            ids, expected,
+            "expected the still-open calls closed in the order they opened"
         );
     }
 }

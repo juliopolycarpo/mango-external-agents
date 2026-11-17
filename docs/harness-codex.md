@@ -549,7 +549,7 @@ overruns its own bound could spend, the overflow row's 41 s (a turn whose commit
 interrupted, and behind an overflow the held commit's wait comes first and leaves the turn claimed,
 so the teardown that follows spends no interrupt stage with the existing fakes), and the
 connection-loss row's 46 s, driven to 34 s as above. The cancel rows are asserted as sums only; the
-stages they are made of are exercised in `tests/cancel_deadlines.rs`.
+stages they are made of are exercised in `tests/it/cancel_deadlines.rs`.
 
 A cancel's first `rt` is the pending
 start and its second the interrupt. In the failed case the third `rt` is the steer hold, paid only
@@ -1371,7 +1371,7 @@ command on a machine with a working login. The transcript shows the parent turn 
 child in a nonempty `agentThreadId`, the child thread running its own turn, a
 `collabAgentToolCall`, and a second `subAgentActivity` (`kind: completed`, item id
 `subagent-completed-...`) before the parent's `turn/completed`.
-`tests/replay/subagent.rs` replays those bytes through `CodexHarness`: the child id becomes
+`tests/it/replay/subagent.rs` replays those bytes through `CodexHarness`: the child id becomes
 `Activity::subagent_id` on both subagent items; the parent turn stays the host's and ends once,
 since the child thread's own `turn/completed` does not end it; and no approval, question, broker
 call, or response frame follows. `ThreadItem::SubAgentActivity` models only `id`, `agentThreadId`
@@ -1427,6 +1427,17 @@ kept per message only up to what one stdio line can carry once decoded (three ti
 it the text is dropped and the completion is emitted whole, never refused. The documented item
 shape is `agentMessage - {id, text, phase?} containing the accumulated agent reply`
 ([app-server][app-server]).
+
+A turn may hold at most 1,024 activities open at once (`MAX_OPEN_ACTIVITIES`, the same figure as
+the default `Limits::turn_channel_capacity`). The app-server decides how many items a turn starts,
+and each open one keeps an id and a bounded output tail, so the count is capped here rather than by
+the vendor. The start past the cap is not forwarded. The reducer records the failure and the
+session fails the turn the way it does for an event the core refuses: every activity the host was
+told about is closed as failed, the turn ends as an `Error` coded `codex-activity-overflow` naming
+the limit and the count reached, and the native turn is interrupted. Admission stays held until
+Codex reports the turn over, so a second `start_turn` is `Busy` until then, and frames that arrive
+after the failure do not reach the host. A repeated id is not a new activity, and a completed one
+frees its slot. The cap is a constant, not a `Limits` field.
 
 ## Structured content
 

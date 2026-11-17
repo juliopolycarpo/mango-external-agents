@@ -218,7 +218,9 @@ claude --print
 - **`--verbose --include-partial-messages`** are both needed for token-level deltas. Without them
   the stream arrives in whole messages and nothing renders until each block is complete.
 - **The prompt is never in argv.** It is written as one `{"type":"user",…}` message on stdin, which
-  is then closed. argv is world-readable in `ps` on every platform this runs on.
+  is then closed. argv is world-readable in `ps` on every platform this runs on. The line is
+  written from typed structs: its members are always `type, message`, then `role, content`
+  inside, whether or not `serde_json/preserve_order` is on in the host's build.
 - **Prompt input is bounded.** The write and stdin close share `Limits::request_timeout`. A dropped
   stream, host shutdown, `Session::cancel` or `Session::close` stops the child through the turn's
   one teardown owner instead of waiting for a blocked host sink. This follows Claude's documented
@@ -866,7 +868,7 @@ So a host that discovers and then opens without vouching for the result pays **s
 its first token, and one that passes a receipt pays four. `open_session` deliberately does not
 cache: the harness cannot know the executable, the environment or the account did not move between
 the two calls, and guessing is exactly what the receipt replaces. The numbers are asserted as exact
-counts in `tests/harness_over_a_fake_cli.rs`, so probe creep fails a test rather than quietly
+counts in `tests/it/harness_over_a_fake_cli.rs`, so probe creep fails a test rather than quietly
 slowing a first token.
 
 `auth status` returns more personal data than any other vendor's status call — `email`, `orgId`,
@@ -964,6 +966,11 @@ creates a scratch leaf or starts a Claude probe; diagnostics identify the server
 printing its URL or headers. Claude documents [HTTP servers](https://code.claude.com/docs/en/mcp#option-1-add-a-remote-http-server)
 and the [`--mcp-config` flag](https://code.claude.com/docs/en/cli-reference).
 
+The file's bytes are the same in every build: servers go out in the order the host listed them
+and each entry's members in the order `command, args, env` or `type, url, headers`, whether or not
+`serde_json/preserve_order` is on somewhere in the host's dependency graph. The CLI reads the file
+as JSON, so this is about stable fixtures and captures, not a dialect difference.
+
 A build that does not declare `--mcp-config` returns
 `Error::NotSupported { capability: Capability::McpPassthrough }`; a transport kind this harness
 does not map is refused as host configuration. Accepting either would run every turn without the
@@ -983,12 +990,21 @@ What the harness checks, all before anything is spawned:
 
 - The text parses as JSON and its top level is an object. A bare `-1` is valid JSON and starts
   with `-`, which the CLI's parser would read as another flag.
-- The argument is the compact re-serialisation, so pretty-printing never puts a newline on argv.
-  Its length is bounded as a Windows command line writes it, not in bytes: Rust's `Command`
+- The argument is the host's text with the whitespace between tokens removed, so pretty-printing
+  never puts a newline on argv. It is not re-serialised: members, escapes, number spellings and a
+  repeated key reach the CLI as the host wrote them, and the member order does not depend on
+  whether some crate in the host's build turns on `serde_json/preserve_order`. The vendor
+  documents no meaning for key order, so this makes the argv reproducible rather than correcting a
+  wire difference.
+  The length is bounded as a Windows command line writes it, not in bytes: Rust's `Command`
   turns every `"` into `\"` and doubles the backslashes before it, so a quote-dense schema
   grows. When the launcher runs a `.bat` or `.cmd` shim (an npm `claude.cmd`), Rust also writes
   each `%` as `%%cd:~,%`, 8 units for 1. The count takes the larger figure for both, so it is an
-  upper bound whichever program the host launches.
+  upper bound whichever program the host launches. The cap counts the text as the host wrote it,
+  not decoded: an escaped `\u00e9` takes 6 units where the character takes 1. A host whose JSON
+  encoder escapes non-ASCII by default (Python's `json.dumps`) should turn that off
+  (`ensure_ascii=False`), since a schema heavy in escapes that fit the cap before the harness
+  stopped re-serialising it can now be refused.
 - The bound is a conservative worst case for a batch-shim launch. A `.cmd` launch runs through
   `cmd.exe /e:ON /v:OFF /d /c "…"`, and `cmd.exe` rejects a line past 8,191 characters, well
   under the 32,767 units CreateProcess takes. The whole turn line is therefore counted against
@@ -1147,6 +1163,15 @@ conversation `UnfinishedTurn` and refuses later turns. That verdict survives a g
 saved native history does not qualify a transcript the host could not accept. Ordinary user
 cancellation retains its existing resumability rules. Receiver abandonment and bounded stream
 overflow keep their own terminal behavior.
+
+A run may hold at most 1,024 tool calls open at once (`MAX_OPEN_ACTIVITIES`, the same figure as the
+default `Limits::turn_channel_capacity`); a real turn runs a handful. The vendor decides how many
+calls it issues before their results arrive, so the cap is not left to it. The call past the cap is
+not forwarded, and the pump ends the turn as it does a broken stream: the reducer's abort closes
+every call the host was told about as cancelled, the turn's terminal is an `Error` coded
+`claude-activity-overflow` naming the limit and the count reached, the conversation is marked
+`UnfinishedTurn`, and the child is stopped. Claude closes as cancelled where Codex and ACP close as
+failed, because its failure path is the abort that always cancels the run's open calls. The cap is a constant, not a `Limits` field.
 
 The reducer holds three properties, exercised by replay and reducer tests:
 

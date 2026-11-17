@@ -13,8 +13,10 @@
 //! - the text parses as JSON, so a typo is a typed refusal rather than a CLI exit after launch;
 //! - the top level is an object, so the argument starts with `{` and can never be read by the
 //!   CLI's parser as another flag (`-1` is valid JSON and begins with `-`);
-//! - the argument is the compact re-serialisation, so a newline or other control character the
-//!   host's pretty-printing carried never reaches argv;
+//! - the argument is the host's text with the whitespace outside strings removed, so a newline or
+//!   other control character the host's pretty-printing carried never reaches argv. The text is
+//!   not re-serialised: members keep the order the host wrote them in, in every build, where a
+//!   `serde_json::Value` sorts its keys unless some crate turns on `preserve_order`;
 //! - the argument fits [`MAX_JSON_SCHEMA_ARGUMENT_UNITS`] as a Windows command line writes it.
 
 use mango_external_agents::{Error, Result};
@@ -65,8 +67,10 @@ const fn plain_argument_units(arguments: &[&str]) -> usize {
 /// The count is [`windows_argument_units`]: every `"` becomes `\"` and the backslashes before it are
 /// doubled, and a batch-file launcher also turns every `%` into 8 units. A compact schema dense in
 /// quotes or percent signs therefore grows well past its byte length, so the bound is on the
-/// escaped length. A host with a larger schema needs a surface the vendor documents for it; none
-/// is documented for `--json-schema` today.
+/// escaped length. The text is counted as the host wrote it: a `\u00e9` escape is 6 units where the
+/// character is 1, so a host whose JSON encoder escapes non-ASCII should turn that off. A host with
+/// a larger schema needs a surface the vendor documents for it; none is documented for
+/// `--json-schema` today.
 pub const MAX_JSON_SCHEMA_ARGUMENT_UNITS: usize = BATCH_COMMAND_LINE_LIMIT_UNITS
     - BATCH_OVERHEAD_UNITS
     - plain_argument_units(&crate::argv::FIXED_FLAGS)
@@ -86,7 +90,8 @@ const EXPECTED_SHAPE: &str = "a JSON object, no larger than 6861 UTF-16 code uni
 /// What a refusal of a whole turn command line names as the accepted shape.
 const EXPECTED_COMMAND_LINE: &str = "a turn command line of at most 8191 UTF-16 code units as a cmd.exe batch launch writes it, counting the launch prefix, every quoted argument and 1024 units for the launcher path";
 
-/// Checks a host's schema text and returns the compact form that goes on argv.
+/// Checks a host's schema text and returns the compact form that goes on argv: the same text,
+/// without the whitespace between tokens.
 ///
 /// # Errors
 ///
@@ -120,13 +125,9 @@ pub fn compact(raw: &str) -> Result<String> {
             json_kind(&value)
         )));
     }
-    // Serialising a parsed `Value` cannot fail: every key is a string.
-    let compact = serde_json::to_string(&value).map_err(|error| {
-        refusal(format!(
-            "{} that could not be re-serialised ({error})",
-            crate::argv::value_summary(raw)
-        ))
-    })?;
+    // The text parsed, so a raw control character can only be whitespace between tokens (JSON
+    // refuses one inside a string), and removing that whitespace leaves none on argv.
+    let compact = without_insignificant_whitespace(raw);
     let units = windows_argument_units(&compact);
     if units > MAX_JSON_SCHEMA_ARGUMENT_UNITS {
         return Err(refusal(format!(
@@ -225,6 +226,32 @@ pub(crate) fn check_turn_command_line(argv: &[String]) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// `text` without the space, tab, line feed and carriage return that JSON allows between tokens.
+///
+/// Only for text that already parsed as JSON. Inside a string those characters are data, so a
+/// string is copied as written, escapes included.
+fn without_insignificant_whitespace(text: &str) -> String {
+    let mut compact = String::with_capacity(text.len());
+    let mut in_string = false;
+    let mut after_backslash = false;
+    for character in text.chars() {
+        if in_string {
+            compact.push(character);
+            if after_backslash {
+                after_backslash = false;
+            } else if character == '\\' {
+                after_backslash = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+        } else if !matches!(character, ' ' | '\t' | '\n' | '\r') {
+            compact.push(character);
+            in_string = character == '"';
+        }
+    }
+    compact
 }
 
 fn refusal(received: String) -> Error {
@@ -591,6 +618,74 @@ mod tests {
                 "expected {units} units | received {argument:?}"
             );
         }
+    }
+
+    /// The argument keeps the members in the order the host wrote them, in a build with or without
+    /// `serde_json/preserve_order` (a sorted map would write `properties` before `type`).
+    /// `cargo nextest run --workspace` runs this with the feature on (`mango-agent-acp` turns it
+    /// on), and `cargo nextest run -p mango-agent-claude`, the lane `scripts/check.sh` and CI add,
+    /// runs it without.
+    #[test]
+    fn the_argument_keeps_the_hosts_member_order_in_every_build() {
+        let raw = r#"{
+            "type": "object",
+            "properties": {
+                "zeta": {"type": "string", "description": "last name"},
+                "alpha": {"minimum": 1, "multipleOf": 3},
+                "mid": {"enum": [null, true, "b", "a"]}
+            },
+            "required": ["zeta", "alpha"],
+            "additionalProperties": false
+        }"#;
+        let argument = compact(raw).expect("expected a schema");
+        let expected = concat!(
+            r#"{"type":"object","properties":{"#,
+            r#""zeta":{"type":"string","description":"last name"},"#,
+            r#""alpha":{"minimum":1,"multipleOf":3},"#,
+            r#""mid":{"enum":[null,true,"b","a"]}},"#,
+            r#""required":["zeta","alpha"],"additionalProperties":false}"#,
+        );
+        assert_eq!(
+            argument, expected,
+            "expected these exact bytes for --json-schema | received {argument}"
+        );
+    }
+
+    /// The cap counts the text as the host wrote it: an escaped `\u00e9` takes 6 units on the line
+    /// where the character takes 1, so a schema of escapes is refused once they no longer fit.
+    #[test]
+    fn counts_escapes_as_the_host_wrote_them() {
+        let escapes = |count: usize| format!("{{\"d\":\"{}\"}}", "\\u00e9".repeat(count));
+        // `{"d":""}` takes 14 units quoted and escaped, and each escape takes 6.
+        let fitting = (MAX_JSON_SCHEMA_ARGUMENT_UNITS - 14) / 6;
+        let argument = compact(&escapes(fitting)).expect("expected the escapes that fit to pass");
+        assert_eq!(
+            windows_argument_units(&argument),
+            14 + 6 * fitting,
+            "expected 6 units per escape on the line | received {argument:.40}"
+        );
+        let received = refusal_received(&escapes(fitting + 1));
+        assert!(
+            received.contains(&format!("{} UTF-16 code units", 14 + 6 * (fitting + 1))),
+            "expected the refusal to count the escapes as written | received {received:?}"
+        );
+    }
+
+    /// The host's text is passed on as written, minus the whitespace between tokens: whitespace,
+    /// brackets, quotes and escapes inside a string stay, and so do escapes, number spellings and
+    /// a repeated key, which a re-serialisation would have rewritten.
+    #[test]
+    fn the_argument_is_the_hosts_text_without_the_whitespace_between_tokens() {
+        let raw = "{ \"description\" : \"a  b\\t{ } \\\"q\\\" \\\\\" ,\n\t\"note\":\"caf\\u00e9 \\/\" , \"minimum\" : 1.0 , \"maximum\":1e2,\r\n \"huge\" : 18446744073709551616 , \"dup\":1 , \"dup\":3 }";
+        let argument = compact(raw).expect("expected a schema");
+        let expected = concat!(
+            r#"{"description":"a  b\t{ } \"q\" \\","note":"caf\u00e9 \/","#,
+            r#""minimum":1.0,"maximum":1e2,"huge":18446744073709551616,"dup":1,"dup":3}"#,
+        );
+        assert_eq!(
+            argument, expected,
+            "expected the host's text without inter-token whitespace | received {argument}"
+        );
     }
 
     #[test]
