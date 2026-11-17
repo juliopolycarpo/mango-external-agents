@@ -13,7 +13,10 @@
 //! place that knows how an answer reaches the peer.
 
 use agent_client_protocol_schema::v1::{Error as AcpError, RequestPermissionResponse};
-use mango_external_agents::jsonrpc::{JsonRpcError, Responder, ServerRequestOutcome};
+use mango_external_agents::Error;
+use mango_external_agents::jsonrpc::{
+    JsonRpcError, Responder, ServerRequestOutcome, Unanswered, Written,
+};
 
 use crate::permission;
 
@@ -54,18 +57,21 @@ impl PermissionReply {
     /// reply.respond(permission::selected("reject"))?;
     /// ```
     pub(super) fn respond(mut self, response: RequestPermissionResponse) -> Result<(), AcpError> {
-        let result = serde_json::to_value(response).map_err(|error| {
-            internal_error(format!(
-                "expected a serialisable session/request_permission response | received: {error}"
-            ))
-        })?;
         let Some(responder) = self.responder.take() else {
             return Ok(());
         };
-        answer(responder, ServerRequestOutcome::Answer(result)).map_err(|error| {
-            internal_error(format!(
+        // Written from the typed response, not from a `Value`: its members go out in their
+        // declared order (`outcome`, then `optionId`) whether or not some crate in the build
+        // turns on `serde_json/preserve_order`. This crate's schema dependency happens to, but
+        // the bytes do not rest on that.
+        let attempt = responder.answer_with(&response);
+        settle(attempt).map_err(|error| match error {
+            Error::Protocol { received, .. } => internal_error(format!(
+                "expected a serialisable session/request_permission response | received: {received}"
+            )),
+            error => internal_error(format!(
                 "expected an ACP connection that takes this answer | received: {error}"
-            ))
+            )),
         })
     }
 }
@@ -106,13 +112,15 @@ pub(super) fn past_cap(is_permission: bool) -> ServerRequestOutcome {
 /// place so it does not wait on the question: the caller must not take the question as
 /// answered the way it asked. Only an agent that chose an id nearly as large as the bound can
 /// make an answer that size.
-fn answer(
-    responder: Responder,
-    outcome: ServerRequestOutcome,
-) -> mango_external_agents::Result<()> {
+fn answer(responder: Responder, outcome: ServerRequestOutcome) -> Result<(), Error> {
+    settle(responder.answer(outcome))
+}
+
+/// The outcome of queuing an answer: done, or why the agent was not given it.
+fn settle(attempt: Result<Written, Unanswered>) -> Result<(), Error> {
     // The write itself is not waited for: the frame is queued, in order, and the connection
     // reports a write that fails as its own end.
-    let unanswered = match responder.answer(outcome) {
+    let unanswered = match attempt {
         Ok(_written) => return Ok(()),
         Err(unanswered) => unanswered,
     };
@@ -248,6 +256,25 @@ mod tests {
         assert_eq!(
             received, expected,
             "expected the answer on the wire: {expected} | received: {received}"
+        );
+    }
+
+    /// The bytes of a permission answer: `outcome` before `optionId`, as the schema declares
+    /// them. `json!` equality above ignores member order, so this pins the text itself.
+    #[tokio::test]
+    async fn a_permission_answer_is_written_in_the_schemas_member_order() {
+        let (_client, link, responder) = asked(12).await;
+        PermissionReply::new(responder)
+            .respond(permission::selected("reject"))
+            .expect("expected the answer to be accepted");
+
+        link.wait_for_sent(1).await;
+        let expected = r#"{"jsonrpc":"2.0","id":12,"result":{"outcome":{"outcome":"selected","optionId":"reject"}}}"#;
+        let received = link.sent();
+        assert_eq!(
+            received,
+            [expected],
+            "expected exactly this permission answer on the wire: {expected} | received: {received:?}"
         );
     }
 
