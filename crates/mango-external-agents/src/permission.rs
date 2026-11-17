@@ -1572,10 +1572,18 @@ mod tests {
             .allow()
             .expect_err("expected a refusal, received an answer");
         assert!(
-            matches!(error, Error::Protocol { .. }),
-            "expected a protocol refusal, received {error:?}"
+            matches!(&error, Error::Protocol { expected, received }
+                if expected == "an option that allows" && received == "[Other]"),
+            "expected a protocol refusal naming the missing allow and the offered [Other], received {error:?}"
         );
-        assert!(request.deny().is_err());
+        let error = request
+            .deny()
+            .expect_err("expected a refusal, received an answer");
+        assert!(
+            matches!(&error, Error::Protocol { expected, received }
+                if expected == "an option that refuses" && received == "[Other]"),
+            "expected a protocol refusal naming the missing refusal and the offered [Other], received {error:?}"
+        );
     }
 
     #[test]
