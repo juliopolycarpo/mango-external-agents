@@ -14,9 +14,11 @@ use mango_external_agents::{
 
 use super::*;
 
-/// [`super::redact_line`] for a test that does not read the drift report.
+/// [`super::redact_line`] for a test that does not read the drift report. The line is a recording
+/// of its own: the `StructuredOutput` calls it names are the answer's.
 fn redact_line(raw: &str, paths: Paths<'_>) -> Option<String> {
-    super::redact_line(raw, paths, &mut DriftReport::default())
+    let answers = AnswerCalls::in_lines(&[raw.to_owned()]);
+    super::redact_line(raw, &answers, paths, &mut DriftReport::default())
 }
 
 /// Collects the notices a capture hands to the operator, in place of stderr.
@@ -371,6 +373,25 @@ fn redacted_record(record: &Value) -> Value {
     })
 }
 
+/// Redacts the records of one recording together, as a capture does, so a record can depend on
+/// another one.
+fn redacted_records(records: &[Value]) -> Vec<Value> {
+    let facts = MachineFacts::new();
+    let lines = lines_of(records);
+    let answers = AnswerCalls::in_lines(&lines);
+    let mut drift = DriftReport::default();
+    lines
+        .iter()
+        .map(|line| {
+            let kept = super::redact_line(line, &answers, facts.paths(), &mut drift)
+                .unwrap_or_else(|| panic!("expected a JSON object to be kept | received: {line}"));
+            serde_json::from_str(&kept).unwrap_or_else(|error| {
+                panic!("expected a redacted JSON line | received: {kept} ({error})")
+            })
+        })
+        .collect()
+}
+
 #[test]
 fn a_rate_limit_event_keeps_only_the_members_that_identify_the_record() {
     let line = redacted_record(&rate_limit_event());
@@ -715,6 +736,310 @@ fn a_number_inside_the_models_answer_stays_even_under_a_tool_data_name() {
         line["structured_output"]["tool_input"],
         json!({"count": 1, "ready": true}),
         "expected the answer's numbers and booleans kept, as the README says | received: {line}"
+    );
+}
+
+/// The answer's own tool call: its input is what `--json-schema` made the model write.
+const ANSWER_TOOL_USE_ID: &str = "toolu_answer";
+/// A tool author's call, recorded beside the answer's.
+const LEDGER_TOOL_USE_ID: &str = "toolu_ledger";
+
+/// The answer a `--json-schema` turn wrote: numbers and booleans a replay and a qualification read.
+fn schema_answer() -> Value {
+    json!({"count": 1, "ready": true, "nested": {"total": 2}})
+}
+
+/// An assistant record holding the answer's `StructuredOutput` call and a tool author's call, each
+/// with `input` as given.
+fn assistant_record_with_calls(answer_input: &Value, ledger_input: &Value) -> Value {
+    json!({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": ANSWER_TOOL_USE_ID, "name": "StructuredOutput",
+         "input": answer_input},
+        {"type": "tool_use", "id": LEDGER_TOOL_USE_ID, "name": "mcp__ledger__lookup",
+         "input": ledger_input}]}})
+}
+
+/// A record repeating each call's input under `wire_tool_inputs`, keyed by tool-use id.
+fn wire_inputs_record(answer_input: &Value, ledger_input: &Value) -> Value {
+    json!({"type": "result", "wire_tool_inputs": {
+        ANSWER_TOOL_USE_ID: answer_input, LEDGER_TOOL_USE_ID: ledger_input}})
+}
+
+#[test]
+fn a_tool_authors_call_input_replaces_numbers_and_booleans_and_the_answers_keeps_them() {
+    let records = redacted_records(&[assistant_record_with_calls(
+        &schema_answer(),
+        &tool_author_numbers_and_booleans(),
+    )]);
+
+    let [answer_call, ledger_call] = &records[0]["message"]["content"]
+        .as_array()
+        .expect("expected the content blocks")[..]
+    else {
+        panic!("expected two tool calls | received: {}", records[0]);
+    };
+    assert_eq!(
+        answer_call["input"],
+        schema_answer(),
+        "expected the StructuredOutput call's answer intact | received: {answer_call}"
+    );
+    assert_eq!(
+        ledger_call["input"],
+        tool_author_numbers_and_booleans_replaced(),
+        "expected every number 0 and every boolean false in another tool's input | received: {ledger_call}"
+    );
+}
+
+/// A number only a tool author would write, inside a block that reads like the answer's call.
+const LOOKALIKE_ACCOUNT: u64 = 123_456;
+
+/// A `StructuredOutput` tool_use block as a tool author's data can spell it out.
+fn answer_lookalike_block() -> Value {
+    json!({"type": "tool_use", "id": ANSWER_TOOL_USE_ID, "name": "StructuredOutput",
+        "input": {"acct": LOOKALIKE_ACCOUNT, "open": true}})
+}
+
+/// Fails unless `value` is the lookalike block's input with its number and boolean replaced.
+fn assert_lookalike_input_replaced(value: &Value, where_: &str) {
+    assert_eq!(
+        value,
+        &json!({"acct": 0, "open": false}),
+        "expected a StructuredOutput lookalike {where_} to be replaced like any tool data | received: {value}"
+    );
+}
+
+#[test]
+fn an_answer_lookalike_inside_another_tools_input_does_not_keep_its_numbers() {
+    let records = redacted_records(&[assistant_record_with_calls(
+        &schema_answer(),
+        &json!({"payload": answer_lookalike_block()}),
+    )]);
+
+    let ledger_call = &records[0]["message"]["content"][1];
+    assert_lookalike_input_replaced(
+        &ledger_call["input"]["payload"]["input"],
+        "in another tool's input",
+    );
+    assert_eq!(
+        records[0]["message"]["content"][0]["input"],
+        schema_answer(),
+        "expected the real answer call intact beside it | received: {}",
+        records[0]
+    );
+}
+
+#[test]
+fn an_answer_lookalike_inside_a_tool_result_or_denied_input_does_not_keep_its_numbers() {
+    let records = redacted_records(&[
+        assistant_record_with_calls(&schema_answer(), &json!({})),
+        json!({"type": "user", "tool_use_result": {"echo": answer_lookalike_block()}}),
+        json!({"type": "result", "permission_denials": [
+            {"tool_use_id": LEDGER_TOOL_USE_ID, "tool_input": {"echo": answer_lookalike_block()}}]}),
+    ]);
+
+    assert_lookalike_input_replaced(
+        &records[1]["tool_use_result"]["echo"]["input"],
+        "in tool_use_result",
+    );
+    assert_lookalike_input_replaced(
+        &records[2]["permission_denials"][0]["tool_input"]["echo"]["input"],
+        "in tool_input",
+    );
+}
+
+#[test]
+fn an_answer_id_used_as_a_key_inside_another_tools_input_does_not_keep_its_numbers() {
+    let records = redacted_records(&[assistant_record_with_calls(
+        &schema_answer(),
+        &json!({
+            "wire_tool_inputs": {ANSWER_TOOL_USE_ID: {"acct": LOOKALIKE_ACCOUNT, "open": true}}}),
+    )]);
+
+    assert_lookalike_input_replaced(
+        &records[0]["message"]["content"][1]["input"]["wire_tool_inputs"][ANSWER_TOOL_USE_ID],
+        "under a wire_tool_inputs key nested in another tool's input",
+    );
+}
+
+#[test]
+fn a_structured_output_member_inside_tool_data_does_not_keep_its_numbers() {
+    let records = redacted_records(&[
+        json!({"type": "user", "tool_use_result": {"structured_output": {"acct": LOOKALIKE_ACCOUNT, "open": true}}}),
+    ]);
+
+    assert_eq!(
+        records[0]["tool_use_result"]["structured_output"],
+        json!({"acct": 0, "open": false}),
+        "expected a structured_output member a tool wrote to be tool data | received: {}",
+        records[0]
+    );
+}
+
+#[test]
+fn an_answer_lookalike_inside_tool_data_names_no_answer_call() {
+    let answers = AnswerCalls::in_lines(&lines_of(&[
+        assistant_record_with_calls(
+            &json!({}),
+            &json!({"payload": {
+            "type": "tool_use", "id": "toolu_nested_in_input", "name": "StructuredOutput"}}),
+        ),
+        json!({"type": "user", "tool_use_result": {"echo": {
+            "type": "tool_use", "id": "toolu_nested_in_result", "name": "StructuredOutput"}}}),
+        json!({"type": "result", "permission_denials": [{"tool_input": {"echo": {
+            "type": "tool_use", "id": "toolu_nested_in_denial", "name": "StructuredOutput"}}}]}),
+        json!({"type": "result", "wire_tool_inputs": {LEDGER_TOOL_USE_ID: {"echo": {
+            "type": "tool_use", "id": "toolu_nested_in_wire", "name": "StructuredOutput"}}}}),
+    ]));
+
+    let claimed: Vec<&str> = [
+        ANSWER_TOOL_USE_ID,
+        "toolu_nested_in_input",
+        "toolu_nested_in_result",
+        "toolu_nested_in_denial",
+        "toolu_nested_in_wire",
+    ]
+    .into_iter()
+    .filter(|id| answers.contains(id))
+    .collect();
+    assert_eq!(
+        claimed,
+        vec![ANSWER_TOOL_USE_ID],
+        "expected only the call in the message to be the answer's, none a tool's data spelled out"
+    );
+}
+
+#[test]
+fn an_mcp_tool_named_like_the_answer_tool_is_another_tools_call() {
+    let records = redacted_records(&[json!({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "toolu_mcp", "name": "mcp__x__StructuredOutput",
+         "input": {"count": 1, "ready": true}}]}})]);
+
+    assert_eq!(
+        records[0]["message"]["content"][0]["input"],
+        json!({"count": 0, "ready": false}),
+        "expected only the exact StructuredOutput name to keep an input's numbers | received: {}",
+        records[0]
+    );
+}
+
+#[test]
+fn a_tool_authors_call_input_replaces_strings_under_structural_parameter_names() {
+    let records = redacted_records(&[assistant_record_with_calls(
+        &json!({}),
+        &tool_author_object(),
+    )]);
+
+    assert_no_tool_author_value(&records[0], "under another tool's input");
+}
+
+#[test]
+fn wire_tool_inputs_replaces_numbers_of_a_tool_authors_call_and_keeps_the_answers() {
+    // The answer's call is named once in the stream; the repeat may come before or after it.
+    for records in [
+        vec![
+            assistant_record_with_calls(&json!({}), &json!({})),
+            wire_inputs_record(&schema_answer(), &tool_author_numbers_and_booleans()),
+        ],
+        vec![
+            wire_inputs_record(&schema_answer(), &tool_author_numbers_and_booleans()),
+            assistant_record_with_calls(&json!({}), &json!({})),
+        ],
+    ] {
+        let wire_position = records
+            .iter()
+            .position(|record| record.get("wire_tool_inputs").is_some())
+            .expect("expected a wire_tool_inputs record");
+        let redacted = redacted_records(&records);
+
+        let wire = &redacted[wire_position]["wire_tool_inputs"];
+        assert_eq!(
+            wire[ANSWER_TOOL_USE_ID],
+            schema_answer(),
+            "expected the answer's repeat intact | received: {wire}"
+        );
+        assert_eq!(
+            wire[LEDGER_TOOL_USE_ID],
+            tool_author_numbers_and_booleans_replaced(),
+            "expected the tool author's repeat replaced, keyed by the same id | received: {wire}"
+        );
+    }
+}
+
+#[test]
+fn a_wire_input_of_an_unknown_call_is_replaced_like_a_tool_authors() {
+    let records = redacted_records(&[wire_inputs_record(
+        &schema_answer(),
+        &tool_author_numbers_and_booleans(),
+    )]);
+
+    let wire = &records[0]["wire_tool_inputs"];
+    assert_eq!(
+        wire[ANSWER_TOOL_USE_ID],
+        json!({"count": 0, "ready": false, "nested": {"total": 0}}),
+        "expected an input no StructuredOutput call claims to be replaced | received: {wire}"
+    );
+}
+
+#[test]
+fn the_names_of_a_tool_authors_input_are_keys_and_not_retained_members() {
+    let drift = drift_over(&lines_of(&[
+        assistant_record_with_calls(&schema_answer(), &json!({"novelCounter": 3})),
+        wire_inputs_record(&schema_answer(), &json!({"novelCounter": 3})),
+    ]));
+
+    assert!(
+        drift.retained.is_empty() && drift.replaced_scalars.is_empty() && drift.unseen.is_empty(),
+        "expected the tool author's parameter on the key line only | received retained: {:?} replaced: {:?} strings: {:?}",
+        drift.retained,
+        drift.replaced_scalars,
+        drift.unseen
+    );
+    assert!(
+        drift.map_keys.contains("novelCounter") && !drift.map_keys.contains(LEDGER_TOOL_USE_ID),
+        "expected the parameter listed and the tool-use id not | received keys: {:?}",
+        drift.map_keys
+    );
+}
+
+#[test]
+fn the_answer_calls_are_the_structured_output_tool_uses_at_any_depth() {
+    let answers = AnswerCalls::in_lines(&[
+        lines_of(&[json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_message", "name": "StructuredOutput", "input": {}},
+            {"type": "tool_use", "id": "toolu_other", "name": "mcp__ledger__lookup", "input": {}},
+            {"type": "text", "id": "toolu_text", "name": "StructuredOutput"}]}})])
+        .remove(0),
+        lines_of(
+            &[json!({"type": "stream_event", "event": {"content_block": {
+            "type": "tool_use", "id": "toolu_stream", "name": "StructuredOutput"}}})],
+        )
+        .remove(0),
+        String::from("not json: toolu_text"),
+        lines_of(&[json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "StructuredOutput"}]}})])
+        .remove(0),
+    ]);
+
+    let found: Vec<&str> = ["toolu_message", "toolu_stream", "toolu_other", "toolu_text"]
+        .into_iter()
+        .filter(|id| answers.contains(id))
+        .collect();
+    assert_eq!(
+        found,
+        vec!["toolu_message", "toolu_stream"],
+        "expected only the ids of StructuredOutput tool_use blocks, a call with no id adding none"
+    );
+}
+
+#[test]
+fn every_member_the_walk_reads_as_a_tool_calls_arguments_is_declared() {
+    assert_eq!(
+        [CALL_INPUT_MEMBER, WIRE_INPUTS_MEMBER]
+            .iter()
+            .map(|member| child_keys_of(member))
+            .collect::<Vec<_>>(),
+        vec![Some(ChildKeys::UserChosen), Some(ChildKeys::ToolUseIds)],
+        "expected input declared UserChosen and wire_tool_inputs declared ToolUseIds in REVIEWED_RETAINED_MEMBERS"
     );
 }
 
@@ -2447,9 +2772,10 @@ fn drifted_turn_lines(facts: &MachineFacts) -> Vec<String> {
 /// Runs the walk over `lines` as a capture does and returns the drift it collected.
 fn drift_over(lines: &[String]) -> DriftReport {
     let facts = MachineFacts::new();
+    let answers = AnswerCalls::in_lines(lines);
     let mut drift = DriftReport::default();
     for line in lines {
-        super::redact_line(line, facts.paths(), &mut drift);
+        super::redact_line(line, &answers, facts.paths(), &mut drift);
     }
     drift
 }
@@ -2904,18 +3230,25 @@ fn a_member_that_is_a_number_in_an_array_is_reported_once_under_the_array_member
 
 #[test]
 fn a_retained_number_inside_the_models_answer_is_the_schemas_own_and_not_reported() {
-    let names = retained_names(&[
+    let drift = drift_over(&lines_of(&[
         json!({"type": "assistant", "message": {"content": [
-            {"type": "tool_use", "name": "StructuredOutput",
+            {"type": "tool_use", "id": "toolu_1", "name": "StructuredOutput",
              "input": {"schemaCounter": 1, "schemaFlag": true, "schemaGroup": {"nested": 2}}}]}}),
         json!({"type": "result", "structured_output": {
             "schemaCounter": 1, "schemaGroup": {"nested": 2, "deeper": {"leaf": 3}}},
             "wire_tool_inputs": {"toolu_1": {"schemaCounter": 1}}}),
-    ]);
+    ]));
 
     assert!(
-        names.is_empty(),
-        "expected no answer member in the report | received: {names:?}"
+        drift.retained.is_empty()
+            && drift.replaced_scalars.is_empty()
+            && drift.unseen.is_empty()
+            && drift.map_keys.is_empty(),
+        "expected no answer member in the report | received retained: {:?} replaced: {:?} strings: {:?} keys: {:?}",
+        drift.retained,
+        drift.replaced_scalars,
+        drift.unseen,
+        drift.map_keys
     );
 }
 
