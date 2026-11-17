@@ -732,7 +732,6 @@ dependencies = [
  "agent-client-protocol-schema",
  "async-trait",
  "base64 0.22.1",
- "chrono",
  "mango-agent-acp",
  "mango-external-agents",
  "serde",
