@@ -408,6 +408,12 @@ block_fail 'a command after assignments and command before a trap' $'X=1 Y=2 com
 block_pass 'a command after an assigned exec that only redirects' $'X=1 exec > log 2>&1\nscripts/test-beta.py'
 block_pass 'a command after an assigned trap that only lists' $'X=1 trap -p\nscripts/test-beta.py'
 block_pass 'a command after a timed command that changes nothing' $'time echo hi\nscripts/test-beta.py'
+# `command -p` still runs the builtin with a default PATH; `command -v` and `-V` only print.
+block_fail 'a command after command -p source' $'command -p source ./x.sh\nscripts/test-beta.py' "it follows \`command -p source ./x.sh\`, $source_reason"
+block_fail 'a command after command -p -- exec' $'command -p -- exec true\nscripts/test-beta.py' "it follows \`command -p -- exec true\`, $exec_reason"
+block_fail 'a command after command -p set +e' $'command -p set +e\nscripts/test-beta.py' 'it follows `command -p set +e`, which turns off errexit'
+block_pass 'a command after command -v source, which only prints' $'command -v source\nscripts/test-beta.py'
+block_pass 'a command after command -V trap, which only prints' $'command -V trap\nscripts/test-beta.py'
 
 # The shell has to stop at a failing command, wherever it is declared.
 shell_pass() {
