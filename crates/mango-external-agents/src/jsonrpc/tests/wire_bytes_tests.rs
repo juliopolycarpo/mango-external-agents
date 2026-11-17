@@ -11,7 +11,7 @@
 
 use super::outbox_tests::{options, sent, within};
 use super::*;
-use crate::jsonrpc::WireOptions;
+use crate::jsonrpc::{Responder, WireOptions};
 use serde::Serialize;
 
 const CANCEL: &str = "$/cancel_request";
@@ -368,5 +368,156 @@ async fn params_that_fail_to_serialise_queue_nothing() {
         }
     }
     assert_written(&link, &[], "params that fail to serialise");
+    client.close().await.expect("expected a clean close");
+}
+
+/// A typed answer whose declared field order is not its sorted order, like an ACP permission
+/// answer: `outcome` before `optionId`, where a sorted map writes `optionId` first.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DecisionAnswer {
+    outcome: &'static str,
+    option_id: &'static str,
+    detail: DecisionDetail,
+}
+
+#[derive(Serialize)]
+struct DecisionDetail {
+    zone: u8,
+    alpha: u8,
+}
+
+/// Answers each question through `Responder::answer_with`, as its method says: `typed` with a
+/// [`DecisionAnswer`], `null` with `()`, `raw` with a result holding line breaks, anything else
+/// with a result that does not serialise. The failure of that last one is kept for the test.
+struct TypedAnswerHandler {
+    failed: std::sync::Mutex<Vec<Error>>,
+}
+
+#[async_trait::async_trait]
+impl PeerHandler for TypedAnswerHandler {
+    async fn on_notification(&self, _method: String, _params: Value) {}
+
+    async fn on_request(
+        &self,
+        _method: String,
+        _params: Value,
+        _id: RequestId,
+    ) -> ServerRequestOutcome {
+        ServerRequestOutcome::Answer(Value::Null)
+    }
+
+    async fn on_request_handoff(&self, method: String, _params: Value, responder: Responder) {
+        let answered = match method.as_str() {
+            "typed" => responder.answer_with(&DecisionAnswer {
+                outcome: "selected",
+                option_id: "allow",
+                detail: DecisionDetail { zone: 1, alpha: 2 },
+            }),
+            "null" => responder.answer_with(&()),
+            "raw" => {
+                let note =
+                    serde_json::value::RawValue::from_string(String::from("{\n \"a\": 1\r\n}"))
+                        .expect("expected valid JSON");
+                responder.answer_with(&NoteParams { note })
+            }
+            _ => responder.answer_with(&RefusesToSerialise),
+        };
+        if let Err(unanswered) = answered {
+            self.failed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(unanswered.error().clone());
+        }
+    }
+}
+
+fn connect_typed_answers(versioned: bool) -> (ScriptedLink, Arc<Client>, Arc<TypedAnswerHandler>) {
+    let link = ScriptedLink::new();
+    let handler = Arc::new(TypedAnswerHandler {
+        failed: std::sync::Mutex::new(Vec::new()),
+    });
+    let client = Arc::new(Client::connect_with(
+        link.clone().into_link(),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        speaking(versioned),
+        WireOptions::new().with_request_handoff(),
+    ));
+    (link, client, handler)
+}
+
+/// A typed answer goes out in its declared field order, nested structs included, with the
+/// version first and the id as it arrived, in every build. A `Value` answer would be sorted, or
+/// kept in insertion order, depending on `serde_json/preserve_order`.
+#[tokio::test]
+async fn a_typed_answer_keeps_its_declared_field_order() {
+    for versioned in [true, false] {
+        let (link, client, _handler) = connect_typed_answers(versioned);
+        link.push_line(r#"{"jsonrpc":"2.0","id":7,"method":"typed","params":{}}"#);
+        sent(&link, 1).await;
+        link.push_line(r#"{"jsonrpc":"2.0","id":"q-2","method":"null","params":{}}"#);
+        sent(&link, 2).await;
+
+        let v = version(versioned);
+        assert_written(
+            &link,
+            &[
+                format!(
+                    r#"{{{v}"id":7,"result":{{"outcome":"selected","optionId":"allow","detail":{{"zone":1,"alpha":2}}}}}}"#
+                ),
+                format!(r#"{{{v}"id":"q-2","result":null}}"#),
+            ],
+            &format!("typed answers (versioned: {versioned})"),
+        );
+        client.close().await.expect("expected a clean close");
+    }
+}
+
+/// A typed answer holding a `RawValue` with line breaks is still one compact line.
+#[tokio::test]
+async fn a_typed_answer_with_a_raw_value_is_written_on_one_line() {
+    let (link, client, _handler) = connect_typed_answers(true);
+    link.push_line(r#"{"jsonrpc":"2.0","id":1,"method":"raw","params":{}}"#);
+    sent(&link, 1).await;
+
+    assert_written(
+        &link,
+        &[String::from(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"note":{"a":1}}}"#,
+        )],
+        "a typed answer holding a raw value",
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// A result that does not serialise is an error naming the expected shape and the cause. Nothing
+/// is queued for it: the one frame written is the refusal that the dropped responder sends, so
+/// the question was still open when the handler let it go.
+#[tokio::test]
+async fn a_typed_answer_that_fails_to_serialise_queues_nothing_but_the_drop_refusal() {
+    let (link, client, handler) = connect_typed_answers(true);
+    link.push_line(r#"{"jsonrpc":"2.0","id":3,"method":"fails","params":{}}"#);
+    sent(&link, 1).await;
+
+    let failed = handler
+        .failed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    match failed.as_slice() {
+        [Error::Protocol { expected, received }] => assert_eq!(
+            (expected.as_str(), received.contains("refused by the test")),
+            ("serialisable JSON-RPC result", true),
+            "expected the failed answer to name the result and the cause | received {received:?}"
+        ),
+        other => panic!(
+            "expected one Error::Protocol for a result that fails to serialise | received {other:?}"
+        ),
+    }
+    let written = link.sent();
+    assert!(
+        matches!(written.as_slice(), [frame] if frame.contains(r#""id":3"#) && frame.contains(r#""error""#)),
+        "expected only the refusal a dropped responder writes | received {written:?}"
+    );
     client.close().await.expect("expected a clean close");
 }

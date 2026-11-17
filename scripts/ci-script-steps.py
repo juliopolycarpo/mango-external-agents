@@ -13,10 +13,12 @@ as run only when every one of these holds:
   newlines, `;`, `&&`, `||`, `|` and `&` (quotes, `$(...)`, comments and here-documents respected)
   and a test command counts only when it is joined to its neighbours by a newline or `;`, sits in no
   `if`, loop, `case`, function, group or subshell, follows no `exit` that can end the block and no
-  `set +e`, no `trap` on EXIT, ERR or DEBUG that is still set, and no `exec` with a command, and is not
-  followed by a `||` handler other than an `exit` with a failing status;
-- the step runs under no `shell:` or under `bash` or `sh`, the shells that stop at a failing
-  command, whether set on the step or by `defaults.run`;
+  `set +e`, no `trap` on EXIT, ERR or DEBUG that is still set, and no `exec` with a command, and is
+  not followed by a `||` handler other than an `exit` with a failing status;
+- the step runs under `bash` or `sh`, the shells that stop at a failing command, set on the step
+  or by `defaults.run`; with no `shell:` at all it runs under `bash -e` on Linux and macOS but
+  under `pwsh` on Windows, so it counts only when its job cannot run there (no `runs-on` label,
+  expanded per matrix combination, and no matrix `os` value names Windows);
 - the workflow triggers on `pull_request`, and has a `gate` job.
 
 Output, one tab-separated record per line:
@@ -108,17 +110,76 @@ def gate_needs(workflow):
     return {needs} if isinstance(needs, str) else set(needs)
 
 
-def shell_blocker(workflow, job, step):
+WINDOWS_TAIL = (
+    "where a step with no `shell:` runs under pwsh, which does not stop at a failing command; "
+    "expected `shell: bash` on the step or in `defaults.run`"
+)
+RUNS_ON_MATRIX = re.compile(r"\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}")
+
+
+def runs_on_labels(runs_on):
+    """The labels of a job's `runs-on`: a string, a list, or a mapping with `labels` and `group`."""
+    if isinstance(runs_on, str):
+        return [runs_on]
+    if isinstance(runs_on, list):
+        return [str(label) for label in runs_on]
+    if isinstance(runs_on, dict):
+        return runs_on_labels(runs_on.get("labels", [])) + runs_on_labels(runs_on.get("group", []))
+    return []
+
+
+def windows_blocker(job_id, job, step):
+    """Why the step may run on Windows, where no `shell:` means pwsh, or None.
+
+    The job can run on Windows when a `runs-on` label names it, after its `${{ matrix.<key> }}`
+    parts are replaced from each matrix combination, or when a combination's `os` does, as for a
+    self-hosted runner picked another way. A step guarded to one `os` runs only on those
+    combinations. An expression the check cannot expand may be Windows, so it is refused.
+    """
+    labels = runs_on_labels(job.get("runs-on"))
+    raw = job.get("runs-on")
+    has_expression = any("${{" in label for label in labels)
+    combinations, problem = matrix_combinations((job.get("strategy") or {}).get("matrix"))
+    if problem:
+        if has_expression:
+            return (
+                f"job '{job_id}' has `runs-on: {raw}` and its matrix cannot be expanded ({problem}), "
+                f"so it may run on Windows, {WINDOWS_TAIL}"
+            )
+        combinations = [{}]
+    guard = OS_TEST.match(step_condition(step))
+    for combination in combinations:
+        if guard and combination.get("os") != guard.group(1):
+            continue
+        names = [RUNS_ON_MATRIX.sub(lambda m: str(combination.get(m.group(1), m.group(0))), label)
+                 for label in labels]
+        if isinstance(combination.get("os"), str):
+            names.append(combination["os"])
+        for name in names:
+            if "${{" in name:
+                return (
+                    f"job '{job_id}' has `runs-on: {raw}`, which the check cannot expand, "
+                    f"so it may run on Windows, {WINDOWS_TAIL}"
+                )
+            if "windows" in name.lower():
+                return f"job '{job_id}' can run on Windows ({name!r}), {WINDOWS_TAIL}"
+    return None
+
+
+def shell_blocker(workflow, job_id, job, step):
     """Why the step's shell may not stop on a failing command, or None.
 
-    Without `shell:` GitHub runs `bash -e`; `bash` adds pipefail and `sh` runs `sh -e`. Any other
+    Without `shell:` GitHub runs `bash -e` on Linux and macOS but `pwsh` on Windows, which returns
+    the status of its last native command; `bash` adds pipefail and `sh` runs `sh -e`. Any other
     shell (`pwsh`, `python`, `cmd`, a custom template) has no errexit the check knows about.
     """
     shell = step.get("shell")
     for scope in (job, workflow):
         default = ((scope.get("defaults") or {}).get("run") or {}).get("shell")
         shell = shell if shell is not None else default
-    if shell is None or shell in ("bash", "sh"):
+    if shell is None:
+        return windows_blocker(job_id, job, step)
+    if shell in ("bash", "sh"):
         return None
     return f"its step runs under `shell: {shell}`, expected bash or sh, which stop at a failing command"
 
@@ -139,16 +200,21 @@ def job_blocker(job_id, job, needs):
     return None
 
 
+def step_condition(step):
+    """The step's `if:` without the optional `${{ }}` wrapper; '' when it has none."""
+    condition = str(step.get("if", "")).strip()
+    if condition.startswith("${{") and condition.endswith("}}"):
+        condition = condition[3:-2].strip()
+    return condition
+
+
 def step_blocker(job_id, job, step):
     """Why this step may not run or may not fail its job, or None."""
     if is_truthy(step.get("continue-on-error")):
         return f"a step of job '{job_id}' sets `continue-on-error: {step['continue-on-error']}`"
     if "if" not in step:
         return None
-    condition = str(step["if"]).strip()
-    if condition.startswith("${{") and condition.endswith("}}"):
-        condition = condition[3:-2].strip()
-    match = OS_TEST.match(condition)
+    match = OS_TEST.match(step_condition(step))
     if not match:
         return (
             f"a step of job '{job_id}' has `if: {step['if']}`, "
@@ -610,7 +676,7 @@ def report(workflow):
             run = step.get("run") if isinstance(step, dict) else None
             if not isinstance(run, str):
                 continue
-            reason = blocker or step_blocker(job_id, job, step) or shell_blocker(workflow, job, step)
+            reason = blocker or step_blocker(job_id, job, step) or shell_blocker(workflow, job_id, job, step)
             for name, line_reason in run_findings(run):
                 if reason or line_reason:
                     yield ("blocked", name, reason or line_reason)

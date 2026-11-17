@@ -1273,6 +1273,15 @@ probe with an isolated `CODEX_HOME` accepted a stdio `config.mcp_servers` overri
 resume mapping, header and environment separation, and pre-spawn refusals. MCP tool calls still
 render as `ActivityKind::Mcp`.
 
+The `config` of both requests is written with every object sorted by member name, so its bytes are
+the same whether or not some crate in the host's build turns on `serde_json/preserve_order`
+(`mango-agent-acp` does). A `Value` object would otherwise keep the host's server order in one build
+and sort in the other. The field stays a `BTreeMap<String, serde_json::Value>`; a sorting
+`serialize_with` fixes the order without changing the public type, and arrays such as `args` keep
+theirs. The [config reference][config-reference], read on 2026-11-17, describes `command`, `args`,
+`env`, `url` and `http_headers` as keyed fields of an `mcp_servers.<id>` table and gives member
+order no meaning, so this is about stable fixtures and captures, not a dialect difference.
+
 ## Environment
 
 One variable survives the allowlist: `CODEX_HOME`, the directory the user's own CLI keeps its

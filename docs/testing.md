@@ -117,8 +117,17 @@ Naming a test in `ci.yml` is not enough. `scripts/ci-script-steps.py` parses the
   lifts it. A signal word the shell expands (`$T`, `E*`) may name any of them, so a trap on it is
   never lifted. `exec` with only redirections (`exec > log`, `exec {fd}>log`,
   `exec 2> >(tee log)`) is fine;
-- its step runs under no `shell:`, or `bash` or `sh`, the shells that stop at a failing command;
-  the step, the job's `defaults.run` and the workflow's `defaults.run` are all read;
+- its step runs under `bash` or `sh`, the shells that stop at a failing command, read from the
+  step, the job's `defaults.run` and the workflow's `defaults.run`. With no `shell:` anywhere the
+  step runs under `bash -e` on Linux and macOS but under `pwsh` on Windows, which returns the status
+  of its last native command, so such a step counts only when its job cannot run on Windows: no
+  `runs-on` label, after `${{ matrix.<key> }}` is filled from each matrix combination, and no
+  matrix `os` value names it (a step guarded to one `os` is judged on that `os` alone). Windows is
+  recognised only from a label or `os` value that contains `windows`, in any case: a self-hosted
+  runner whose labels do not say so (`[self-hosted, gpu]`) is taken as non-Windows. A `runs-on` the
+  check cannot expand (`${{ inputs.runner }}`, or `${{ matrix.os }}` over a matrix built from an
+  expression) is refused as possibly Windows. Modelling `pwsh` is not attempted: the step is
+  refused, and `shell: bash` on it fixes that;
 - the workflow triggers on `pull_request` and has a `gate` job.
 
 A construct the analysis cannot follow, such as an `if` around the command, a matrix built from an

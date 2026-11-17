@@ -6,6 +6,8 @@
 
 #[path = "replay/account_kinds.rs"]
 mod account_kinds;
+#[path = "replay/config_bytes.rs"]
+mod config_bytes;
 #[path = "replay/contracts.rs"]
 mod contracts;
 #[path = "replay/gateway.rs"]

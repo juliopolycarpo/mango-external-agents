@@ -2251,11 +2251,47 @@ impl Responder {
     /// }
     /// # }
     /// ```
-    pub fn answer(
-        mut self,
-        outcome: ServerRequestOutcome,
-    ) -> std::result::Result<Written, Unanswered> {
+    pub fn answer(self, outcome: ServerRequestOutcome) -> std::result::Result<Written, Unanswered> {
         let frame = reply_frame(&self.state, self.id.as_json().clone(), outcome);
+        self.enqueue(frame)
+    }
+
+    /// [`answer`](Self::answer) with a result written straight from a typed value.
+    ///
+    /// The result's fields go out in their declared order, in every build. An answer given as a
+    /// [`ServerRequestOutcome::Answer`] holds a `serde_json::Value`, whose object members are
+    /// sorted by name, or kept in insertion order when some crate in the build turns on
+    /// `serde_json/preserve_order`, so the same answer would write different bytes depending on
+    /// what else the host links.
+    ///
+    /// # Errors
+    ///
+    /// The refusals of [`answer`](Self::answer), and [`Error::Protocol`] for a result that does
+    /// not serialise, with nothing queued and the question still open.
+    ///
+    /// ```no_run
+    /// # use mango_external_agents::jsonrpc::Responder;
+    /// #[derive(serde::Serialize)]
+    /// struct Decision {
+    ///     outcome: &'static str,
+    ///     option_id: &'static str,
+    /// }
+    ///
+    /// # fn example(responder: Responder) {
+    /// let _ = responder.answer_with(&Decision { outcome: "selected", option_id: "allow" });
+    /// # }
+    /// ```
+    pub fn answer_with<R: Serialize>(self, result: &R) -> std::result::Result<Written, Unanswered> {
+        match self.state.typed_reply_frame(self.id.as_json(), result) {
+            Ok(frame) => self.enqueue(frame),
+            Err(error) => Err(Unanswered {
+                parts: Box::new((self, error)),
+            }),
+        }
+    }
+
+    /// Queues the frame that answers this question, settling it once it is queued.
+    fn enqueue(mut self, frame: String) -> std::result::Result<Written, Unanswered> {
         match self.state.enqueue_reply(frame) {
             Ok(ticket) => {
                 // Settled: what it held goes back now, and its drop has nothing to say.
@@ -3719,6 +3755,29 @@ impl Drop for Client {
 }
 
 impl ClientState {
+    /// The frame that answers the peer's question `raw_id` with `result`, written straight from
+    /// the typed value so its fields keep their declared order.
+    fn typed_reply_frame<R: Serialize>(&self, raw_id: &Value, result: &R) -> Result<String> {
+        let frame = ReplyFrame {
+            jsonrpc: self.version_member(),
+            id: raw_id,
+            result: Some(result),
+            error: None,
+        };
+        let text = serde_json::to_string(&frame).map_err(|error| result_error(&error))?;
+        // As for a call: a `RawValue` is copied in as written, and the stdio link writes a frame
+        // as one line, so a result holding a raw line break is written again from a tree.
+        if !text.contains(['\n', '\r']) {
+            return Ok(text);
+        }
+        let tree = serde_json::to_value(result).map_err(|error| result_error(&error))?;
+        Ok(reply_frame(
+            self,
+            raw_id.clone(),
+            ServerRequestOutcome::Answer(tree),
+        ))
+    }
+
     fn frame<P: Serialize>(&self, id: Option<Value>, method: &str, params: P) -> Result<String> {
         let text = self.call_text(id.as_ref(), method, &params)?;
         // Compact serde_json output holds no raw line break: a string escapes its own. One that
@@ -5390,14 +5449,17 @@ struct CallFrame<'a, P> {
 
 /// A response this side writes, with its members in the one order every build writes them:
 /// `jsonrpc`, `id`, then `result` or `error`. See [`CallFrame`] for why it is not a `Map`.
+///
+/// The result is a `Value` for a handler's [`ServerRequestOutcome::Answer`], and the caller's own
+/// typed value for [`Responder::answer_with`], so a typed answer keeps its declared field order.
 #[derive(Serialize)]
-struct ReplyFrame<'a> {
+struct ReplyFrame<'a, R = Value> {
     #[serde(skip_serializing_if = "Option::is_none")]
     jsonrpc: Option<&'static str>,
     id: &'a Value,
     // A result of `null` is still a result, so only an absent one is skipped.
     #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<&'a Value>,
+    result: Option<&'a R>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'a JsonRpcError>,
 }
@@ -5437,6 +5499,14 @@ impl<'a> ReplyFrame<'a> {
                 self.id
             )
         })
+    }
+}
+
+/// The error for a result that could not be written.
+fn result_error(error: &serde_json::Error) -> Error {
+    Error::Protocol {
+        expected: String::from("serialisable JSON-RPC result"),
+        received: error.to_string(),
     }
 }
 

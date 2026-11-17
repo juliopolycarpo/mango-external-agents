@@ -750,6 +750,14 @@ follow the
 The timer answers the agent even if the bounded event channel is full. Approval events remain
 ordered before the turn terminal and arrive when the host resumes reading.
 
+The answer to a `session/request_permission` is written from the schema's typed response through
+`Responder::answer_with`, so a selection is always `{"outcome":{"outcome":"selected","optionId":…}}`
+in that member order, whether or not some crate in the build turns on `serde_json/preserve_order`
+(this crate's schema dependency does, so the bytes did not change). The
+[tool calls page](https://agentclientprotocol.com/protocol/v1/tool-calls#requesting-permission),
+read on 2026-11-17, gives the `selected` and `cancelled` shapes and says nothing about member
+order, so this makes the bytes reproducible rather than correcting a wire difference.
+
 ## Auth
 
 **No login handling, ever.** `authenticate` is never sent, no browser is opened and no credential is

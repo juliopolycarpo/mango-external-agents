@@ -13,7 +13,11 @@
 //! place that knows how an answer reaches the peer.
 
 use agent_client_protocol_schema::v1::{Error as AcpError, RequestPermissionResponse};
-use mango_external_agents::jsonrpc::{JsonRpcError, Responder, ServerRequestOutcome};
+use mango_external_agents::Error;
+use mango_external_agents::jsonrpc::{
+    JsonRpcError, Responder, ServerRequestOutcome, Unanswered, Written,
+};
+use serde::Serialize;
 
 use crate::permission;
 
@@ -53,16 +57,36 @@ impl PermissionReply {
     /// ```ignore
     /// reply.respond(permission::selected("reject"))?;
     /// ```
-    pub(super) fn respond(mut self, response: RequestPermissionResponse) -> Result<(), AcpError> {
-        let result = serde_json::to_value(response).map_err(|error| {
-            internal_error(format!(
-                "expected a serialisable session/request_permission response | received: {error}"
-            ))
-        })?;
+    pub(super) fn respond(self, response: RequestPermissionResponse) -> Result<(), AcpError> {
+        self.respond_with(&response)
+    }
+
+    /// [`respond`](Self::respond) for any serialisable response, so a result that fails to
+    /// serialise can be driven in a test.
+    fn respond_with<R: Serialize>(mut self, response: &R) -> Result<(), AcpError> {
         let Some(responder) = self.responder.take() else {
             return Ok(());
         };
-        answer(responder, ServerRequestOutcome::Answer(result)).map_err(|error| {
+        // Written from the typed response, not from a `Value`: its members go out in their
+        // declared order (`outcome`, then `optionId`) whether or not some crate in the build
+        // turns on `serde_json/preserve_order`. This crate's schema dependency happens to, but
+        // the bytes do not rest on that.
+        let unanswered = match responder.answer_with(response) {
+            Ok(_written) => return Ok(()),
+            Err(unanswered) => unanswered,
+        };
+        if let Error::Protocol { received, .. } = unanswered.error() {
+            // The response could not be written and nothing was queued, so the question is
+            // still open. Withdraw it with ACP's `cancelled` outcome, which an agent already
+            // handles, rather than letting the responder's drop refuse it with an error.
+            let error = internal_error(format!(
+                "expected a serialisable session/request_permission response | received: {received}"
+            ));
+            let (responder, _) = unanswered.into_parts();
+            let _ = answer(responder, withdrawn());
+            return Err(error);
+        }
+        settle(Err(unanswered)).map_err(|error| {
             internal_error(format!(
                 "expected an ACP connection that takes this answer | received: {error}"
             ))
@@ -106,13 +130,15 @@ pub(super) fn past_cap(is_permission: bool) -> ServerRequestOutcome {
 /// place so it does not wait on the question: the caller must not take the question as
 /// answered the way it asked. Only an agent that chose an id nearly as large as the bound can
 /// make an answer that size.
-fn answer(
-    responder: Responder,
-    outcome: ServerRequestOutcome,
-) -> mango_external_agents::Result<()> {
+fn answer(responder: Responder, outcome: ServerRequestOutcome) -> Result<(), Error> {
+    settle(responder.answer(outcome))
+}
+
+/// The outcome of queuing an answer: done, or why the agent was not given it.
+fn settle(attempt: Result<Written, Unanswered>) -> Result<(), Error> {
     // The write itself is not waited for: the frame is queued, in order, and the connection
     // reports a write that fails as its own end.
-    let unanswered = match responder.answer(outcome) {
+    let unanswered = match attempt {
         Ok(_written) => return Ok(()),
         Err(unanswered) => unanswered,
     };
@@ -248,6 +274,60 @@ mod tests {
         assert_eq!(
             received, expected,
             "expected the answer on the wire: {expected} | received: {received}"
+        );
+    }
+
+    /// The bytes of a permission answer: `outcome` before `optionId`, as the schema declares
+    /// them. `json!` equality above ignores member order, so this pins the text itself.
+    #[tokio::test]
+    async fn a_permission_answer_is_written_in_the_schemas_member_order() {
+        let (_client, link, responder) = asked(12).await;
+        PermissionReply::new(responder)
+            .respond(permission::selected("reject"))
+            .expect("expected the answer to be accepted");
+
+        link.wait_for_sent(1).await;
+        let expected = r#"{"jsonrpc":"2.0","id":12,"result":{"outcome":{"outcome":"selected","optionId":"reject"}}}"#;
+        let received = link.sent();
+        assert_eq!(
+            received,
+            [expected],
+            "expected exactly this permission answer on the wire: {expected} | received: {received:?}"
+        );
+    }
+
+    /// A response that cannot be written.
+    struct UnserialisableResponse;
+
+    impl serde::Serialize for UnserialisableResponse {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("refused by the test"))
+        }
+    }
+
+    /// Nothing was queued for a response that does not serialise, so the question is withdrawn
+    /// with the `cancelled` outcome, as a reply dropped unanswered is, and the caller is told why.
+    #[tokio::test]
+    async fn a_response_that_does_not_serialise_withdraws_the_question_and_names_the_cause() {
+        let (_client, link, responder) = asked(13).await;
+        let error = PermissionReply::new(responder)
+            .respond_with(&UnserialisableResponse)
+            .expect_err("expected the unserialisable response to be refused");
+
+        let received = first_sent(&link).await;
+        let expected = serde_json::json!({
+            "jsonrpc": "2.0", "id": 13, "result": { "outcome": { "outcome": "cancelled" } }
+        });
+        assert_eq!(
+            received, expected,
+            "expected the question withdrawn on the wire: {expected} | received: {received}"
+        );
+        assert!(
+            error.message.starts_with(
+                "expected a serialisable session/request_permission response | received: "
+            ) && error.message.contains("refused by the test"),
+            "expected an error naming the response and the cause | received: {:?}",
+            error.message
         );
     }
 
