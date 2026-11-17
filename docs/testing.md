@@ -111,7 +111,12 @@ Naming a test in `ci.yml` is not enough. `scripts/ci-script-steps.py` parses the
 - its `run:` block reaches it: the block is split into commands at newlines, `;`, `&&`, `||`, `|`
   and `&`, and the test command is joined to its neighbours only by a newline or `;`, sits in no
   `if`, loop, `case`, function, group or subshell, follows no `exit` that can end the block and no
-  `set +e`, and is not followed by a `||` handler other than an `exit` with a failing status;
+  `set +e`, no `trap` on `EXIT`, `ERR` or `DEBUG` that is still set, and no `exec` with a command,
+  and is not followed by a `||` handler other than an `exit` with a failing status. Each of the
+  three traps is tracked on its own and only an unconditional `trap - <signal>` for that signal
+  lifts it. A signal word the shell expands (`$T`, `E*`) may name any of them, so a trap on it is
+  never lifted. `exec` with only redirections (`exec > log`, `exec {fd}>log`,
+  `exec 2> >(tee log)`) is fine;
 - its step runs under `bash` or `sh`, the shells that stop at a failing command, read from the
   step, the job's `defaults.run` and the workflow's `defaults.run`. With no `shell:` anywhere the
   step runs under `bash -e` on Linux and macOS but under `pwsh` on Windows, which returns the status
@@ -127,8 +132,7 @@ Naming a test in `ci.yml` is not enough. `scripts/ci-script-steps.py` parses the
 
 A construct the analysis cannot follow, such as an `if` around the command, a matrix built from an
 expression or a `shell: pwsh` step, is reported as a reason the test is blocked, never counted as
-run. It still does not follow `trap` or `exec` earlier in the block, or what a test script does once
-it starts.
+run. It still does not follow what a test script does once it starts.
 `scripts/test-check-script-tests.sh` pins each rule against a scratch workflow.
 
 ## Shell lint

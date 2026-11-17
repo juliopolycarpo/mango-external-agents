@@ -13,7 +13,8 @@ as run only when every one of these holds:
   newlines, `;`, `&&`, `||`, `|` and `&` (quotes, `$(...)`, comments and here-documents respected)
   and a test command counts only when it is joined to its neighbours by a newline or `;`, sits in no
   `if`, loop, `case`, function, group or subshell, follows no `exit` that can end the block and no
-  `set +e`, and is not followed by a `||` handler other than an `exit` with a failing status;
+  `set +e`, no `trap` on EXIT, ERR or DEBUG that is still set, and no `exec` with a command, and is
+  not followed by a `||` handler other than an `exit` with a failing status;
 - the step runs under `bash` or `sh`, the shells that stop at a failing command, set on the step
   or by `defaults.run`; with no `shell:` at all it runs under `bash -e` on Linux and macOS but
   under `pwsh` on Windows, so it counts only when its job cannot run there (no `runs-on` label,
@@ -27,8 +28,8 @@ Output, one tab-separated record per line:
     workflow <reason>                the workflow itself breaks a rule above
 
 A construct the analysis does not follow is a reason to block, never a silent count. What it still
-does not follow: expressions other than the single OS test above, `trap` and `exec` earlier in the
-block, and anything a command does after it starts (a test script that exits 0 on its own).
+does not follow: expressions other than the single OS test above, and anything a command does after
+it starts (a test script that exits 0 on its own).
 
 Usage: ci-script-steps.py WORKFLOW
 """
@@ -470,23 +471,37 @@ def enter_constructs(command, stack):
             return command.strip(), can_run, closes
 
 
-def errexit_change(command):
-    """'off' for `set +e`, `set +eu`, `set +o errexit`; 'on' for the `-` forms; else None.
-
-    `command` and `builtin` before `set` change nothing; `eval` runs its arguments as commands, so
-    the last change among them counts.
-    """
+def shell_words(command):
+    """The words of a simple command, without a leading `command` or `builtin`, which change nothing."""
     try:
         words = shlex.split(command)
     except ValueError:
         words = command.split()
     while words and words[0] in ("command", "builtin"):
         words = words[1:]
+    return words
+
+
+def last_change_in_eval(words, detect):
+    """What `detect` reports for the last of the commands that `eval` runs, or None.
+
+    `eval` runs its arguments as commands, so a change made by any of them holds for the rest of
+    the block and the last one wins.
+    """
+    parts = [part for part in re.split(r"[;&|\n]+", " ".join(words[1:])) if part.strip()]
+    changes = [detect(part) for part in parts]
+    return next((change for change in reversed(changes) if change), None)
+
+
+def errexit_change(command):
+    """'off' for `set +e`, `set +eu`, `set +o errexit`; 'on' for the `-` forms; else None.
+
+    `command` and `builtin` before `set` change nothing; `eval` runs its arguments as commands, so
+    the last change among them counts.
+    """
+    words = shell_words(command)
     if words and words[0] == "eval":
-        changes = [
-            errexit_change(part) for part in re.split(r"[;&|\n]+", " ".join(words[1:])) if part.strip()
-        ]
-        return next((change for change in reversed(changes) if change), None)
+        return last_change_in_eval(words, errexit_change)
     if not words or words[0] != "set":
         return None
     change = None
@@ -498,10 +513,83 @@ def errexit_change(command):
     return change
 
 
-def command_blocker(entries, index, stack, ended_by, errexit_off):
+# The pseudo-signals whose trap can end the shell with status 0 or run before a later command:
+# EXIT as the shell exits (`0` is its number), ERR after a failing command, DEBUG before every one.
+STATUS_TRAPS = {"EXIT", "ERR", "DEBUG"}
+# A signal word that the shell expands (`$T`, `` `cmd` ``, `E*`, `{EXIT,INT}`) can name any of them.
+DYNAMIC_SIGNAL = re.compile(r"[$`*?\[{]")
+UNKNOWN_SIGNAL = "?"
+
+
+def exit_trap_events(command):
+    """The (action, signals) pairs a command applies to the traps that can end the shell.
+
+    `action` is 'set' for `trap ACTION SIG...` and 'reset' for `trap - SIG...`, `trap SIG` and
+    `trap 0 SIG`; `signals` holds EXIT, ERR and DEBUG by name (`0` is EXIT), and "?" for a word the
+    shell expands. `trap -p` and `trap -l` only print, and a trap on other signals does not touch
+    the step's status, so neither yields an event. `eval` runs its arguments as commands.
+    """
+    words = shell_words(command)
+    if words and words[0] == "eval":
+        parts = [part for part in re.split(r"[;&|\n]+", " ".join(words[1:])) if part.strip()]
+        return [event for part in parts for event in exit_trap_events(part)]
+    if not words or words[0] != "trap":
+        return []
+    arguments = words[1:]
+    if arguments[:1] == ["--"]:
+        arguments = arguments[1:]
+    if not arguments or arguments[0] in ("-p", "-l"):
+        return []
+    # `trap - SIG...`, `trap SIG` and `trap 0 SIG` (a leading number) reset; otherwise the first
+    # word is the action and the rest are signals.
+    resets = arguments[0] == "-" or len(arguments) == 1 or arguments[0].isdigit()
+    signals = arguments[1:] if arguments[0] == "-" else arguments if resets else arguments[1:]
+    named = set()
+    for signal in signals:
+        name = signal.upper().removeprefix("SIG")
+        if DYNAMIC_SIGNAL.search(signal):
+            named.add(UNKNOWN_SIGNAL)
+        elif name in STATUS_TRAPS or name == "0":
+            named.add("EXIT" if name == "0" else name)
+    return [("reset" if resets else "set", sorted(named))] if named else []
+
+
+# A redirection word, `2>&1`, `{fd}>log` or `> log`: an optional descriptor or `{name}`, the
+# operator, then its target when it is attached.
+REDIRECTION = re.compile(r"^(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:&>>?|>>|>\||<>|<<<?|[<>]&?)(.*)$")
+# A process substitution, `>(tee log)`, standing in as a redirection target.
+PROCESS_SUBSTITUTION = re.compile(r"[<>]\([^()]*\)")
+
+
+def replaces_shell(command):
+    """True for `exec` with a command: the shell is replaced and no later command runs.
+
+    `exec` with only redirections (`exec > log 2>&1`, `exec 3<&0`) changes the shell's descriptors
+    and runs on, also with a `{name}` descriptor or a process substitution as the target
+    (`exec {fd}>log`, `exec 2> >(tee log)`). Anything else after `exec`, an option included, counts
+    as a command.
+    """
+    words = shell_words(PROCESS_SUBSTITUTION.sub("procsub", command))
+    if words and words[0] == "eval":
+        return bool(last_change_in_eval(words, replaces_shell))
+    if not words or words[0] != "exec":
+        return False
+    position = 1
+    while position < len(words):
+        redirection = REDIRECTION.match(words[position])
+        if not redirection:
+            return True
+        # A bare operator (`>`, `2>>`) takes the next word as its target.
+        position += 1 if redirection.group(1) else 2
+    return False
+
+
+def command_blocker(entries, index, stack, ended_by, errexit_off, exit_traps):
     """Why the test command in entries[index] may not run or may not fail the step, or None."""
     if ended_by:
         return ended_by
+    if exit_traps:
+        return f"it follows `{next(iter(exit_traps.values()))}`, which can turn a later failure into a clean exit"
     if stack:
         return f"it is inside a shell `{stack[-1]}` block, which the check does not follow"
     if errexit_off:
@@ -527,7 +615,8 @@ def command_blocker(entries, index, stack, ended_by, errexit_off):
 def run_findings(run):
     """Yields (test, reason or None) for each test named in a `run:` block."""
     entries = split_commands(run)
-    stack, ended_by, errexit_off, closes = [], None, None, False
+    # exit_traps maps each pseudo-signal with a trap still set to the command that set it.
+    stack, ended_by, errexit_off, exit_traps, closes = [], None, None, {}, False
     for index, (text, after, is_here_document) in enumerate(entries):
         if closes:
             stack.pop()
@@ -541,7 +630,7 @@ def run_findings(run):
         unconditional = not stack and before in SEQUENTIAL and after in SEQUENTIAL
         match = COMMAND.match(command) if can_run else None
         if match:
-            yield match.group(1), command_blocker(entries, index, stack, ended_by, errexit_off)
+            yield match.group(1), command_blocker(entries, index, stack, ended_by, errexit_off, exit_traps)
             continue
         for name in ANY_NAME.findall(command):
             yield name, f"`{command}` names it but does not start with it as a command"
@@ -550,6 +639,17 @@ def run_findings(run):
             errexit_off = errexit_off or command
         elif change == "on" and unconditional:
             errexit_off = None
+        # A trap set anywhere counts, even under a condition; only an unconditional reset of that
+        # same signal lifts it. A word the shell expands ("?") may name any of them, so a trap set on
+        # it can never be proven lifted.
+        for action, signals in exit_trap_events(command):
+            for signal in signals:
+                if action == "set":
+                    exit_traps.setdefault(signal, command)
+                elif unconditional and signal != UNKNOWN_SIGNAL:
+                    exit_traps.pop(signal, None)
+        if replaces_shell(command) and not ended_by:
+            ended_by = f"it follows `{command}`, which replaces the shell, so no later command runs"
         if EXIT.match(command) and not ended_by:
             if unconditional:
                 ended_by = f"it follows `{command}` on an earlier line of the same run block"
