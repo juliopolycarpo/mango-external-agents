@@ -236,10 +236,11 @@ async fn claude_with(
     let closed = session.close(CloseReason::Requested).await;
     // Redacted before anything is written or judged: what qualifies is what the file holds.
     let mut drift = DriftReport::default();
-    let body: Vec<String> = tap
-        .take_lines()
+    let lines = tap.take_lines();
+    let answers = AnswerCalls::in_lines(&lines);
+    let body: Vec<String> = lines
         .iter()
-        .filter_map(|line| redact_line(line, paths, &mut drift))
+        .filter_map(|line| redact_line(line, &answers, paths, &mut drift))
         .collect();
     let outcome = crate::failure::with_cleanup(conversation, closed, |primary| {
         notices.notice(&primary_failure_line(scenario.name, primary));
@@ -493,20 +494,39 @@ const STRUCTURAL_STRING_MEMBERS: &[&str] = &[
     "uuid",
 ];
 
-/// Members whose whole subtree is the model's answer or its input: every string inside is
-/// replaced, even one under a structural member name, because a schema can name a property `type`.
+/// Members whose whole subtree is the model's answer: every string inside is replaced, even one
+/// under a structural member name, because a schema can name a property `type`. Numbers and
+/// booleans stay: the answer's shape is what qualification and replay read, and it comes from the
+/// operator's `--json-schema`.
 ///
-/// `wire_tool_inputs` is the same answer a second time, keyed by tool-use id: Claude Code repeats
-/// each tool call's input there, so a schema that names a property `type` or `id` would survive it
-/// if it were not listed. The `toolu_…` keys stay. They are opaque and random, and the same ids
-/// are kept as the values of `id` and `tool_use_id` so a call still pairs with its result.
-const ANSWER_MEMBERS: &[&str] = &["input", "structured_output", "wire_tool_inputs"];
+/// The answer also sits in the arguments of the `StructuredOutput` tool call. Those are a tool
+/// call's [`CALL_INPUT_MEMBER`] and its entry under [`WIRE_INPUTS_MEMBER`].
+const ANSWER_MEMBERS: &[&str] = &["structured_output"];
+
+/// The tool whose call is the answer itself: under `--json-schema` the CLI makes the model answer
+/// by calling it, and its `input` is the structured answer. Every other tool's `input` is its
+/// author's data.
+const ANSWER_TOOL_NAME: &str = "StructuredOutput";
+
+/// The member of a `tool_use` block that holds the call's arguments: the answer for the
+/// [`ANSWER_TOOL_NAME`] call and a tool author's data for every other.
+const CALL_INPUT_MEMBER: &str = "input";
+
+/// The member that repeats each call's input a second time, keyed by tool-use id (the `toolu_…`
+/// keys stay: they are opaque and random, and the same ids are kept as the values of `id` and
+/// `tool_use_id` so a call still pairs with its result).
+///
+/// A repeat is the answer when [`AnswerCalls`] holds its id, and a tool author's data otherwise, so
+/// an id no `StructuredOutput` call claims is treated as data. The walk reads each repeat as that
+/// call's [`CALL_INPUT_MEMBER`].
+const WIRE_INPUTS_MEMBER: &str = "wire_tool_inputs";
 
 /// Members whose subtree is a tool's data: the call's arguments repeated under
 /// `permission_denials`, and the tool's result. A tool author names the fields, so one called
 /// `type`, `id` or `role` is the author's and its string is replaced like any other. A number
 /// becomes `0` and a boolean `false`, so a field keeps its type and no figure of the author's
-/// survives.
+/// survives. The arguments of every call but the answer's get the same treatment, under
+/// [`CALL_INPUT_MEMBER`] and [`WIRE_INPUTS_MEMBER`].
 ///
 /// Unlike [`ANSWER_MEMBERS`], the members below are still judged by name for the drift report when
 /// a string, a number, a boolean or an object sits under an unlisted name: the vendor owns this
@@ -702,11 +722,62 @@ fn unused_key(map: &Map<String, Value>, key: String) -> String {
 /// warning with a path in it), so it is dropped rather than copied.
 ///
 /// The names of the members the walk replaced by default are noted in `drift`, never their values.
-fn redact_line(raw: &str, paths: Paths<'_>, drift: &mut DriftReport) -> Option<String> {
+///
+/// `answers` names the `StructuredOutput` calls of the whole recording, because a repeat of a call's
+/// input under `wire_tool_inputs` may sit in a different record from the call.
+fn redact_line(
+    raw: &str,
+    answers: &AnswerCalls,
+    paths: Paths<'_>,
+    drift: &mut DriftReport,
+) -> Option<String> {
     let record: Value = serde_json::from_str(raw).ok()?;
-    record
-        .is_object()
-        .then(|| redact_value(record, None, ValueContext::default(), paths, drift).to_string())
+    record.is_object().then(|| {
+        redact_value(record, None, ValueContext::default(), answers, paths, drift).to_string()
+    })
+}
+
+/// The tool-use ids of the `StructuredOutput` calls in a recording: the calls whose input is the
+/// model's answer, so that every other call's input is a tool author's data.
+///
+/// Read from every line before any is redacted. Claude Code repeats a call's input under
+/// `wire_tool_inputs`, keyed by that id, and nothing says the repeat follows the call.
+#[derive(Default)]
+struct AnswerCalls(BTreeSet<String>);
+
+impl AnswerCalls {
+    /// The ids of the `StructuredOutput` calls among `lines`, at any depth of a record. A line that
+    /// is not JSON holds none.
+    fn in_lines(lines: &[String]) -> Self {
+        fn collect(value: &Value, ids: &mut BTreeSet<String>) {
+            match value {
+                Value::Object(members) => {
+                    if matches!(
+                        members.get("type").and_then(Value::as_str),
+                        Some("tool_use" | "server_tool_use")
+                    ) && members.get("name").and_then(Value::as_str) == Some(ANSWER_TOOL_NAME)
+                        && let Some(id) = members.get("id").and_then(Value::as_str)
+                    {
+                        ids.insert(id.to_owned());
+                    }
+                    members.values().for_each(|child| collect(child, ids));
+                }
+                Value::Array(items) => items.iter().for_each(|item| collect(item, ids)),
+                _ => {}
+            }
+        }
+        let mut ids = BTreeSet::new();
+        for line in lines {
+            if let Ok(record) = serde_json::from_str::<Value>(line) {
+                collect(&record, &mut ids);
+            }
+        }
+        Self(ids)
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.0.contains(id)
+    }
 }
 
 /// What the walk knows about the object a value sits in.
@@ -714,9 +785,11 @@ fn redact_line(raw: &str, paths: Paths<'_>, drift: &mut DriftReport) -> Option<S
 struct ValueContext {
     /// The enclosing object is a tool call, so its `name` is a tool name.
     tool_call: bool,
-    /// The value is inside a member of [`ANSWER_MEMBERS`].
+    /// The value is inside a member of [`ANSWER_MEMBERS`], or in the arguments of the
+    /// `StructuredOutput` call (see [`CALL_INPUT_MEMBER`]).
     answer: bool,
-    /// The value is inside a member of [`TOOL_DATA_MEMBERS`]: no member name keeps its string.
+    /// The value is inside a member of [`TOOL_DATA_MEMBERS`], or in the arguments of another tool's
+    /// call: no member name keeps its string.
     tool_data: bool,
     /// The value sits under a key of a [`MODEL_KEYED_MEMBERS`] map, which the transcript writes
     /// through [`redact_model_id`].
@@ -730,6 +803,7 @@ fn redact_value(
     value: Value,
     member: Option<&str>,
     context: ValueContext,
+    answers: &AnswerCalls,
     paths: Paths<'_>,
     drift: &mut DriftReport,
 ) -> Value {
@@ -755,6 +829,11 @@ fn redact_value(
             let user_chosen = !context.answer
                 && member
                     .is_some_and(|member| child_keys_of(member) == Some(ChildKeys::UserChosen));
+            // The call is the answer's when it is the `StructuredOutput` tool; its `input` is then
+            // the structured answer, as is its repeat under `wire_tool_inputs`.
+            let answer_call =
+                tool_call && members.get("name").and_then(Value::as_str) == Some(ANSWER_TOOL_NAME);
+            let wire_inputs = member == Some(WIRE_INPUTS_MEMBER);
             let mut redacted = Map::new();
             for (name, value) in members {
                 // Keys are rewritten too: a map keyed by a path would carry it.
@@ -785,14 +864,34 @@ fn redact_value(
                     }
                     placeholder()
                 } else {
+                    // A tool call's arguments: the answer for the `StructuredOutput` call, a tool
+                    // author's data for the rest. An `input` that is not a tool call's is neither.
+                    let (answer_input, tool_input) = if wire_inputs {
+                        (answers.contains(&name), !answers.contains(&name))
+                    } else if tool_call && name == CALL_INPUT_MEMBER {
+                        (answer_call, !answer_call)
+                    } else {
+                        (false, false)
+                    };
                     let inner = ValueContext {
                         tool_call,
-                        answer: context.answer || ANSWER_MEMBERS.contains(&name.as_str()),
-                        tool_data: context.tool_data || TOOL_DATA_MEMBERS.contains(&name.as_str()),
+                        answer: context.answer
+                            || ANSWER_MEMBERS.contains(&name.as_str())
+                            || answer_input,
+                        tool_data: context.tool_data
+                            || TOOL_DATA_MEMBERS.contains(&name.as_str())
+                            || tool_input,
                         model_key: model_keyed,
                         user_key: user_chosen,
                     };
-                    redact_value(value, Some(&name), inner, paths, drift)
+                    // Each repeat under `wire_tool_inputs` is walked as the call's own `input`, so
+                    // the drift report treats it alike and the tool-use id is not read as a name.
+                    let label = if wire_inputs {
+                        CALL_INPUT_MEMBER
+                    } else {
+                        &name
+                    };
+                    redact_value(value, Some(label), inner, answers, paths, drift)
                 };
                 redacted.insert(key, kept);
             }
@@ -803,7 +902,7 @@ fn redact_value(
         Value::Array(items) => Value::Array(
             items
                 .into_iter()
-                .map(|item| redact_value(item, member, context, paths, drift))
+                .map(|item| redact_value(item, member, context, answers, paths, drift))
                 .collect(),
         ),
         Value::String(text) => match member {
@@ -1011,6 +1110,10 @@ enum ChildKeys {
     /// drift report's own line. Only the direct children are keys; the members below them are
     /// judged by name.
     UserChosen,
+    /// A map keyed by tool-use id (see [`WIRE_INPUTS_MEMBER`]). The `toolu_…` key is opaque and kept
+    /// and is not reported. Each value is walked as the `input` of that call, so its members are
+    /// reported as the members of any other call's `input`.
+    ToolUseIds,
 }
 
 /// Number, boolean and object members the committed Claude transcripts under
@@ -1043,6 +1146,9 @@ const REVIEWED_RETAINED_MEMBERS: &[(&str, ChildKeys)] = &[
     ("event", ChildKeys::Vendor),
     ("file", ChildKeys::Vendor),
     ("index", ChildKeys::Leaf),
+    // A tool call's arguments: whatever parameters its author chose, or the answer's own for the
+    // `StructuredOutput` call, whose keys are not reported (see [`CALL_INPUT_MEMBER`]).
+    ("input", ChildKeys::UserChosen),
     ("inputTokens", ChildKeys::Leaf),
     ("input_tokens", ChildKeys::Leaf),
     ("is_error", ChildKeys::Leaf),
@@ -1075,6 +1181,7 @@ const REVIEWED_RETAINED_MEMBERS: &[(&str, ChildKeys)] = &[
     ("webSearchRequests", ChildKeys::Leaf),
     ("web_fetch_requests", ChildKeys::Leaf),
     ("web_search_requests", ChildKeys::Leaf),
+    ("wire_tool_inputs", ChildKeys::ToolUseIds),
 ];
 
 /// How many names of each kind the drift report prints before it only counts the rest.

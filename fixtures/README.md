@@ -70,19 +70,24 @@ Redacted whatever the value type:
   ids); every other member is replaced whole, so an unknown member is denied by default. Strings
   inside the kept lists still become `[REDACTED]`, so each list keeps its length and not its names.
 - `subagent_stats.by_type`: its keys are subagent type names, which a user can define themselves.
-- Strings inside `input`, `structured_output` and `wire_tool_inputs` (the same tool input again,
-  keyed by tool-use id), even under a name such as `type` or `id`.
-- Strings inside `tool_input` (the arguments of a denied call, repeated under `permission_denials`)
-  and `tool_use_result` (the tool's output), under the same rule: a tool author names those
+- Strings inside `structured_output` and inside the arguments of the `StructuredOutput` tool call,
+  which sit under `input` and again under `wire_tool_inputs` (the same tool input again, keyed by
+  tool-use id), even under a name such as `type` or `id`.
+- Strings inside `tool_input` (the arguments of a denied call, repeated under `permission_denials`),
+  `tool_use_result` (the tool's output) and the arguments of every other tool call, under `input`
+  and `wire_tool_inputs`, under the same rule: a tool author names those
   fields, so a parameter called `type`, `id` or `role` loses its value too. Numbers and booleans
   there are replaced as well, by `0` and `false`: an account number, an amount or a flag over a
   customer's data is the author's, and the replacement keeps the field's type where a `[REDACTED]`
   string would not. A `null` stays. The names stay. A string, number, boolean or object under a name no review
   lists is reported as below, unless it is a direct key of the map, which the key line below lists
-  (a string under a structural name or `model` is the exception, since the recorder already knows it). The
-  same call's arguments also sit under `input` and `wire_tool_inputs`, which keep their numbers
-  as the model's answer, so this rule removes them from `tool_input` only. A `tool_use_result` recorded before this rule keeps a vendor string such as
-  `"type": "text"` and its numbers (`numLines`, `totalLines`); the committed transcripts are
+  (a string under a structural name or `model` is the exception, since the recorder already knows it).
+  A call is the answer's when it is a `tool_use` named exactly `StructuredOutput`
+  (`mcp__x__StructuredOutput` is another tool's). A repeat under `wire_tool_inputs` follows its
+  tool-use id, wherever in the recording that call is, and an id no `StructuredOutput` call claims
+  is another tool's. A `tool_use_result` recorded before this rule keeps a vendor string such as
+  `"type": "text"` and its numbers (`numLines`, `totalLines`), and the `input` of an earlier
+  transcript keeps its numbers; the committed transcripts are
   archival and are not rewritten. A `tool_input` or `tool_use_result` inside the model's answer is
   the answer's own and keeps its numbers, as below.
 - A model id that is not a plain vendor name, in `model`, in the keys of `modelUsage` and
@@ -97,7 +102,8 @@ Redacted whatever the value type:
 
 Retained on purpose:
 
-- The key names and numbers of the model's answer. They come from the operator's `--json-schema`
+- The key names and numbers of the model's answer, in `structured_output` and in the
+  `StructuredOutput` call's `input`. They come from the operator's `--json-schema`
   and the scripted prompt, so the answer's shape stays for qualification. Redaction cannot tell a
   placeholder from a real figure, so an answer is kept as the model wrote it: a schema or prompt
   that elicits real data (a balance, an id, a usage count) commits that data. The built-in
