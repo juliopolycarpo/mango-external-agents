@@ -2610,7 +2610,7 @@ fn a_report_counts_distinct_names_once_and_shows_the_first_few_sorted() {
     let mut drift = DriftReport::default();
     for _ in 0..3 {
         for ordinal in (0..DRIFT_NAMES_SHOWN + 5).rev() {
-            drift.note_unseen(&format!("member{ordinal:02}"));
+            drift.note_unseen(&format!("member{ordinal:03}"));
         }
     }
 
@@ -2623,13 +2623,62 @@ fn a_report_counts_distinct_names_once_and_shows_the_first_few_sorted() {
     );
     let total = DRIFT_NAMES_SHOWN + 5;
     let expected_shown: Vec<String> = (0..DRIFT_NAMES_SHOWN)
-        .map(|ordinal| format!("member{ordinal:02}"))
+        .map(|ordinal| format!("member{ordinal:03}"))
         .collect();
     assert!(
         lines[0].contains(&format!("({total}): {}", expected_shown.join(", ")))
             && lines[0].contains(", and 5 more;")
-            && !lines[0].contains(&format!("member{DRIFT_NAMES_SHOWN:02}")),
+            && !lines[0].contains(&format!("member{DRIFT_NAMES_SHOWN:03}")),
         "expected {total} distinct names, the first {DRIFT_NAMES_SHOWN} sorted, and 5 more | received: {lines:?}"
+    );
+}
+
+/// The bound the report had before it was raised: a real run with this many new names hid the
+/// rest behind a count.
+const FORMER_DRIFT_NAMES_SHOWN: usize = 12;
+
+#[test]
+fn a_report_names_every_member_past_the_former_bound_up_to_the_current_one() {
+    let mut drift = DriftReport::default();
+    let total = FORMER_DRIFT_NAMES_SHOWN * 3;
+    for ordinal in 0..total {
+        drift.note_denied(&format!("member{ordinal:03}"));
+    }
+
+    let lines = drift.lines(STRUCTURED_OUTPUT);
+
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected one line for one kind | received: {lines:?}"
+    );
+    let missing: Vec<String> = (0..total)
+        .map(|ordinal| format!("member{ordinal:03}"))
+        .filter(|name| !lines[0].contains(name))
+        .collect();
+    assert!(
+        missing.is_empty() && !lines[0].contains(" more;"),
+        "expected all {total} names and no remainder | missing: {missing:?} | received: {lines:?}"
+    );
+}
+
+#[test]
+fn a_report_past_the_bound_counts_the_names_it_left_out() {
+    let mut drift = DriftReport::default();
+    let total = DRIFT_NAMES_SHOWN + 7;
+    for ordinal in 0..total {
+        drift.note_retained(&format!("member{ordinal:03}"));
+    }
+
+    let lines = drift.lines(STRUCTURED_OUTPUT);
+
+    let shown = lines[0].matches("member").count();
+    assert!(
+        lines[0].contains(&format!("({total}):"))
+            && lines[0].contains(", and 7 more;")
+            && lines[0].contains(&format!("member{:03}", DRIFT_NAMES_SHOWN - 1))
+            && !lines[0].contains(&format!("member{DRIFT_NAMES_SHOWN:03}")),
+        "expected {total} names counted, the first {DRIFT_NAMES_SHOWN} shown and 7 more | shown: {shown} | received: {lines:?}"
     );
 }
 

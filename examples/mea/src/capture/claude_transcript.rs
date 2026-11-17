@@ -1064,7 +1064,11 @@ const REVIEWED_RETAINED_MEMBERS: &[(&str, ChildKeys)] = &[
 ];
 
 /// How many names of each kind the drift report prints before it only counts the rest.
-const DRIFT_NAMES_SHOWN: usize = 12;
+///
+/// A run after a vendor release can add many names at once, which is the case the report exists
+/// for, so the bound is large enough to name them all. It still bounds the line: at
+/// [`DRIFT_NAME_CHARS`] each, a line stays within a few kilobytes.
+const DRIFT_NAMES_SHOWN: usize = 100;
 
 /// How many characters of one name the drift report prints. A data-keyed map can have a key of any
 /// length.
