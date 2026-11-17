@@ -511,9 +511,11 @@ fn the_retry_contract_refuses_an_unsafe_replay_from_outside_this_crate() {
 
     // Same logical turn, different content, is a different request and is refused.
     let tampered = TurnRequest::new("turn-1", "say something else").as_attempt(AttemptId::new(3));
+    let refused = record.validate(&tampered);
     assert!(
-        record.validate(&tampered).is_err(),
-        "expected a reused logical id with changed content to be refused"
+        matches!(&refused, Err(Error::HostConfiguration { expected, .. })
+            if expected.contains("identical request fingerprint")),
+        "expected HostConfiguration naming the request fingerprint for a reused logical id with changed content | received {refused:?}"
     );
     assert_ne!(
         RequestFingerprint::of(&request).expect("expected a fingerprint"),
@@ -525,11 +527,11 @@ fn the_retry_contract_refuses_an_unsafe_replay_from_outside_this_crate() {
         .finish(&advanced, TerminalStatus::Completed)
         .expect("expected the terminal to commit");
     assert_eq!(record.action(), RecoveryAction::Finished);
+    let after_terminal = record.retry(&request.clone().as_attempt(AttemptId::new(4)));
     assert!(
-        record
-            .retry(&request.clone().as_attempt(AttemptId::new(4)))
-            .is_err(),
-        "expected a committed terminal to end recovery"
+        matches!(&after_terminal, Err(Error::HostConfiguration { expected, .. })
+            if expected.contains("a newer attempt after proof of non-submission")),
+        "expected HostConfiguration refusing a retry after a committed terminal | received {after_terminal:?}"
     );
 }
 

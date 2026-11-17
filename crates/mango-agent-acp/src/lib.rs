@@ -10,6 +10,7 @@ pub mod permission;
 pub mod profile;
 mod prompt_size;
 pub mod reducer;
+mod rfc3339;
 pub mod session;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

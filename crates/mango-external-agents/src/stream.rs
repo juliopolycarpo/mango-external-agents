@@ -624,12 +624,19 @@ mod tests {
         assert_eq!(stream.dispatch(), Dispatch::AcceptanceUnknown);
         assert!(sink.is_terminal());
         sink.terminated().await;
-        assert!(
-            sink.emit(EventKind::TextDelta {
-                text: "late".into()
+        let late = sink
+            .emit(EventKind::TextDelta {
+                text: "late".into(),
             })
-            .await
-            .is_err()
+            .await;
+        assert!(
+            matches!(
+                late,
+                Err(Error::Closed {
+                    subject: "turn stream"
+                })
+            ),
+            "expected Error::Closed for an event after the terminal | received {late:?}"
         );
         stream.recv().await.expect("queued");
         assert!(stream.recv().await.expect("terminal").is_terminal());
@@ -990,8 +997,13 @@ mod tests {
             .expect("expected a value that fits");
         let refused = sink.emit(late).await;
         assert!(
-            refused.is_err(),
-            "expected a refusal after the terminal | received: {refused:?}"
+            matches!(
+                refused,
+                Err(Error::Closed {
+                    subject: "turn stream"
+                })
+            ),
+            "expected Error::Closed after the terminal | received: {refused:?}"
         );
     }
 
