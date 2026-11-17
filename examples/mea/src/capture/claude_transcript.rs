@@ -746,9 +746,21 @@ fn redact_line(
 struct AnswerCalls(BTreeSet<String>);
 
 impl AnswerCalls {
-    /// The ids of the `StructuredOutput` calls among `lines`, at any depth of a record. A line that
-    /// is not JSON holds none.
+    /// The ids of the `StructuredOutput` calls among `lines`, at any depth of a record except
+    /// inside data. A line that is not JSON holds none.
+    ///
+    /// Data is every member the walk reads as a tool's or the model's own content: a tool's result,
+    /// a denied call's arguments, any call's `input` and the `wire_tool_inputs` repeat, and the
+    /// structured answer. A tool author can write a block that reads like the answer's call there,
+    /// and it must not claim an id.
     fn in_lines(lines: &[String]) -> Self {
+        fn is_data_member(name: &str) -> bool {
+            TOOL_DATA_MEMBERS.contains(&name)
+                || ANSWER_MEMBERS.contains(&name)
+                || name == CALL_INPUT_MEMBER
+                || name == WIRE_INPUTS_MEMBER
+        }
+
         fn collect(value: &Value, ids: &mut BTreeSet<String>) {
             match value {
                 Value::Object(members) => {
@@ -760,7 +772,10 @@ impl AnswerCalls {
                     {
                         ids.insert(id.to_owned());
                     }
-                    members.values().for_each(|child| collect(child, ids));
+                    members
+                        .iter()
+                        .filter(|(name, _)| !is_data_member(name))
+                        .for_each(|(_, child)| collect(child, ids));
                 }
                 Value::Array(items) => items.iter().for_each(|item| collect(item, ids)),
                 _ => {}
@@ -873,11 +888,17 @@ fn redact_value(
                     } else {
                         (false, false)
                     };
+                    // Answer-ness is only ever claimed by the recording's own structure. A tool
+                    // author's data can spell out a `StructuredOutput` block, a `wire_tool_inputs`
+                    // keyed by a real answer id or a `structured_output` member, and none of them
+                    // is the answer, so nothing inside tool data starts one. An answer that
+                    // already holds tool data (a schema property named `tool_input`) stays an
+                    // answer through `context.answer`.
+                    let claims_answer = !context.tool_data
+                        && (ANSWER_MEMBERS.contains(&name.as_str()) || answer_input);
                     let inner = ValueContext {
                         tool_call,
-                        answer: context.answer
-                            || ANSWER_MEMBERS.contains(&name.as_str())
-                            || answer_input,
+                        answer: context.answer || claims_answer,
                         tool_data: context.tool_data
                             || TOOL_DATA_MEMBERS.contains(&name.as_str())
                             || tool_input,

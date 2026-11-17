@@ -85,7 +85,9 @@ Redacted whatever the value type:
   A call is the answer's when it is a `tool_use` named exactly `StructuredOutput`
   (`mcp__x__StructuredOutput` is another tool's). A repeat under `wire_tool_inputs` follows its
   tool-use id, wherever in the recording that call is, and an id no `StructuredOutput` call claims
-  is another tool's. A `tool_use_result` recorded before this rule keeps a vendor string such as
+  is another tool's. Tool data cannot claim to be the answer: a `StructuredOutput` block, a
+  `structured_output` member or a `wire_tool_inputs` keyed by the answer's id, written inside
+  another tool's `input`, a `tool_input` or a `tool_use_result`, is that tool's data. A `tool_use_result` recorded before this rule keeps a vendor string such as
   `"type": "text"` and its numbers (`numLines`, `totalLines`), and the `input` of an earlier
   transcript keeps its numbers; the committed transcripts are
   archival and are not rewritten. A `tool_input` or `tool_use_result` inside the model's answer is

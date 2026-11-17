@@ -791,6 +791,124 @@ fn a_tool_authors_call_input_replaces_numbers_and_booleans_and_the_answers_keeps
     );
 }
 
+/// A number only a tool author would write, inside a block that reads like the answer's call.
+const LOOKALIKE_ACCOUNT: u64 = 123_456;
+
+/// A `StructuredOutput` tool_use block as a tool author's data can spell it out.
+fn answer_lookalike_block() -> Value {
+    json!({"type": "tool_use", "id": ANSWER_TOOL_USE_ID, "name": "StructuredOutput",
+        "input": {"acct": LOOKALIKE_ACCOUNT, "open": true}})
+}
+
+/// Fails unless `value` is the lookalike block's input with its number and boolean replaced.
+fn assert_lookalike_input_replaced(value: &Value, where_: &str) {
+    assert_eq!(
+        value,
+        &json!({"acct": 0, "open": false}),
+        "expected a StructuredOutput lookalike {where_} to be replaced like any tool data | received: {value}"
+    );
+}
+
+#[test]
+fn an_answer_lookalike_inside_another_tools_input_does_not_keep_its_numbers() {
+    let records = redacted_records(&[assistant_record_with_calls(
+        &schema_answer(),
+        &json!({"payload": answer_lookalike_block()}),
+    )]);
+
+    let ledger_call = &records[0]["message"]["content"][1];
+    assert_lookalike_input_replaced(
+        &ledger_call["input"]["payload"]["input"],
+        "in another tool's input",
+    );
+    assert_eq!(
+        records[0]["message"]["content"][0]["input"],
+        schema_answer(),
+        "expected the real answer call intact beside it | received: {}",
+        records[0]
+    );
+}
+
+#[test]
+fn an_answer_lookalike_inside_a_tool_result_or_denied_input_does_not_keep_its_numbers() {
+    let records = redacted_records(&[
+        assistant_record_with_calls(&schema_answer(), &json!({})),
+        json!({"type": "user", "tool_use_result": {"echo": answer_lookalike_block()}}),
+        json!({"type": "result", "permission_denials": [
+            {"tool_use_id": LEDGER_TOOL_USE_ID, "tool_input": {"echo": answer_lookalike_block()}}]}),
+    ]);
+
+    assert_lookalike_input_replaced(
+        &records[1]["tool_use_result"]["echo"]["input"],
+        "in tool_use_result",
+    );
+    assert_lookalike_input_replaced(
+        &records[2]["permission_denials"][0]["tool_input"]["echo"]["input"],
+        "in tool_input",
+    );
+}
+
+#[test]
+fn an_answer_id_used_as_a_key_inside_another_tools_input_does_not_keep_its_numbers() {
+    let records = redacted_records(&[assistant_record_with_calls(
+        &schema_answer(),
+        &json!({
+            "wire_tool_inputs": {ANSWER_TOOL_USE_ID: {"acct": LOOKALIKE_ACCOUNT, "open": true}}}),
+    )]);
+
+    assert_lookalike_input_replaced(
+        &records[0]["message"]["content"][1]["input"]["wire_tool_inputs"][ANSWER_TOOL_USE_ID],
+        "under a wire_tool_inputs key nested in another tool's input",
+    );
+}
+
+#[test]
+fn a_structured_output_member_inside_tool_data_does_not_keep_its_numbers() {
+    let records = redacted_records(&[
+        json!({"type": "user", "tool_use_result": {"structured_output": {"acct": LOOKALIKE_ACCOUNT, "open": true}}}),
+    ]);
+
+    assert_eq!(
+        records[0]["tool_use_result"]["structured_output"],
+        json!({"acct": 0, "open": false}),
+        "expected a structured_output member a tool wrote to be tool data | received: {}",
+        records[0]
+    );
+}
+
+#[test]
+fn an_answer_lookalike_inside_tool_data_names_no_answer_call() {
+    let answers = AnswerCalls::in_lines(&lines_of(&[
+        assistant_record_with_calls(
+            &json!({}),
+            &json!({"payload": {
+            "type": "tool_use", "id": "toolu_nested_in_input", "name": "StructuredOutput"}}),
+        ),
+        json!({"type": "user", "tool_use_result": {"echo": {
+            "type": "tool_use", "id": "toolu_nested_in_result", "name": "StructuredOutput"}}}),
+        json!({"type": "result", "permission_denials": [{"tool_input": {"echo": {
+            "type": "tool_use", "id": "toolu_nested_in_denial", "name": "StructuredOutput"}}}]}),
+        json!({"type": "result", "wire_tool_inputs": {LEDGER_TOOL_USE_ID: {"echo": {
+            "type": "tool_use", "id": "toolu_nested_in_wire", "name": "StructuredOutput"}}}}),
+    ]));
+
+    let claimed: Vec<&str> = [
+        ANSWER_TOOL_USE_ID,
+        "toolu_nested_in_input",
+        "toolu_nested_in_result",
+        "toolu_nested_in_denial",
+        "toolu_nested_in_wire",
+    ]
+    .into_iter()
+    .filter(|id| answers.contains(id))
+    .collect();
+    assert_eq!(
+        claimed,
+        vec![ANSWER_TOOL_USE_ID],
+        "expected only the call in the message to be the answer's, none a tool's data spelled out"
+    );
+}
+
 #[test]
 fn an_mcp_tool_named_like_the_answer_tool_is_another_tools_call() {
     let records = redacted_records(&[json!({"type": "assistant", "message": {"content": [
