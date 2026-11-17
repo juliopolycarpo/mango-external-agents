@@ -664,6 +664,98 @@ test_committed_acp_allowlist_is_well_formed() {
   accepted_lines codex > /dev/null
 }
 
+# Writes a scratch assessment whose "Accepted documentation mentions" section carries the given
+# lines inside a text fence, after a decoy section whose fence always carries `a decoy line`.
+write_acp_assessment() {
+  local path="$1"
+  shift
+  {
+    printf '%s\n' '# ACP convergence assessment' '' '## Another section' '' 'A decoy mention.' ''
+    printf '%s\n' '```text' 'a decoy line' '```' ''
+    printf '%s\n' '## Accepted documentation mentions' '' 'Prose before the entries.' '' '```text'
+    printf '%s\n' "$@"
+    printf '%s\n' '```' '' '## Closing section' '' '```text'
+    printf '%s\n' 'a line after the section'
+    printf '%s\n' '```'
+  } > "$path"
+}
+
+test_vendor_acp_allowlist_entries_are_recorded() {
+  local allowlist="$test_root/acp-record-allowlist.txt"
+  local assessment="$test_root/acp-record-assessment.md"
+  local error="$test_root/acp-record.error"
+  local original_allowlist="$ACP_DOCS_ALLOWLIST"
+  local original_assessment="$ACP_CONVERGENCE_DOC"
+  local claude_row='- [claude-agent-acp](https://example.test/adapter.md): adapter | note'
+  # The backticks are page text, not a command substitution.
+  # shellcheck disable=SC2016
+  local codex_row='| `codex acp` | Run as an ACP agent |'
+  ACP_DOCS_ALLOWLIST="$allowlist"
+  ACP_CONVERGENCE_DOC="$assessment"
+
+  # Both entries present as whole lines of the section: recorded.
+  write_acp_allowlist "$allowlist" claude "$claude_row" 'third-party adapter' codex "$codex_row" 'reviewed row'
+  write_acp_assessment "$assessment" "$claude_row" "$codex_row"
+  unrecorded_allowlist_entries
+
+  # An allowlist without entries needs no record.
+  write_acp_allowlist "$allowlist"
+  write_acp_assessment "$assessment"
+  unrecorded_allowlist_entries
+
+  # One entry absent: it fails and names only that entry, with the allowlist and the section.
+  write_acp_allowlist "$allowlist" claude "$claude_row" 'third-party adapter' codex "$codex_row" 'reviewed row'
+  write_acp_assessment "$assessment" "$claude_row"
+  expect_status 1 unrecorded_allowlist_entries
+  unrecorded_allowlist_entries 2> "$error" || true
+  assert_contains "$error" "expected every entry in $allowlist to be a whole line of the \"Accepted documentation mentions\" section of $assessment" \
+    'an unrecorded entry names the allowlist, the section and the assessment'
+  assert_contains "$error" "received no record for:" 'an unrecorded entry states what was received'
+  assert_contains "$error" "$codex_row" 'the unrecorded entry is named'
+  assert_not_contains "$error" 'claude-agent-acp' 'the recorded entry is not named'
+
+  # A reworded or partial record is not a record.
+  write_acp_assessment "$assessment" "$claude_row (updated)" "prefix $codex_row"
+  expect_status 1 unrecorded_allowlist_entries
+
+  # The entry text before the section does not count: only the decoy section carries it here.
+  write_acp_allowlist "$allowlist" claude 'a decoy line' 'third-party adapter'
+  write_acp_assessment "$assessment" 'another line'
+  assert_contains "$assessment" 'a decoy line' 'the decoy section carries the entry'
+  expect_status 1 unrecorded_allowlist_entries
+  # The same entry inside the section is recorded.
+  write_acp_assessment "$assessment" 'a decoy line'
+  unrecorded_allowlist_entries
+  # Nor does a line of a section after it.
+  write_acp_allowlist "$allowlist" claude 'a line after the section' 'third-party adapter'
+  expect_status 1 unrecorded_allowlist_entries
+
+  # An assessment without the section records nothing.
+  printf '%s\n' '# ACP convergence assessment' "$claude_row" > "$assessment"
+  write_acp_allowlist "$allowlist" claude "$claude_row" 'third-party adapter'
+  expect_status 1 unrecorded_allowlist_entries
+
+  # A fenced page line that starts with `## ` does not end the section early.
+  write_acp_assessment "$assessment" '## Heading-shaped page line' "$claude_row"
+  write_acp_allowlist "$allowlist" claude "$claude_row" 'third-party adapter'
+  unrecorded_allowlist_entries
+
+  # A missing assessment and a malformed allowlist are errors, not an unrecorded entry.
+  ACP_CONVERGENCE_DOC="$test_root/acp-record-assessment.missing"
+  expect_status 2 unrecorded_allowlist_entries
+  ACP_CONVERGENCE_DOC="$assessment"
+  printf 'claude\tno reason\n' >> "$allowlist"
+  expect_status 2 unrecorded_allowlist_entries
+
+  ACP_DOCS_ALLOWLIST="$original_allowlist"
+  ACP_CONVERGENCE_DOC="$original_assessment"
+}
+
+# The committed allowlist is recorded in the committed assessment.
+test_committed_acp_allowlist_is_recorded() {
+  unrecorded_allowlist_entries
+}
+
 test_issue_deduplication() {
   local fake_bin="$test_root/fake-bin"
   local report="$test_root/issue.md"
@@ -726,6 +818,8 @@ test_vendor_acp_allowlist_entries
 test_vendor_acp_document_allowlist
 test_vendor_acp_docs_allowlist_watch
 test_committed_acp_allowlist_is_well_formed
+test_vendor_acp_allowlist_entries_are_recorded
+test_committed_acp_allowlist_is_recorded
 test_issue_deduplication
 python3 scripts/test-vendor-result.py
 python3 scripts/test-codex-schema-inventory.py

@@ -509,9 +509,10 @@ const ANSWER_MEMBERS: &[&str] = &["input", "structured_output", "wire_tool_input
 /// survives.
 ///
 /// Unlike [`ANSWER_MEMBERS`], the members below are still judged by name for the drift report when
-/// a string or an object sits under an unlisted name: the vendor owns this record's frame, and a
-/// field it adds there is worth a review. A number or a boolean is replaced and not reported, so a
-/// numeric field a later Claude Code adds goes by unnoticed.
+/// a string, a number, a boolean or an object sits under an unlisted name: the vendor owns this
+/// record's frame, and a field it adds there is worth a review. A replaced number or boolean is
+/// named on its own line, never by value. A direct key of either member is on the key line
+/// instead, so no member name is judged twice.
 const TOOL_DATA_MEMBERS: &[&str] = &["tool_input", "tool_use_result"];
 
 /// The members of a `rate_limit_event` that identify the record rather than describe the account.
@@ -850,9 +851,15 @@ fn redact_value(
         // same type's neutral value: `0` and `false` keep what a replay reads as a number or a
         // flag, where a placeholder string would change the type. The model's answer keeps its
         // numbers (see `ANSWER_MEMBERS`), so the answer's own `tool_input` property is not
-        // touched. Nothing is kept, so nothing is reported as retained.
-        Value::Number(_) if context.tool_data && !context.answer => Value::from(0),
-        Value::Bool(_) if context.tool_data && !context.answer => Value::Bool(false),
+        // touched. The name stays, so a name no review lists is reported like a replaced string's.
+        Value::Number(_) if context.tool_data && !context.answer => {
+            note_replaced_scalar(member, context, paths, drift);
+            Value::from(0)
+        }
+        Value::Bool(_) if context.tool_data && !context.answer => {
+            note_replaced_scalar(member, context, paths, drift);
+            Value::Bool(false)
+        }
         // Everywhere else a number or a boolean is kept as is; a null carries nothing and has no
         // name to review.
         other => {
@@ -901,6 +908,28 @@ fn note_retained_member(
     {
         // As the transcript writes the key, so the report holds nothing the file does not.
         drift.note_retained(&redact::rewrite_paths(member, paths));
+    }
+}
+
+/// Notes the name of a number or boolean replaced inside a tool's data that no review has seen.
+///
+/// The names [`REVIEWED_RETAINED_MEMBERS`] lists are the vendor's number and boolean members
+/// (`numLines`, `totalLines`), so they are the review for this line too. A direct key of a
+/// user-chosen map is in [`DriftReport::map_keys`] already and is not judged again, and a key of a
+/// model-keyed map is a model id, which the transcript redacts and the report must not name.
+fn note_replaced_scalar(
+    member: Option<&str>,
+    context: ValueContext,
+    paths: Paths<'_>,
+    drift: &mut DriftReport,
+) {
+    if let Some(member) = member
+        && !context.user_key
+        && !context.model_key
+        && !is_reviewed_retained(member)
+    {
+        // As the transcript writes the key, so the report holds nothing the file does not.
+        drift.note_replaced_scalar(&redact::rewrite_paths(member, paths));
     }
 }
 
@@ -1070,6 +1099,10 @@ struct DriftReport {
     /// Members whose number, boolean or object the recorder kept and that
     /// [`REVIEWED_RETAINED_MEMBERS`] does not list.
     retained: BTreeSet<String>,
+    /// Members whose number or boolean the walk replaced inside a tool's data and that
+    /// [`REVIEWED_RETAINED_MEMBERS`] does not list. A direct key of `tool_input` or
+    /// `tool_use_result` is in `map_keys` instead.
+    replaced_scalars: BTreeSet<String>,
     /// Keys of a member [`REVIEWED_RETAINED_MEMBERS`] declares [`ChildKeys::UserChosen`], as the
     /// transcript writes them. A key there is data, so it is always listed and never reviewed.
     map_keys: BTreeSet<String>,
@@ -1086,6 +1119,10 @@ impl DriftReport {
 
     fn note_retained(&mut self, name: &str) {
         self.retained.insert(name.to_owned());
+    }
+
+    fn note_replaced_scalar(&mut self, name: &str) {
+        self.replaced_scalars.insert(name.to_owned());
     }
 
     fn note_map_key(&mut self, key: &str) {
@@ -1112,6 +1149,11 @@ impl DriftReport {
             (
                 "members not seen before, their numbers, booleans and objects kept",
                 &self.retained,
+                REVIEW,
+            ),
+            (
+                "members not seen before, their numbers and booleans replaced",
+                &self.replaced_scalars,
                 REVIEW,
             ),
             (

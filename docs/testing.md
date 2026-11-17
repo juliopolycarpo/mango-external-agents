@@ -105,13 +105,21 @@ Naming a test in `ci.yml` is not enough. `scripts/ci-script-steps.py` parses the
 - it is a command of a `run:` step, not text in an `echo` or a comment;
 - its job is listed in the `needs` of the `gate` job, and neither the job nor the step sets
   `continue-on-error`;
-- its job has no `if:`, and its step has no `if:` or only one `matrix.os == '<os>'` test naming an
-  OS the job's matrix lists;
-- no earlier line of the same `run:` block is an `exit`, and its own line does not end in
-  `|| true`, `|| :` or `|| exit 0`;
+- its job has no `if:`, and its step has no `if:` or only one `matrix.os == '<os>'` test. The
+  matrix is expanded as GitHub does (lists, then `exclude`, then `include`) and some combination has
+  to carry that `os`;
+- its `run:` block reaches it: the block is split into commands at newlines, `;`, `&&`, `||`, `|`
+  and `&`, and the test command is joined to its neighbours only by a newline or `;`, sits in no
+  `if`, loop, `case`, function, group or subshell, follows no `exit` that can end the block and no
+  `set +e`, and is not followed by a `||` handler other than an `exit` with a failing status;
+- its step runs under no `shell:`, or `bash` or `sh`, the shells that stop at a failing command;
+  the step, the job's `defaults.run` and the workflow's `defaults.run` are all read;
 - the workflow triggers on `pull_request` and has a `gate` job.
 
-It does not follow shell conditionals inside a `run:` block, `set +e`, or `matrix.include` entries.
+A construct the analysis cannot follow, such as an `if` around the command, a matrix built from an
+expression or a `shell: pwsh` step, is reported as a reason the test is blocked, never counted as
+run. It still does not follow `trap` or `exec` earlier in the block, or what a test script does once
+it starts.
 `scripts/test-check-script-tests.sh` pins each rule against a scratch workflow.
 
 ## Shell lint

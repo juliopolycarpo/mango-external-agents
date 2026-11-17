@@ -719,18 +719,102 @@ fn a_number_inside_the_models_answer_stays_even_under_a_tool_data_name() {
     );
 }
 
+/// A numeric and a boolean member no review lists, nested one level below a direct key.
+const NOVEL_NESTED_NUMBER_MEMBER: &str = "novelNestedCounter";
+const NOVEL_NESTED_BOOLEAN_MEMBER: &str = "novelNestedFlag";
+/// The value of [`NOVEL_NESTED_NUMBER_MEMBER`]; it must never reach a notice.
+const NOVEL_NESTED_NUMBER_VALUE: u64 = 7_305_118;
+
+fn tool_data_with_novel_nested_scalars() -> Value {
+    json!({"wrapper": {
+        NOVEL_NESTED_NUMBER_MEMBER: NOVEL_NESTED_NUMBER_VALUE,
+        NOVEL_NESTED_BOOLEAN_MEMBER: true,
+        "numLines": 4,
+        "absent": null,
+    }})
+}
+
 #[test]
-fn a_replaced_tool_data_number_is_in_no_drift_set() {
+fn a_direct_tool_data_number_is_listed_as_a_key_and_not_as_a_replaced_member() {
     let drift = drift_over(&lines_of(&[
         json!({"type": "user", "tool_use_result": {"novelCounter": 3, "novelFlag": true}}),
     ]));
 
     assert!(
-        drift.retained.is_empty() && drift.unseen.is_empty() && drift.denied.is_empty(),
-        "expected no drift set to name a number or boolean the walk replaced | received retained: {:?} strings: {:?} denied: {:?}",
+        drift.retained.is_empty()
+            && drift.unseen.is_empty()
+            && drift.denied.is_empty()
+            && drift.replaced_scalars.is_empty()
+            && drift.map_keys.len() == 2,
+        "expected a direct key on the key line only | received retained: {:?} strings: {:?} denied: {:?} replaced: {:?} keys: {:?}",
         drift.retained,
         drift.unseen,
-        drift.denied
+        drift.denied,
+        drift.replaced_scalars,
+        drift.map_keys
+    );
+}
+
+#[test]
+fn a_number_or_boolean_replaced_below_a_direct_tool_data_key_is_reported_by_name() {
+    let drift = drift_over(&lines_of(&[
+        json!({"type": "user", "tool_use_result": tool_data_with_novel_nested_scalars()}),
+        json!({"type": "result", "permission_denials": [
+            {"tool_input": tool_data_with_novel_nested_scalars()}]}),
+    ]));
+
+    assert_eq!(
+        drift.replaced_scalars.iter().collect::<Vec<_>>(),
+        vec![NOVEL_NESTED_NUMBER_MEMBER, NOVEL_NESTED_BOOLEAN_MEMBER],
+        "expected the replaced numeric and boolean member no review lists, and not `numLines` or the null | received replaced: {:?}",
+        drift.replaced_scalars
+    );
+}
+
+#[test]
+fn a_replaced_tool_data_scalar_is_named_on_a_notice_and_never_by_value() {
+    // A built-in result as the vendor shapes it, with a numeric field no review lists.
+    let drift = drift_over(&lines_of(&[json!({"type": "user", "tool_use_result": {
+        "file": {"numLines": 4, NOVEL_NESTED_NUMBER_MEMBER: NOVEL_NESTED_NUMBER_VALUE}}})]));
+
+    let notices = drift.lines(STRUCTURED_OUTPUT);
+    assert!(
+        notices.iter().any(|notice| notice
+            .contains("members not seen before, their numbers and booleans replaced (1)")
+            && notice.contains(NOVEL_NESTED_NUMBER_MEMBER)),
+        "expected the member name on the replaced line | received: {notices:?}"
+    );
+    assert_no_value_in(&notices, &[&NOVEL_NESTED_NUMBER_VALUE.to_string()]);
+}
+
+/// An ARN that names an account; the transcript writes its key as `[REDACTED]`.
+const MODEL_KEY_NAMING_AN_ACCOUNT: &str =
+    "arn:aws:bedrock:us-east-1:111122223333:inference-profile/team-ledger";
+
+#[test]
+fn a_number_under_a_model_keyed_map_inside_tool_data_is_not_reported_by_its_raw_key() {
+    let drift = drift_over(&lines_of(&[json!({"type": "user", "tool_use_result": {
+        "wrapper": {"modelUsage": {MODEL_KEY_NAMING_AN_ACCOUNT: 5}}}})]));
+
+    let notices = drift.lines(STRUCTURED_OUTPUT);
+    assert!(
+        !drift.replaced_scalars.contains(MODEL_KEY_NAMING_AN_ACCOUNT),
+        "expected a model id key to stay out of the replaced line, as the transcript redacts it | received: {:?}",
+        drift.replaced_scalars
+    );
+    assert_no_value_in(&notices, &["111122223333"]);
+}
+
+#[test]
+fn a_number_inside_the_models_answer_is_not_a_replaced_tool_data_member() {
+    let drift = drift_over(&lines_of(&[
+        json!({"type": "result", "structured_output": {"tool_input": tool_data_with_novel_nested_scalars()}}),
+    ]));
+
+    assert!(
+        drift.replaced_scalars.is_empty(),
+        "expected the answer's own numbers left out of the replaced line | received: {:?}",
+        drift.replaced_scalars
     );
 }
 
@@ -2674,12 +2758,16 @@ fn the_committed_claude_transcripts_report_no_member_outside_the_reviewed_lists(
     let drift = drift_over(&committed_transcript_lines());
 
     assert!(
-        drift.denied.is_empty() && drift.unseen.is_empty() && drift.retained.is_empty(),
+        drift.denied.is_empty()
+            && drift.unseen.is_empty()
+            && drift.retained.is_empty()
+            && drift.replaced_scalars.is_empty(),
         "expected the committed transcripts to need no new reviewed member | received denied: {:?} \
-         unseen: {:?} retained: {:?}",
+         unseen: {:?} retained: {:?} replaced: {:?}",
         drift.denied,
         drift.unseen,
-        drift.retained
+        drift.retained,
+        drift.replaced_scalars
     );
 }
 
