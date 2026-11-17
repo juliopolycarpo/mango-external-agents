@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use mango_external_agents::Limits;
-use mango_external_agents::error::VendorError;
+use mango_external_agents::error::{ErrorCode, VendorError};
 use mango_external_agents::event::{
     ActivityResult, ActivityStatus, ActivityUpdate, EventKind, StructureClose,
 };
@@ -55,15 +55,17 @@ pub const ACTIVITY_UPDATE_DETAIL_MAX_CHARS: usize = 2_000;
 /// rather than by what the vendor sends. The same figure as the default
 /// `Limits::turn_channel_capacity`, and far above what a real turn runs concurrently.
 ///
-/// Past it the turn fails with the vendor code [`ACTIVITY_OVERFLOW`], the way the stream fails a
-/// turn that overflows its queue: the activity that would exceed it is not forwarded, every
-/// activity already open is closed as failed by the terminal, and nothing is left half tracked. The
-/// alternative, forwarding the excess untracked, would hand the host a start that no completion
-/// or terminal close is ever owed for.
+/// Past it the turn fails with [`ACTIVITY_OVERFLOW`]: the activity that would exceed it is not
+/// forwarded, and the reducer records the failure for the session to take with
+/// [`TurnReducer::take_activity_overflow`]. The session then fails the turn as it does for an event
+/// the core refuses: every activity already open is closed as failed, the failure is committed,
+/// and the native turn is interrupted, with admission held until the app-server reports it over.
+/// The alternative, forwarding the excess untracked, would hand the host a start that no
+/// completion or terminal close is ever owed for.
 pub(crate) const MAX_OPEN_ACTIVITIES: usize = 1_024;
 
-/// The vendor code of the failure a turn ends with when it passes [`MAX_OPEN_ACTIVITIES`].
-pub(crate) const ACTIVITY_OVERFLOW: &str = "activity-overflow";
+/// The code of the failure a turn ends with when it passes [`MAX_OPEN_ACTIVITIES`].
+pub(crate) const ACTIVITY_OVERFLOW: ErrorCode = ErrorCode::from_static("codex-activity-overflow");
 
 /// What one turn has announced so far, for the announcements that depend on it.
 ///
@@ -105,6 +107,9 @@ pub struct TurnReducer {
     max_message_bytes: Option<usize>,
     /// The vendor code of the last error report the server did not mean to retry.
     reported_code: Option<String>,
+    /// The failure for the first start refused past [`MAX_OPEN_ACTIVITIES`], until the session
+    /// takes it.
+    activity_overflow: Option<VendorError>,
 }
 
 impl std::fmt::Debug for TurnReducer {
@@ -487,29 +492,31 @@ impl TurnReducer {
     /// Tracks which activities are open, from what the pure reducer decided to emit.
     ///
     /// Returns `outcome` unchanged unless it would open an activity past [`MAX_OPEN_ACTIVITIES`].
-    /// Then the turn ends as a failure coded [`ACTIVITY_OVERFLOW`], carrying only the events that
-    /// came before the refused start.
+    /// Then the outcome keeps only the events before the refused start, and the failure is recorded
+    /// for [`Self::take_activity_overflow`]. The turn is not finished here: the app-server has not
+    /// said it is over, so the session fails it and interrupts the native turn instead.
     fn observe(&mut self, outcome: Outcome) -> Outcome {
-        let Outcome::Emit(events) = &outcome else {
-            if matches!(outcome, Outcome::Finish { .. } | Outcome::Poison { .. }) {
-                self.activities.clear();
+        let mut events = match outcome {
+            Outcome::Emit(events) => events,
+            other => {
+                if matches!(other, Outcome::Finish { .. } | Outcome::Poison { .. }) {
+                    self.activities.clear();
+                }
+                return other;
             }
-            return outcome;
         };
-        for (position, event) in events.iter().enumerate() {
-            match event {
+        for position in 0..events.len() {
+            match &events[position] {
                 EventKind::ActivityStarted { call_id, .. } => {
                     // A repeated id replaces its entry, so only a new one can pass the bound.
                     if self.activities.len() >= MAX_OPEN_ACTIVITIES
                         && !self.activities.contains_key(call_id)
                     {
-                        let failure = activity_overflow_failure(self.activities.len() + 1);
-                        self.activities.clear();
-                        return Outcome::Finish {
-                            events: events[..position].to_vec(),
-                            cancelled: None,
-                            failure: Some(failure),
-                        };
+                        let received = self.activities.len() + 1;
+                        self.activity_overflow
+                            .get_or_insert_with(|| activity_overflow_failure(received));
+                        events.truncate(position);
+                        return Outcome::Emit(events);
                     }
                     self.activities
                         .insert(call_id.clone(), OpenActivity::default());
@@ -520,7 +527,15 @@ impl TurnReducer {
                 _ => {}
             }
         }
-        outcome
+        Outcome::Emit(events)
+    }
+
+    /// The failure recorded when a start past [`MAX_OPEN_ACTIVITIES`] was refused, once.
+    ///
+    /// The session asks after it has published the events of a reduction, and fails the turn on
+    /// `Some`.
+    pub(crate) fn take_activity_overflow(&mut self) -> Option<VendorError> {
+        self.activity_overflow.take()
     }
 
     /// Folds one progress frame into its activity and emits an update when the window allows.
@@ -577,13 +592,12 @@ impl TurnReducer {
 /// Names the limit and the count the turn reached; neither is vendor text.
 fn activity_overflow_failure(received: usize) -> VendorError {
     VendorError::new(
-        reducer::PROTOCOL_ERROR,
+        ACTIVITY_OVERFLOW,
         format!(
             "expected at most {MAX_OPEN_ACTIVITIES} concurrently open activities in one turn | \
              received {received}"
         ),
     )
-    .with_vendor_code(ACTIVITY_OVERFLOW, false)
 }
 
 /// Where the last [`ACTIVITY_UPDATE_DETAIL_MAX_CHARS`] characters of `text` begin, or `None` when
@@ -1587,31 +1601,34 @@ mod tests {
     }
 
     #[test]
-    fn a_start_past_the_open_activity_bound_fails_the_turn_with_the_named_code() {
+    fn a_start_past_the_open_activity_bound_is_refused_and_recorded_for_the_session() {
         let mut turn = TurnReducer::new();
         let at_bound = open_commands(&mut turn, MAX_OPEN_ACTIVITIES);
         assert!(
             matches!(&at_bound, Outcome::Emit(events) if events.len() == 1),
             "expected the start at the bound to be emitted | received {at_bound:?}"
         );
-        let past = reduce_at(&mut turn, &command_started("one-too-many"), tokio_now());
-        let Outcome::Finish {
-            events,
-            cancelled,
-            failure: Some(failure),
-        } = past
-        else {
-            panic!(
-                "expected the start past {MAX_OPEN_ACTIVITIES} open activities to end the turn | \
-                 received {past:?}"
-            );
-        };
         assert!(
-            events.is_empty() && cancelled.is_none(),
-            "expected the refused start not to be forwarded and no cancellation | \
-             received events {events:?}, cancelled {cancelled:?}"
+            turn.take_activity_overflow().is_none(),
+            "expected no overflow at exactly {MAX_OPEN_ACTIVITIES} open activities"
         );
-        assert_eq!(failure.vendor_code.as_deref(), Some(ACTIVITY_OVERFLOW));
+        let past = reduce_at(&mut turn, &command_started("one-too-many"), tokio_now());
+        // Not a Finish: the app-server has not said the turn is over, so the session must fail it
+        // and interrupt the native turn rather than treat it as ended.
+        assert_eq!(
+            past,
+            Outcome::Emit(Vec::new()),
+            "expected the refused start to forward nothing and not to finish the turn"
+        );
+        let failure = turn
+            .take_activity_overflow()
+            .expect("expected the start past the bound to record a failure");
+        assert_eq!(failure.code, ACTIVITY_OVERFLOW);
+        assert_eq!(failure.code.as_str(), "codex-activity-overflow");
+        assert!(
+            turn.take_activity_overflow().is_none(),
+            "expected the failure to be taken once"
+        );
         let expected_message = format!(
             "expected at most {MAX_OPEN_ACTIVITIES} concurrently open activities in one turn | \
              received {}",

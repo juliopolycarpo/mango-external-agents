@@ -328,6 +328,105 @@ async fn admission_stays_held_until_codex_reports_the_turn_over() {
     run.close().await;
 }
 
+/// `count` commands announced as running, `cmd-0` onwards, none ever completed.
+fn open_commands(thread: &str, count: usize) -> Vec<String> {
+    (0..count)
+        .map(|index| {
+            json!({"method": "item/started", "params": {"threadId": thread,
+                "turnId": "real-turn", "item": {"type": "commandExecution",
+                "id": format!("cmd-{index}"), "command": "sleep 1000",
+                "status": "inProgress"}}})
+            .to_string()
+        })
+        .collect()
+}
+
+/// An app-server that opens more activities than a turn may hold open is still running that turn
+/// when the host is told it failed, so the failure goes through the refused-event path: the native
+/// turn is interrupted once, admission is held until Codex reports it over, and what arrives after
+/// the failure never reaches the host.
+#[tokio::test]
+async fn a_turn_past_the_open_activity_bound_is_failed_interrupted_and_held_until_over() {
+    const BOUND: usize = 1_024;
+    // Room for every start and close, so the turn queue is not what ends the turn. Five starts
+    // past the bound, to show that what follows the first refusal does not reach the host.
+    let limits = Limits {
+        turn_channel_capacity: 4 * BOUND,
+        ..Limits::default()
+    };
+    let run = Run::start(
+        |thread| open_commands(thread, BOUND + 5),
+        |_| Vec::new(),
+        limits,
+        true,
+    )
+    .await;
+    let shape = shape(&run.events);
+    let starts = run
+        .events
+        .iter()
+        .filter(|kind| matches!(kind, EventKind::ActivityStarted { .. }))
+        .count();
+    let failed_closes = run
+        .events
+        .iter()
+        .filter(|kind| {
+            matches!(kind, EventKind::ActivityCompleted { result, .. }
+                if result.status == mango_external_agents::ActivityStatus::Failed)
+        })
+        .count();
+    assert_eq!(
+        (starts, failed_closes),
+        (BOUND, BOUND),
+        "expected {BOUND} starts, each closed as failed, and nothing from the starts after the refusal | received {} events",
+        shape.len()
+    );
+    assert_eq!(
+        failure_code(&run.events),
+        Some("codex-activity-overflow"),
+        "expected the turn to end as codex-activity-overflow | received the last event {:?}",
+        shape.last()
+    );
+    assert_eq!(
+        run.until_interrupted().await,
+        1,
+        "expected the native turn to be interrupted once after the overflow"
+    );
+
+    let while_running = run
+        .session
+        .start_turn(TurnRequest::new("second-turn", "again"))
+        .await;
+    assert!(
+        matches!(&while_running, Err(error) if matches!(error.cause(), Error::Busy)),
+        "expected a second turn to be refused as Busy while Codex has not reported the first over | received {:?}",
+        while_running.as_ref().map(|_| "an accepted turn")
+    );
+
+    run.report_turn_over();
+    let mut admitted = false;
+    for _ in 0..200 {
+        match run
+            .session
+            .start_turn(TurnRequest::new("third-turn", "again"))
+            .await
+        {
+            Err(error) if matches!(error.cause(), Error::Busy) => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            _ => {
+                admitted = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        admitted,
+        "expected admission to be released once Codex reported the turn over"
+    );
+    run.close().await;
+}
+
 /// A delta for the session's own turn, as the app-server writes it.
 fn delta(thread: &str, round: usize) -> String {
     json!({"method": "item/agentMessage/delta", "params": {"threadId": thread,

@@ -219,8 +219,8 @@ async fn a_turn_past_the_open_activity_bound_closes_what_it_opened_and_fails_by_
         );
     };
     assert_eq!(
-        error.vendor_code.as_deref(),
-        Some("activity-overflow"),
+        error.code.as_str(),
+        "codex-activity-overflow",
         "expected the named overflow code | received {error:?}"
     );
 }
