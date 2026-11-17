@@ -111,8 +111,12 @@ Naming a test in `ci.yml` is not enough. `scripts/ci-script-steps.py` parses the
 - its `run:` block reaches it: the block is split into commands at newlines, `;`, `&&`, `||`, `|`
   and `&`, and the test command is joined to its neighbours only by a newline or `;`, sits in no
   `if`, loop, `case`, function, group or subshell, follows no `exit` that can end the block and no
-  `set +e`, no `trap` on `EXIT`, `ERR` or `DEBUG` that is still set, and no `exec` with a command,
-  and is not followed by a `||` handler other than an `exit` with a failing status. Each of the
+  `set +e`, no `trap` on `EXIT`, `ERR` or `DEBUG` that is still set, no `exec` with a command and
+  no `.` or `source` of a file, and is not followed by a `||` handler other than an `exit` with a
+  failing status. A sourced file runs in the same shell, so a `trap`, `set +e` or `exec` in it
+  would change a later test; the check does not open the file and refuses every test after the
+  sourcing, even one under a condition. A test before the sourcing, or in a step of its own, still
+  counts. Each of the
   three traps is tracked on its own and only an unconditional `trap - <signal>` for that signal
   lifts it. A signal word the shell expands (`$T`, `E*`) may name any of them, so a trap on it is
   never lifted. `exec` with only redirections (`exec > log`, `exec {fd}>log`,

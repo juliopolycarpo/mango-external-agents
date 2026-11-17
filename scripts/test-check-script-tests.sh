@@ -376,6 +376,21 @@ block_fail 'a command after exec of a process substitution' $'exec <(echo hi)\ns
 block_pass 'a command after exec with an attached redirection' $'exec 4>>log\nscripts/test-beta.py'
 block_pass 'a command that runs before exec' $'scripts/test-beta.py\nexec echo done'
 
+# `.` and `source` run another file's commands in this shell, so a `trap`, `set +e` or `exec` in
+# that file changes what happens to a later test. The check does not open the file: it refuses the
+# test after the sourcing, whether or not the sourcing is conditional.
+source_reason='which runs a file in this shell, and the check does not open the file'
+block_fail 'a command after a dot-sourced file' $'. ./x.sh\nscripts/test-beta.py' "it follows \`. ./x.sh\`, $source_reason"
+block_fail 'a command after a source-d file' $'source ./x.sh\nscripts/test-beta.py' "it follows \`source ./x.sh\`, $source_reason"
+block_fail 'a command after a sourced file on the same line' 'source ./x.sh; scripts/test-beta.py' "it follows \`source ./x.sh\`, $source_reason"
+block_fail 'a command after a file sourced under a condition' $'[ -f ./x.sh ] && . ./x.sh\nscripts/test-beta.py' "it follows \`. ./x.sh\`, $source_reason"
+block_fail 'a command after command source' $'command source ./x.sh\nscripts/test-beta.py' "it follows \`command source ./x.sh\`, $source_reason"
+block_fail 'a command after builtin dot' $'builtin . ./x.sh\nscripts/test-beta.py' "it follows \`builtin . ./x.sh\`, $source_reason"
+block_fail 'a command after eval source' $'eval "source ./x.sh"\nscripts/test-beta.py' "it follows \`eval \"source ./x.sh\"\`, $source_reason"
+block_pass 'a command in a block that sources nothing' $'echo ready\nscripts/test-beta.py'
+block_pass 'a command after an echo that names source' $'echo source ./x.sh\nscripts/test-beta.py'
+block_pass 'a command that runs before a sourced file' $'scripts/test-beta.py\nsource ./x.sh'
+
 # The shell has to stop at a failing command, wherever it is declared.
 shell_pass() {
   shell_name=$2
