@@ -73,9 +73,10 @@ Each page must still contain a phrase it carries today (`Claude Code Docs`, `--p
 not pass as clean. Either outcome opens the managed `drift(<vendor>)` issue. The contract
 comparison still runs, so when a release ships the mode the issue carries the help diff too. The
 issue body carries a "Documentation watch" section: each page URL that needs attention and the
-matching line text with its line number (at most three lines per page, each cut at 200 characters,
-with the count shown), a note for a page that could
-not be downloaded or lost its phrase, and any stale allowlist entry. The section holds public page
+matching line text with its line number (at most three lines per page, each cut at 1000 bytes,
+which holds a whole `llms.txt` index line, with the count shown), a note for a page that could
+not be downloaded or lost its phrase, and any stale allowlist entry. The contract diff is cut at
+48000 bytes so the whole report stays under the 65536 bytes the "Bound the drift result" step allows. The section holds public page
 text and public URLs only; the workflow passes a report path as the script's second argument, and
 the file exists only when the watch fails. The step runs on the schedule only, so a vendor page
 cannot block a pull request. Its tests use the named fake fetcher

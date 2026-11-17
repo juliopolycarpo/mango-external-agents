@@ -9,7 +9,10 @@
 #        scripts/write-vendor-drift-report.sh --docs <vendor> <docs-report> <report-file>
 set -euo pipefail
 
-readonly MAX_DIFF_BYTES=60000
+# The diff shares the 65536-byte report bound the drift workflow enforces with the documentation
+# watch section appended after it (up to six page lines of check-vendor-acp-docs.sh's ACP_LINE_CUT
+# bytes each, plus the stale allowlist entries), so it leaves them room.
+readonly MAX_DIFF_BYTES=48000
 
 # shellcheck source=vendor-contract-lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/vendor-contract-lib.sh"
