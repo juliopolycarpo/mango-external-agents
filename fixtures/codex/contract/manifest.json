@@ -16,6 +16,6 @@
     "help.txt": "sha256:b69c5454449539e250b4d7f636e612e7a6686d60d1a9d2d50c8b82628af00dde",
     "initialize-params.schema.json": "sha256:c608ff6bdd94e661423dca9b44cd1dcea7eac610f74e1310284c61eab64280bc",
     "initialize-response.schema.json": "sha256:62ad689c2cb6379913c1d72749cfd8de5089d35760214123518eb92eef11acc9",
-    "version.json": "sha256:0f5229209b6825e82b40cedb055aaf4f220d43b83c69f0e56e8d2a944ca5cbb7"
+    "version.json": "sha256:5ab4e87b868e68001b22bbca82fc30f8acf5373518d1be9f46dd78fe7cb28a95"
   }
 }

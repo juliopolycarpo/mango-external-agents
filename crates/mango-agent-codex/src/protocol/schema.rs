@@ -250,7 +250,7 @@ mod tests {
         assert_declares("InitializeResponse", &["userAgent", "platformOs"]);
     }
 
-    /// The 0.167.1 pin declares `requiredHumanApproval` (experimental, needs `experimentalApi`).
+    /// The pin (since 0.167.1) declares `requiredHumanApproval` (experimental, needs `experimentalApi`).
     /// The harness never brokers a person's one-time decision on its own, so every capability it
     /// can serialize is declared by the pin and neither opt-in is among them.
     #[test]

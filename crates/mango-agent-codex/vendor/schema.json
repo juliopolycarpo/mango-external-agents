@@ -1,5 +1,5 @@
 {
-  "codexVersion": "0.167.1",
+  "codexVersion": "0.169.0",
   "consumed": {
     "$referenced": {
       "v2#/definitions/TextElement": {
@@ -3793,6 +3793,7 @@
         "contextWindowExceeded",
         "cyberPolicy",
         "flexUnavailable",
+        "inferenceHookDenied",
         "internalServerError",
         "misalignmentPolicyViolation",
         "modelNotFound",
@@ -3918,7 +3919,8 @@
         "providerId",
         "providerName",
         "required",
-        "status"
+        "status",
+        "supportsDeviceAuth"
       ]
     },
     "GatewayOAuthStatus": {
@@ -3947,7 +3949,8 @@
     "GetAccountResponse": {
       "properties": [
         "account",
-        "requiresOpenaiAuth"
+        "requiresOpenaiAuth",
+        "userId"
       ]
     },
     "GrantedPermissionProfile": {
@@ -3984,6 +3987,7 @@
     "ItemCompletedNotification": {
       "properties": [
         "completedAtMs",
+        "contentTokenCount",
         "item",
         "threadId",
         "turnId"
@@ -4066,7 +4070,8 @@
       "properties": [
         "cursor",
         "includeHidden",
-        "limit"
+        "limit",
+        "modelProvider"
       ]
     },
     "ModelListResponse": {
@@ -4324,6 +4329,7 @@
         "mcpAppUi",
         "memoryCitation",
         "model",
+        "moderation",
         "name",
         "namespace",
         "output",
@@ -4382,6 +4388,7 @@
             "delivery",
             "id",
             "memoryCitation",
+            "moderation",
             "phase",
             "questions",
             "text",
@@ -4678,6 +4685,7 @@
     "ThreadListParams": {
       "properties": [
         "archived",
+        "currentAccountOnly",
         "cursor",
         "cwd",
         "excludedThreadIds",

@@ -51,3 +51,12 @@ codex 0.167.1 codex-aarch64-unknown-linux-musl.tar.gz 3eefec1b400ea67d01a1a091ef
 codex 0.167.1 codex-x86_64-apple-darwin.tar.gz 1639c947f200d0ca8094534c910688512b2effc3c4a4ff32b8c8522605cfe064
 codex 0.167.1 codex-x86_64-pc-windows-msvc.exe.zip 191bd0dcd77a6aa17d4f8a4ab166fc9d05d24ca4b7015789e2aa9a53dcafb658
 codex 0.167.1 codex-x86_64-unknown-linux-musl.tar.gz 64bcc99c32e434b4bcb0508a97df9b7aeecdb97e956d976fb13661096ec4e3e2
+
+# Official GitHub Releases API asset digests retrieved 2026-11-17.
+# openai/codex rust-v0.169.0.
+codex 0.169.0 codex-aarch64-apple-darwin.tar.gz 7f4c49c80bae1d0b4e347acfcdf11faa3475d87ae5e65a5eb1261d3c358145ee
+codex 0.169.0 codex-aarch64-pc-windows-msvc.exe.zip cd30a3d3a2a7ed89d1956383cadd4122ae500c0d90bf3cba23c7459b4d6175d5
+codex 0.169.0 codex-aarch64-unknown-linux-musl.tar.gz 97b97d87eea075c5cb7709c7f6156a451622a7667953ecda40e0276637196f3f
+codex 0.169.0 codex-x86_64-apple-darwin.tar.gz 6a2be05a75ecb88f92baf3e6988ce6efbe1d68341b68dac3ae505c4b8bbce475
+codex 0.169.0 codex-x86_64-pc-windows-msvc.exe.zip 5382754ba12c6bc7934c25fb09c25b62d1bb156a6c92489ddbdb609cd5847791
+codex 0.169.0 codex-x86_64-unknown-linux-musl.tar.gz 9af4d751fce183faedea629437d5252dbf458eeb04130cf4f97be844621ea985

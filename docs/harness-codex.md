@@ -3,11 +3,43 @@
 Drives the `codex` CLI a user already installed, through `codex app-server` — the interface OpenAI
 documents for rich clients and uses for its own VS Code extension.
 
-The current public-contract pin is `codex-cli 0.167.1` (`vendor/PIN` records `rust-v0.167.1`);
+The current public-contract pin is `codex-cli 0.169.0` (`vendor/PIN` records `rust-v0.169.0`);
 the supported minimum stays `0.166.0`. Older behavioral observations below retain their
 dated source versions and do not qualify current startup behavior.
 
-## Pin refresh — 2026-11-13
+## Pin refresh — 2026-11-17
+
+The reproduction pin moves from 0.167.1 to 0.169.0, published 2026-11-13 and the newest stable
+release past the three-day release-age window (0.170.0 and 0.171.0 exist only as alphas). The Linux
+x64 archive passed the installer's SHA-256 check before it ran, and the checksum registry now lists
+all six 0.169.0 assets. `mea capture --harness codex` regenerated `fixtures/codex/contract/` and
+`scripts/vendor-codex.sh 0.169.0` regenerated `vendor/schema.json`, with an empty `CODEX_HOME`. The
+followed document is the
+[0.169.0 app-server guide](https://github.com/openai/codex/blob/rust-v0.169.0/codex-rs/app-server/README.md).
+
+The public contract changes only in `version.json`: the help surfaces and the initialize
+schemas are byte-identical to 0.167.1. The vendored inventory gains eight entries, all additive:
+
+| Inventory member                                           | What it is                                                            | Harness impact                                                                                                   |
+| ---------------------------------------------------------- | --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `CodexErrorInfo` value `inferenceHookDenied`               | A workspace inference hook denied the request                         | `codexErrorInfo` is kept as raw JSON and surfaces as the vendor code string; no enum to extend                   |
+| `GatewayOAuthReadResponse.supportsDeviceAuth`              | A device authorization endpoint is configured (default `false`)       | Not read; the harness reads `required` and `status` only                                                         |
+| `GetAccountResponse.userId`                                | Nullable ChatGPT user id                                              | Not read, and never forwarded                                                                                    |
+| `ItemCompletedNotification.contentTokenCount`              | A token count on a completed item                                     | Not read                                                                                                         |
+| `ModelListParams.modelProvider`                            | Optional provider selector for `model/list`                           | Not sent; omitted keeps the app-server default                                                                   |
+| `ThreadListParams.currentAccountOnly`                      | Optional scope to the current account's local history (default false) | Not sent; omitted keeps the old behaviour                                                                        |
+| `moderation` on `agentMessage` and the generic item record | Optional `moderated` flag and a display hint                          | Not read, so a moderated answer reaches the host without the flag; `ThreadItem` decoding ignores unknown members |
+
+A full `generate-json-schema` comparison of 0.167.1 against 0.169.0 outside the inventory shows
+the same kind of change: new client methods (`account/securitySetup/read`, `modelProvider/list`,
+`modelProvider/config/write`), a `prompt` in the gateway login response and an `input_audio` item
+that now accepts `file_id` beside `audio_url`. No server request, approval or notification method
+the harness answers was removed or reshaped. The handshake still sends `explicitGatewayOauth`
+and the readiness read still sends empty params, which the guide says select the current provider.
+The unauthenticated capture covers no vendor turn, and the readiness read was not run against the
+real binary because it may read local credential state.
+
+## Previous pin refresh — 2026-11-13
 
 The reproduction pin moves from 0.166.0 to 0.167.1, published 2026-11-10 and past the three-day
 release-age window. 0.167.2, 0.168.0 and 0.169.0 were still inside it. The Linux x64 archive passed
@@ -72,10 +104,10 @@ adapter explicitly supplies synthetic current-protocol readiness, which is not c
 | Executable        | `codex`, resolved by the host (`OpenSession::with_executable`) or by name                                                            |
 | Arguments         | `app-server`, and nothing else                                                                                                       |
 | Version read from | `codex --version` before any app-server starts (discovery, session open, picker); the handshake's own `userAgent` as the second line |
-| Minimum version   | `0.166.0` (`MINIMUM_CODEX_VERSION`); current schema pin: `rust-v0.167.1`                                                             |
+| Minimum version   | `0.166.0` (`MINIMUM_CODEX_VERSION`); current schema pin: `rust-v0.169.0`                                                             |
 
 The supported floor is 0.166.0 because startup requires explicit gateway readiness; the current
-reproduction pin is 0.167.1. A `codex` below 0.166.0 on `PATH` reports
+reproduction pin is 0.169.0. A `codex` below 0.166.0 on `PATH` reports
 `GateVerdict::VersionTooOld` with both numbers and claims no capabilities; it never crashes, and no
 app-server is spawned for it. That holds for a session open and the short-lived picker connection
 too: they apply the same floor before they spawn `codex app-server`, because an older app-server
@@ -134,7 +166,7 @@ second line, for what `--version` could not say.
 Every method below follows the [official app-server documentation][app-server] and the
 [`codex-rs/app-server/README.md`][readme] at document revision
 `41e22fee981a63b3698df7ed36bad393cda24715` (`rust-v0.153.0`), re-read on 2026-10-22.
-The current public-contract CLI and schema pin are `rust-v0.167.1`. JSON-RPC
+The current public-contract CLI and schema pin are `rust-v0.169.0`. JSON-RPC
 2.0 over newline-delimited JSON, **without** the `"jsonrpc"` member — the README's own words:
 "bidirectional communication using JSON-RPC 2.0 messages (with the `"jsonrpc":"2.0"` header omitted
 on the wire)".
@@ -1328,7 +1360,7 @@ desktop-only `app` subcommand (listed on macOS and Windows, not on Linux) is dro
 command and transport surface part of the drift check. A new subcommand (a native `codex acp`, say),
 a changed `--listen` transport list, or an `app-server` subcommand such as `daemon` or `proxy`
 being added or removed fails the weekly latest-contract job and, on a re-pin, the pinned job.
-At 0.167.1 neither help lists an ACP mode, so the dedicated Codex harness stays. A native mode is
+At 0.169.0 (and 0.167.1 before it) neither help lists an ACP mode, so the dedicated Codex harness stays. A native mode is
 the condition the ACP convergence watch in #363 waits for.
 
 `fixtures/codex/` also holds archival conversations recorded by `mea capture codex` against a real

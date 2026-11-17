@@ -58,11 +58,12 @@ present. Neither is a new authenticated turn. The `--json-schema` rows were obse
 | `uuid`                                                         | runtime | —                               | omit        | Numbers a stream record nothing addresses; the session and the turn are both already identified                                                                                   | none — recorded as a decision                                                                      |
 | `--permission-prompt-tool stdio`                               | runtime | —                               | refuse      | Real and undocumented. Driving it would make this library the answering host for every prompt                                                                                     | `docs/harness-claude.md` "Approvals: none, and why"                                                |
 
-## Codex — reproduction pin `codex` 0.167.1 (`vendor/PIN`)
+## Codex — reproduction pin `codex` 0.169.0 (`vendor/PIN`)
 
 The supported minimum is 0.166.0 for the documented explicit gateway readiness handshake; the pin
-is 0.167.1. See [the 2026-11-13 refresh](harness-codex.md#pin-refresh--2026-11-13) for the one
-additive member of that bump.
+is 0.169.0. See [the 2026-11-17 refresh](harness-codex.md#pin-refresh--2026-11-17) for the eight
+additive inventory entries of that bump, none of which the harness reads, and
+[the 2026-11-13 refresh](harness-codex.md#previous-pin-refresh--2026-11-13) for the one before it.
 Historical field observations and transcripts retain their original versions. The 2026-11-07
 refresh covers GCP account kinds, optional subagent model/reasoning fields and generic
 image-generation handling. `explicitGatewayOauth` is sent as true; `required` and `status` from
