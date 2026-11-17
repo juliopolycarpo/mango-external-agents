@@ -1170,7 +1170,8 @@ calls it issues before their results arrive, so the cap is not left to it. The c
 not forwarded, and the pump ends the turn as it does a broken stream: the reducer's abort closes
 every call the host was told about as cancelled, the turn's terminal is an `Error` coded
 `claude-activity-overflow` naming the limit and the count reached, the conversation is marked
-`UnfinishedTurn`, and the child is stopped. The cap is a constant, not a `Limits` field.
+`UnfinishedTurn`, and the child is stopped. Claude closes as cancelled where Codex and ACP close as
+failed, because its failure path is the abort that always cancels the run's open calls. The cap is a constant, not a `Limits` field.
 
 The reducer holds three properties, exercised by replay and reducer tests:
 
