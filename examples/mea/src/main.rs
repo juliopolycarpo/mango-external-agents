@@ -1233,15 +1233,21 @@ mod tests {
 
     #[test]
     fn refuses_a_value_it_does_not_recognise_rather_than_guessing() {
-        for arguments in [
-            vec![String::from("--level"), String::from("yolo")],
-            vec![String::from("--harness"), String::from("acp")],
-            vec![String::from("--harness"), String::from("acp:unknown")],
-            vec![String::from("--level")],
+        for (arguments, bad_input) in [
+            (vec![String::from("--level"), String::from("yolo")], "yolo"),
+            (vec![String::from("--harness"), String::from("acp")], "acp"),
+            (
+                vec![String::from("--harness"), String::from("acp:unknown")],
+                "unknown",
+            ),
+            (vec![String::from("--level")], "--level"),
         ] {
+            let error = Options::parse(&arguments).err().unwrap_or_else(|| {
+                panic!("expected {arguments:?} to be refused | received options")
+            });
             assert!(
-                Options::parse(&arguments).is_err(),
-                "expected {arguments:?} to be refused"
+                error.contains(bad_input),
+                "expected the refusal for {arguments:?} to name {bad_input:?} | received {error:?}"
             );
         }
     }
