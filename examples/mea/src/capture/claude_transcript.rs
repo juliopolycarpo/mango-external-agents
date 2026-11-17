@@ -689,20 +689,24 @@ fn redact_model_id(id: &str) -> String {
     }
 }
 
-/// Whether an object key reads as a figure: an optional `-`, ASCII digits and at most one `.` with
-/// digits on both sides (`4111111111111111`, `-12.50`).
+/// The separators a figure-shaped key may carry besides its digits: the ones card, account and
+/// phone numbers, amounts, dates and times are written with.
+const FIGURE_KEY_SEPARATORS: &str = " -./:+()";
+
+/// Whether an object key reads as a figure: ASCII digits and the separators in
+/// [`FIGURE_KEY_SEPARATORS`], with at least one digit (`4111111111111111`, `4111-1111-1111-1111`,
+/// `4111 1111 1111 1111`, `-12.50`).
 ///
 /// A tool author can key a map by an account or card number or by an amount, and a key is not a
 /// number to the walk, so it would otherwise survive the replacement of the author's numbers. A
-/// date, an exponent form or a word is not a figure and is kept as a name.
+/// date or a time written with these separators is a figure too and is zeroed with the rest, which
+/// loses nothing a replay needs. A word, an exponent form or a key with any other character is a
+/// name and is kept.
 fn is_figure_key(text: &str) -> bool {
-    let unsigned = text.strip_prefix('-').unwrap_or(text);
-    let (whole, fraction) = match unsigned.split_once('.') {
-        Some((whole, fraction)) => (whole, Some(fraction)),
-        None => (unsigned, None),
-    };
-    let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
-    digits(whole) && fraction.is_none_or(digits)
+    text.bytes().any(|byte| byte.is_ascii_digit())
+        && text.chars().all(|character| {
+            character.is_ascii_digit() || FIGURE_KEY_SEPARATORS.contains(character)
+        })
 }
 
 /// A figure-shaped key with every digit written as `0`, so the key keeps its shape and length and

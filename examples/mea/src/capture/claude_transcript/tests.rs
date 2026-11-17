@@ -760,7 +760,7 @@ fn a_figure_used_as_a_key_under_tool_data_is_replaced_by_zeros() {
     )]);
 
     let expected = json!({CARD_NUMBER_KEY_REDACTED: false, "-00.00": 0, "000": "[REDACTED]",
-        "2024-01-01": 0, "v2": 0});
+        "0000-00-00": 0, "v2": 0});
     for (where_, balances) in [
         (
             "tool_input",
@@ -829,6 +829,56 @@ fn a_figure_used_as_a_key_in_the_models_answer_stays() {
 }
 
 #[test]
+fn a_card_number_with_separators_or_a_date_used_as_a_key_is_zeroed_keeping_its_separators() {
+    let line = redacted_record(&json!({"type": "user", "tool_use_result": {
+        "4111-1111-1111-1111": true,
+        "4111 1111 1111 1111": true,
+        "2024-03-09": 1,
+        "12:30:45": 2,
+        "named": 3}}));
+
+    let result = line["tool_use_result"]
+        .as_object()
+        .expect("expected the result object");
+    let keys: std::collections::BTreeSet<&str> = result.keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        std::collections::BTreeSet::from([
+            "0000 0000 0000 0000",
+            "0000-0000-0000-0000",
+            "00:00:00",
+            "0000-00-00",
+            "named"
+        ]),
+        "expected each separated figure key written as zeros with its separators | received: {line}"
+    );
+    let written = line.to_string();
+    assert!(
+        ["4111", "2024", "12:30"]
+            .iter()
+            .all(|figure| !written.contains(figure)),
+        "expected no digit of a card number, date or time to survive as a key | received: {line}"
+    );
+}
+
+#[test]
+fn separated_figure_keys_that_collapse_to_the_same_zeros_keep_both_entries() {
+    let line = redacted_record(&json!({"type": "user", "tool_use_result": {
+        "4111-1111": true, "5222-2222": false}}));
+
+    let result = line["tool_use_result"]
+        .as_object()
+        .expect("expected the result object");
+    let mut keys: Vec<&str> = result.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["0000-0000", "0000-0000#2"],
+        "expected two dashed figure keys to stay two entries | received: {line}"
+    );
+}
+
+#[test]
 fn the_drift_report_lists_a_figure_key_as_the_transcript_writes_it() {
     let drift = drift_over(&lines_of(&[json!({"type": "user",
         "tool_use_result": {CARD_NUMBER_KEY: true}})]));
@@ -843,19 +893,34 @@ fn the_drift_report_lists_a_figure_key_as_the_transcript_writes_it() {
 
 #[test]
 fn only_a_figure_shaped_text_is_a_figure_key() {
-    let figures = ["0", "4111111111111111", "-12.50", "3.14"];
+    let figures = [
+        "0",
+        "4111111111111111",
+        "-12.50",
+        "3.14",
+        "4111-1111-1111-1111",
+        "4111 1111 1111 1111",
+        "2024-01-01",
+        "12:30:45",
+        "01/02/2024",
+        "+1 (555) 010-0100",
+        "1.",
+        ".5",
+        "1.2.3",
+        "+1",
+    ];
     let others = [
         "",
         "-",
         ".",
-        "1.",
-        ".5",
-        "1.2.3",
+        " ",
+        "()",
         "1e5",
-        "+1",
-        "2024-01-01",
         "v2",
         "id",
+        "a1",
+        "1a",
+        "2024-01-01T10:00",
         "١٢",
         "inf",
         "NaN",
