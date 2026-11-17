@@ -117,9 +117,12 @@ Naming a test in `ci.yml` is not enough. `scripts/ci-script-steps.py` parses the
   step runs under `bash -e` on Linux and macOS but under `pwsh` on Windows, which returns the status
   of its last native command, so such a step counts only when its job cannot run on Windows: no
   `runs-on` label, after `${{ matrix.<key> }}` is filled from each matrix combination, and no
-  matrix `os` value names it (a step guarded to one `os` is judged on that `os` alone). A
-  `runs-on` the check cannot expand is treated as possibly Windows. Modelling `pwsh` is not
-  attempted: the step is refused, and `shell: bash` on it fixes that;
+  matrix `os` value names it (a step guarded to one `os` is judged on that `os` alone). Windows is
+  recognised only from a label or `os` value that contains `windows`, in any case: a self-hosted
+  runner whose labels do not say so (`[self-hosted, gpu]`) is taken as non-Windows. A `runs-on` the
+  check cannot expand (`${{ inputs.runner }}`, or `${{ matrix.os }}` over a matrix built from an
+  expression) is refused as possibly Windows. Modelling `pwsh` is not attempted: the step is
+  refused, and `shell: bash` on it fixes that;
 - the workflow triggers on `pull_request` and has a `gate` job.
 
 A construct the analysis cannot follow, such as an `if` around the command, a matrix built from an

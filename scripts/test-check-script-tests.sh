@@ -414,6 +414,10 @@ windows_pass 'a matrix whose Windows combinations are excluded' "$all_os" $'os: 
 windows_pass 'a step guarded to a Linux os of a matrix with Windows' "$all_os" "$matrix_windows" "matrix.os == 'ubuntu-latest'"
 windows_pass 'a matrix of Linux and macOS with no shell' "$all_os" $'os: [ubuntu-latest, macos-latest]' ''
 windows_pass 'a ubuntu-latest job with no shell' ubuntu-latest '' ''
+# Windows is recognised only by a `windows` label (any case); the check cannot know what else a
+# self-hosted runner is, and docs/testing.md says so.
+windows_pass 'a self-hosted runner whose labels do not name Windows' '[self-hosted, gpu]' '' ''
+windows_fail 'a runs-on label that names Windows in capitals' "job 'matrixed' can run on Windows ('Windows'), $pwsh_tail" '[self-hosted, Windows]' '' ''
 matrix_runs_on='${{ matrix.os }}' step_shell=bash job_shell='' workflow_shell=''
 
 # An indirect parent is held to the same rule.
