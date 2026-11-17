@@ -8,7 +8,50 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
+
+/// A `serde_json::Value` that writes every object with its members sorted by name, however the
+/// build orders them.
+///
+/// A `Value` object is sorted by key unless some crate in the build turns on
+/// `serde_json/preserve_order`, which keeps insertion order instead. `mango-agent-acp` does, so a
+/// host that links it would write a different `config` than one that drives Codex alone. Sorting on
+/// the way out gives the bytes the build without the feature has always written, in every build.
+/// Array order is untouched: it is data (an MCP server's `args`).
+struct SortedValue<'a>(&'a serde_json::Value);
+
+impl Serialize for SortedValue<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            serde_json::Value::Object(members) => {
+                let mut sorted: Vec<_> = members.iter().collect();
+                sorted.sort_unstable_by_key(|(name, _)| name.as_str());
+                serializer.collect_map(sorted.into_iter().map(|(name, value)| (name, Self(value))))
+            }
+            serde_json::Value::Array(items) => serializer.collect_seq(items.iter().map(Self)),
+            scalar => scalar.serialize(serializer),
+        }
+    }
+}
+
+/// Writes a request's `config` with every object in it sorted by member name.
+///
+/// The field stays a `BTreeMap<String, Value>`, so the public type is unchanged; only its bytes are
+/// fixed. Used as `serialize_with` on [`ThreadStartParams::config`] and
+/// [`ThreadResumeParams::config`], after `skip_serializing_if` has dropped an absent one.
+fn serialize_config_sorted<S: Serializer>(
+    config: &Option<BTreeMap<String, serde_json::Value>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match config {
+        Some(config) => serializer.collect_map(
+            config
+                .iter()
+                .map(|(name, value)| (name, SortedValue(value))),
+        ),
+        None => serializer.serialize_none(),
+    }
+}
 
 /// Who the host says it is, as the app-server's `clientInfo`.
 ///
@@ -241,7 +284,10 @@ pub struct ThreadStartParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approvals_reviewer: Option<ApprovalsReviewer>,
     /// Request-scoped app-server config; never written to the user's config file.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_config_sorted"
+    )]
     pub config: Option<BTreeMap<String, serde_json::Value>>,
 }
 
@@ -281,7 +327,10 @@ pub struct ThreadResumeParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approvals_reviewer: Option<ApprovalsReviewer>,
     /// Request-scoped app-server config; never written to the user's config file.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_config_sorted"
+    )]
     pub config: Option<BTreeMap<String, serde_json::Value>>,
     /// Metadata only: the transcript is the vendor's, and this harness never replays one.
     pub exclude_turns: bool,
@@ -1306,6 +1355,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every object in `config` is written sorted by member name, however the build orders a
+    /// `Value` object; arrays keep their order and scalars are written as they are. The input is
+    /// built in unsorted order, so a build with `serde_json/preserve_order` shows a missed sort.
+    #[test]
+    fn thread_config_is_written_with_every_object_sorted_and_arrays_in_order() {
+        let config = BTreeMap::from([
+            (
+                String::from("zeta"),
+                serde_json::json!({"b": [{"y": 1, "x": 2}, "keep", 3.5, null, true], "a": {"d": 0, "c": -1}}),
+            ),
+            (String::from("alpha"), serde_json::json!("text \"quoted\"")),
+        ]);
+        let start = ThreadStartParams {
+            cwd: String::from("/workspace"),
+            config: Some(config.clone()),
+            ..ThreadStartParams::default()
+        };
+        let resume = ThreadResumeParams {
+            thread_id: String::from("thread-1"),
+            cwd: String::from("/workspace"),
+            config: Some(config),
+            exclude_turns: true,
+            ..ThreadResumeParams::default()
+        };
+        let body = r#""config":{"alpha":"text \"quoted\"","zeta":{"a":{"c":-1,"d":0},"b":[{"x":2,"y":1},"keep",3.5,null,true]}}"#;
+
+        let received = (
+            serde_json::to_string(&start).expect("expected a start frame"),
+            serde_json::to_string(&resume).expect("expected a resume frame"),
+        );
+        let expected = (
+            format!(r#"{{"cwd":"/workspace",{body}}}"#),
+            format!(r#"{{"threadId":"thread-1","cwd":"/workspace",{body},"excludeTurns":true}}"#),
+        );
+        assert_eq!(
+            received, expected,
+            "expected thread/start and thread/resume with sorted config objects: {expected:?} | received: {received:?}"
+        );
     }
 
     #[test]
