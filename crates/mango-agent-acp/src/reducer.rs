@@ -3703,10 +3703,11 @@ mod tests {
     }
 
     /// Ten thousand calls opened and finished in turn never reach the bound, and a bound-sized batch
-    /// left open is closed in the order it opened. The elapsed bound is far above what the map
-    /// lookups need, so a slow host does not fail it.
+    /// left open is closed in the order it opened. The reducer already kept its open calls in a
+    /// map, so this guards that, and the order, rather than a fix: it passes on the code before the
+    /// cap too.
     #[test]
-    fn many_calls_opened_and_finished_stay_linear_and_close_in_start_order() {
+    fn many_calls_opened_and_finished_close_the_rest_in_start_order() {
         let started = std::time::Instant::now();
         let mut reducer = Reducer::new();
         for index in 0..10_000 {

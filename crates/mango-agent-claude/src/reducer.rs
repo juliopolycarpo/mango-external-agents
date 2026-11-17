@@ -173,6 +173,9 @@ pub struct TurnReducer {
     next_activity_sequence: u64,
     /// Set when a call past [`MAX_OPEN_ACTIVITIES`] was refused, until the session takes it.
     activity_overflow: Option<VendorError>,
+    /// The open-call bound, [`MAX_OPEN_ACTIVITIES`] except where a test raises it to hold more
+    /// calls open than the production bound allows.
+    max_open_activities: usize,
     /// Forwarded subagent text per parent call, so updates accumulate rather than replace.
     ///
     /// The flag is set once a cut has happened: the buffer then holds the bound's worth of
@@ -324,6 +327,7 @@ impl TurnReducer {
             open_activities: HashMap::new(),
             next_activity_sequence: 0,
             activity_overflow: None,
+            max_open_activities: MAX_OPEN_ACTIVITIES,
             nested_text: BTreeMap::new(),
             denied_activities: BTreeMap::new(),
             delivered_by_block: BTreeMap::new(),
@@ -722,13 +726,14 @@ impl TurnReducer {
         if self.is_open(call_id) {
             return None;
         }
-        if self.open_activities.len() >= MAX_OPEN_ACTIVITIES {
+        let bound = self.max_open_activities;
+        if self.open_activities.len() >= bound {
             // Only the first refusal is kept: it names the count the run first reached.
             self.activity_overflow.get_or_insert_with(|| {
                 VendorError::new(
                     ErrorCode::from_static(ACTIVITY_OVERFLOW),
                     format!(
-                        "expected at most {MAX_OPEN_ACTIVITIES} concurrently open tool calls in \
+                        "expected at most {bound} concurrently open tool calls in \
                          one turn | received {}",
                         self.open_activities.len() + 1
                     ),
@@ -3026,12 +3031,9 @@ mod tests {
         );
     }
 
-    /// Ten thousand calls each opened and answered in turn, and a bound-sized batch opened and
-    /// answered in start order. A list scanned per call makes the second shape quadratic; the
-    /// bound is deliberately generous so a slow host does not fail it.
+    /// Ten thousand calls each opened and answered in turn never reach the bound.
     #[test]
-    fn opening_and_closing_many_calls_is_linear_and_never_trips_the_bound() {
-        let started = std::time::Instant::now();
+    fn calls_opened_and_answered_one_at_a_time_never_trip_the_bound() {
         let mut reducer = TurnReducer::new();
         for index in 0..10_000 {
             let id = format!("call-{index}");
@@ -3041,18 +3043,6 @@ mod tests {
             );
             reduce(&mut reducer, &tool_result_line(&id, false, "ok"));
         }
-        open_calls(&mut reducer, MAX_OPEN_ACTIVITIES);
-        for index in 0..MAX_OPEN_ACTIVITIES {
-            reduce(
-                &mut reducer,
-                &tool_result_line(&format!("call-{index}"), false, "ok"),
-            );
-        }
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_secs(10),
-            "expected 10,000 call round trips and a full batch within 10s | received {elapsed:?}"
-        );
         assert!(
             reducer.take_activity_overflow().is_none(),
             "expected no overflow when calls are closed as they finish"
@@ -3060,6 +3050,64 @@ mod tests {
         assert!(
             reducer.cancel().is_empty(),
             "expected nothing left open after every call was answered"
+        );
+    }
+
+    /// Many calls held open at once, in a reducer whose bound a test raised past the production
+    /// one. This is the shape a list scanned per start and per close makes quadratic: 20,000 calls
+    /// open together cost on the order of 4 x 10^8 id comparisons that way. The elapsed bound is
+    /// deliberately generous so a slow host does not fail it.
+    #[test]
+    fn many_calls_held_open_at_once_open_and_close_within_a_generous_bound() {
+        const HELD: usize = 20_000;
+        let started = std::time::Instant::now();
+        let mut reducer = TurnReducer::new();
+        reducer.max_open_activities = HELD;
+        open_calls(&mut reducer, HELD);
+        for index in (0..HELD).step_by(2) {
+            reduce(
+                &mut reducer,
+                &tool_result_line(&format!("call-{index}"), false, "ok"),
+            );
+        }
+        let closes: Vec<String> = reducer
+            .cancel()
+            .into_iter()
+            .filter_map(|event| match event {
+                EventKind::ActivityCompleted { call_id, .. } => Some(call_id),
+                _ => None,
+            })
+            .collect();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "expected {HELD} calls held open, half answered and the rest closed within 20s | received {elapsed:?}"
+        );
+        assert!(reducer.take_activity_overflow().is_none());
+        let expected: Vec<String> = (1..HELD)
+            .step_by(2)
+            .map(|index| format!("call-{index}"))
+            .collect();
+        assert_eq!(
+            closes, expected,
+            "expected the unanswered calls closed in the order they opened"
+        );
+    }
+
+    #[test]
+    fn a_raised_bound_moves_the_refusal_and_names_the_raised_limit() {
+        let mut reducer = TurnReducer::new();
+        reducer.max_open_activities = 3;
+        open_calls(&mut reducer, 4);
+        let error = reducer
+            .take_activity_overflow()
+            .expect("expected the fourth call to be refused");
+        assert!(
+            error
+                .message
+                .starts_with("expected at most 3 concurrently open tool calls"),
+            "expected the message to name the raised limit | received {:?}",
+            error.message
         );
     }
 }
