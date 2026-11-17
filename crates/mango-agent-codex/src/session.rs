@@ -1686,6 +1686,31 @@ impl Shared {
     /// wakes the abandonment watcher, which interrupts the native turn and releases the slot once
     /// Codex reports it over, so a new turn cannot start on top of one that is still running.
     async fn fail_refused_event(&self, route: &ActiveTurnRoute, error: &Error) {
+        self.fail_turn(
+            route,
+            VendorError::new(
+                REFUSED_EVENT,
+                format!("expected an app-server event the core can publish, received one it refused: {error}"),
+            ),
+        )
+        .await;
+    }
+
+    /// The failure the turn reducer recorded for an activity past its open bound, once.
+    async fn take_activity_overflow(&self, route: &ActiveTurnRoute) -> Option<VendorError> {
+        let mut turn = self.turn.lock().await;
+        turn.as_mut()
+            .filter(|active| !active.finishing && Arc::ptr_eq(&active.owner, &route.owner))
+            .and_then(|active| active.reducer.take_activity_overflow())
+    }
+
+    /// Fails the turn with `failure`, closing what the host holds open first, as failed.
+    ///
+    /// The path [`Self::fail_refused_event`] documents: the failure is committed on the sink and
+    /// admission is kept, so the abandonment watcher interrupts the native turn and releases the
+    /// slot once Codex reports it over. Used for every failure this side decides on while the
+    /// app-server is still running the turn.
+    async fn fail_turn(&self, route: &ActiveTurnRoute, failure: VendorError) {
         // What the turn was still asking is settled first, as it is ahead of an ordinary terminal:
         // once the sink holds the failure it refuses the resolutions, and the host would keep a
         // prompt nobody can answer. Held through the failure, so a request that routed to this
@@ -1710,13 +1735,7 @@ impl Shared {
                 break;
             }
         }
-        let _ = active
-            .sink
-            .fail(VendorError::new(
-                REFUSED_EVENT,
-                format!("expected an app-server event the core can publish, received one it refused: {error}"),
-            ))
-            .await;
+        let _ = active.sink.fail(failure).await;
     }
 
     /// Keeps the notification call this is made from whole until the returned hold is dropped,
@@ -2735,6 +2754,11 @@ impl CodexHandler {
                         }
                         _ => {}
                     }
+                }
+                // After the events: the ones before the refused start still reach the host, and
+                // the failure closes them.
+                if let Some(failure) = self.shared.take_activity_overflow(&active_route).await {
+                    self.shared.fail_turn(&active_route, failure).await;
                 }
             }
             Outcome::Finish { .. } => {

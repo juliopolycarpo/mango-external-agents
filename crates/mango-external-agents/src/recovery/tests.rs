@@ -71,26 +71,30 @@ fn lost_acknowledgement_never_authorizes_another_submission() {
         .validate(&request)
         .expect("identical request reconciles the same record");
     assert_eq!(record.action(), RecoveryAction::Reconcile);
-    assert!(
-        record
-            .retry(&request.clone().as_attempt(AttemptId::new(2)))
-            .is_err()
+    assert_refused(
+        "retry while acceptance is unknown",
+        record.retry(&request.clone().as_attempt(AttemptId::new(2))),
+        UNSAFE_RETRY,
     );
-    assert!(
-        record
-            .record_dispatch(&first, Dispatch::NotSubmitted)
-            .is_err()
+    assert_refused(
+        "downgrade to NotSubmitted without proof",
+        record.record_dispatch(&first, Dispatch::NotSubmitted),
+        CERTAINTY_DOWNGRADE,
     );
     record
         .record_dispatch(&first, Dispatch::Accepted)
         .expect("late acknowledgement");
     assert_eq!(record.action(), RecoveryAction::Observe);
-    assert!(
-        record
-            .record_dispatch(&first, Dispatch::AcceptanceUnknown)
-            .is_err()
+    assert_refused(
+        "downgrade from Accepted to AcceptanceUnknown",
+        record.record_dispatch(&first, Dispatch::AcceptanceUnknown),
+        CERTAINTY_DOWNGRADE,
     );
-    assert!(record.reconcile_not_submitted(&first).is_err());
+    assert_refused(
+        "reconcile an accepted attempt",
+        record.reconcile_not_submitted(&first),
+        NOT_ACCEPTANCE_UNKNOWN,
+    );
     record
         .finish(&first, TerminalStatus::Completed)
         .expect("terminal");
@@ -99,21 +103,25 @@ fn lost_acknowledgement_never_authorizes_another_submission() {
         .expect("duplicate terminal");
     assert_eq!(record.action(), RecoveryAction::Finished);
     assert_eq!(record.terminal(), Some(&TerminalStatus::Completed));
-    assert!(
-        record
-            .finish(
-                &first,
-                TerminalStatus::Cancelled {
-                    reason: CancelReason::Requested
-                }
-            )
-            .is_err()
+    assert_refused(
+        "conflicting terminal outcome",
+        record.finish(
+            &first,
+            TerminalStatus::Cancelled {
+                reason: CancelReason::Requested,
+            },
+        ),
+        CONFLICTING_TERMINAL,
     );
-    assert!(record.record_dispatch(&first, Dispatch::Accepted).is_err());
-    assert!(
-        record
-            .retry(&request.as_attempt(AttemptId::new(3)))
-            .is_err()
+    assert_refused(
+        "dispatch after a terminal outcome",
+        record.record_dispatch(&first, Dispatch::Accepted),
+        CERTAINTY_DOWNGRADE,
+    );
+    assert_refused(
+        "retry after a terminal outcome",
+        record.retry(&request.as_attempt(AttemptId::new(3))),
+        UNSAFE_RETRY,
     );
 }
 
@@ -122,7 +130,11 @@ fn proven_absence_allows_only_a_new_attempt_of_the_original_request() {
     let request = TurnRequest::new("logical", "write file");
     let mut record = RecoveryRecord::new(SessionId::new("s"), &request).expect("record");
     let old = record.operation().clone();
-    assert!(record.retry(&request).is_err());
+    assert_refused(
+        "retry with the same attempt number",
+        record.retry(&request),
+        UNSAFE_RETRY,
+    );
     record
         .record_dispatch(&old, Dispatch::AcceptanceUnknown)
         .expect("submitted");
@@ -133,24 +145,76 @@ fn proven_absence_allows_only_a_new_attempt_of_the_original_request() {
         .retry(&request.clone().as_attempt(AttemptId::new(2)))
         .expect("safe retry");
     assert_eq!(new.attempt, AttemptId::new(2));
-    assert!(record.record_dispatch(&old, Dispatch::Accepted).is_err());
-    assert!(record.finish(&old, TerminalStatus::Completed).is_err());
-    assert!(
-        record
-            .validate(&TurnRequest::new("logical", "changed command"))
-            .is_err()
+    assert_refused(
+        "dispatch from the superseded attempt",
+        record.record_dispatch(&old, Dispatch::Accepted),
+        NOT_CURRENT_OPERATION,
     );
-    assert!(
-        record
-            .validate(&TurnRequest::new("different ID", "write file"))
-            .is_err()
+    assert_refused(
+        "terminal from the superseded attempt",
+        record.finish(&old, TerminalStatus::Completed),
+        NOT_CURRENT_OPERATION,
+    );
+    assert_refused(
+        "changed command under the same turn ID",
+        record.validate(&TurnRequest::new("logical", "changed command")),
+        IDENTITY_MISMATCH,
+    );
+    assert_refused(
+        "same command under a different turn ID",
+        record.validate(&TurnRequest::new("different ID", "write file")),
+        IDENTITY_MISMATCH,
     );
     let foreign = OperationRef::new(SessionId::new("other"), request.turn_id, new.attempt);
-    assert!(
-        record
-            .record_dispatch(&foreign, Dispatch::Accepted)
-            .is_err()
+    assert_refused(
+        "dispatch from a foreign session",
+        record.record_dispatch(&foreign, Dispatch::Accepted),
+        NOT_CURRENT_OPERATION,
     );
+}
+
+// The `expected` sentence each refusal in `recovery.rs` carries. They are the only thing that
+// tells one `HostConfiguration` refusal from another, so each assertion names the one it intends.
+const UNSAFE_RETRY: &str = "a newer attempt after proof of non-submission";
+const CERTAINTY_DOWNGRADE: &str = "monotonic dispatch certainty for a live attempt";
+const NOT_ACCEPTANCE_UNKNOWN: &str = "a live acceptance-unknown attempt";
+const CONFLICTING_TERMINAL: &str = "one logical terminal outcome";
+const NOT_CURRENT_OPERATION: &str = "the current session, logical turn and attempt";
+const IDENTITY_MISMATCH: &str = "the original logical turn ID and identical request fingerprint";
+
+/// Asserts `result` is the `HostConfiguration` refusal whose `expected` sentence is `expected`.
+fn assert_refused<T: std::fmt::Debug>(action: &str, result: Result<T>, expected: &str) {
+    match result {
+        Err(Error::HostConfiguration {
+            expected: actual, ..
+        }) if actual == expected => {}
+        other => panic!(
+            "({action}): expected HostConfiguration refusing with {expected:?} | received {other:?}"
+        ),
+    }
+}
+
+#[test]
+fn assert_refused_accepts_only_the_named_refusal() {
+    let refusal = || {
+        Err::<(), _>(Error::HostConfiguration {
+            expected: UNSAFE_RETRY,
+            received: "anything".into(),
+        })
+    };
+    assert_refused("named refusal", refusal(), UNSAFE_RETRY);
+
+    let wrong_sentence = std::panic::catch_unwind(|| {
+        assert_refused("wrong sentence", refusal(), CONFLICTING_TERMINAL);
+    });
+    assert!(
+        wrong_sentence.is_err(),
+        "expected a different sentence to fail"
+    );
+    let success = std::panic::catch_unwind(|| {
+        assert_refused("success", Ok(()), UNSAFE_RETRY);
+    });
+    assert!(success.is_err(), "expected Ok to fail the assertion");
 }
 
 /// An attachment whose fields are fed raw and adjacent.
@@ -196,5 +260,54 @@ fn a_byte_moved_across_the_attachment_boundary_changes_the_fingerprint() {
     assert_ne!(
         fingerprint_of(vec![adjacent("", "", b"xy"), adjacent("z", "", b"")]),
         fingerprint_of(vec![adjacent("", "", b"x"), adjacent("yz", "", b"")])
+    );
+}
+
+/// Lowercase hex of a fingerprint's 32 bytes, the form a host persists it in.
+fn fingerprint_hex(fingerprint: &RequestFingerprint) -> String {
+    fingerprint
+        .0
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The fingerprint is persisted and compared after a host restart, so its bytes must not move
+/// when the SHA-256 implementation behind it changes. These values were computed by the
+/// implementation that shipped in 0.9.0 and pin the whole framing: the JSON head, the
+/// length-framed attachment fields, and contents that span many SHA-256 blocks.
+#[test]
+fn fingerprint_bytes_are_pinned_to_the_values_the_shipped_digest_produced() {
+    let prompt_only = RequestFingerprint::of(&TurnRequest::new("turn", "hello")).expect("digest");
+    assert_eq!(
+        fingerprint_hex(&prompt_only),
+        "4cfcacc07e73a4d8bc5e85107dcb4589176b23b04ae5270d2e47a4fff58e75fe",
+        "fingerprint of a prompt-only request"
+    );
+
+    // 200_000 bytes cover thousands of 64-byte blocks and every residue of the final block.
+    let large: Vec<u8> = (0..200_000_u32).map(|index| (index % 251) as u8).collect();
+    let rich = TurnRequest::new("turn", "naïve prompt — with \"quotes\"")
+        .with_configuration(ConfigurationPatch::new().model(ConfigurationChange::Reset))
+        .with_attachments(vec![
+            Attachment {
+                id: "file-1".into(),
+                name: "notes.txt".into(),
+                mime_type: "text/plain".into(),
+                kind: AttachmentKind::Text,
+                bytes: b"content".to_vec(),
+            },
+            Attachment {
+                id: "file-2".into(),
+                name: "blob.bin".into(),
+                mime_type: "application/octet-stream".into(),
+                kind: AttachmentKind::Data,
+                bytes: large,
+            },
+        ]);
+    assert_eq!(
+        fingerprint_hex(&RequestFingerprint::of(&rich).expect("digest")),
+        "9fe359cf63a0d603eccbfa1f5474f86da9c19a7c2d01e87e097edc0737b7ec82",
+        "fingerprint of a request with configuration and two attachments"
     );
 }

@@ -218,7 +218,7 @@ fn print_summary(name: &str, unit: Unit, samples: &[Duration]) {
 }
 
 // A bench target built with `harness = false` cannot run `#[test]`s, so these run where the file is
-// included as a module of a test crate: `examples/hub-host/tests/bench_runner.rs`. The five copies
+// included as a module of a test crate: `examples/hub-host/tests/it/bench_runner.rs`. The five copies
 // are byte-identical, so that one run covers them all.
 #[cfg(test)]
 mod tests {

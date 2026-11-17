@@ -178,7 +178,7 @@ Codex's pinned inventory now preserves properties and required fields for each o
 `receiverThreadIds` belong to `collabAgentToolCall`. The former is carried as `subagent_id`.
 One authenticated subagent capture exists (Codex 0.167.2, 2026-11-14, model `gpt-5.6-terra`, a
 `free` account): `agentThreadId` arrives nonempty on both `subAgentActivity` items and
-`agentPath` arrives `[REDACTED]`. The replay in `tests/replay/subagent.rs` asserts the child id on
+`agentPath` arrives `[REDACTED]`. The replay in `tests/it/replay/subagent.rs` asserts the child id on
 the activity, and the schema-shaped tests remain. It is a single run, so it makes no claim of live
 smoke qualification across models or accounts, and the collaboration call's own `senderThreadId`
 and `receiverThreadIds` did not name the child, so no parent call relationship is claimed.
