@@ -10,7 +10,7 @@ them with the committed files:
 
 | Vendor       | Pin       | Reproduced public artifact                                   |
 | ------------ | --------- | ------------------------------------------------------------ |
-| Claude Code  | `2.1.322` | `fixtures/claude/contract/`                                  |
+| Claude Code  | `2.1.325` | `fixtures/claude/contract/`                                  |
 | OpenAI Codex | `0.169.0` | `fixtures/codex/contract/` and the vendored schema inventory |
 | OpenCode ACP | `1.19.5`  | `fixtures/acp/opencode/contract/`                            |
 

@@ -105,13 +105,21 @@ Naming a test in `ci.yml` is not enough. `scripts/ci-script-steps.py` parses the
 - it is a command of a `run:` step, not text in an `echo` or a comment;
 - its job is listed in the `needs` of the `gate` job, and neither the job nor the step sets
   `continue-on-error`;
-- its job has no `if:`, and its step has no `if:` or only one `matrix.os == '<os>'` test naming an
-  OS the job's matrix lists;
-- no earlier line of the same `run:` block is an `exit`, and its own line does not end in
-  `|| true`, `|| :` or `|| exit 0`;
+- its job has no `if:`, and its step has no `if:` or only one `matrix.os == '<os>'` test. The
+  matrix is expanded as GitHub does (lists, then `exclude`, then `include`) and some combination has
+  to carry that `os`;
+- its `run:` block reaches it: the block is split into commands at newlines, `;`, `&&`, `||`, `|`
+  and `&`, and the test command is joined to its neighbours only by a newline or `;`, sits in no
+  `if`, loop, `case`, function, group or subshell, follows no `exit` that can end the block and no
+  `set +e`, and is not followed by a `||` handler other than an `exit` with a failing status;
+- its step runs under no `shell:`, or `bash` or `sh`, the shells that stop at a failing command;
+  the step, the job's `defaults.run` and the workflow's `defaults.run` are all read;
 - the workflow triggers on `pull_request` and has a `gate` job.
 
-It does not follow shell conditionals inside a `run:` block, `set +e`, or `matrix.include` entries.
+A construct the analysis cannot follow, such as an `if` around the command, a matrix built from an
+expression or a `shell: pwsh` step, is reported as a reason the test is blocked, never counted as
+run. It still does not follow `trap` or `exec` earlier in the block, or what a test script does once
+it starts.
 `scripts/test-check-script-tests.sh` pins each rule against a scratch workflow.
 
 ## Shell lint
@@ -163,3 +171,29 @@ workflow runs it with `--delete` after each successful `CI` push run on `main`, 
 dispatch with a `dry-run` input that defaults to true.
 `scripts/test-prune-rust-caches.sh` covers the policy with a named fake `gh`
 (`scripts/test-fixtures/fake-gh-cache-cli.sh`).
+
+## Workflow lint
+
+The shell inside a workflow's `run:` blocks is not under `scripts/`, so shellcheck's gate never sees
+it. `scripts/check-actionlint.sh` runs actionlint over `.github/workflows/*.yml`: it checks the
+workflow syntax and `${{ }}` expressions and passes each `run:` block to shellcheck. actionlint
+skips that pass without a message when shellcheck is not on `PATH`, so the gate fails when either
+tool is missing rather than reporting a clean run with the blocks unchecked. It prints both versions.
+
+`taiki-e/install-action` has no actionlint manifest, so the Policy job installs it with
+`scripts/install-actionlint.sh <bin-dir>`. The helper downloads the exact release asset from
+rhysd/actionlint, refuses to extract it unless its SHA-256 matches
+`scripts/actionlint-pinned-sha256sums.txt`, and appends the directory to `GITHUB_PATH` in a
+workflow step. The pinned version is `ACTIONLINT_VERSION` in the helper; a bump changes it and the
+registry together. Locally, run the helper into a directory of your choice and put that on `PATH`.
+The shellcheck the Policy job installs is the one actionlint calls.
+
+`scripts/check.sh` runs the gate when both tools are on `PATH` and otherwise warns once and skips it.
+The release workflow's verify job does not install actionlint, so there the gate is skipped with that
+warning unless the runner image provides it.
+
+A finding that is intentional gets `# shellcheck disable=SCxxxx # reason` on the first line of the
+`run:` block, never an `-ignore` flag in the gate. `scripts/test-check-actionlint.sh` covers the
+gate with a named fake actionlint and, when both real tools are installed, with a `run:` block that
+has a finding and one that carries a reasoned directive. `scripts/test-install-actionlint.sh` covers
+the installer with a named fake curl and uname.
