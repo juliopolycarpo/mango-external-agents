@@ -306,15 +306,20 @@ test_vendor_acp_docs_watch() {
   local docs="$test_root/vendor-acp-docs"
   local fake_bin="$test_root/fake-doc-bin"
   local error="$test_root/vendor-acp-docs.error"
+  local allowlist="$test_root/acp-watch-scratch-allowlist.txt"
   local original_path="$PATH"
+  local original_allowlist="$ACP_DOCS_ALLOWLIST"
   local claude_index='https://code.claude.com/docs/llms.txt'
   local claude_reference='https://code.claude.com/docs/en/cli-reference.md'
   local codex_index='https://learn.chatgpt.com/llms.txt'
   local codex_reference='https://learn.chatgpt.com/docs/developer-commands.md?surface=cli'
   mkdir -p "$fake_bin"
-  ln -s "$repo_root/scripts/test-fixtures/fake-doc-curl.sh" "$fake_bin/curl"
+  ln -sf "$repo_root/scripts/test-fixtures/fake-doc-curl.sh" "$fake_bin/curl"
   export PATH="$fake_bin:$PATH"
   export FAKE_DOC_ROOT="$docs"
+  # An empty scratch allowlist: these cases are about the pages, not the committed entries.
+  ACP_DOCS_ALLOWLIST="$allowlist"
+  write_acp_allowlist "$allowlist"
 
   assert_eq "$(vendor_documents claude | wc -l | tr -d ' ')" '2' 'Claude watches its index and CLI reference'
   assert_eq "$(vendor_documents codex | wc -l | tr -d ' ')" '2' 'Codex watches its index and CLI reference'
@@ -360,6 +365,7 @@ test_vendor_acp_docs_watch() {
   expect_status 2 main
   expect_status 2 main claude "$test_root/unused-report.md" codex
   unset FAKE_DOC_ROOT
+  ACP_DOCS_ALLOWLIST="$original_allowlist"
   export PATH="$original_path"
 }
 
@@ -388,7 +394,7 @@ test_vendor_acp_docs_report() {
   local claude_reference='https://code.claude.com/docs/en/cli-reference.md'
   local reviewed='- [claude-agent-acp](https://code.claude.com/docs/en/adapter.md): Third-party ACP adapter'
   mkdir -p "$fake_bin"
-  ln -s "$repo_root/scripts/test-fixtures/fake-doc-curl.sh" "$fake_bin/curl"
+  ln -sf "$repo_root/scripts/test-fixtures/fake-doc-curl.sh" "$fake_bin/curl"
   export PATH="$fake_bin:$PATH"
   export FAKE_DOC_ROOT="$docs"
   ACP_DOCS_ALLOWLIST="$allowlist"
@@ -476,6 +482,21 @@ EXPECTED
   unset FAKE_DOC_ROOT
   ACP_DOCS_ALLOWLIST="$original_allowlist"
   export PATH="$original_path"
+}
+
+# The watch tests must not read the committed allowlist: its first real entry would match no line of
+# their fake pages and fail every one of them. Stand in for that entry by pointing the inherited
+# allowlist at a populated file, then run each watch test against it.
+test_vendor_acp_docs_tests_ignore_the_inherited_allowlist() {
+  local committed_stand_in="$test_root/acp-committed-stand-in.txt"
+  local original_allowlist="$ACP_DOCS_ALLOWLIST"
+  write_acp_allowlist "$committed_stand_in" claude '- [x-acp](https://e.test/a.md): adapter' 'third-party'
+  ACP_DOCS_ALLOWLIST="$committed_stand_in"
+  test_vendor_acp_docs_watch
+  assert_eq "$ACP_DOCS_ALLOWLIST" "$committed_stand_in" 'the watch test restores the allowlist it found'
+  test_vendor_acp_docs_report
+  assert_eq "$ACP_DOCS_ALLOWLIST" "$committed_stand_in" 'the report test restores the allowlist it found'
+  ACP_DOCS_ALLOWLIST="$original_allowlist"
 }
 
 test_docs_drift_report() {
@@ -813,6 +834,7 @@ test_claude_bare_reference
 test_vendor_acp_document
 test_vendor_acp_docs_watch
 test_vendor_acp_docs_report
+test_vendor_acp_docs_tests_ignore_the_inherited_allowlist
 test_docs_drift_report
 test_vendor_acp_allowlist_entries
 test_vendor_acp_document_allowlist
