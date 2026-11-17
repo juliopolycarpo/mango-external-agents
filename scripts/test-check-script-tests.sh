@@ -391,6 +391,24 @@ block_pass 'a command in a block that sources nothing' $'echo ready\nscripts/tes
 block_pass 'a command after an echo that names source' $'echo source ./x.sh\nscripts/test-beta.py'
 block_pass 'a command that runs before a sourced file' $'scripts/test-beta.py\nsource ./x.sh'
 
+# A leading `NAME=value` assignment or `time` (`time -p`) does not stop a builtin from changing the
+# shell: `X=1 exec true` still replaces it and `X=1 trap ... EXIT` still sets the trap. The rules see
+# through both, as they do through `command` and `builtin`.
+block_fail 'a command after an assigned source' $'X=1 source ./x.sh\nscripts/test-beta.py' "it follows \`X=1 source ./x.sh\`, $source_reason"
+block_fail 'a command after an assigned dot' $'LC_ALL=C . ./x.sh\nscripts/test-beta.py' "it follows \`LC_ALL=C . ./x.sh\`, $source_reason"
+block_fail 'a command after a timed source' $'time source ./x.sh\nscripts/test-beta.py' "it follows \`time source ./x.sh\`, $source_reason"
+block_fail 'a command after a timed source with -p' $'time -p source ./x.sh\nscripts/test-beta.py' "it follows \`time -p source ./x.sh\`, $source_reason"
+block_fail 'a command after an assigned exec' $'X=1 exec true\nscripts/test-beta.py' "it follows \`X=1 exec true\`, $exec_reason"
+block_fail 'a command after a timed exec' $'time exec true\nscripts/test-beta.py' "it follows \`time exec true\`, $exec_reason"
+block_fail 'a command after an assigned trap' $'X=1 trap \'exit 0\' EXIT\nscripts/test-beta.py' "it follows \`X=1 trap 'exit 0' EXIT\`, $trap_reason"
+block_fail 'a command after a timed trap' $'time trap \'exit 0\' EXIT\nscripts/test-beta.py' "it follows \`time trap 'exit 0' EXIT\`, $trap_reason"
+block_fail 'a command after an assigned set +e' $'X=1 set +e\nscripts/test-beta.py' 'it follows `X=1 set +e`, which turns off errexit'
+block_fail 'a command after a timed set +e' $'time set +e\nscripts/test-beta.py' 'it follows `time set +e`, which turns off errexit'
+block_fail 'a command after assignments and command before a trap' $'X=1 Y=2 command trap \'exit 0\' EXIT\nscripts/test-beta.py' "it follows \`X=1 Y=2 command trap 'exit 0' EXIT\`, $trap_reason"
+block_pass 'a command after an assigned exec that only redirects' $'X=1 exec > log 2>&1\nscripts/test-beta.py'
+block_pass 'a command after an assigned trap that only lists' $'X=1 trap -p\nscripts/test-beta.py'
+block_pass 'a command after a timed command that changes nothing' $'time echo hi\nscripts/test-beta.py'
+
 # The shell has to stop at a failing command, wherever it is declared.
 shell_pass() {
   shell_name=$2
