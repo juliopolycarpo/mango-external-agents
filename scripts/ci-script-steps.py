@@ -471,14 +471,30 @@ def enter_constructs(command, stack):
             return command.strip(), can_run, closes
 
 
+# A `NAME=value` word ahead of a command: the assignment is for that command and changes no rule.
+ASSIGNMENT_WORD = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
+
+
 def shell_words(command):
-    """The words of a simple command, without a leading `command` or `builtin`, which change nothing."""
+    """The words of a simple command, without what changes nothing in front of its name.
+
+    That is `command` (with `-p` and `--`), `builtin`, leading `NAME=value` assignments, and `time`
+    with its `-p` and `--`: `X=1 exec true` still replaces the shell and `time source ./x.sh` still
+    sources in it. `command -v` and `-V` only print, so they are left in place and match nothing.
+    """
     try:
         words = shlex.split(command)
     except ValueError:
         words = command.split()
-    while words and words[0] in ("command", "builtin"):
-        words = words[1:]
+    while words:
+        if words[0] == "builtin" or ASSIGNMENT_WORD.match(words[0]):
+            words = words[1:]
+        elif words[0] in ("command", "time"):
+            words = words[1:]
+            while words and words[0] in ("-p", "--"):
+                words = words[1:]
+        else:
+            break
     return words
 
 

@@ -120,7 +120,8 @@ Naming a test in `ci.yml` is not enough. `scripts/ci-script-steps.py` parses the
   three traps is tracked on its own and only an unconditional `trap - <signal>` for that signal
   lifts it. A signal word the shell expands (`$T`, `E*`) may name any of them, so a trap on it is
   never lifted. `exec` with only redirections (`exec > log`, `exec {fd}>log`,
-  `exec 2> >(tee log)`) is fine;
+  `exec 2> >(tee log)`) is fine. `command` (`command -p`), `builtin`, `eval`, leading `NAME=value`
+  assignments and `time` (`time -p`) in front of `set`, `trap`, `exec`, `.` or `source` are looked through;
 - its step runs under `bash` or `sh`, the shells that stop at a failing command, read from the
   step, the job's `defaults.run` and the workflow's `defaults.run`. With no `shell:` anywhere the
   step runs under `bash -e` on Linux and macOS but under `pwsh` on Windows, which returns the status
