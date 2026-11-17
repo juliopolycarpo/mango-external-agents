@@ -439,21 +439,34 @@ mod tests {
 
     #[test]
     fn rejects_misspelled_flags_and_mismatched_profiles() {
-        for args in [
-            vec!["--jsno"],
-            vec!["--cwd"],
-            vec!["--harness", "codex", "--profile", "cursor"],
-            vec!["--harness", "acp:no-such-profile"],
+        // Each case names the flag or value its refusal must quote; the errors are plain strings,
+        // so the message is all that tells a refusal for the right reason from another one.
+        for (args, bad_input) in [
+            (vec!["--jsno"], "--jsno"),
+            (vec!["--cwd"], "--cwd"),
+            (
+                vec!["--harness", "codex", "--profile", "cursor"],
+                "--profile",
+            ),
+            (vec!["--harness", "acp:no-such-profile"], "no-such-profile"),
             // A value outside the accepted set must be refused, never quietly read as the
             // permissive end of the axis.
-            vec!["--level", "plan"],
-            vec!["--transport", "unix"],
+            (vec!["--level", "plan"], "plan"),
+            (vec!["--transport", "unix"], "unix"),
         ] {
+            let error = Options::parse(&args.iter().copied().map(String::from).collect::<Vec<_>>())
+                .err()
+                .unwrap_or_else(|| panic!("expected {args:?} to be refused | received options"));
             assert!(
-                Options::parse(&args.into_iter().map(String::from).collect::<Vec<_>>()).is_err()
+                error.contains(bad_input),
+                "expected the refusal for {args:?} to name {bad_input:?} | received {error:?}"
             );
         }
-        assert!(kind(Some("acp"), None).is_err());
+        let error = kind(Some("acp"), None).expect_err("expected acp without a profile to fail");
+        assert!(
+            error.contains("acp"),
+            "expected the refusal to name the harness acp | received {error:?}"
+        );
         assert!(acp("cursor").is_ok());
     }
 
@@ -1427,7 +1440,13 @@ mod digest_tests {
                 .expect("expected a scoped digest root");
         assert_eq!(scoped.root(), PathBuf::from("fixtures/codex"));
         assert!(scoped.check);
-        assert!(DigestOptions::parse(&["--oot".into()]).is_err());
+        let misspelled = DigestOptions::parse(&["--oot".into()])
+            .err()
+            .expect("expected a misspelled flag to be refused");
+        assert!(
+            misspelled.contains("--oot"),
+            "expected the refusal to name --oot | received {misspelled:?}"
+        );
     }
 }
 
