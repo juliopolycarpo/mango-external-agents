@@ -29,7 +29,6 @@ mango-external-agents = { path = "crates/mango-external-agents", version = "0.10
 # exactly, and no other member may take it.
 async-trait = "0.1.92"
 base64 = { version = "0.22", default-features = false }
-chrono = { version = "0.4.44", default-features = false }
 clap = "4.6.6"
 futures-util = { version = "0.3.34", default-features = false }
 http = "1.4.0"
