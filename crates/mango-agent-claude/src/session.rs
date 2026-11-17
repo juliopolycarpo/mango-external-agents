@@ -2275,6 +2275,13 @@ async fn pump(
         if native_finished {
             break;
         }
+        // The run opened more tool calls than a turn may hold open. Ended like a broken stream, not
+        // like a finished run: the vendor has not said the turn is over, so the conversation is
+        // not resumable, and the abort in `finish` closes what the host was told is open.
+        if let Some(overflow) = reducer.take_activity_overflow() {
+            failure = Some(Error::Vendor(overflow));
+            break;
+        }
     }
 
     // The watch holds a wait on the host's control. The stop below waits on the same control, so

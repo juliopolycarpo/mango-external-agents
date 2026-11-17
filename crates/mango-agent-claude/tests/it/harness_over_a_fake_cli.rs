@@ -3185,6 +3185,67 @@ mod a_turn {
         );
     }
 
+    /// A run that opens more tool calls than a turn may hold open, with no `result`, ends as the
+    /// named overflow failure after every call the host was told about is closed.
+    #[tokio::test]
+    async fn a_run_past_the_open_activity_bound_closes_its_calls_and_fails_by_name() {
+        const BOUND: usize = 1_024;
+        let lines: Vec<String> = (0..=BOUND)
+            .map(|index| {
+                format!(
+                    r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_{index}","name":"Bash","input":{{"command":"sleep 600"}}}}]}}}}"#
+                )
+            })
+            .collect();
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::Transcript {
+            lines,
+            exit: mango_external_agents::ExitStatus {
+                code: Some(0),
+                signal: None,
+            },
+        }));
+        // Room for every start and every close, so the turn queue is not what ends the turn.
+        let host = host_under(
+            launcher,
+            Limits {
+                turn_channel_capacity: 4 * BOUND,
+                ..Limits::default()
+            },
+        );
+        let session = ClaudeHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session");
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "run it"))
+            .await
+            .expect("expected a turn");
+        let events = drain(&mut turn).await;
+
+        let started = events
+            .iter()
+            .filter(|event| matches!(event, EventKind::ActivityStarted { .. }))
+            .count();
+        let closed = events
+            .iter()
+            .filter(|event| matches!(event, EventKind::ActivityCompleted { .. }))
+            .count();
+        assert_eq!(
+            (started, closed),
+            (BOUND, BOUND),
+            "expected {BOUND} starts, each closed, and start {} refused | received {} events",
+            BOUND + 1,
+            events.len()
+        );
+        let Some(EventKind::Error { error }) = events.last() else {
+            panic!(
+                "expected the turn to end with an error | received {:?}",
+                events.last()
+            );
+        };
+        assert_eq!(error.code.as_str(), "claude-activity-overflow");
+    }
+
     #[tokio::test]
     async fn a_missing_result_redacts_a_stderr_tail_the_host_did_not() {
         let fake = Arc::new(FakeClaudeCli::new().with_turn(Run::Transcript {
