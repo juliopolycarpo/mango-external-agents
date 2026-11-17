@@ -739,6 +739,138 @@ fn a_number_inside_the_models_answer_stays_even_under_a_tool_data_name() {
     );
 }
 
+/// A card number a tool author used as an object key, and what the walk writes for it.
+const CARD_NUMBER_KEY: &str = "4111111111111111";
+const CARD_NUMBER_KEY_REDACTED: &str = "0000000000000000";
+
+/// A map keyed by figures, as a tool author's ledger could write it.
+fn figure_keyed_map() -> Value {
+    json!({CARD_NUMBER_KEY: true, "-12.50": 1, "007": "x", "2024-01-01": 2, "v2": 3})
+}
+
+#[test]
+fn a_figure_used_as_a_key_under_tool_data_is_replaced_by_zeros() {
+    let denied = redacted_record(&json!({"type": "result", "permission_denials": [
+        {"tool_name": "mcp__ledger__lookup", "tool_input": {"balances": figure_keyed_map()}}]}));
+    let result = redacted_record(&json!({"type": "user",
+        "tool_use_result": {"balances": figure_keyed_map()}}));
+    let call = redacted_records(&[assistant_record_with_calls(
+        &json!({}),
+        &json!({"balances": figure_keyed_map()}),
+    )]);
+
+    let expected = json!({CARD_NUMBER_KEY_REDACTED: false, "-00.00": 0, "000": "[REDACTED]",
+        "2024-01-01": 0, "v2": 0});
+    for (where_, balances) in [
+        (
+            "tool_input",
+            &denied["permission_denials"][0]["tool_input"]["balances"],
+        ),
+        ("tool_use_result", &result["tool_use_result"]["balances"]),
+        (
+            "a call's input",
+            &call[0]["message"]["content"][1]["input"]["balances"],
+        ),
+    ] {
+        assert_eq!(
+            balances, &expected,
+            "expected a figure-shaped key under {where_} written as zeros, any other key as given | received: {balances}"
+        );
+    }
+}
+
+#[test]
+fn figure_keys_that_collapse_to_the_same_zeros_keep_both_entries() {
+    let line = redacted_record(&json!({"type": "user", "tool_use_result": {
+        "4111": true, "5222": false, "0000": true}}));
+
+    let result = line["tool_use_result"]
+        .as_object()
+        .expect("expected the result object");
+    let mut keys: Vec<&str> = result.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["0000", "0000#2", "0000#3"],
+        "expected three figure keys to stay three entries | received: {line}"
+    );
+    assert!(
+        !line.to_string().contains("4111") && !line.to_string().contains("5222"),
+        "expected no figure to survive as a key | received: {line}"
+    );
+}
+
+#[test]
+fn a_figure_used_as_a_key_in_the_models_answer_stays() {
+    let records = redacted_records(&[
+        assistant_record_with_calls(&json!({CARD_NUMBER_KEY: 1}), &json!({})),
+        json!({"type": "result", "structured_output": {CARD_NUMBER_KEY: 1, "nested": {"42": true}},
+            "wire_tool_inputs": {ANSWER_TOOL_USE_ID: {"7": 1}}}),
+    ]);
+
+    assert_eq!(
+        records[0]["message"]["content"][0]["input"],
+        json!({CARD_NUMBER_KEY: 1}),
+        "expected the answer call's keys as the schema named them | received: {}",
+        records[0]
+    );
+    assert_eq!(
+        records[1]["structured_output"],
+        json!({CARD_NUMBER_KEY: 1, "nested": {"42": true}}),
+        "expected structured_output's keys as the schema named them | received: {}",
+        records[1]
+    );
+    assert_eq!(
+        records[1]["wire_tool_inputs"][ANSWER_TOOL_USE_ID],
+        json!({"7": 1}),
+        "expected the answer's repeat keyed as the schema named it | received: {}",
+        records[1]
+    );
+}
+
+#[test]
+fn the_drift_report_lists_a_figure_key_as_the_transcript_writes_it() {
+    let drift = drift_over(&lines_of(&[json!({"type": "user",
+        "tool_use_result": {CARD_NUMBER_KEY: true}})]));
+
+    assert!(
+        drift.map_keys.contains(CARD_NUMBER_KEY_REDACTED)
+            && !drift.map_keys.contains(CARD_NUMBER_KEY),
+        "expected the key line to hold the written zeros and not the figure | received: {:?}",
+        drift.map_keys
+    );
+}
+
+#[test]
+fn only_a_figure_shaped_text_is_a_figure_key() {
+    let figures = ["0", "4111111111111111", "-12.50", "3.14"];
+    let others = [
+        "",
+        "-",
+        ".",
+        "1.",
+        ".5",
+        "1.2.3",
+        "1e5",
+        "+1",
+        "2024-01-01",
+        "v2",
+        "id",
+        "١٢",
+        "inf",
+        "NaN",
+    ];
+    for text in figures {
+        assert!(is_figure_key(text), "expected {text:?} read as a figure");
+    }
+    for text in others {
+        assert!(
+            !is_figure_key(text),
+            "expected {text:?} not read as a figure"
+        );
+    }
+}
+
 /// The answer's own tool call: its input is what `--json-schema` made the model write.
 const ANSWER_TOOL_USE_ID: &str = "toolu_answer";
 /// A tool author's call, recorded beside the answer's.

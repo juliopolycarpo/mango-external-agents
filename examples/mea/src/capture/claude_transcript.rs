@@ -689,6 +689,36 @@ fn redact_model_id(id: &str) -> String {
     }
 }
 
+/// Whether an object key reads as a figure: an optional `-`, ASCII digits and at most one `.` with
+/// digits on both sides (`4111111111111111`, `-12.50`).
+///
+/// A tool author can key a map by an account or card number or by an amount, and a key is not a
+/// number to the walk, so it would otherwise survive the replacement of the author's numbers. A
+/// date, an exponent form or a word is not a figure and is kept as a name.
+fn is_figure_key(text: &str) -> bool {
+    let unsigned = text.strip_prefix('-').unwrap_or(text);
+    let (whole, fraction) = match unsigned.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (unsigned, None),
+    };
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    digits(whole) && fraction.is_none_or(digits)
+}
+
+/// A figure-shaped key with every digit written as `0`, so the key keeps its shape and length and
+/// none of the author's figure.
+fn zero_figure_key(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_ascii_digit() {
+                '0'
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
 /// `key` if the map has no such entry, otherwise `key#2`, `key#3`, … so that two keys redacted to
 /// the same text keep both entries and their counters.
 fn unused_key(map: &Map<String, Value>, key: String) -> String {
@@ -840,6 +870,11 @@ fn redact_value(
                 // Keys are rewritten too: a map keyed by a path would carry it.
                 let written = if model_keyed {
                     redact_model_id(&name)
+                } else if context.tool_data && !context.answer && is_figure_key(&name) {
+                    // A figure the tool's author used as a key is as much their data as a number
+                    // they wrote as a value. Two keys can collapse to the same zeros: `unused_key`
+                    // keeps both entries. The answer's keys are the schema's own and stay.
+                    zero_figure_key(&name)
                 } else {
                     redact::rewrite_paths(&name, paths)
                 };
