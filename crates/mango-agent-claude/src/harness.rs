@@ -139,7 +139,7 @@ impl ClaudeHarness {
     /// `claude-error_max_structured_output_retries`, whatever `is_error` says. The value is
     /// untrusted input and never model input. The `StructuredOutput` tool call that carries it
     /// (<https://code.claude.com/docs/en/agent-sdk/structured-outputs>) opens no activity. The shape
-    /// was measured at Claude Code 2.1.325, not at the pinned 2.1.322; see
+    /// was measured at Claude Code 2.1.325, when the pinned contract was still 2.1.322; see
     /// `docs/harness-claude.md`.
     ///
     /// # Errors

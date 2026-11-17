@@ -10,16 +10,25 @@ under `fixtures/claude/contract/`.
 
 Compliance posture: see [compliance.md](compliance.md).
 
-## Public-contract refresh — 2026-11-13
+## Public-contract refresh — 2026-11-17
 
-The current public-contract pin is **2.1.322**, the newest release that had passed the
-three-day release-age policy on this date (2.1.323 and later were younger). `scripts/install-vendor-cli.sh`
+The current public-contract pin is **2.1.325**, published 2026-11-13 and the newest release past
+the three-day release-age policy on this date (2.1.326 was younger). `scripts/install-vendor-cli.sh`
 verified its official release archive against the recorded checksum before `mea capture`
-regenerated the contract. Apart from the version, the capture is byte-identical to the 2.1.318
-one: the same flag inventory and the same help text. No harness argument or parser change
-follows, and this capture is not an authenticated turn.
+regenerated the contract. The version moves and one help row changes: the `rm` subcommand's
+description now reads "If it's safe, remove a background session from the list and delete its
+worktree. Its conversation is kept: `claude --resume` lists it." The flag inventory in
+`cli-surface.json` is byte-identical to 2.1.322. The harness reads only the option declarations
+under `Options:` (`help::declared_options`), never the `Commands:` rows, so no argument or parser
+change follows. This capture is not an authenticated turn. Source:
+https://code.claude.com/docs/en/cli-reference.md.
 
-## Previous refresh — 2026-11-07
+## Previous refresh — 2026-11-13
+
+The 2.1.322 pin was the newest release past the three-day window on that date (2.1.323 and later
+were younger). Apart from the version, its capture was byte-identical to the 2.1.318 one.
+
+## Earlier refresh — 2026-11-07
 
 The 2.1.318 contract added `--desktop` to the CLI flag inventory; existing harness arguments
 remained present. Help descriptions and command listings also changed, so help was not
@@ -1089,9 +1098,9 @@ from the event stream:
 TurnStarted … Usage, StructuredOutput { value }, Completed
 ```
 
-**Measured at Claude Code 2.1.325, not at the pin.** The pinned contract is 2.1.322 and the
-run that showed this shape used 2.1.325, with the harness's own argv plus
-`--json-schema`, with and without `--permission-mode default --permission-prompts none`, a schema
+**Measured at Claude Code 2.1.325**, while the pinned contract was still 2.1.322. The pin has
+since moved to 2.1.325, but it is a public capture and not a turn. The run used the harness's own
+argv plus `--json-schema`, with and without `--permission-mode default --permission-prompts none`, a schema
 of `{word: string}` and the prompt "Reply with the word ok." The records came in this order:
 `system` (init, status, commands_changed), `stream_event`s, an `assistant` message with a
 `tool_use` named `StructuredOutput` whose input was the value, a `user` message with its
