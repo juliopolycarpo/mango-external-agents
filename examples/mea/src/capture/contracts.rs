@@ -431,7 +431,8 @@ fn normalize_acp_initialize(frame: Value) -> Result<Value> {
     // `initialize` with an error frame. `Error::Protocol` never prints what it received, so the
     // cause is raised as the vendor failure the ACP harness uses for the same reply: `mea` prints
     // that one with the agent's redacted message and code.
-    if let Some(error) = frame.get("error") {
+    // A `null` error member is no error: some peers write one beside a result.
+    if let Some(error) = frame.get("error").filter(|error| !error.is_null()) {
         return Err(
             match serde_json::from_value::<JsonRpcError>(error.clone()) {
                 Ok(error) => Error::Vendor(
@@ -855,6 +856,34 @@ mod tests {
         assert!(
             !printed.contains("invalid vendor data") && !printed.contains("private-token"),
             "(acp initialize): expected no generic text and no credential | received: {printed}"
+        );
+    }
+
+    #[test]
+    fn a_null_error_member_beside_a_result_is_no_error() {
+        let normalized = normalize_acp_initialize(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"protocolVersion": 1},
+            "error": null
+        }))
+        .unwrap_or_else(|error| {
+            panic!(
+                "(acp initialize): expected the result of a reply with `\"error\": null` | received: {error:?}"
+            )
+        });
+
+        assert_eq!(normalized["protocolVersion"], 1);
+    }
+
+    #[test]
+    fn a_null_error_member_without_a_result_is_refused_for_the_missing_result() {
+        let error = normalize_acp_initialize(json!({"id": 1, "error": null}))
+            .expect_err("expected a reply with no result to be refused");
+
+        assert!(
+            matches!(&error, Error::Protocol { expected, .. } if expected.contains("result object")),
+            "(acp initialize): expected the missing-result refusal, not an error shape | received: {error:?}"
         );
     }
 
