@@ -67,6 +67,10 @@ pub(crate) const ACTIVITY_OVERFLOW: &str = "activity-overflow";
 
 /// What one turn has announced so far, for the announcements that depend on it.
 ///
+/// A reducer built with [`TurnReducer::new`] holds streamed message text without bound; a session
+/// builds it with a bound derived from its `Limits`, and a host driving the reducer directly over
+/// untrusted input does the same through [`TurnReducer::builder`].
+///
 /// # Example
 ///
 /// ```
@@ -74,7 +78,10 @@ pub(crate) const ACTIVITY_OVERFLOW: &str = "activity-overflow";
 /// use mango_agent_codex::turn_reducer::TurnReducer;
 /// use serde_json::json;
 ///
-/// let mut turn = TurnReducer::new();
+/// // Bounded as a session does: no message's streamed text outgrows one decoded line.
+/// let mut turn = TurnReducer::builder()
+///     .max_message_bytes(2 * 1024 * 1024)
+///     .build();
 /// let delta = Notification::parse(
 ///     "item/commandExecution/outputDelta",
 ///     json!({"threadId": "t", "turnId": "u", "itemId": "never-started", "delta": "hi"}),
@@ -323,7 +330,11 @@ enum Progress<'a> {
 }
 
 impl TurnReducer {
-    /// A turn nothing has been announced for yet.
+    /// A turn nothing has been announced for yet, with no bound on streamed message text.
+    ///
+    /// Fit for a transcript the caller trusts, such as a recorded fixture replayed in a test. A
+    /// reducer reading a live vendor stream is built with [`Self::builder`] and
+    /// [`TurnReducerBuilder::max_message_bytes`], which is what a session does.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
