@@ -55,6 +55,7 @@ FAKE_UNAME
 # RecordingTar: logs each call, then runs the real tar, so a case can tell whether the archive was
 # opened at all.
 real_tar=$(command -v tar)
+# shellcheck disable=SC2016 # the fake must contain the literal $* and $RECORDING_TAR_LOG, expanded when it runs
 printf '#!/usr/bin/env bash\necho "$*" >> "$RECORDING_TAR_LOG"\nexec %q "$@"\n' "$real_tar" > "$work/fakebin/tar"
 chmod +x "$work/fakebin/curl" "$work/fakebin/uname" "$work/fakebin/tar"
 
