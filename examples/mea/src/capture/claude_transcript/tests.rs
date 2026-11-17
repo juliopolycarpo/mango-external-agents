@@ -241,12 +241,11 @@ fn read_transcript(out_dir: &Path, file: &str) -> String {
 }
 
 #[test]
-fn the_registry_names_its_scenario_and_says_it_needs_a_schema() {
+fn the_registry_names_its_scenario() {
     assert_eq!(scenario_names(), vec!["structured-output"]);
-    assert!(scenario_needs_schema("structured-output"));
     assert!(
-        !scenario_needs_schema("handshake"),
-        "expected a Codex scenario to need no Claude schema"
+        !scenario_names().contains(&"handshake"),
+        "expected a Codex scenario to be absent from the Claude registry"
     );
 }
 

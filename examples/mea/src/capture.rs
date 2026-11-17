@@ -27,7 +27,6 @@ mod contracts;
 
 pub use claude_transcript::{
     claude as claude_transcripts, scenario_names as claude_scenario_names,
-    scenario_needs_schema as claude_scenario_needs_schema,
 };
 pub use contracts::{DEFAULT_ACP_CAPTURE_PROFILE, acp, claude, codex_contract, manifest};
 

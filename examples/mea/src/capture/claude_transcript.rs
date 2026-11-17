@@ -55,6 +55,11 @@ fn output_name(scenario: &str, suffix: &str) -> String {
 }
 
 /// One scripted Claude conversation.
+///
+/// Every scenario runs under `--json-schema`, which the operator supplies: the answer's
+/// `StructuredOutput` tool call is the evidence a scenario qualifies on, and the CLI makes no such
+/// call without a schema. A scenario that needs none would bring back a schema-less path through
+/// [`claude_with`], the verbatim-answer notice (which is only true under a schema) included.
 struct Scenario {
     /// The file stem it is written to, under `transcripts/`.
     name: &'static str,
@@ -63,8 +68,6 @@ struct Scenario {
     /// What the turn says. It asks for no tool beyond the structured answer, so nothing needs
     /// approving.
     prompt: &'static str,
-    /// Whether the conversation runs under `--json-schema`, which the operator must supply.
-    needs_schema: bool,
 }
 
 /// The scenarios `mea capture --harness claude --transcripts` records.
@@ -72,19 +75,13 @@ const SCENARIOS: &[Scenario] = &[Scenario {
     name: STRUCTURED_OUTPUT,
     purpose: "a turn answered under --json-schema: a StructuredOutput tool call and a result carrying structured_output",
     prompt: "Answer through the structured output tool only. Fill every string with the word mango and every number with 1. Do not use any other tool.",
-    needs_schema: true,
 }];
 
 /// The named Claude transcript scenarios, for the CLI's `--scenario` parser.
+///
+/// Each one runs under a schema the operator supplies.
 pub fn scenario_names() -> Vec<&'static str> {
     SCENARIOS.iter().map(|scenario| scenario.name).collect()
-}
-
-/// Whether the named Claude scenario runs under a schema the operator supplies.
-pub fn scenario_needs_schema(name: &str) -> bool {
-    SCENARIOS
-        .iter()
-        .any(|scenario| scenario.name == name && scenario.needs_schema)
 }
 
 /// Records one Claude scenario into `out_dir/transcripts/`.
@@ -170,21 +167,12 @@ async fn claude_with(
             expected: "a named Claude transcript scenario",
             received: selected.to_owned(),
         })?;
-    let schema = match (scenario.needs_schema, schema) {
-        (true, Some(schema)) => Some(schema),
-        (true, None) => {
-            return Err(Error::HostConfiguration {
-                expected: "a JSON Schema for a scenario that runs under --json-schema",
-                received: format!("no schema for claude/{}", scenario.name),
-            });
-        }
-        (false, _) => None,
-    };
+    let schema = schema.ok_or_else(|| Error::HostConfiguration {
+        expected: "a JSON Schema for a scenario that runs under --json-schema",
+        received: format!("no schema for claude/{}", scenario.name),
+    })?;
     // Validated before any process starts: the harness's refusal says what is wrong with it.
-    let harness = match schema {
-        Some(schema) => ClaudeHarness::new().with_json_schema(schema)?,
-        None => ClaudeHarness::new(),
-    };
+    let harness = ClaudeHarness::new().with_json_schema(schema)?;
     // The harness refuses a model that reads as a flag too, but only once it has probed the CLI.
     if let Some(model) = model {
         mango_agent_claude::models::validate_model(model)?;
@@ -196,11 +184,9 @@ async fn claude_with(
     })?;
 
     println!("capturing claude/{}: {}", scenario.name, scenario.purpose);
-    if schema.is_some() {
-        // Through the notice sink, which reaches stderr like the failure lines: the operator reads
-        // it before the file is committed.
-        notices.notice(&verbatim_answer_notice(scenario.name));
-    }
+    // Through the notice sink, which reaches stderr like the failure lines: the operator reads it
+    // before the file is committed. Every scenario carries a schema by here, so none is exempt.
+    notices.notice(&verbatim_answer_notice(scenario.name));
     let discovery = harness.discover(host).await?;
     if let AuthState::LoggedOut { login_hint } = &discovery.auth {
         return Err(Error::HostConfiguration {
