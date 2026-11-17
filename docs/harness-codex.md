@@ -1428,6 +1428,14 @@ it the text is dropped and the completion is emitted whole, never refused. The d
 shape is `agentMessage - {id, text, phase?} containing the accumulated agent reply`
 ([app-server][app-server]).
 
+A turn may hold at most 1,024 activities open at once (`MAX_OPEN_ACTIVITIES`, the same figure as
+the default `Limits::turn_channel_capacity`). The app-server decides how many items a turn starts,
+and each open one keeps an id and a bounded output tail, so the count is capped here rather than by
+the vendor. The start past the cap is not forwarded: the turn ends as an `Error` coded
+`codex-protocol-error` with vendor code `activity-overflow`, naming the limit and the count reached,
+after the terminal closes every activity the host was told about as failed. A repeated id is not a
+new activity, and a completed one frees its slot. The cap is a constant, not a `Limits` field.
+
 ## Structured content
 
 What an item reports reaches a host as structure rather than as one more line of `detail`:
