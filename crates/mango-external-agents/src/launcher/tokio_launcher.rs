@@ -247,9 +247,11 @@ impl ProcessLauncher for TokioLauncher {
             // The child is owned by one reaper task, so every waiter reads the same answer and
             // nothing races to `wait` on it twice.
             let (exited, exit) = watch::channel(None);
+            let reaper_error = Arc::new(std::sync::Mutex::new(None));
+            let recorded_error = Arc::clone(&reaper_error);
             tokio::spawn(async move {
-                let status = child.wait().await.ok().map(native_exit_status);
-                let _ = exited.send(Some(status.unwrap_or_default()));
+                let waited = child.wait().await;
+                publish_reaped_status(&exited, &recorded_error, waited);
             });
 
             Ok(managed_process(
@@ -261,6 +263,7 @@ impl ProcessLauncher for TokioLauncher {
                     stderr,
                     kill_grace: self.kill_grace,
                     killed: AtomicBool::new(false),
+                    reaper_error,
                 },
             ))
         }
@@ -293,17 +296,19 @@ impl ProcessLauncher for TokioLauncher {
             let (leader_exited, exit) = watch::channel(None);
             let (cleaned, cleanup) = watch::channel(None);
             let (stop, stopping) = watch::channel(false);
-            let cleanup_error = Arc::new(std::sync::Mutex::new(None));
-            let reaper_error = Arc::clone(&cleanup_error);
+            let reaper_error = Arc::new(std::sync::Mutex::new(None));
+            let recorded_error = Arc::clone(&reaper_error);
             tokio::spawn(async move {
-                match reap_windows_process_tree(child, containment_job, stopping, leader_exited)
+                // `leader_exited` is lent, not moved: this task drops it only after the match
+                // below, so a failure is recorded before any `wait` can see the channel close.
+                match reap_windows_process_tree(child, containment_job, stopping, &leader_exited)
                     .await
                 {
                     Ok(status) => {
                         let _ = cleaned.send(Some(native_exit_status(status)));
                     }
                     Err(error) => {
-                        let mut recorded = reaper_error
+                        let mut recorded = recorded_error
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         *recorded = Some(format!(
@@ -325,7 +330,7 @@ impl ProcessLauncher for TokioLauncher {
                     killed: AtomicBool::new(false),
                     stop,
                     cleanup,
-                    cleanup_error,
+                    reaper_error,
                 },
             ))
         }
@@ -714,8 +719,10 @@ struct TokioChild {
     stop: watch::Sender<bool>,
     #[cfg(windows)]
     cleanup: watch::Receiver<Option<ExitStatus>>,
-    #[cfg(windows)]
-    cleanup_error: Arc<std::sync::Mutex<Option<String>>>,
+    /// Why the reaper ended without publishing an exit status, when it knew. Written once by the
+    /// reaper task before it drops the `exit` sender (on Windows the task owns the sender and drops
+    /// it after recording); read only to explain a closed channel.
+    reaper_error: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl TokioChild {
@@ -724,14 +731,21 @@ impl TokioChild {
         *self.exit.borrow()
     }
 
-    #[cfg(windows)]
-    fn job_cleanup_error(&self) -> Error {
+    /// The error for a reaper channel that closed before it published a result.
+    ///
+    /// Carries the reaper's own reason when it recorded one, so a failed OS `wait` is not
+    /// confused with a reaper task that was cancelled or panicked. `expected` names what the
+    /// caller was waiting for, because `wait` wants an exit status and a Windows `kill` wants an
+    /// empty Job.
+    fn lost_reaper_error(&self, expected: &str) -> Error {
         let message = self
-            .cleanup_error
+            .reaper_error
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
-            .unwrap_or_else(|| String::from("the contained process tree ended without a result"));
+            .unwrap_or_else(|| {
+                format!("a lost process reaper that ended without a result; expected {expected}")
+            });
         Error::Teardown {
             pid: self.pid,
             message,
@@ -741,7 +755,7 @@ impl TokioChild {
     #[cfg(windows)]
     fn job_timeout_error(&self, waited: Duration) -> Error {
         let recorded = self
-            .cleanup_error
+            .reaper_error
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
@@ -752,6 +766,34 @@ impl TokioChild {
                     "a contained process tree still had members after {waited:?}; expected an empty Job"
                 )
             }),
+        }
+    }
+}
+
+/// Publishes what the reaper learned from `wait`, and never invents an exit status.
+///
+/// A successful wait is published. A failed one is recorded as a kind and OS error number, which
+/// carry no path, and the sender is dropped unpublished: every waiter then sees a closed channel and
+/// reads the recorded reason through [`TokioChild::lost_reaper_error`], instead of a default status
+/// that looks like a real exit without a code or signal.
+#[cfg(not(windows))]
+fn publish_reaped_status(
+    exited: &watch::Sender<Option<ExitStatus>>,
+    reaper_error: &std::sync::Mutex<Option<String>>,
+    waited: std::io::Result<std::process::ExitStatus>,
+) {
+    match waited {
+        Ok(status) => {
+            let _ = exited.send(Some(native_exit_status(status)));
+        }
+        Err(error) => {
+            // Recorded before the sender can drop, so a waiter woken by the close sees it.
+            *reaper_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(format!(
+                "a failed wait on the child ({})",
+                describe_os_error(&error)
+            ));
         }
     }
 }
@@ -814,7 +856,7 @@ async fn reap_windows_process_tree(
     mut child: Box<dyn process_wrap::tokio::ChildWrapper>,
     containment_job: Arc<win32job::Job>,
     mut stop: watch::Receiver<bool>,
-    leader_exited: watch::Sender<Option<ExitStatus>>,
+    leader_exited: &watch::Sender<Option<ExitStatus>>,
 ) -> std::io::Result<std::process::ExitStatus> {
     let leader = {
         let leader_wait = child
@@ -940,10 +982,9 @@ impl ProcessControl for TokioChild {
                 return Ok(status);
             }
             if exit.changed().await.is_err() {
-                #[cfg(windows)]
-                return Err(self.job_cleanup_error());
-                #[cfg(not(windows))]
-                return Ok(ExitStatus::default());
+                // The sender closed unpublished. An exit without a code or signal is a different
+                // fact, so this is an error rather than `ExitStatus::default()`.
+                return Err(self.lost_reaper_error("an exit status"));
             }
         }
     }
@@ -959,7 +1000,7 @@ impl ProcessControl for TokioChild {
             let waited = self.kill_grace * 2;
             return match job_ends_within(self.cleanup.clone(), waited).await {
                 JobEnd::Empty => Ok(()),
-                JobEnd::ReaperClosed => Err(self.job_cleanup_error()),
+                JobEnd::ReaperClosed => Err(self.lost_reaper_error("an empty Job")),
                 JobEnd::TimedOut => Err(self.job_timeout_error(waited)),
             };
         }
@@ -1252,6 +1293,7 @@ mod tests {
             stderr: StderrTail::default(),
             kill_grace: Duration::ZERO,
             killed: AtomicBool::new(true),
+            reaper_error: Default::default(),
         };
         let error = crate::ProcessControl::kill(&child, CancelReason::Shutdown)
             .await
@@ -1280,6 +1322,96 @@ mod tests {
         );
     }
 
+    /// A reaper that vanished: the runtime cancelled its task, or it panicked, before it sent.
+    ///
+    /// Dropping the sender without `send` is exactly what both look like to a waiter.
+    #[cfg(unix)]
+    struct ReaperDroppedBeforeSending;
+
+    #[cfg(unix)]
+    impl ReaperDroppedBeforeSending {
+        fn child(pid: Option<u32>) -> super::TokioChild {
+            let (sender, exit) = tokio::sync::watch::channel(None);
+            drop(sender);
+            Self::child_watching(pid, exit)
+        }
+
+        /// A child whose exit channel the test drives itself.
+        fn child_watching(
+            pid: Option<u32>,
+            exit: tokio::sync::watch::Receiver<Option<crate::process::ExitStatus>>,
+        ) -> super::TokioChild {
+            super::TokioChild {
+                pid,
+                exit,
+                stderr: crate::StderrTail::default(),
+                kill_grace: Duration::ZERO,
+                killed: std::sync::atomic::AtomicBool::new(true),
+                reaper_error: Default::default(),
+            }
+        }
+    }
+
+    /// A closed exit channel is a lost reaper, not an exit without a code or signal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_reports_a_lost_reaper_when_no_status_was_published() {
+        let child = ReaperDroppedBeforeSending::child(Some(4242));
+        let error = crate::ProcessControl::wait(&child)
+            .await
+            .expect_err("a closed exit channel must not read as a status");
+        assert_eq!(
+            error.to_string(),
+            "expected to end process tree 4242, received a lost process reaper that ended without \
+             a result; expected an exit status"
+        );
+    }
+
+    /// An OS `wait` failure reaches every waiter as an error naming the OS error, never as a
+    /// default status.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_reports_the_os_error_the_reaper_recorded() {
+        let (exited, exit) = tokio::sync::watch::channel(None);
+        let child = ReaperDroppedBeforeSending::child_watching(Some(4242), exit);
+        // ECHILD: what `waitpid` returns when something else already reaped the child.
+        let echild = std::io::Error::from_raw_os_error(10);
+        super::publish_reaped_status(&exited, &child.reaper_error, Err(echild));
+        assert_eq!(
+            *child.exit.borrow(),
+            None,
+            "a failed wait must not publish a status"
+        );
+        drop(exited);
+        let error = crate::ProcessControl::wait(&child)
+            .await
+            .expect_err("a failed wait must not read as a status");
+        assert_eq!(
+            error.to_string(),
+            "expected to end process tree 4242, received a failed wait on the child (Uncategorized, os error 10)"
+        );
+    }
+
+    /// A status the OS reported is published unchanged, so the error path stays the exception.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_reports_the_status_the_reaper_published() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let (exited, exit) = tokio::sync::watch::channel(None);
+        let child = ReaperDroppedBeforeSending::child_watching(None, exit);
+        let code_three = std::process::ExitStatus::from_raw(3 << 8);
+        super::publish_reaped_status(&exited, &child.reaper_error, Ok(code_three));
+        drop(exited);
+        let status = crate::ProcessControl::wait(&child)
+            .await
+            .expect("a published status must be returned");
+        assert_eq!(
+            (status.code, status.signal),
+            (Some(3), None),
+            "expected the published exit code 3 and no signal"
+        );
+    }
+
     /// Both Job failure paths retain the launched leader without redacting it as a program.
     #[cfg(windows)]
     #[tokio::test]
@@ -1297,15 +1429,24 @@ mod tests {
             killed: AtomicBool::new(true),
             stop,
             cleanup: exit,
-            cleanup_error: Arc::new(Mutex::new(Some(String::from(
+            reaper_error: Arc::new(Mutex::new(Some(String::from(
                 "a Windows Job cleanup failure (PermissionDenied)",
             )))),
         };
         assert_eq!(
-            child.job_cleanup_error().to_string(),
+            child.lost_reaper_error("an empty Job").to_string(),
             "expected to end process tree 42, received a Windows Job cleanup failure (PermissionDenied)"
         );
-        *child.cleanup_error.lock().expect("cleanup") = None;
+        *child.reaper_error.lock().expect("cleanup") = None;
+        // With no recorded reason, each caller's own expectation is the one named.
+        assert_eq!(
+            child.lost_reaper_error("an empty Job").to_string(),
+            "expected to end process tree 42, received a lost process reaper that ended without a result; expected an empty Job"
+        );
+        assert_eq!(
+            child.lost_reaper_error("an exit status").to_string(),
+            "expected to end process tree 42, received a lost process reaper that ended without a result; expected an exit status"
+        );
         assert_eq!(
             child.job_timeout_error(Duration::from_secs(5)).to_string(),
             "expected to end process tree 42, received a contained process tree still had members after 5s; expected an empty Job"

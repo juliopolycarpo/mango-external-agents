@@ -133,6 +133,8 @@ pub struct Reducer {
     /// Source of [`OpenCall::opened`], so the calls a turn ends owing are closed in the order the
     /// agent opened them rather than in a hash map's.
     next_call: u64,
+    /// How many calls were open when one past [`MAX_OPEN_CALLS`] was first refused, until taken.
+    call_overflow: Option<usize>,
     /// The shortest gap between two updates one running call sends a host.
     update_interval: Duration,
     /// The summary and error each running compaction has reported so far.
@@ -152,6 +154,19 @@ pub struct Reducer {
 /// than a rendering one. Change it per reducer with [`Reducer::with_update_interval`].
 pub const TOOL_UPDATE_INTERVAL: Duration = Duration::from_secs(5);
 
+/// The most tool calls one turn may have open at once.
+///
+/// The agent decides how many calls it starts before finishing any, and each open one holds its
+/// id and a held update, so the count is bounded here rather than by what the agent sends. The same
+/// figure as the default `Limits::turn_channel_capacity`, and far above what a real turn runs
+/// concurrently.
+///
+/// A call past it is refused whole: nothing is forwarded for it, [`Reducer::take_call_overflow`]
+/// reports it, and the client fails the turn as `acp-activity-overflow` after closing every call
+/// the host was told about, as it does for an event the core refuses. Forwarding the excess
+/// untracked instead would give the host a start nothing closes.
+pub(crate) const MAX_OPEN_CALLS: usize = 1_024;
+
 impl Default for Reducer {
     fn default() -> Self {
         Self {
@@ -161,6 +176,7 @@ impl Default for Reducer {
             finished_calls: HashSet::new(),
             digest_key: RandomState::new(),
             next_call: 0,
+            call_overflow: None,
             update_interval: TOOL_UPDATE_INTERVAL,
             compactions: compaction::Compactions::default(),
         }
@@ -585,6 +601,12 @@ impl Reducer {
             .sum()
     }
 
+    /// How many tool calls the turn reached when it first tried to open one past
+    /// [`MAX_OPEN_CALLS`], once; the client then fails the turn.
+    pub(crate) fn take_call_overflow(&mut self) -> Option<usize> {
+        self.call_overflow.take()
+    }
+
     /// The ids of the tool calls still open, as [`call_key`] names them.
     ///
     /// What a turn's terminal is about to close. For example, a reducer that saw `call_1` start
@@ -693,6 +715,13 @@ impl Reducer {
             return Vec::new();
         }
         let finished = finished(call.status).is_some();
+        // A call that is already over is remembered as a digest, not held open; only one that will
+        // run counts against the bound. Refused whole, with nothing forwarded, so the host never
+        // holds a start the turn owes no close for.
+        if !finished && self.open_calls.len() >= MAX_OPEN_CALLS {
+            self.call_overflow.get_or_insert(self.open_calls.len() + 1);
+            return Vec::new();
+        }
         let events = tool_call(call);
         // An id the core refuses is refused on every event that names it, so this call can never
         // reach a host and a running entry for it would only hold its id and any held update for a
@@ -3609,6 +3638,106 @@ mod tests {
             !delivered.truncated,
             "expected truncated: false once the cut body was replaced | received: {:?}",
             delivered.truncated
+        );
+    }
+
+    #[test]
+    fn a_call_past_the_open_call_bound_is_refused_and_not_forwarded() {
+        let mut reducer = Reducer::new();
+        for index in 0..super::MAX_OPEN_CALLS {
+            let (events, _) = reducer.update(update(announced(&format!("call_{index}"))));
+            assert_eq!(
+                events.len(),
+                1,
+                "expected call {index} within the bound to start | received {events:?}"
+            );
+        }
+        assert_eq!(
+            reducer.take_call_overflow(),
+            None,
+            "expected no overflow at exactly {} open calls",
+            super::MAX_OPEN_CALLS
+        );
+        let (events, _) = reducer.update(update(announced("one_too_many")));
+        assert!(
+            events.is_empty(),
+            "expected the refused call not to be forwarded | received {events:?}"
+        );
+        assert_eq!(
+            reducer.take_call_overflow(),
+            Some(super::MAX_OPEN_CALLS + 1),
+            "expected the overflow to name the count the turn reached"
+        );
+        assert_eq!(
+            reducer.take_call_overflow(),
+            None,
+            "expected the overflow to be taken once"
+        );
+        assert_eq!(
+            reducer.open_calls_len(),
+            super::MAX_OPEN_CALLS,
+            "expected the refused call not to be tracked"
+        );
+    }
+
+    #[test]
+    fn finished_calls_and_repeats_do_not_count_against_the_open_call_bound() {
+        let mut reducer = Reducer::new();
+        for index in 0..super::MAX_OPEN_CALLS {
+            let _ = reducer.update(update(announced(&format!("call_{index}"))));
+        }
+        // Already over when announced: bracketed and remembered as a digest, never held open.
+        let (finished_events, _) = reducer.update(update(finished_call("already_over")));
+        assert_eq!(
+            finished_events.len(),
+            2,
+            "expected a start and a completion for a call that is already over | received {finished_events:?}"
+        );
+        // A repeat for an open call is an update to it, not a new call.
+        let _ = reducer.update(update(announced("call_0")));
+        assert_eq!(
+            reducer.take_call_overflow(),
+            None,
+            "expected neither a finished call nor a repeat to count as a new open call"
+        );
+    }
+
+    /// Ten thousand calls opened and finished in turn never reach the bound, and a bound-sized batch
+    /// left open is closed in the order it opened. The reducer already kept its open calls in a
+    /// map, so this guards that, and the order, rather than a fix: it passes on the code before the
+    /// cap too.
+    #[test]
+    fn many_calls_opened_and_finished_close_the_rest_in_start_order() {
+        let started = std::time::Instant::now();
+        let mut reducer = Reducer::new();
+        for index in 0..10_000 {
+            let id = format!("call_{index}");
+            let _ = reducer.update(update(announced(&id)));
+            let _ = reducer.update(update(finished_call(&id)));
+        }
+        for index in 0..super::MAX_OPEN_CALLS {
+            let _ = reducer.update(update(announced(&format!("open_{index}"))));
+        }
+        let closes: Vec<String> = reducer
+            .finish_with(ActivityStatus::Cancelled)
+            .into_iter()
+            .filter_map(|event| match event {
+                EventKind::ActivityCompleted { call_id, .. } => Some(call_id),
+                _ => None,
+            })
+            .collect();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "expected 10,000 call round trips and a full batch within 10s | received {elapsed:?}"
+        );
+        assert_eq!(reducer.take_call_overflow(), None);
+        let expected: Vec<String> = (0..super::MAX_OPEN_CALLS)
+            .map(|index| format!("open_{index}"))
+            .collect();
+        assert_eq!(
+            closes, expected,
+            "expected the open calls closed in the order they opened"
         );
     }
 }

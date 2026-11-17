@@ -727,8 +727,7 @@ pub(crate) async fn list_sessions(
             workspace_path: Some(workspace.clone()),
             updated_at: session
                 .updated_at
-                .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
-                .map(std::time::SystemTime::from),
+                .and_then(|value| crate::rfc3339::parse_system_time(&value)),
         })
         .collect();
     if sessions.len() > limit {

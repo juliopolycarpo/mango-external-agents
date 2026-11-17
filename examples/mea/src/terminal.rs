@@ -5,12 +5,16 @@ use mango_external_agents::{
 };
 
 pub(crate) struct TerminalBroker {
-    input: crate::ask::TerminalInput,
+    // A trait object so a test can state whether anyone is at the keyboard; the real
+    // `TerminalInput` reads process state (`stdin().is_terminal()`) that a test cannot set.
+    input: Box<dyn crate::ask::QuestionInput>,
 }
 
 impl TerminalBroker {
-    pub(crate) fn new(input: crate::ask::TerminalInput) -> Self {
-        Self { input }
+    pub(crate) fn new(input: impl crate::ask::QuestionInput + 'static) -> Self {
+        Self {
+            input: Box::new(input),
+        }
     }
 }
 
@@ -23,7 +27,7 @@ impl Default for TerminalBroker {
 #[async_trait::async_trait]
 impl PermissionBroker for TerminalBroker {
     async fn decide(&self, request: &PermissionRequest) -> BrokerDecision {
-        let Some(answer) = self.input.prompt_line(&render_prompt(request)).await else {
+        let Some(answer) = self.input.read_line(&render_prompt(request)).await else {
             return decision_for(request, "");
         };
         decision_for(request, &answer)
@@ -90,10 +94,11 @@ fn decision(answer: &str) -> BrokerDecision {
 
 #[cfg(test)]
 mod tests {
-    use std::io::IsTerminal;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime};
 
     use super::*;
+    use crate::ask::QuestionInput;
     use mango_external_agents::{
         ActivityKind, Interaction, InteractionId, InteractionKind, PermissionEffect,
         PermissionOption, PermissionScope, SessionId,
@@ -109,19 +114,78 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn redirected_input_never_grants_permission() {
-        if std::io::stdin().is_terminal() {
-            return;
+    /// A keyboard whose answer is fixed by the test: `None` is redirected input (nobody there to
+    /// type), `Some(line)` is a person at a terminal typing `line`. Records the prompts it saw.
+    struct FakeKeyboard {
+        typed: Option<&'static str>,
+        prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeKeyboard {
+        fn new(typed: Option<&'static str>) -> (Self, Arc<Mutex<Vec<String>>>) {
+            let prompts = Arc::new(Mutex::new(Vec::new()));
+            let keyboard = Self {
+                typed,
+                prompts: Arc::clone(&prompts),
+            };
+            (keyboard, prompts)
         }
-        let request = permission_request(vec![
+    }
+
+    #[async_trait::async_trait]
+    impl QuestionInput for FakeKeyboard {
+        async fn read_line(&self, prompt: &str) -> Option<String> {
+            self.prompts
+                .lock()
+                .expect("expected an unpoisoned prompt log")
+                .push(prompt.to_owned());
+            self.typed.map(str::to_owned)
+        }
+    }
+
+    fn once_allow_request() -> PermissionRequest {
+        permission_request(vec![
             PermissionOption::new("allow", PermissionEffect::Allow)
                 .with_scope(PermissionScope::Once),
-        ]);
-        assert!(matches!(
-            TerminalBroker::default().decide(&request).await,
-            BrokerDecision::Deny { .. }
-        ));
+        ])
+    }
+
+    #[tokio::test]
+    async fn redirected_input_never_grants_permission() {
+        let (keyboard, prompts) = FakeKeyboard::new(None);
+        let decision = TerminalBroker::new(keyboard)
+            .decide(&once_allow_request())
+            .await;
+        assert!(
+            matches!(decision, BrokerDecision::Deny { .. }),
+            "expected Deny with redirected input | received {decision:?}"
+        );
+        assert_eq!(
+            prompts.lock().expect("expected prompt log").len(),
+            1,
+            "expected the broker to ask the input exactly once"
+        );
+    }
+
+    /// A terminal-looking input still grants only on an explicit yes: a bare Enter or an
+    /// unrecognised word is a refusal, and the same broker does grant on "yes".
+    #[tokio::test]
+    async fn a_person_at_the_terminal_grants_only_by_typing_yes() {
+        for typed in ["", "\n", "no", "perhaps", "true"] {
+            let (keyboard, _) = FakeKeyboard::new(Some(typed));
+            let decision = TerminalBroker::new(keyboard)
+                .decide(&once_allow_request())
+                .await;
+            assert!(
+                matches!(decision, BrokerDecision::Deny { .. }),
+                "expected Deny for typed {typed:?} | received {decision:?}"
+            );
+        }
+        let (keyboard, _) = FakeKeyboard::new(Some("yes\n"));
+        let decision = TerminalBroker::new(keyboard)
+            .decide(&once_allow_request())
+            .await;
+        assert_eq!(decision, BrokerDecision::Allow);
     }
 
     /// A single request with `options`, for a test that only cares about the options offered.

@@ -87,10 +87,16 @@ fn named_tests(document: &str) -> BTreeSet<String> {
 }
 
 /// Every Rust source file in the workspace, excluding build output.
+///
+/// An unreadable directory is a failure, not an empty result: a renamed `crates/` would otherwise
+/// leave the inventory check scanning nothing and passing.
 fn sources(directory: &Path, found: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
+    let entries = std::fs::read_dir(directory).unwrap_or_else(|error| {
+        panic!(
+            "expected {} to be a readable directory (layout: <root>/crates and <root>/examples hold the workspace sources) | received {error}",
+            directory.display()
+        )
+    });
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -104,16 +110,53 @@ fn sources(directory: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
+/// Far below the real count (about 280), far above what a half-renamed tree would still hold.
+const MINIMUM_SCANNED_SOURCE_FILES: usize = 100;
+
 fn workspace_source_text() -> String {
     let root = repository_root();
     let mut files = Vec::new();
     sources(&root.join("crates"), &mut files);
     sources(&root.join("examples"), &mut files);
+    assert_scanned_enough(files.len());
     files
         .iter()
         .filter_map(|path| std::fs::read_to_string(path).ok())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn assert_scanned_enough(scanned: usize) {
+    assert!(
+        scanned >= MINIMUM_SCANNED_SOURCE_FILES,
+        "expected at least {MINIMUM_SCANNED_SOURCE_FILES} .rs files under crates/ and examples/ | received {scanned}"
+    );
+}
+
+#[test]
+#[should_panic(
+    expected = "expected at least 100 .rs files under crates/ and examples/ | received 3"
+)]
+fn a_tree_with_too_few_sources_fails_the_inventory() {
+    assert_scanned_enough(3);
+}
+
+#[test]
+#[should_panic(expected = "to be a readable directory")]
+fn a_missing_source_directory_fails_the_inventory() {
+    let missing = repository_root().join("crates-renamed-away");
+    sources(&missing, &mut Vec::new());
+}
+
+#[test]
+fn the_workspace_scan_finds_the_real_tree() {
+    let mut files = Vec::new();
+    sources(&repository_root().join("crates"), &mut files);
+    assert!(
+        files.iter().any(|path| path.ends_with("permission.rs")),
+        "expected the scan of crates/ to include permission.rs | received {} files",
+        files.len()
+    );
 }
 
 /// A row naming a test that no longer exists claims a decision is pinned when nothing pins it.

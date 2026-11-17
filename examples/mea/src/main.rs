@@ -1233,15 +1233,21 @@ mod tests {
 
     #[test]
     fn refuses_a_value_it_does_not_recognise_rather_than_guessing() {
-        for arguments in [
-            vec![String::from("--level"), String::from("yolo")],
-            vec![String::from("--harness"), String::from("acp")],
-            vec![String::from("--harness"), String::from("acp:unknown")],
-            vec![String::from("--level")],
+        for (arguments, bad_input) in [
+            (vec![String::from("--level"), String::from("yolo")], "yolo"),
+            (vec![String::from("--harness"), String::from("acp")], "acp"),
+            (
+                vec![String::from("--harness"), String::from("acp:unknown")],
+                "unknown",
+            ),
+            (vec![String::from("--level")], "--level"),
         ] {
+            let error = Options::parse(&arguments).err().unwrap_or_else(|| {
+                panic!("expected {arguments:?} to be refused | received options")
+            });
             assert!(
-                Options::parse(&arguments).is_err(),
-                "expected {arguments:?} to be refused"
+                error.contains(bad_input),
+                "expected the refusal for {arguments:?} to name {bad_input:?} | received {error:?}"
             );
         }
     }
@@ -1344,7 +1350,7 @@ mod tests {
 ///
 /// The stand-in refuses the WebSocket upgrade, so a run crosses a real socket and the harness's
 /// real connect and upgrade, and ends in a refusal whose words the test can name. A full replayed
-/// turn lives in `crates/mango-agent-codex/tests/unix_socket.rs`, which owns the recorded
+/// turn lives in `crates/mango-agent-codex/tests/it/unix_socket.rs`, which owns the recorded
 /// conversation and the WebSocket server that speaks it.
 #[cfg(all(test, unix))]
 mod unix_socket_tests {
