@@ -111,15 +111,16 @@ Naming a test in `ci.yml` is not enough. `scripts/ci-script-steps.py` parses the
 - its `run:` block reaches it: the block is split into commands at newlines, `;`, `&&`, `||`, `|`
   and `&`, and the test command is joined to its neighbours only by a newline or `;`, sits in no
   `if`, loop, `case`, function, group or subshell, follows no `exit` that can end the block and no
-  `set +e`, and is not followed by a `||` handler other than an `exit` with a failing status;
+  `set +e`, no `trap` on `EXIT` or `ERR` that is still set (a `trap - EXIT` lifts it), and no
+  `exec` with a command (`exec > log` alone is fine), and is not followed by a `||` handler other
+  than an `exit` with a failing status;
 - its step runs under no `shell:`, or `bash` or `sh`, the shells that stop at a failing command;
   the step, the job's `defaults.run` and the workflow's `defaults.run` are all read;
 - the workflow triggers on `pull_request` and has a `gate` job.
 
 A construct the analysis cannot follow, such as an `if` around the command, a matrix built from an
 expression or a `shell: pwsh` step, is reported as a reason the test is blocked, never counted as
-run. It still does not follow `trap` or `exec` earlier in the block, or what a test script does once
-it starts.
+run. It still does not follow what a test script does once it starts.
 `scripts/test-check-script-tests.sh` pins each rule against a scratch workflow.
 
 ## Shell lint

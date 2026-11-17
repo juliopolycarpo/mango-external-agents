@@ -324,6 +324,34 @@ block_fail 'a command after eval set +e' $'eval \'set +e\'\nscripts/test-beta.py
 block_fail 'a command after command set +e' $'command set +e\nscripts/test-beta.py' 'it follows `command set +e`, which turns off errexit'
 block_fail 'a command after builtin set +e' $'builtin set +e\nscripts/test-beta.py' 'it follows `builtin set +e`, which turns off errexit'
 
+# `trap` on EXIT or ERR can turn a later failure into a clean exit, and `exec` with a command
+# replaces the shell, so neither lets a test after it fail the step.
+trap_reason='which can turn a later failure into a clean exit'
+exec_reason='which replaces the shell, so no later command runs'
+block_fail 'a command after trap on EXIT' $'trap \'exit 0\' EXIT\nscripts/test-beta.py' "it follows \`trap 'exit 0' EXIT\`, $trap_reason"
+block_fail 'a command after trap on ERR' $'trap \'exit 0\' ERR\nscripts/test-beta.py' "it follows \`trap 'exit 0' ERR\`, $trap_reason"
+block_fail 'a command after trap on signal 0' $'trap \'exit 0\' 0\nscripts/test-beta.py' "it follows \`trap 'exit 0' 0\`, $trap_reason"
+block_fail 'a command after trap on EXIT among other signals' $'trap cleanup INT EXIT TERM\nscripts/test-beta.py' "it follows \`trap cleanup INT EXIT TERM\`, $trap_reason"
+block_fail 'a command after a lower-case trap condition' $'trap cleanup exit\nscripts/test-beta.py' "it follows \`trap cleanup exit\`, $trap_reason"
+block_fail 'a command after trap on the same line' 'trap "exit 0" EXIT; scripts/test-beta.py' "it follows \`trap \"exit 0\" EXIT\`, $trap_reason"
+block_fail 'a command after trap set under a condition' $'[ -n "$X" ] && trap \'exit 0\' EXIT\nscripts/test-beta.py' "it follows \`trap 'exit 0' EXIT\`, $trap_reason"
+block_fail 'a command after command trap' $'command trap \'exit 0\' EXIT\nscripts/test-beta.py' "it follows \`command trap 'exit 0' EXIT\`, $trap_reason"
+block_fail 'a command after eval trap' $'eval "trap \'exit 0\' EXIT"\nscripts/test-beta.py' "it follows \`eval \"trap 'exit 0' EXIT\"\`, $trap_reason"
+block_fail 'a command after a trap that was reset only under a condition' $'trap \'exit 0\' EXIT\n[ -n "$X" ] && trap - EXIT\nscripts/test-beta.py' "it follows \`trap 'exit 0' EXIT\`, $trap_reason"
+block_pass 'a command after trap on a signal other than EXIT or ERR' $'trap \'echo bye\' INT TERM\nscripts/test-beta.py'
+block_pass 'a command after a trap that was reset' $'trap \'exit 0\' EXIT\ntrap - EXIT\nscripts/test-beta.py'
+block_pass 'a command after trap -p, which only lists' $'trap -p\nscripts/test-beta.py'
+block_pass 'a command that runs before a trap' $'scripts/test-beta.py\ntrap \'exit 0\' EXIT'
+block_fail 'a command after exec with a command' $'exec echo hi\nscripts/test-beta.py' "it follows \`exec echo hi\`, $exec_reason"
+block_fail 'a command after exec on the same line' 'exec echo hi; scripts/test-beta.py' "it follows \`exec echo hi\`, $exec_reason"
+block_fail 'a command after exec with an environment' $'exec env A=1 true\nscripts/test-beta.py' "it follows \`exec env A=1 true\`, $exec_reason"
+block_fail 'a command after command exec' $'command exec echo hi\nscripts/test-beta.py' "it follows \`command exec echo hi\`, $exec_reason"
+block_fail 'a command after exec under a condition' $'[ -n "$X" ] && exec echo hi\nscripts/test-beta.py' "it follows \`exec echo hi\`, $exec_reason"
+block_pass 'a command after exec that only redirects' $'exec > log 2>&1\nscripts/test-beta.py'
+block_pass 'a command after exec that opens a descriptor' $'exec 3<&0\nscripts/test-beta.py'
+block_pass 'a command after exec with an attached redirection' $'exec 4>>log\nscripts/test-beta.py'
+block_pass 'a command that runs before exec' $'scripts/test-beta.py\nexec echo done'
+
 # The shell has to stop at a failing command, wherever it is declared.
 shell_pass() {
   shell_name=$2
