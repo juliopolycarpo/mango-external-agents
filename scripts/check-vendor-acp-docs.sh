@@ -26,6 +26,12 @@ set -euo pipefail
 # while `--acp`, `acp` and `claude-agent-acp` do match.
 readonly ACP_PATTERN='\bacp\b|agent[ -]?client[ -]?protocol'
 
+# The most bytes of one reported page line (its line number included). An allowlist entry is a
+# whole page line, so this is long enough for an llms.txt index line; it stays a bound because the
+# report shares the 65536 bytes the drift workflow allows with the contract diff, which
+# write-vendor-drift-report.sh caps well below that. Counted in bytes, whatever the locale.
+readonly ACP_LINE_CUT=1000
+
 # Reviewed mentions: `vendor<TAB>exact line text<TAB>reason`; `#` starts a comment. Tests point
 # ACP_DOCS_ALLOWLIST at their own file.
 ACP_DOCS_ALLOWLIST="${ACP_DOCS_ALLOWLIST:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vendor-acp-docs-allowlist.txt}"
@@ -178,10 +184,10 @@ validate_document() {
     if [ "${#unaccepted[@]}" -lt "$shown" ]; then
       shown="${#unaccepted[@]}"
     fi
-    matches=$(printf '%s\n' "${unaccepted[@]:0:3}" | cut -c 1-200)
+    matches=$(printf '%s\n' "${unaccepted[@]:0:3}" | LC_ALL=C cut -c "1-$ACP_LINE_CUT")
     printf 'expected no ACP page or command in %s, received:\n%s\n' "$url" "$matches" >&2
     report_section "$report_file" "$url" \
-      "Lines naming ACP that no reviewed allowlist entry accepts, with their line numbers (showing $shown of ${#unaccepted[@]}; each line is cut at 200 characters):" "$matches"
+      "Lines naming ACP that no reviewed allowlist entry accepts, with their line numbers (showing $shown of ${#unaccepted[@]}; each line is cut at $ACP_LINE_CUT bytes):" "$matches"
     return 1
   fi
   printf 'no ACP mention in %s\n' "$url"
