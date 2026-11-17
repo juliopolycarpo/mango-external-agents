@@ -1028,19 +1028,35 @@ mod capture_tests {
 
     #[test]
     fn malformed_capture_flags_never_fall_back_to_defaults() {
-        for args in [
-            vec!["--out"],
-            vec!["--harness", "claude", "--transcripts"],
-            vec!["codex", "--harness", "claude"],
-            vec!["--transcrips"],
-            vec!["--harness", "claude", "--scenario", "subagent"],
-            vec!["--harness", "codex", "--scenario", "subagent"],
-            vec!["codex", "--scenario", "unknown"],
-            vec!["codex", "--scenario"],
+        // Each case names the bad flag or value its error message must quote. Errors are plain
+        // strings here, so the message is the only thing that tells one refusal from another.
+        for (args, bad_input) in [
+            (vec!["--out"], "--out"),
+            (vec!["--harness", "claude", "--transcripts"], "--scenario"),
+            (vec!["codex", "--harness", "claude"], "--harness"),
+            (vec!["--transcrips"], "--transcrips"),
+            (
+                vec!["--harness", "claude", "--scenario", "subagent"],
+                "subagent",
+            ),
+            (
+                vec!["--harness", "codex", "--scenario", "subagent"],
+                "subagent",
+            ),
+            (vec!["codex", "--scenario", "unknown"], "unknown"),
+            (vec!["codex", "--scenario"], "--scenario"),
         ] {
             let parsed =
-                CaptureOptions::parse(&args.into_iter().map(String::from).collect::<Vec<_>>());
-            assert!(parsed.and_then(|options| options.kind()).is_err());
+                CaptureOptions::parse(&args.iter().copied().map(String::from).collect::<Vec<_>>());
+            let error = parsed
+                .and_then(|options| options.kind())
+                .expect_err(&format!(
+                    "expected {args:?} to be refused | received a capture selection"
+                ));
+            assert!(
+                error.contains(bad_input),
+                "expected the error for {args:?} to name {bad_input:?} | received {error:?}"
+            );
         }
     }
 
