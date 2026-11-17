@@ -4,6 +4,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.11.0] - 2026-11-17
+
+### 🐛 Bug Fixes
+
+- **(core)** Report a lost process reaper as an error (#536)
+- Bound per-turn open-activity tracking (#533)
+
+### 🧪 Testing
+
+- Assert specific errors and drop host-dependent early returns (#532)
+- **(release)** Pin the registry consumer at 0.10.0 (#528)
+
+### ⬆️ Dependencies
+
+- **(deps)** Replace chrono with an in-crate RFC 3339 parser (#535)
+
 ## [0.10.0] - 2026-11-16
 
 ### 🐛 Bug Fixes
