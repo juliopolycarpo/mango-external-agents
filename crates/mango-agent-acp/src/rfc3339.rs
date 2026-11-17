@@ -90,6 +90,14 @@ pub(crate) fn parse_system_time(value: &str) -> Option<SystemTime> {
 
 /// [`parse_system_time`] with the reason a timestamp was refused.
 pub(crate) fn parse_rfc3339(value: &str) -> Result<SystemTime, Rfc3339Error> {
+    let (unix_seconds, nanos) = parse_unix_parts(value)?;
+    system_time_from_unix(unix_seconds, nanos).ok_or(Rfc3339Error::Unrepresentable)
+}
+
+/// The timestamp as whole seconds from the epoch, rounded down, and the nanoseconds forward from
+/// there. Exact on every platform: the conversion to `SystemTime` is where Windows drops below
+/// 100 ns and before 1601, so the parser's own results are checked at this layer.
+fn parse_unix_parts(value: &str) -> Result<(i64, u32), Rfc3339Error> {
     if value.len() > MAX_INPUT_BYTES {
         return Err(Rfc3339Error::TooLong { len: value.len() });
     }
@@ -142,7 +150,7 @@ pub(crate) fn parse_rfc3339(value: &str) -> Result<SystemTime, Rfc3339Error> {
     let unix_seconds = local_seconds
         .checked_sub(offset_seconds)
         .ok_or(Rfc3339Error::Unrepresentable)?;
-    system_time_from_unix(unix_seconds, nanos).ok_or(Rfc3339Error::Unrepresentable)
+    Ok((unix_seconds, nanos))
 }
 
 /// A left-to-right reader over the ASCII bytes of one timestamp.

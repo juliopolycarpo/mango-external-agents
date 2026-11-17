@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
     Field, MAX_INPUT_BYTES, Rfc3339Error, days_from_civil, is_leap_year, parse_rfc3339,
-    parse_system_time, system_time_from_unix,
+    parse_system_time, parse_unix_parts, system_time_from_unix,
 };
 
 /// A `SystemTime` as whole seconds from the epoch, rounded down, and the nanoseconds forward from
@@ -219,7 +219,7 @@ fn the_parser_matches_what_chrono_returned_on_every_table_case() {
     let mismatches: Vec<String> = CHRONO_EQUIVALENCE_TABLE
         .iter()
         .filter_map(|&(input, expected)| {
-            let received = parse_system_time(input).map(unix_parts);
+            let received = parse_unix_parts(input).ok();
             (received != expected)
                 .then(|| format!("{input:?}: expected {expected:?}, received {received:?}"))
         })
@@ -355,8 +355,8 @@ fn input_past_the_length_cap_is_refused_and_input_at_it_is_read() {
     let at_cap = format!("{prefix}{}{suffix}", "7".repeat(fraction_digits));
     assert_eq!(at_cap.len(), MAX_INPUT_BYTES);
     assert_eq!(
-        parse_system_time(&at_cap).map(unix_parts),
-        Some((1_704_067_200, 777_777_777)),
+        parse_unix_parts(&at_cap),
+        Ok((1_704_067_200, 777_777_777)),
         "(rfc3339): expected the {MAX_INPUT_BYTES}-byte input to be read"
     );
 
@@ -386,9 +386,10 @@ fn the_unix_conversion_answers_at_the_extremes_without_panicking() {
     let _ = system_time_from_unix(i64::MIN, 999_999_999);
     let _ = system_time_from_unix(i64::MAX, 999_999_999);
     assert_eq!(
-        system_time_from_unix(-1, 1).map(unix_parts),
-        Some((-1, 1)),
-        "expected one nanosecond after the second before the epoch to round-trip"
+        // 100 ns, not 1: Windows `SystemTime` counts in 100 ns ticks.
+        system_time_from_unix(-1, 100).map(unix_parts),
+        Some((-1, 100)),
+        "expected 100 ns after the second before the epoch to round-trip"
     );
     assert_eq!(system_time_from_unix(0, 0), Some(UNIX_EPOCH));
 }
@@ -516,7 +517,7 @@ fn random_valid_timestamps_match_an_independent_count() {
         let expected_seconds = midnight_by_counting(year, month, day)
             + i64::from(hour * 3600 + minute * 60 + second)
             - offset_seconds;
-        let received = parse_system_time(&input).map(unix_parts);
+        let received = parse_unix_parts(&input).ok();
         assert_eq!(
             received,
             Some((expected_seconds, nanos)),
