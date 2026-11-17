@@ -12,7 +12,8 @@ use mango_external_agents::error::{Error, Result};
 use mango_external_agents::launcher::TokioLauncher;
 use mango_external_agents::transports::stdio;
 use mango_external_agents::{
-    CancelReason, EnvSource, ExecutablePath, HostContext, ProcessCleanupGuard, StdioSpec,
+    CancelReason, EnvSource, ErrorCode, ExecutablePath, HostContext, JsonRpcError,
+    ProcessCleanupGuard, StdioSpec,
 };
 use serde_json::{Map, Value, json};
 
@@ -426,6 +427,26 @@ async fn acp_initialize(
 }
 
 fn normalize_acp_initialize(frame: Value) -> Result<Value> {
+    // An adapter that cannot start (`codex-acp` with a `CODEX_HOME` that does not exist) answers
+    // `initialize` with an error frame. `Error::Protocol` never prints what it received, so the
+    // cause is raised as the vendor failure the ACP harness uses for the same reply: `mea` prints
+    // that one with the agent's redacted message and code.
+    // A `null` error member is no error: some peers write one beside a result.
+    if let Some(error) = frame.get("error").filter(|error| !error.is_null()) {
+        return Err(
+            match serde_json::from_value::<JsonRpcError>(error.clone()) {
+                Ok(error) => Error::Vendor(
+                    error.into_vendor_error(ErrorCode::from_static("acp-request-failed"), None),
+                ),
+                Err(_) => Error::Protocol {
+                    expected: String::from(
+                        "an ACP initialize JSON-RPC error with an integer code and a string message",
+                    ),
+                    received: value_shape(error),
+                },
+            },
+        );
+    }
     let result = frame
         .get("result")
         .and_then(Value::as_object)
@@ -757,6 +778,125 @@ mod tests {
             "expected the missing protocolVersion field, received {error:?}"
         );
         assert!(!error.to_string().contains("private"), "{error}");
+    }
+
+    /// A named fake ACP agent whose adapter cannot start: it answers `initialize` with a JSON-RPC
+    /// error frame, as `codex-acp` does when `CODEX_HOME` points at a directory that is absent.
+    struct RefusingInitializeAgent {
+        code: i64,
+        message: &'static str,
+    }
+
+    impl RefusingInitializeAgent {
+        fn frame(&self) -> serde_json::Value {
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"code": self.code, "message": self.message, "data": {"detail": "private"}}
+            })
+        }
+
+        fn process(&self) -> FakeProcess {
+            FakeProcess::transcript([self.frame().to_string()]).with_exit(success())
+        }
+    }
+
+    const CODEX_HOME_REFUSAL: &str = "Codex process has exited with code 1: CODEX_HOME points to \"/nowhere\", but that path does not exist API_KEY=private-token";
+
+    #[test]
+    fn initialize_error_frame_names_its_code_and_redacted_message() {
+        let agent = RefusingInitializeAgent {
+            code: 1001,
+            message: CODEX_HOME_REFUSAL,
+        };
+
+        let error = normalize_acp_initialize(agent.frame())
+            .expect_err("expected an initialize error frame to fail the capture");
+
+        let Error::Vendor(vendor) = &error else {
+            panic!(
+                "(acp initialize): expected the agent's JSON-RPC error as a vendor failure | received: {error:?}"
+            );
+        };
+        assert_eq!(vendor.vendor_code.as_deref(), Some("1001"));
+        assert!(
+            vendor.message.contains("CODEX_HOME points to"),
+            "(acp initialize): expected the agent's message | received: {}",
+            vendor.message
+        );
+        assert!(
+            !vendor.message.contains("private-token"),
+            "(acp initialize): expected credential-shaped text redacted | received: {}",
+            vendor.message
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_acp_initialize_prints_the_error_code_and_message_an_operator_reads() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(
+            RefusingInitializeAgent {
+                code: 1001,
+                message: CODEX_HOME_REFUSAL,
+            }
+            .process(),
+        );
+        let profile =
+            mango_agent_acp::builtin_profile("opencode").expect("expected OpenCode profile");
+
+        let error = acp_initialize(&host(Arc::clone(&launcher)), profile.as_ref())
+            .await
+            .expect_err("expected the agent's error frame to fail the capture");
+
+        let printed = crate::command_failure(&error);
+        assert!(
+            printed.contains("CODEX_HOME points to") && printed.contains("1001"),
+            "(acp initialize): expected the error message and code 1001 | received: {printed}"
+        );
+        assert!(
+            !printed.contains("invalid vendor data") && !printed.contains("private-token"),
+            "(acp initialize): expected no generic text and no credential | received: {printed}"
+        );
+    }
+
+    #[test]
+    fn a_null_error_member_beside_a_result_is_no_error() {
+        let normalized = normalize_acp_initialize(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"protocolVersion": 1},
+            "error": null
+        }))
+        .unwrap_or_else(|error| {
+            panic!(
+                "(acp initialize): expected the result of a reply with `\"error\": null` | received: {error:?}"
+            )
+        });
+
+        assert_eq!(normalized["protocolVersion"], 1);
+    }
+
+    #[test]
+    fn a_null_error_member_without_a_result_is_refused_for_the_missing_result() {
+        let error = normalize_acp_initialize(json!({"id": 1, "error": null}))
+            .expect_err("expected a reply with no result to be refused");
+
+        assert!(
+            matches!(&error, Error::Protocol { expected, .. } if expected.contains("result object")),
+            "(acp initialize): expected the missing-result refusal, not an error shape | received: {error:?}"
+        );
+    }
+
+    #[test]
+    fn initialize_error_member_without_a_code_and_message_is_a_shape_refusal() {
+        let error = normalize_acp_initialize(json!({"id": 1, "error": "boom"}))
+            .expect_err("expected a malformed error member to be refused");
+
+        assert!(
+            matches!(&error, Error::Protocol { expected, received }
+                if expected.contains("JSON-RPC error") && received == "string"),
+            "(acp initialize): expected a JSON-RPC error shape refusal | received: {error:?}"
+        );
     }
 
     #[test]
