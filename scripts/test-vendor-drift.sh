@@ -494,7 +494,13 @@ test_vendor_acp_docs_report_long_lines() {
   local claude_reference='https://code.claude.com/docs/en/cli-reference.md'
   local long_line
   local overlong_line
+  local multibyte_line
   local reported
+  local reported_bytes
+  local character
+  local padding
+  local cut_input
+  local cut_output
   local bytes
   mkdir -p "$fake_bin"
   ln -sf "$repo_root/scripts/test-fixtures/fake-doc-curl.sh" "$fake_bin/curl"
@@ -517,6 +523,34 @@ test_vendor_acp_docs_report_long_lines() {
   reported=$(grep -m 1 '^2:ACP ' "$report")
   assert_eq "${#reported}" "$ACP_LINE_CUT" 'an overlong matching line is cut at the bound'
   assert_contains "$report" "each line is cut at $ACP_LINE_CUT bytes" 'the report names the cut'
+
+  # The cut counts bytes, so it must not leave half of a multibyte character in the report: "2:ACP x"
+  # is 7 bytes, so the 1000-byte cut falls between the two bytes of the 497th two-byte character.
+  multibyte_line="ACP x$(printf 'é%.0s' {1..600})"
+  write_fake_doc "$docs" "$claude_index" '# Claude Code Docs' "$multibyte_line"
+  expect_status 1 check_vendor claude "$report"
+  if ! python3 -I -c 'import sys; sys.stdin.buffer.read().decode("utf-8")' < "$report" 2> "$test_root/acp-long-utf8.error"; then
+    fail "(report encoding): expected valid UTF-8 after a cut inside a multibyte character | received $(tr '\n' '|' < "$test_root/acp-long-utf8.error")"
+  fi
+  reported_bytes=$(grep -m 1 '^2:ACP x' "$report" | wc -c | tr -d ' ')
+  # wc counts the newline too.
+  if [ "$reported_bytes" -gt "$((ACP_LINE_CUT + 1))" ]; then
+    fail "(report line length): expected at most $ACP_LINE_CUT bytes | received $((reported_bytes - 1))"
+  fi
+
+  # Every split of a two-, three- and four-byte character leaves valid UTF-8, and a character the
+  # cut leaves whole stays.
+  for character in 'é' '€' '😀'; do
+    for padding in 995 996 997 998 999 1000; do
+      cut_input="$(head -c "$padding" /dev/zero | tr '\0' 'x')${character}tail"
+      cut_output=$(printf '%s\n' "$cut_input" | cut_lines_to_report_bytes)
+      if ! printf '%s' "$cut_output" | python3 -I -c 'import sys; sys.stdin.buffer.read().decode("utf-8")' 2> /dev/null; then
+        fail "(cut_lines_to_report_bytes): expected valid UTF-8 for $padding bytes then $character | received invalid bytes"
+      fi
+    done
+  done
+  assert_eq "$(printf '%s\n' "$(head -c 996 /dev/zero | tr '\0' 'x')é" | cut_lines_to_report_bytes | tail -c 4)" 'xé' \
+    'a two-byte character that fits before the cut is kept'
 
   # The worst docs section on both pages of a vendor, joined to a diff of the largest size, still
   # fits the bound the workflow enforces.
