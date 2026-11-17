@@ -17,6 +17,7 @@ use mango_external_agents::Error;
 use mango_external_agents::jsonrpc::{
     JsonRpcError, Responder, ServerRequestOutcome, Unanswered, Written,
 };
+use serde::Serialize;
 
 use crate::permission;
 
@@ -56,7 +57,13 @@ impl PermissionReply {
     /// ```ignore
     /// reply.respond(permission::selected("reject"))?;
     /// ```
-    pub(super) fn respond(mut self, response: RequestPermissionResponse) -> Result<(), AcpError> {
+    pub(super) fn respond(self, response: RequestPermissionResponse) -> Result<(), AcpError> {
+        self.respond_with(&response)
+    }
+
+    /// [`respond`](Self::respond) for any serialisable response, so a result that fails to
+    /// serialise can be driven in a test.
+    fn respond_with<R: Serialize>(mut self, response: &R) -> Result<(), AcpError> {
         let Some(responder) = self.responder.take() else {
             return Ok(());
         };
@@ -64,14 +71,25 @@ impl PermissionReply {
         // declared order (`outcome`, then `optionId`) whether or not some crate in the build
         // turns on `serde_json/preserve_order`. This crate's schema dependency happens to, but
         // the bytes do not rest on that.
-        let attempt = responder.answer_with(&response);
-        settle(attempt).map_err(|error| match error {
-            Error::Protocol { received, .. } => internal_error(format!(
+        let unanswered = match responder.answer_with(response) {
+            Ok(_written) => return Ok(()),
+            Err(unanswered) => unanswered,
+        };
+        if let Error::Protocol { received, .. } = unanswered.error() {
+            // The response could not be written and nothing was queued, so the question is
+            // still open. Withdraw it with ACP's `cancelled` outcome, which an agent already
+            // handles, rather than letting the responder's drop refuse it with an error.
+            let error = internal_error(format!(
                 "expected a serialisable session/request_permission response | received: {received}"
-            )),
-            error => internal_error(format!(
+            ));
+            let (responder, _) = unanswered.into_parts();
+            let _ = answer(responder, withdrawn());
+            return Err(error);
+        }
+        settle(Err(unanswered)).map_err(|error| {
+            internal_error(format!(
                 "expected an ACP connection that takes this answer | received: {error}"
-            )),
+            ))
         })
     }
 }
@@ -275,6 +293,41 @@ mod tests {
             received,
             [expected],
             "expected exactly this permission answer on the wire: {expected} | received: {received:?}"
+        );
+    }
+
+    /// A response that cannot be written.
+    struct UnserialisableResponse;
+
+    impl serde::Serialize for UnserialisableResponse {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("refused by the test"))
+        }
+    }
+
+    /// Nothing was queued for a response that does not serialise, so the question is withdrawn
+    /// with the `cancelled` outcome, as a reply dropped unanswered is, and the caller is told why.
+    #[tokio::test]
+    async fn a_response_that_does_not_serialise_withdraws_the_question_and_names_the_cause() {
+        let (_client, link, responder) = asked(13).await;
+        let error = PermissionReply::new(responder)
+            .respond_with(&UnserialisableResponse)
+            .expect_err("expected the unserialisable response to be refused");
+
+        let received = first_sent(&link).await;
+        let expected = serde_json::json!({
+            "jsonrpc": "2.0", "id": 13, "result": { "outcome": { "outcome": "cancelled" } }
+        });
+        assert_eq!(
+            received, expected,
+            "expected the question withdrawn on the wire: {expected} | received: {received}"
+        );
+        assert!(
+            error.message.starts_with(
+                "expected a serialisable session/request_permission response | received: "
+            ) && error.message.contains("refused by the test"),
+            "expected an error naming the response and the cause | received: {:?}",
+            error.message
         );
     }
 
