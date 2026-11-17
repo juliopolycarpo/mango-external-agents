@@ -1539,6 +1539,12 @@ async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotif
             return;
         }
     }
+    // Taken after the events: the ones before the refused call still reach the host, and the
+    // terminal closes them.
+    let overflow = state.lock_reducer().take_call_overflow();
+    if let Some(received) = overflow {
+        report_open_call_overflow(state, &turn, received).await;
+    }
 }
 
 /// What a `session/update` this client cannot read still does: the turn's host is told once.
@@ -1615,7 +1621,45 @@ async fn on_unreadable_update(
 /// reasoning and plan the agent left running are closed as failed where the payload budget
 /// permits, and then the reserved terminal commits.
 async fn report_refused_event(state: &SessionState, turn: &TurnHandle, error: &Error) {
-    if !matches!(error, Error::InvalidVendorValue { .. }) || turn.sink.is_terminal() {
+    if !matches!(error, Error::InvalidVendorValue { .. }) {
+        return;
+    }
+    fail_turn_with(
+        state,
+        turn,
+        VendorError::new(
+            mango_external_agents::ErrorCode::from_static("acp-refused-event"),
+            format!("the ACP agent sent an event the core refused to publish: {error}"),
+        ),
+    )
+    .await;
+}
+
+/// Fails the turn when the agent holds more tool calls open than [`crate::reducer::MAX_OPEN_CALLS`]
+/// allows, so the host is told why the turn ended.
+///
+/// The reducer refused the call that would pass the bound and forwarded nothing for it, so the host
+/// holds no start without a close: what the turn owes is settled as for a refused event, by
+/// [`fail_turn_with`].
+async fn report_open_call_overflow(state: &SessionState, turn: &TurnHandle, received: usize) {
+    fail_turn_with(
+        state,
+        turn,
+        VendorError::new(
+            mango_external_agents::ErrorCode::from_static("acp-activity-overflow"),
+            format!(
+                "expected at most {} concurrently open tool calls in one turn | received {received}",
+                crate::reducer::MAX_OPEN_CALLS
+            ),
+        ),
+    )
+    .await;
+}
+
+/// Settles what the turn still owes and commits `failure` as its terminal, unless it already has
+/// one. See [`report_refused_event`] for the order and why.
+async fn fail_turn_with(state: &SessionState, turn: &TurnHandle, failure: VendorError) {
+    if turn.sink.is_terminal() {
         return;
     }
     // From taking what the turn owes to committing its terminal in one piece: see
@@ -1632,13 +1676,7 @@ async fn report_refused_event(state: &SessionState, turn: &TurnHandle, error: &E
     let _ = turn.approvals.flush(&turn.sink).await;
     crate::session::emit_terminal_activity_events(&turn.sink, closing, ActivityStatus::Failed)
         .await;
-    let _ = turn
-        .sink
-        .fail(VendorError::new(
-            mango_external_agents::ErrorCode::from_static("acp-refused-event"),
-            format!("the ACP agent sent an event the core refused to publish: {error}"),
-        ))
-        .await;
+    let _ = turn.sink.fail(failure).await;
 }
 
 /// One `session/request_permission` request, brokered.
@@ -3645,6 +3683,11 @@ mod tests {
 
         /// A state with a turn running on it, and the receiver the host reads that turn from.
         fn running_turn() -> (Arc<SessionState>, EventSink, EventReceiver) {
+            running_turn_holding(16)
+        }
+
+        /// [`running_turn`] with room for `capacity` queued payload events.
+        fn running_turn_holding(capacity: usize) -> (Arc<SessionState>, EventSink, EventReceiver) {
             let (state, host) = state();
             let state = Arc::new(state);
             let (sink, events) = EventSink::new(
@@ -3652,7 +3695,7 @@ mod tests {
                 TurnId::new("turn-1"),
                 AttemptId::default(),
                 Arc::clone(host.clock()),
-                16,
+                capacity,
             );
             state
                 .begin_turn(sink.clone(), None)
@@ -3741,6 +3784,53 @@ mod tests {
             assert!(
                 last == "error acp-refused-event" && owed == closed,
                 "expected the running call, plan and thought closed before acp-refused-event | received {sequence:?}"
+            );
+        }
+
+        /// An agent that starts more calls than a turn may hold open, and finishes none, fails the
+        /// turn by name; every call the host saw start is closed first and the refused one never
+        /// reached it.
+        #[tokio::test]
+        async fn a_call_past_the_open_call_bound_fails_the_turn_after_closing_what_it_opened() {
+            use crate::reducer::MAX_OPEN_CALLS;
+            use mango_external_agents::ActivityStatus;
+
+            let (state, _sink, mut events) = running_turn_holding(4 * MAX_OPEN_CALLS);
+            for index in 0..=MAX_OPEN_CALLS {
+                crate::client::on_session_update(&state, running_call(index)).await;
+            }
+            let outcome = outcome(&events);
+            assert_eq!(
+                outcome, "acp-activity-overflow",
+                "expected the turn to fail with acp-activity-overflow | received: {outcome}"
+            );
+            let (mut started, mut failed_closes) = (0, 0);
+            let mut message = String::new();
+            while let Ok(event) = events.try_recv() {
+                match event.kind {
+                    EventKind::ActivityStarted { .. } => started += 1,
+                    EventKind::ActivityCompleted { result, .. }
+                        if result.status == ActivityStatus::Failed =>
+                    {
+                        failed_closes += 1;
+                    }
+                    EventKind::Error { error } => message = error.message,
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                (started, failed_closes),
+                (MAX_OPEN_CALLS, MAX_OPEN_CALLS),
+                "expected {MAX_OPEN_CALLS} starts, each closed as failed, and start {} refused",
+                MAX_OPEN_CALLS + 1
+            );
+            assert_eq!(
+                message,
+                format!(
+                    "expected at most {MAX_OPEN_CALLS} concurrently open tool calls in one turn | \
+                     received {}",
+                    MAX_OPEN_CALLS + 1
+                )
             );
         }
 
