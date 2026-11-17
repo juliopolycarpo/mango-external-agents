@@ -169,7 +169,7 @@ as raw JSON and fails when a reviewed member holds an object its entry does not 
 `Vendor` member holds a child that no list names. A name is listed flat, not per parent, so a
 vendor child that shares a name with a member reviewed elsewhere passes.
 
-Each line gives the count of distinct names and the first 12 in sorted order, then `and N more`.
+Each line gives the count of distinct names and the first 100 in sorted order, then `and N more` for the names it left out.
 A name is escaped for a terminal and cut at 48 characters. The report holds names only, never a
 value, and nothing is printed when no member is new and no user-chosen map has a key. A name inside the model's answer is the
 operator's schema and is left out. Reading a name is the prompt to review it: move it to the

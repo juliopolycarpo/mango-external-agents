@@ -306,15 +306,20 @@ test_vendor_acp_docs_watch() {
   local docs="$test_root/vendor-acp-docs"
   local fake_bin="$test_root/fake-doc-bin"
   local error="$test_root/vendor-acp-docs.error"
+  local allowlist="$test_root/acp-watch-scratch-allowlist.txt"
   local original_path="$PATH"
+  local original_allowlist="$ACP_DOCS_ALLOWLIST"
   local claude_index='https://code.claude.com/docs/llms.txt'
   local claude_reference='https://code.claude.com/docs/en/cli-reference.md'
   local codex_index='https://learn.chatgpt.com/llms.txt'
   local codex_reference='https://learn.chatgpt.com/docs/developer-commands.md?surface=cli'
   mkdir -p "$fake_bin"
-  ln -s "$repo_root/scripts/test-fixtures/fake-doc-curl.sh" "$fake_bin/curl"
+  ln -sf "$repo_root/scripts/test-fixtures/fake-doc-curl.sh" "$fake_bin/curl"
   export PATH="$fake_bin:$PATH"
   export FAKE_DOC_ROOT="$docs"
+  # An empty scratch allowlist: these cases are about the pages, not the committed entries.
+  ACP_DOCS_ALLOWLIST="$allowlist"
+  write_acp_allowlist "$allowlist"
 
   assert_eq "$(vendor_documents claude | wc -l | tr -d ' ')" '2' 'Claude watches its index and CLI reference'
   assert_eq "$(vendor_documents codex | wc -l | tr -d ' ')" '2' 'Codex watches its index and CLI reference'
@@ -360,6 +365,7 @@ test_vendor_acp_docs_watch() {
   expect_status 2 main
   expect_status 2 main claude "$test_root/unused-report.md" codex
   unset FAKE_DOC_ROOT
+  ACP_DOCS_ALLOWLIST="$original_allowlist"
   export PATH="$original_path"
 }
 
@@ -388,7 +394,7 @@ test_vendor_acp_docs_report() {
   local claude_reference='https://code.claude.com/docs/en/cli-reference.md'
   local reviewed='- [claude-agent-acp](https://code.claude.com/docs/en/adapter.md): Third-party ACP adapter'
   mkdir -p "$fake_bin"
-  ln -s "$repo_root/scripts/test-fixtures/fake-doc-curl.sh" "$fake_bin/curl"
+  ln -sf "$repo_root/scripts/test-fixtures/fake-doc-curl.sh" "$fake_bin/curl"
   export PATH="$fake_bin:$PATH"
   export FAKE_DOC_ROOT="$docs"
   ACP_DOCS_ALLOWLIST="$allowlist"
@@ -409,7 +415,7 @@ test_vendor_acp_docs_report() {
   cat > "$expected" <<'EXPECTED'
 ### https://code.claude.com/docs/llms.txt
 
-Lines naming ACP that no reviewed allowlist entry accepts, with their line numbers (showing 1 of 1; each line is cut at 200 characters):
+Lines naming ACP that no reviewed allowlist entry accepts, with their line numbers (showing 1 of 1; each line is cut at 1000 bytes):
 
 ```text
 2:- [ACP](https://code.claude.com/docs/en/acp.md): Run Claude Code as an ACP agent
@@ -436,7 +442,7 @@ EXPECTED
   # More mentions than the report shows are counted, so a maintainer knows to open the page.
   write_fake_doc "$docs" "$claude_index" '# Claude Code Docs' 'ACP one' 'ACP two' 'ACP three' 'ACP four'
   expect_status 1 check_vendor claude "$report"
-  assert_contains "$report" '(showing 3 of 4; each line is cut at 200 characters)' 'a long list states how much it shows'
+  assert_contains "$report" '(showing 3 of 4; each line is cut at 1000 bytes)' 'a long list states how much it shows'
   assert_not_contains "$report" 'ACP four' 'the fourth mention stays out of the report'
 
   # An unreadable page reports its URL and no curl output; exit status 2.
@@ -476,6 +482,115 @@ EXPECTED
   unset FAKE_DOC_ROOT
   ACP_DOCS_ALLOWLIST="$original_allowlist"
   export PATH="$original_path"
+}
+
+# An allowlist entry is a whole page line, so the report must carry a long llms.txt index line whole
+# and still fit the 65536 bytes the "Bound the drift result" step allows.
+test_vendor_acp_docs_report_long_lines() {
+  local docs="$test_root/vendor-acp-long-docs"
+  local fake_bin="$test_root/fake-long-doc-bin"
+  local allowlist="$test_root/acp-long-allowlist.txt"
+  local report="$test_root/acp-long-report/acp-docs.md"
+  local combined="$test_root/acp-long-report/report.md"
+  local committed="$test_root/acp-long-committed"
+  local observed="$test_root/acp-long-observed"
+  local original_path="$PATH"
+  local original_allowlist="$ACP_DOCS_ALLOWLIST"
+  local claude_index='https://code.claude.com/docs/llms.txt'
+  local claude_reference='https://code.claude.com/docs/en/cli-reference.md'
+  local long_line
+  local overlong_line
+  local multibyte_line
+  local reported
+  local reported_bytes
+  local character
+  local padding
+  local cut_input
+  local cut_output
+  local bytes
+  mkdir -p "$fake_bin"
+  ln -sf "$repo_root/scripts/test-fixtures/fake-doc-curl.sh" "$fake_bin/curl"
+  export PATH="$fake_bin:$PATH"
+  export FAKE_DOC_ROOT="$docs"
+  ACP_DOCS_ALLOWLIST="$allowlist"
+  write_acp_allowlist "$allowlist"
+
+  # A line well past the old 200-character cut is reported whole.
+  long_line="- [Reference](https://code.claude.com/docs/en/reference.md): ACP $(printf 'detail %.0s' {1..100})"
+  write_clean_fake_docs "$docs"
+  write_fake_doc "$docs" "$claude_index" '# Claude Code Docs' "$long_line"
+  expect_status 1 check_vendor claude "$report"
+  assert_contains "$report" "2:$long_line" 'a long matching line is reported whole'
+
+  # A line past the bound is cut at it, not dropped: the report names the bound.
+  overlong_line="ACP $(head -c 5000 /dev/zero | tr '\0' 'x')"
+  write_fake_doc "$docs" "$claude_index" '# Claude Code Docs' "$overlong_line"
+  expect_status 1 check_vendor claude "$report"
+  reported=$(grep -m 1 '^2:ACP ' "$report")
+  assert_eq "${#reported}" "$ACP_LINE_CUT" 'an overlong matching line is cut at the bound'
+  assert_contains "$report" "each line is cut at $ACP_LINE_CUT bytes" 'the report names the cut'
+
+  # The cut counts bytes, so it must not leave half of a multibyte character in the report: "2:ACP x"
+  # is 7 bytes, so the 1000-byte cut falls between the two bytes of the 497th two-byte character.
+  multibyte_line="ACP x$(printf 'é%.0s' {1..600})"
+  write_fake_doc "$docs" "$claude_index" '# Claude Code Docs' "$multibyte_line"
+  expect_status 1 check_vendor claude "$report"
+  if ! python3 -I -c 'import sys; sys.stdin.buffer.read().decode("utf-8")' < "$report" 2> "$test_root/acp-long-utf8.error"; then
+    fail "(report encoding): expected valid UTF-8 after a cut inside a multibyte character | received $(tr '\n' '|' < "$test_root/acp-long-utf8.error")"
+  fi
+  reported_bytes=$(grep -m 1 '^2:ACP x' "$report" | wc -c | tr -d ' ')
+  # wc counts the newline too.
+  if [ "$reported_bytes" -gt "$((ACP_LINE_CUT + 1))" ]; then
+    fail "(report line length): expected at most $ACP_LINE_CUT bytes | received $((reported_bytes - 1))"
+  fi
+
+  # Every split of a two-, three- and four-byte character leaves valid UTF-8, and a character the
+  # cut leaves whole stays.
+  for character in 'é' '€' '😀'; do
+    for padding in 995 996 997 998 999 1000; do
+      cut_input="$(head -c "$padding" /dev/zero | tr '\0' 'x')${character}tail"
+      cut_output=$(printf '%s\n' "$cut_input" | cut_lines_to_report_bytes)
+      if ! printf '%s' "$cut_output" | python3 -I -c 'import sys; sys.stdin.buffer.read().decode("utf-8")' 2> /dev/null; then
+        fail "(cut_lines_to_report_bytes): expected valid UTF-8 for $padding bytes then $character | received invalid bytes"
+      fi
+    done
+  done
+  assert_eq "$(printf '%s\n' "$(head -c 996 /dev/zero | tr '\0' 'x')é" | cut_lines_to_report_bytes | tail -c 4)" 'xé' \
+    'a two-byte character that fits before the cut is kept'
+
+  # The worst docs section on both pages of a vendor, joined to a diff of the largest size, still
+  # fits the bound the workflow enforces.
+  write_fake_doc "$docs" "$claude_index" '# Claude Code Docs' "$overlong_line" "$overlong_line" "$overlong_line" "$overlong_line"
+  write_fake_doc "$docs" "$claude_reference" 'claude -p --print' "$overlong_line" "$overlong_line" "$overlong_line" "$overlong_line"
+  expect_status 1 check_vendor claude "$report"
+  mkdir -p "$committed" "$observed"
+  seq 1 40000 > "$committed/contract.json"
+  seq 40001 80000 > "$observed/contract.json"
+  write_report claude "$committed" "$observed" "$combined" || [ $? -eq 1 ]
+  write_docs_report claude "$report" "$combined"
+  bytes=$(wc -c < "$combined")
+  if [ "$bytes" -gt 65536 ]; then
+    fail "(drift report size): expected at most 65536 bytes with a full diff and a full docs section | received $bytes"
+  fi
+
+  unset FAKE_DOC_ROOT
+  ACP_DOCS_ALLOWLIST="$original_allowlist"
+  export PATH="$original_path"
+}
+
+# The watch tests must not read the committed allowlist: its first real entry would match no line of
+# their fake pages and fail every one of them. Stand in for that entry by pointing the inherited
+# allowlist at a populated file, then run each watch test against it.
+test_vendor_acp_docs_tests_ignore_the_inherited_allowlist() {
+  local committed_stand_in="$test_root/acp-committed-stand-in.txt"
+  local original_allowlist="$ACP_DOCS_ALLOWLIST"
+  write_acp_allowlist "$committed_stand_in" claude '- [x-acp](https://e.test/a.md): adapter' 'third-party'
+  ACP_DOCS_ALLOWLIST="$committed_stand_in"
+  test_vendor_acp_docs_watch
+  assert_eq "$ACP_DOCS_ALLOWLIST" "$committed_stand_in" 'the watch test restores the allowlist it found'
+  test_vendor_acp_docs_report
+  assert_eq "$ACP_DOCS_ALLOWLIST" "$committed_stand_in" 'the report test restores the allowlist it found'
+  ACP_DOCS_ALLOWLIST="$original_allowlist"
 }
 
 test_docs_drift_report() {
@@ -813,6 +928,8 @@ test_claude_bare_reference
 test_vendor_acp_document
 test_vendor_acp_docs_watch
 test_vendor_acp_docs_report
+test_vendor_acp_docs_report_long_lines
+test_vendor_acp_docs_tests_ignore_the_inherited_allowlist
 test_docs_drift_report
 test_vendor_acp_allowlist_entries
 test_vendor_acp_document_allowlist

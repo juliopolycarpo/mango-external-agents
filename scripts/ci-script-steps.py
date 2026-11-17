@@ -13,8 +13,8 @@ as run only when every one of these holds:
   newlines, `;`, `&&`, `||`, `|` and `&` (quotes, `$(...)`, comments and here-documents respected)
   and a test command counts only when it is joined to its neighbours by a newline or `;`, sits in no
   `if`, loop, `case`, function, group or subshell, follows no `exit` that can end the block and no
-  `set +e`, no `trap` on EXIT, ERR or DEBUG that is still set, and no `exec` with a command, and is
-  not followed by a `||` handler other than an `exit` with a failing status;
+  `set +e`, no `trap` on EXIT, ERR or DEBUG that is still set, no `exec` with a command and no `.`
+  or `source` of a file (the file is not opened), and is not followed by a `||` handler other than an `exit` with a failing status;
 - the step runs under `bash` or `sh`, the shells that stop at a failing command, set on the step
   or by `defaults.run`; with no `shell:` at all it runs under `bash -e` on Linux and macOS but
   under `pwsh` on Windows, so it counts only when its job cannot run there (no `runs-on` label,
@@ -584,12 +584,27 @@ def replaces_shell(command):
     return False
 
 
-def command_blocker(entries, index, stack, ended_by, errexit_off, exit_traps):
+def sources_file(command):
+    """True for `.` or `source` with a file, which runs that file's commands in this shell.
+
+    A `trap`, `set +e` or `exec` inside the file changes what happens to a later command, and the
+    check does not open the file, so the sourcing is itself the reason to refuse what follows.
+    `command` and `builtin` before it change nothing; `eval` runs its arguments as commands.
+    """
+    words = shell_words(command)
+    if words and words[0] == "eval":
+        return bool(last_change_in_eval(words, sources_file))
+    return len(words) > 1 and words[0] in (".", "source")
+
+
+def command_blocker(entries, index, stack, ended_by, errexit_off, exit_traps, sourced):
     """Why the test command in entries[index] may not run or may not fail the step, or None."""
     if ended_by:
         return ended_by
     if exit_traps:
         return f"it follows `{next(iter(exit_traps.values()))}`, which can turn a later failure into a clean exit"
+    if sourced:
+        return f"it follows `{sourced}`, which runs a file in this shell, and the check does not open the file"
     if stack:
         return f"it is inside a shell `{stack[-1]}` block, which the check does not follow"
     if errexit_off:
@@ -616,7 +631,9 @@ def run_findings(run):
     """Yields (test, reason or None) for each test named in a `run:` block."""
     entries = split_commands(run)
     # exit_traps maps each pseudo-signal with a trap still set to the command that set it.
-    stack, ended_by, errexit_off, exit_traps, closes = [], None, None, {}, False
+    # sourced holds the first `.` or `source` command seen; like a trap it counts even under a
+    # condition, since the file may run and nothing here proves it does not.
+    stack, ended_by, errexit_off, exit_traps, closes, sourced = [], None, None, {}, False, None
     for index, (text, after, is_here_document) in enumerate(entries):
         if closes:
             stack.pop()
@@ -630,7 +647,9 @@ def run_findings(run):
         unconditional = not stack and before in SEQUENTIAL and after in SEQUENTIAL
         match = COMMAND.match(command) if can_run else None
         if match:
-            yield match.group(1), command_blocker(entries, index, stack, ended_by, errexit_off, exit_traps)
+            yield match.group(1), command_blocker(
+                entries, index, stack, ended_by, errexit_off, exit_traps, sourced
+            )
             continue
         for name in ANY_NAME.findall(command):
             yield name, f"`{command}` names it but does not start with it as a command"
@@ -648,6 +667,8 @@ def run_findings(run):
                     exit_traps.setdefault(signal, command)
                 elif unconditional and signal != UNKNOWN_SIGNAL:
                     exit_traps.pop(signal, None)
+        if sources_file(command) and not sourced:
+            sourced = command
         if replaces_shell(command) and not ended_by:
             ended_by = f"it follows `{command}`, which replaces the shell, so no later command runs"
         if EXIT.match(command) and not ended_by:

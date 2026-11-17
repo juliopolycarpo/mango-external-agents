@@ -1001,7 +1001,8 @@ impl CaptureOptions {
             && self
                 .scenario
                 .as_deref()
-                .is_some_and(crate::capture::claude_scenario_needs_schema);
+                // Every Claude scenario runs under a schema, so a named one needs the file.
+                .is_some_and(|name| crate::capture::claude_scenario_names().contains(&name));
         match (&self.json_schema, needs_schema) {
             (Some(_), true) | (None, false) => Ok(()),
             (None, true) => Err(format!(
