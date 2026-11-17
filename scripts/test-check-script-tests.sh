@@ -38,8 +38,8 @@ make_repo() {
 
 # WorkflowFixture: a ci.yml whose `policy` job runs the files in $3 and is gated, plus the one test
 # $2 placed as variant $1 describes. `clean` places nothing extra. `block` places the multi-line
-# run block in $run_block; `matrix-custom` places a matrixed job from $matrix_lines and the step
-# guard $matrix_guard. Whether the check refuses $2 is each case's own expectation.
+# run block in $run_block; `matrix-custom` places a matrixed job from $matrix_lines, $matrix_runs_on,
+# the step guard $matrix_guard and the shells $step_shell, $job_shell and $workflow_shell. Whether the check refuses $2 is each case's own expectation.
 workflow_fixture() {
   local variant=$1 placed=$2 in_ci=$3 name
   local needs='[policy]' triggers='pull_request' gate=true
@@ -48,6 +48,7 @@ workflow_fixture() {
   echo 'name: CI'
   echo "on: { $triggers: { branches: [main] } }"
   [ "$variant" = shell-workflow ] && echo "defaults: { run: { shell: '$shell_name' } }"
+  [ "$variant" = matrix-custom ] && [ -n "$workflow_shell" ] && echo "defaults: { run: { shell: '$workflow_shell' } }"
   echo 'jobs:'
   # A YAML comment naming a test is not a run, with or without the file behind it.
   echo '  # test-ghost.sh is only mentioned in a comment'
@@ -101,12 +102,17 @@ workflow_fixture() {
       needs='[policy, shelled]' ;;
     matrix-custom)
       echo '  matrixed:'
-      echo '    runs-on: ${{ matrix.os }}'
-      echo '    strategy:'
-      echo '      matrix:'
-      while IFS= read -r line; do printf '        %s\n' "$line"; done <<<"$matrix_lines"
+      echo "    runs-on: $matrix_runs_on"
+      [ -n "$job_shell" ] && echo "    defaults: { run: { shell: '$job_shell' } }"
+      if [ -n "$matrix_lines" ]; then
+        echo '    strategy:'
+        echo '      matrix:'
+        while IFS= read -r line; do printf '        %s\n' "$line"; done <<<"$matrix_lines"
+      fi
       echo '    steps:'
-      echo "      - if: $matrix_guard"
+      echo '      - name: placed test'
+      [ -n "$matrix_guard" ] && echo "        if: $matrix_guard"
+      [ -n "$step_shell" ] && echo "        shell: $step_shell"
       echo "        run: scripts/$placed"
       needs='[policy, matrixed]' ;;
     matrix-os | matrix-os-unlisted)
@@ -152,6 +158,9 @@ workflow_fixture() {
 }
 
 run_block='' shell_name='' matrix_lines='' matrix_guard=''
+# The `matrix-custom` job runs on ${{ matrix.os }} under `shell: bash` unless a case says otherwise;
+# `workflow_shell` and `job_shell` set `defaults.run.shell` on the workflow and on that job.
+matrix_runs_on='${{ matrix.os }}' step_shell=bash job_shell='' workflow_shell=''
 base='test-alpha.sh test-beta.py test-vendor-drift.sh test-package-admission.sh'
 
 # expect_pass <case>: the check exits 0.
@@ -366,6 +375,50 @@ matrix_fail 'an OS that exclude removes' $'os: [ubuntu-latest, macos-latest]\nex
 matrix_fail 'an OS that every combination excludes' $'os: [ubuntu-latest]\narch: [x64]\nexclude:\n  - arch: x64' "matrix.os == 'ubuntu-latest'" "the matrix os values are [], expected it to contain 'ubuntu-latest'"
 matrix_fail 'an os list that is an expression' 'os: ${{ fromJSON(needs.plan.outputs.os) }}' "matrix.os == 'ubuntu-latest'" "its matrix cannot be expanded: matrix.os is '\${{ fromJSON(needs.plan.outputs.os) }}', expected a list"
 matrix_fail 'an include os that is an expression' $'os: [ubuntu-latest]\ninclude:\n  - os: ${{ inputs.os }}' "matrix.os == 'ubuntu-latest'" "its matrix cannot be expanded: a matrix entry sets os to '\${{ inputs.os }}', expected a literal"
+
+# A step with no `shell:` runs under bash -e on Linux and macOS but under pwsh on Windows, which
+# does not stop at a failing native command. A step that can run there needs bash or sh declared on
+# the step, its job or the workflow. `runs-on` and every matrix `os` value count; a step guarded to
+# one `os` counts only for that one.
+# windows_setup <runs-on> <matrix lines> <step guard> [step shell] [job shell] [workflow shell]
+windows_setup() {
+  matrix_runs_on=$1 matrix_lines=$2 matrix_guard=$3 step_shell=${4-} job_shell=${5-} workflow_shell=${6-}
+  make_repo "$work/repo" "$base" "$without_beta" matrix-custom
+}
+windows_pass() {
+  windows_setup "${@:2}"
+  expect_pass "$1"
+}
+# windows_fail <case> <reason after the blocked prefix> <windows_setup arguments>
+windows_fail() {
+  windows_setup "${@:3}"
+  expect_fail "$1" "${blocked_prefix}$2"
+}
+pwsh_tail='where a step with no `shell:` runs under pwsh, which does not stop at a failing command; expected `shell: bash` on the step or in `defaults.run`'
+matrix_windows=$'os: [ubuntu-latest, windows-latest]'
+all_os='${{ matrix.os }}'
+
+windows_fail 'a windows-latest job with no shell' "job 'matrixed' can run on Windows ('windows-latest'), $pwsh_tail" windows-latest '' ''
+windows_fail 'a matrix os list that includes Windows' "job 'matrixed' can run on Windows ('windows-latest'), $pwsh_tail" "$all_os" "$matrix_windows" ''
+windows_fail 'a Windows os added by an include entry' "job 'matrixed' can run on Windows ('windows-latest'), $pwsh_tail" "$all_os" $'os: [ubuntu-latest]\ninclude:\n  - os: windows-latest' ''
+windows_fail 'a step guarded to the Windows os' "job 'matrixed' can run on Windows ('windows-latest'), $pwsh_tail" "$all_os" "$matrix_windows" "matrix.os == 'windows-latest'"
+windows_fail 'a Windows os in the matrix of a Linux job' "job 'matrixed' can run on Windows ('windows-latest'), $pwsh_tail" ubuntu-latest 'os: [windows-latest]' ''
+windows_fail 'a runs-on list with a windows label' "job 'matrixed' can run on Windows ('windows'), $pwsh_tail" '[self-hosted, windows]' '' ''
+windows_fail 'a runs-on expression the check cannot expand' "job 'matrixed' has \`runs-on: \${{ inputs.runner }}\`, which the check cannot expand, so it may run on Windows, $pwsh_tail" '${{ inputs.runner }}' '' ''
+windows_fail 'a runs-on that reads a matrix that cannot be expanded' "job 'matrixed' has \`runs-on: \${{ matrix.os }}\` and its matrix cannot be expanded (matrix.os is '\${{ fromJSON(needs.plan.outputs.os) }}', expected a list), so it may run on Windows, $pwsh_tail" "$all_os" 'os: ${{ fromJSON(needs.plan.outputs.os) }}' ''
+windows_pass 'a Windows job under shell: bash on the step' windows-latest '' '' bash
+windows_pass 'a Windows job under shell: bash on the job' windows-latest '' '' '' bash
+windows_pass 'a Windows job under shell: bash on the workflow' windows-latest '' '' '' '' bash
+windows_pass 'a matrix with Windows under shell: bash' "$all_os" "$matrix_windows" '' bash
+windows_pass 'a matrix whose Windows combinations are excluded' "$all_os" $'os: [ubuntu-latest, windows-latest]\nexclude:\n  - os: windows-latest' ''
+windows_pass 'a step guarded to a Linux os of a matrix with Windows' "$all_os" "$matrix_windows" "matrix.os == 'ubuntu-latest'"
+windows_pass 'a matrix of Linux and macOS with no shell' "$all_os" $'os: [ubuntu-latest, macos-latest]' ''
+windows_pass 'a ubuntu-latest job with no shell' ubuntu-latest '' ''
+# Windows is recognised only by a `windows` label (any case); the check cannot know what else a
+# self-hosted runner is, and docs/testing.md says so.
+windows_pass 'a self-hosted runner whose labels do not name Windows' '[self-hosted, gpu]' '' ''
+windows_fail 'a runs-on label that names Windows in capitals' "job 'matrixed' can run on Windows ('Windows'), $pwsh_tail" '[self-hosted, Windows]' '' ''
+matrix_runs_on='${{ matrix.os }}' step_shell=bash job_shell='' workflow_shell=''
 
 # An indirect parent is held to the same rule.
 make_repo "$work/repo" "$base" "test-alpha.sh test-beta.py test-package-admission.sh" orphan-job test-vendor-drift.sh
