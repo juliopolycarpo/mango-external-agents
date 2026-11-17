@@ -27,8 +27,8 @@ testing = ["mango-external-agents/testing"]
 # Driven end to end against the fake agent, which only exists under `testing`. Declared so the
 # `--no-default-features` lane skips the target instead of failing to resolve the import.
 [[test]]
-name = "session"
-path = "tests/session.rs"
+name = "it"
+path = "tests/it/main.rs"
 required-features = ["testing"]
 
 [dependencies]
@@ -40,7 +40,6 @@ required-features = ["testing"]
 agent-client-protocol-schema = { version = "=1.17.0", default-features = false }
 async-trait.workspace = true
 base64 = { workspace = true, features = ["std"] }
-chrono = { workspace = true, features = ["std"] }
 mango-external-agents.workspace = true
 # The bounds on the request and response types a caller hands the connection. No derive here: the
 # schema crate owns every wire type.

@@ -13,6 +13,26 @@ matches `--all-features`. The counts are identical with and without the flag:
 | `cargo nextest run -p <crate>`                | 1271 |    656 |   743 | 631 |
 | `cargo nextest run -p <crate> --all-features` | 1271 |    656 |   743 | 631 |
 
+## One integration binary per crate
+
+Each crate's integration tests are modules of one binary, `tests/it/main.rs`, with a module per
+file (`tests/it/<name>.rs`, and `tests/it/<name>/` for a module's own submodules). A target of its
+own costs a link of the whole dependency tree and about a hundred megabytes in `target/`, so this
+replaces 33 test binaries with 7. Add a test file as a module of that crate's `main.rs`; do not add
+a `tests/<name>.rs` beside it.
+
+- A test is named `<module>::<path>` under the binary `it`, so a filter that named a file now names
+  its module: `cargo nextest run -p mango-agent-claude -E 'test(cleanup_required::)'`.
+- A module that needs a feature is gated in `main.rs` with `#[cfg(feature = "...")]`, so the
+  reduced-feature lanes still compile the others. `mango-agent-acp` needs `testing` for all of its
+  modules, so its target declares `required-features` instead.
+- `mango-agent-acp/tests/smoke.rs` stays a binary of its own: a profile's verification evidence
+  names that file, and it only runs on request.
+- The tradeoff is that one compile error in a module blocks every module of that crate, and a
+  change to one file recompiles the whole binary.
+- `nextest` still runs each test in its own process, so tests do not share statics. `cargo test`
+  runs a binary's tests as threads of one process; do not rely on that.
+
 ## The entry
 
 ```toml
@@ -100,10 +120,7 @@ It does not follow shell conditionals inside a `run:` block, `set +e`, or `matri
 `scripts/test-fixtures/` included. `.shellcheckrc` makes it follow `# shellcheck source=`
 directives. The Policy job in `ci.yml` installs shellcheck through `taiki-e/install-action` at an
 exact version (`shellcheck@0.11.0`, so a new release cannot add findings to an unrelated change),
-runs the gate, and fails when the tool is missing. The release workflow's verify job installs the
-same version before `scripts/check.sh`, because GitHub's runner images ship their own shellcheck
-and the probe in `check.sh` would otherwise pick it up; `scripts/test-release.sh` pins that entry.
-The gate prints the version it ran under.
+runs the gate, and fails when the tool is missing. The gate prints the version it ran under.
 
 `scripts/check.sh` runs the gate when shellcheck is on `PATH` and otherwise warns once and skips
 it, as it does for cargo-hack. To get the CI version without a system-wide install, take the

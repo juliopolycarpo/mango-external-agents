@@ -96,7 +96,8 @@ pub async fn open(
 /// A send fails with exactly the error the child's [`ByteSink`] returned for the write, so the
 /// contract of `LinkSender::send` is the sink's own: an [`Error::Link`] when bytes may have
 /// been accepted, and any other error only when none were. Nothing here turns one into the
-/// other.
+/// other. The one error of its own is for a message that holds a line break, refused before any
+/// byte is written.
 struct LineSink {
     stdin: Box<dyn ByteSink>,
 }
@@ -104,6 +105,14 @@ struct LineSink {
 #[async_trait::async_trait]
 impl LinkSender for LineSink {
     async fn send(&mut self, mut message: String) -> Result<()> {
+        // A line break inside a message would reach the peer as two messages. Nothing was
+        // written, so this is not an `Error::Link`. The text is left out: it may hold a prompt.
+        if message.contains('\n') {
+            return Err(Error::Protocol {
+                expected: String::from("one message with no line break"),
+                received: format!("a message of {} bytes holding a line break", message.len()),
+            });
+        }
         // One write rather than two: a second write could interleave with another task's message
         // and split a frame across two lines. The newline joins the message the caller handed
         // over, which it no longer needs, instead of a second copy of it.
@@ -554,6 +563,42 @@ mod tests {
         assert_eq!(
             writes, expected,
             "expected one write per message, each ending in a single newline | received {writes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_holding_a_line_break_is_refused_before_any_write() {
+        let inner = Arc::new(FakeLauncher::new());
+        inner.push(FakeProcess::responding(|_| Vec::new()));
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let host = HostContext::builder()
+            .launcher(Arc::new(LoggedStdinLauncher {
+                inner,
+                log: Arc::clone(&log),
+            }))
+            .cwd("/workspace")
+            .client_info("test-host", "0.0.0")
+            .build()
+            .expect("expected a host");
+        let transport = open(
+            &host,
+            &StdioSpec::new(["codex"]),
+            &ExecutablePath::default(),
+            &[],
+        )
+        .await
+        .expect("expected a transport");
+        let (mut sender, _receiver) = transport.link.split();
+
+        let refused = sender
+            .send(String::from("{\"method\":\"a\"}\n{\"method\":\"b\"}"))
+            .await;
+
+        let written = log.lock().expect("expected an unpoisoned write log").len();
+        assert!(
+            matches!(&refused, Err(Error::Protocol { expected, .. }) if expected == "one message with no line break")
+                && written == 0,
+            "expected Error::Protocol and no write for a message holding a newline | received {refused:?} after {written} writes"
         );
     }
 

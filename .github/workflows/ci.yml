@@ -50,6 +50,11 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: scripts/run-without-self-dev-dependency.sh cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
       - run: cargo nextest run --workspace --all-features --locked
+      # The run above links `mango-agent-acp`, whose schema crate turns on `serde_json/preserve_order`
+      # for the whole workspace. Selecting this one package builds it with only its own features, so
+      # the byte-pinning tests also run in the build where `serde_json::Map` sorts its keys.
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo nextest run -p mango-agent-claude --locked
       - if: matrix.os == 'ubuntu-latest'
         run: |
           scripts/test-prerelease-toolchain.sh
@@ -120,6 +125,7 @@ jobs:
       - run: scripts/test-consumer-pin.sh
       - run: scripts/test-fresh-receipt.sh
       - run: scripts/test-release.sh
+      - run: scripts/test-check-release-ci.sh
       - run: scripts/test-vendor-drift.sh
       - run: scripts/test-package-admission.sh
       - run: python3 scripts/test-package-fixtures.py

@@ -25,7 +25,7 @@
 //! has never seen is dropped silently; only a `result` ends the turn.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use mango_external_agents::normalize::TextLimit;
@@ -52,6 +52,22 @@ use crate::redacted;
 /// allocation and keeps the cut visible to the one place that reports it; see
 /// `keeps_a_cut_visible_to_the_sink_that_reports_it`.
 const DETAIL_CARRY_MAX_CHARS: usize = 2 * TextLimit::Detail.max_code_points();
+
+/// The most tool calls one run may have open at once.
+///
+/// Claude Code decides how many calls a turn issues before their results arrive, and each open
+/// call holds its id and any denial or subagent text kept for it, so the count is bounded here
+/// rather than by what the vendor sends. The same figure as the default
+/// `Limits::turn_channel_capacity`, and far above the handful of parallel calls a real turn makes.
+///
+/// A call past it is not opened. The reducer records a failure coded [`ACTIVITY_OVERFLOW`] for the
+/// session to take with [`TurnReducer::take_activity_overflow`], and the session ends the turn like
+/// a broken stream: every call the host was told about is closed, then the error is the terminal.
+/// Forwarding the excess untracked instead would give the host a start nothing ever closes.
+pub(crate) const MAX_OPEN_ACTIVITIES: usize = 1_024;
+
+/// The error code of the failure a run ends with when it passes [`MAX_OPEN_ACTIVITIES`].
+pub(crate) const ACTIVITY_OVERFLOW: &str = "claude-activity-overflow";
 
 /// The fields Claude's own built-ins use for "what is this call about", in the order that answers
 /// it best.
@@ -147,9 +163,19 @@ impl Delivered {
 #[derive(Clone, Default)]
 pub struct TurnReducer {
     finished: bool,
-    /// Tool calls this run has opened, in the order it opened them, so an unclosed call can be
-    /// closed in a stable order.
-    open_activities: Vec<String>,
+    /// Tool calls this run has opened and not closed, each with the sequence number it opened
+    /// under, so an unclosed call can be closed in the order it opened.
+    ///
+    /// A map rather than a list: opening, testing and closing a call cost one lookup however many
+    /// calls are open. At most [`MAX_OPEN_ACTIVITIES`] entries.
+    open_activities: HashMap<String, u64>,
+    /// The sequence number the next opened call takes.
+    next_activity_sequence: u64,
+    /// Set when a call past [`MAX_OPEN_ACTIVITIES`] was refused, until the session takes it.
+    activity_overflow: Option<VendorError>,
+    /// The open-call bound, [`MAX_OPEN_ACTIVITIES`] except where a test raises it to hold more
+    /// calls open than the production bound allows.
+    max_open_activities: usize,
     /// Forwarded subagent text per parent call, so updates accumulate rather than replace.
     ///
     /// The flag is set once a cut has happened: the buffer then holds the bound's worth of
@@ -298,7 +324,10 @@ impl TurnReducer {
     pub fn new() -> Self {
         Self {
             finished: false,
-            open_activities: Vec::new(),
+            open_activities: HashMap::new(),
+            next_activity_sequence: 0,
+            activity_overflow: None,
+            max_open_activities: MAX_OPEN_ACTIVITIES,
             nested_text: BTreeMap::new(),
             denied_activities: BTreeMap::new(),
             delivered_by_block: BTreeMap::new(),
@@ -697,7 +726,24 @@ impl TurnReducer {
         if self.is_open(call_id) {
             return None;
         }
-        self.open_activities.push(call_id.to_owned());
+        let bound = self.max_open_activities;
+        if self.open_activities.len() >= bound {
+            // Only the first refusal is kept: it names the count the run first reached.
+            self.activity_overflow.get_or_insert_with(|| {
+                VendorError::new(
+                    ErrorCode::from_static(ACTIVITY_OVERFLOW),
+                    format!(
+                        "expected at most {bound} concurrently open tool calls in \
+                         one turn | received {}",
+                        self.open_activities.len() + 1
+                    ),
+                )
+            });
+            return None;
+        }
+        let sequence = self.next_activity_sequence;
+        self.next_activity_sequence = sequence.wrapping_add(1);
+        self.open_activities.insert(call_id.to_owned(), sequence);
         // Verbatim. `Read` is `Read`, and an MCP tool keeps its namespaced name: renaming
         // another company's tools in a host's interface would misattribute the work.
         let mut activity = Activity::new(
@@ -799,10 +845,14 @@ impl TurnReducer {
     /// that normally delivers the reason never arrived, so the held `system/permission_denied` is
     /// the only statement anyone made about why that call did not happen.
     fn close_open_activities(&mut self) -> Vec<EventKind> {
-        let open = std::mem::take(&mut self.open_activities);
+        let mut open: Vec<(u64, String)> = std::mem::take(&mut self.open_activities)
+            .into_iter()
+            .map(|(call_id, sequence)| (sequence, call_id))
+            .collect();
+        open.sort_unstable_by_key(|(sequence, _)| *sequence);
         let denials = std::mem::take(&mut self.denied_activities);
         open.into_iter()
-            .map(|call_id| {
+            .map(|(_, call_id)| {
                 let detail = denials
                     .get(&call_id)
                     .map(String::as_str)
@@ -817,16 +867,19 @@ impl TurnReducer {
     }
 
     fn is_open(&self, call_id: &str) -> bool {
-        self.open_activities.iter().any(|open| open == call_id)
+        self.open_activities.contains_key(call_id)
     }
 
     /// Removes an open call, answering whether it was one.
     fn close(&mut self, call_id: &str) -> bool {
-        let Some(position) = self.open_activities.iter().position(|open| open == call_id) else {
-            return false;
-        };
-        self.open_activities.remove(position);
-        true
+        self.open_activities.remove(call_id).is_some()
+    }
+
+    /// The failure recorded when a call past [`MAX_OPEN_ACTIVITIES`] was refused, once.
+    ///
+    /// The session asks after every record and ends the turn on `Some`.
+    pub(crate) fn take_activity_overflow(&mut self) -> Option<VendorError> {
+        self.activity_overflow.take()
     }
 
     /// Bounded concatenation of a subagent's forwarded blocks.
@@ -1173,7 +1226,8 @@ fn retryable_status(status: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DETAIL_CARRY_MAX_CHARS, TurnReducer, activity_kind, detail_for, summarize_tool_input,
+        ACTIVITY_OVERFLOW, DETAIL_CARRY_MAX_CHARS, MAX_OPEN_ACTIVITIES, TurnReducer, activity_kind,
+        detail_for, summarize_tool_input,
     };
     use crate::protocol::StreamRecord;
     use mango_external_agents::normalize::TextLimit;
@@ -2890,5 +2944,170 @@ mod tests {
                 assert_eq!(error.message, "Failed after 5 attempts.");
             }
         }
+    }
+
+    /// Opens `count` tool calls, `call-0` onwards, and returns every event they produced.
+    fn open_calls(reducer: &mut TurnReducer, count: usize) -> Vec<EventKind> {
+        let lines: Vec<String> = (0..count)
+            .map(|index| tool_use_line(&format!("call-{index}"), "Bash", &json!({"command": "ls"})))
+            .collect();
+        reduce_lines(reducer, &lines)
+    }
+
+    #[test]
+    fn a_call_past_the_open_activity_bound_is_refused_with_the_named_error() {
+        let mut reducer = TurnReducer::new();
+        let events = open_calls(&mut reducer, MAX_OPEN_ACTIVITIES);
+        assert_eq!(
+            events.len(),
+            MAX_OPEN_ACTIVITIES,
+            "expected one ActivityStarted per call up to the bound"
+        );
+        assert!(
+            reducer.take_activity_overflow().is_none(),
+            "expected no overflow at exactly {MAX_OPEN_ACTIVITIES} open calls"
+        );
+
+        let past = open_calls(&mut reducer, MAX_OPEN_ACTIVITIES + 1);
+        // The calls `call-0..` are already open, so only `call-1024` is new and refused.
+        assert!(
+            past.is_empty(),
+            "expected the refused call not to be forwarded | received {past:?}"
+        );
+        let error = reducer
+            .take_activity_overflow()
+            .expect("expected the call past the bound to record an overflow");
+        assert_eq!(error.code.as_str(), ACTIVITY_OVERFLOW);
+        assert_eq!(
+            error.message,
+            format!(
+                "expected at most {MAX_OPEN_ACTIVITIES} concurrently open tool calls in one turn | \
+                 received {}",
+                MAX_OPEN_ACTIVITIES + 1
+            )
+        );
+        assert!(
+            reducer.take_activity_overflow().is_none(),
+            "expected the overflow to be taken once"
+        );
+    }
+
+    #[test]
+    fn a_completed_call_frees_a_slot_under_the_open_activity_bound() {
+        let mut reducer = TurnReducer::new();
+        open_calls(&mut reducer, MAX_OPEN_ACTIVITIES);
+        reduce(&mut reducer, &tool_result_line("call-0", false, "ok"));
+        let events = reduce(
+            &mut reducer,
+            &tool_use_line("replacement", "Bash", &json!({"command": "ls"})),
+        );
+        assert!(
+            matches!(events.as_slice(), [EventKind::ActivityStarted { .. }])
+                && reducer.take_activity_overflow().is_none(),
+            "expected a freed slot to take a new call | received {events:?}"
+        );
+    }
+
+    #[test]
+    fn the_calls_a_run_leaves_open_are_closed_in_the_order_they_opened() {
+        let mut reducer = TurnReducer::new();
+        open_calls(&mut reducer, 50);
+        reduce(&mut reducer, &tool_result_line("call-7", false, "ok"));
+        let closes: Vec<String> = reducer
+            .cancel()
+            .into_iter()
+            .filter_map(|event| match event {
+                EventKind::ActivityCompleted { call_id, .. } => Some(call_id),
+                _ => None,
+            })
+            .collect();
+        let expected: Vec<String> = (0..50)
+            .filter(|index| *index != 7)
+            .map(|index| format!("call-{index}"))
+            .collect();
+        assert_eq!(
+            closes, expected,
+            "expected the 49 open calls closed in start order"
+        );
+    }
+
+    /// Ten thousand calls each opened and answered in turn never reach the bound.
+    #[test]
+    fn calls_opened_and_answered_one_at_a_time_never_trip_the_bound() {
+        let mut reducer = TurnReducer::new();
+        for index in 0..10_000 {
+            let id = format!("call-{index}");
+            reduce(
+                &mut reducer,
+                &tool_use_line(&id, "Bash", &json!({"command": "ls"})),
+            );
+            reduce(&mut reducer, &tool_result_line(&id, false, "ok"));
+        }
+        assert!(
+            reducer.take_activity_overflow().is_none(),
+            "expected no overflow when calls are closed as they finish"
+        );
+        assert!(
+            reducer.cancel().is_empty(),
+            "expected nothing left open after every call was answered"
+        );
+    }
+
+    /// Many calls held open at once, in a reducer whose bound a test raised past the production
+    /// one. This is the shape a list scanned per start and per close makes quadratic: 20,000 calls
+    /// open together cost on the order of 4 x 10^8 id comparisons that way. The elapsed bound is
+    /// deliberately generous so a slow host does not fail it.
+    #[test]
+    fn many_calls_held_open_at_once_open_and_close_within_a_generous_bound() {
+        const HELD: usize = 20_000;
+        let started = std::time::Instant::now();
+        let mut reducer = TurnReducer::new();
+        reducer.max_open_activities = HELD;
+        open_calls(&mut reducer, HELD);
+        for index in (0..HELD).step_by(2) {
+            reduce(
+                &mut reducer,
+                &tool_result_line(&format!("call-{index}"), false, "ok"),
+            );
+        }
+        let closes: Vec<String> = reducer
+            .cancel()
+            .into_iter()
+            .filter_map(|event| match event {
+                EventKind::ActivityCompleted { call_id, .. } => Some(call_id),
+                _ => None,
+            })
+            .collect();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "expected {HELD} calls held open, half answered and the rest closed within 20s | received {elapsed:?}"
+        );
+        assert!(reducer.take_activity_overflow().is_none());
+        let expected: Vec<String> = (1..HELD)
+            .step_by(2)
+            .map(|index| format!("call-{index}"))
+            .collect();
+        assert_eq!(
+            closes, expected,
+            "expected the unanswered calls closed in the order they opened"
+        );
+    }
+
+    #[test]
+    fn a_raised_bound_moves_the_refusal_and_names_the_raised_limit() {
+        let mut reducer = TurnReducer::new();
+        reducer.max_open_activities = 3;
+        open_calls(&mut reducer, 4);
+        let error = reducer
+            .take_activity_overflow()
+            .expect("expected the fourth call to be refused");
+        assert!(
+            error
+                .message
+                .starts_with("expected at most 3 concurrently open tool calls"),
+            "expected the message to name the raised limit | received {:?}",
+            error.message
+        );
     }
 }
