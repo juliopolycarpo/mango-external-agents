@@ -338,7 +338,17 @@ block_fail 'a command after trap set under a condition' $'[ -n "$X" ] && trap \'
 block_fail 'a command after command trap' $'command trap \'exit 0\' EXIT\nscripts/test-beta.py' "it follows \`command trap 'exit 0' EXIT\`, $trap_reason"
 block_fail 'a command after eval trap' $'eval "trap \'exit 0\' EXIT"\nscripts/test-beta.py' "it follows \`eval \"trap 'exit 0' EXIT\"\`, $trap_reason"
 block_fail 'a command after a trap that was reset only under a condition' $'trap \'exit 0\' EXIT\n[ -n "$X" ] && trap - EXIT\nscripts/test-beta.py' "it follows \`trap 'exit 0' EXIT\`, $trap_reason"
-block_pass 'a command after trap on a signal other than EXIT or ERR' $'trap \'echo bye\' INT TERM\nscripts/test-beta.py'
+block_fail 'a command after trap on DEBUG' $'trap \'exit 0\' DEBUG\nscripts/test-beta.py' "it follows \`trap 'exit 0' DEBUG\`, $trap_reason"
+# Each of EXIT, ERR and DEBUG is tracked on its own: resetting one does not lift another.
+block_fail 'a command after a trap on EXIT when only ERR was reset' $'trap \'exit 0\' EXIT\ntrap - ERR\nscripts/test-beta.py' "it follows \`trap 'exit 0' EXIT\`, $trap_reason"
+block_fail 'a command after a trap on EXIT and ERR when only EXIT was reset' $'trap \'exit 0\' EXIT ERR\ntrap - EXIT\nscripts/test-beta.py' "it follows \`trap 'exit 0' EXIT ERR\`, $trap_reason"
+block_pass 'a command after a trap on EXIT and ERR that were both reset' $'trap \'exit 0\' EXIT ERR\ntrap - EXIT ERR\nscripts/test-beta.py'
+# A signal word the shell expands can name EXIT or ERR, so it counts as one and is never proven reset.
+block_fail 'a command after trap on a signal held in a variable' $'T=EXIT\ntrap \'exit 0\' $T\nscripts/test-beta.py' "it follows \`trap 'exit 0' \$T\`, $trap_reason"
+block_fail 'a command after trap on a command substitution signal' $'trap \'exit 0\' "$(echo EXIT)"\nscripts/test-beta.py' "it follows \`trap 'exit 0' \"\$(echo EXIT)\"\`, $trap_reason"
+block_fail 'a command after trap on a glob signal' $'trap \'exit 0\' EX*\nscripts/test-beta.py' "it follows \`trap 'exit 0' EX*\`, $trap_reason"
+block_fail 'a command after a variable-named trap that a reset cannot be proven to lift' $'trap \'exit 0\' $T\ntrap - EXIT\nscripts/test-beta.py' "it follows \`trap 'exit 0' \$T\`, $trap_reason"
+block_pass 'a command after a trap on a signal other than EXIT or ERR' $'trap \'echo bye\' INT TERM\nscripts/test-beta.py'
 block_pass 'a command after a trap that was reset' $'trap \'exit 0\' EXIT\ntrap - EXIT\nscripts/test-beta.py'
 block_pass 'a command after trap -p, which only lists' $'trap -p\nscripts/test-beta.py'
 block_pass 'a command that runs before a trap' $'scripts/test-beta.py\ntrap \'exit 0\' EXIT'
@@ -349,6 +359,11 @@ block_fail 'a command after command exec' $'command exec echo hi\nscripts/test-b
 block_fail 'a command after exec under a condition' $'[ -n "$X" ] && exec echo hi\nscripts/test-beta.py' "it follows \`exec echo hi\`, $exec_reason"
 block_pass 'a command after exec that only redirects' $'exec > log 2>&1\nscripts/test-beta.py'
 block_pass 'a command after exec that opens a descriptor' $'exec 3<&0\nscripts/test-beta.py'
+block_pass 'a command after exec that opens a named descriptor' $'exec {fd}>log\nscripts/test-beta.py'
+block_pass 'a command after exec with a named descriptor and a separate target' $'exec {fd}> log\nscripts/test-beta.py'
+block_pass 'a command after exec that tees through a process substitution' $'exec 2> >(tee log)\nscripts/test-beta.py'
+block_pass 'a command after exec that redirects to a process substitution and a descriptor' $'exec > >(tee -a log) 2>&1\nscripts/test-beta.py'
+block_fail 'a command after exec of a process substitution' $'exec <(echo hi)\nscripts/test-beta.py' "it follows \`exec <(echo hi)\`, $exec_reason"
 block_pass 'a command after exec with an attached redirection' $'exec 4>>log\nscripts/test-beta.py'
 block_pass 'a command that runs before exec' $'scripts/test-beta.py\nexec echo done'
 

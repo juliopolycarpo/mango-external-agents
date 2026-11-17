@@ -111,9 +111,12 @@ Naming a test in `ci.yml` is not enough. `scripts/ci-script-steps.py` parses the
 - its `run:` block reaches it: the block is split into commands at newlines, `;`, `&&`, `||`, `|`
   and `&`, and the test command is joined to its neighbours only by a newline or `;`, sits in no
   `if`, loop, `case`, function, group or subshell, follows no `exit` that can end the block and no
-  `set +e`, no `trap` on `EXIT` or `ERR` that is still set (a `trap - EXIT` lifts it), and no
-  `exec` with a command (`exec > log` alone is fine), and is not followed by a `||` handler other
-  than an `exit` with a failing status;
+  `set +e`, no `trap` on `EXIT`, `ERR` or `DEBUG` that is still set, and no `exec` with a command,
+  and is not followed by a `||` handler other than an `exit` with a failing status. Each of the
+  three traps is tracked on its own and only an unconditional `trap - <signal>` for that signal
+  lifts it. A signal word the shell expands (`$T`, `E*`) may name any of them, so a trap on it is
+  never lifted. `exec` with only redirections (`exec > log`, `exec {fd}>log`,
+  `exec 2> >(tee log)`) is fine;
 - its step runs under no `shell:`, or `bash` or `sh`, the shells that stop at a failing command;
   the step, the job's `defaults.run` and the workflow's `defaults.run` are all read;
 - the workflow triggers on `pull_request` and has a `gate` job.
