@@ -30,6 +30,11 @@ readonly ACP_PATTERN='\bacp\b|agent[ -]?client[ -]?protocol'
 # ACP_DOCS_ALLOWLIST at their own file.
 ACP_DOCS_ALLOWLIST="${ACP_DOCS_ALLOWLIST:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vendor-acp-docs-allowlist.txt}"
 
+# The assessment that records each accepted mention, and the section of it that does. Tests point
+# ACP_CONVERGENCE_DOC at their own file.
+ACP_CONVERGENCE_DOC="${ACP_CONVERGENCE_DOC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docs/acp-convergence.md}"
+readonly ACP_RECORD_HEADING='## Accepted documentation mentions'
+
 usage() {
   echo 'usage: scripts/check-vendor-acp-docs.sh <claude|codex> [report-file]' >&2
 }
@@ -71,6 +76,45 @@ accepted_lines() {
     $1 == vendor { print $2 }
     END { exit bad ? 2 : 0 }
   ' "$ACP_DOCS_ALLOWLIST"
+}
+
+# Prints the lines of the assessment section that records accepted mentions: from the heading to
+# the next level-2 heading, outside code fences, so a fenced page line that starts with `## ` does
+# not end the section early. Prints nothing when the heading is absent.
+recorded_section() {
+  awk -v heading="$ACP_RECORD_HEADING" '
+    /^```/ { fenced = !fenced }
+    !fenced && /^## / { in_section = ($0 == heading); next }
+    in_section { print }
+  ' "$ACP_CONVERGENCE_DOC"
+}
+
+# Fails (1) and names each allowlist entry, of either vendor, whose line text is not a whole line of
+# the "Accepted documentation mentions" section of the assessment. The allowlist header asks that
+# the decision be recorded there; this is what holds the two together. Exit 2: the assessment is
+# missing or the allowlist is malformed.
+unrecorded_allowlist_entries() {
+  local vendor
+  local entries
+  local section
+  local missing
+  if [ ! -f "$ACP_CONVERGENCE_DOC" ]; then
+    printf 'expected assessment file %s, received none\n' "$ACP_CONVERGENCE_DOC" >&2
+    return 2
+  fi
+  entries=$(for vendor in claude codex; do accepted_lines "$vendor" || exit 2; done) || return 2
+  [ -n "$entries" ] || return 0
+  section=$(mktemp "${TMPDIR:-/tmp}/mea-vendor-acp-record.XXXXXX")
+  # Capture the quoted local path while this function still owns it.
+  # shellcheck disable=SC2064
+  trap "rm -f -- $(printf '%q' "$section")" RETURN
+  recorded_section > "$section"
+  missing=$(printf '%s\n' "$entries" | grep -Fxv -f "$section" | cut -c 1-200 || true)
+  if [ -n "$missing" ]; then
+    printf 'expected every entry in %s to be a whole line of the "%s" section of %s, received no record for:\n%s\n' \
+      "$ACP_DOCS_ALLOWLIST" "${ACP_RECORD_HEADING#\#\# }" "$ACP_CONVERGENCE_DOC" "$missing" >&2
+    return 1
+  fi
 }
 
 # Appends one section to the report file, if there is one: the page URL, a sentence, and optional
