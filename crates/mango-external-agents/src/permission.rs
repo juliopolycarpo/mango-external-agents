@@ -1608,12 +1608,28 @@ mod tests {
 
     #[test]
     fn a_request_with_no_options_or_too_many_is_refused_on_its_own() {
-        assert!(request(Vec::new()).normalized().is_err());
+        let empty = request(Vec::new()).normalized();
+        assert!(
+            matches!(&empty, Err(Error::Protocol { expected, .. })
+                if expected == "at least one approval option"),
+            "expected Error::Protocol requiring at least one approval option | received {empty:?}"
+        );
 
         let many = (0..17)
             .map(|index| PermissionOption::new(format!("option-{index}"), PermissionEffect::Allow))
             .collect();
-        assert!(request(many).normalized().is_err());
+        let too_many = request(many).normalized();
+        assert!(
+            matches!(
+                &too_many,
+                Err(Error::LimitExceeded {
+                    subject: "approval options offered",
+                    received: 17,
+                    ..
+                })
+            ),
+            "expected Error::LimitExceeded for 17 approval options | received {too_many:?}"
+        );
     }
 
     const DUPLICATE_OPTION_ID: &str = "private-duplicate-option-id";
