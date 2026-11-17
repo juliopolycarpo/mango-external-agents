@@ -2,6 +2,7 @@
 //!
 //! One module per former test file: a target of its own costs a link of the whole dependency tree.
 
+mod activity_pairing;
 mod cancel_deadlines;
 mod debug_carriers;
 mod debug_records;

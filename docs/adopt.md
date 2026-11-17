@@ -261,6 +261,17 @@ match a failure on its `code` and `vendor_code`, never on its message.
   approval requested and resolved, question asked and resolved, usage, thread usage, account
   limits, notices, cancelled, completed and error. `AgentEvent::is_terminal` answers "is this turn
   over" without a match, and `AgentEvent::operation()` answers "whose work was this".
+- **At most 1,024 activities open at once per turn**, on all three harnesses (the same figure as the
+  default `Limits::turn_channel_capacity`, a constant rather than a `Limits` field). A turn that
+  starts more before completing any fails by name instead of forwarding starts nothing will close.
+  The start past the cap is not forwarded, every activity already reported is closed first, and the
+  terminal is an `Error` whose code is `codex-activity-overflow`, `claude-activity-overflow` or
+  `acp-activity-overflow`, naming the limit and the count reached. The close status differs: Codex
+  and ACP close the open activities as failed, because the turn failed while the vendor still ran
+  it; Claude closes them as cancelled, because its failure path always stops the child and
+  cancels the run's open calls. A real turn runs a handful, so only a runaway one meets it. This is
+  an observable change: a turn that held more than 1,024 activities open used to be forwarded
+  untracked and now fails.
 
 Session facts are **not** turn events. The vendor's own session handle and the slash-command
 catalog are read from the snapshot, because they change between turns and before the first one —

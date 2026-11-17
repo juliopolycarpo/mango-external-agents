@@ -1164,6 +1164,15 @@ saved native history does not qualify a transcript the host could not accept. Or
 cancellation retains its existing resumability rules. Receiver abandonment and bounded stream
 overflow keep their own terminal behavior.
 
+A run may hold at most 1,024 tool calls open at once (`MAX_OPEN_ACTIVITIES`, the same figure as the
+default `Limits::turn_channel_capacity`); a real turn runs a handful. The vendor decides how many
+calls it issues before their results arrive, so the cap is not left to it. The call past the cap is
+not forwarded, and the pump ends the turn as it does a broken stream: the reducer's abort closes
+every call the host was told about as cancelled, the turn's terminal is an `Error` coded
+`claude-activity-overflow` naming the limit and the count reached, the conversation is marked
+`UnfinishedTurn`, and the child is stopped. Claude closes as cancelled where Codex and ACP close as
+failed, because its failure path is the abort that always cancels the run's open calls. The cap is a constant, not a `Limits` field.
+
 The reducer holds three properties, exercised by replay and reducer tests:
 
 - **Text is delivered once.** `--include-partial-messages` carries the same output twice — as
