@@ -1,13 +1,14 @@
 {
   "format": 1,
   "profile": "claude-agent-acp",
-  "probe": "initialize",
+  "probe": "initialize, session/new",
   "reproducible": false,
-  "sessionOpened": false,
+  "sessionOpened": true,
   "capturedFrom": "0.107.0",
-  "capturedAt": "2026-11-14",
+  "capturedAt": "2026-11-18",
   "files": {
     "initialize.json": "sha256:f0bc88b8203b6bde85834aed730dfc582aab965a6878367e4159f4590cefcfc2",
+    "session-new.json": "sha256:df5a9c19498f98d5fa9c3aae713ddb9fd8100aeef199b1cf047bc360878bd8be",
     "version.json": "sha256:c9041ad9b3b4e0ffe6a2c4ff52718524f9e9aad749415fddb166bd551c810599"
   }
 }
