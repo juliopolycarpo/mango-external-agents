@@ -70,25 +70,25 @@ host did not name; see
 answer reads "unmeasured" instead of a guess. The two adapters advertise the same values for the
 cells below, so the column holds for either.
 
-| Capability                 | Claude dedicated                                                        | Codex dedicated                                    | ACP profile (either adapter)                                                      |
-| -------------------------- | ----------------------------------------------------------------------- | -------------------------------------------------- | --------------------------------------------------------------------------------- |
-| Structured output          | yes: `--json-schema`, `structured_output`                               | not driven                                         | no: no driven ACP method carries a schema                                         |
-| Interactive approvals      | no: modes and allow-lists only                                          | yes, brokered                                      | yes, when the agent sends `session/request_permission`                            |
-| Typed questions            | no                                                                      | yes (experimental upstream)                        | no: `elicitation/create` is declined                                              |
-| Permission levels          | `ReadOnly`, `Default`, `FullAccess`, and `auto` for qualifying accounts | full matrix over `approvalPolicy` and sandbox      | `Default`, `ReadOnly`; `FullAccess` only if the profile knows a mode id (none do) |
-| Resume                     | `--resume`; nonresumable after a forced kill                            | `thread/resume`                                    | `session/load`; both adapters advertise `loadSession`                             |
-| Cancellation               | SIGINT or kill, with a recorded resumability verdict                    | `turn/interrupt`                                   | `session/cancel`, then the kill grace                                             |
-| Steering                   | no                                                                      | yes                                                | no: ACP v1 has no surface; adapter extensions are not consumed                    |
-| Native review              | no                                                                      | yes                                                | no: `native_review` stays false                                                   |
-| Account quota, rate limits | no                                                                      | yes: `account/rateLimits/*` into `AccountLimits`   | no: `usage_update` reports the context window, not plan quota                     |
-| Usage reporting            | yes: the `result` record's counts                                       | yes                                                | context-window use only                                                           |
-| Model catalog flag         | yes, per build: aliases from `--model` help                             | yes: `model/list`                                  | `model_catalog` stays false; a `model` config option: unmeasured (`session/new`)  |
-| Session configuration      | no: argv on a fresh child                                               | per turn                                           | yes: `session/set_config_option`                                                  |
-| Session listing            | no                                                                      | yes                                                | `session/list`; both adapters advertise `sessionCapabilities.list`                |
-| Images                     | no                                                                      | yes                                                | yes: both adapters advertise `promptCapabilities.image`                           |
-| MCP passthrough            | `--mcp-config`, per build                                               | per-thread `config.mcp_servers`                    | `mcpServers`; HTTP only when advertised                                           |
-| Login state                | `auth status` probe                                                     | `account/read`                                     | always `Unknown`                                                                  |
-| Public contract under CI   | `fixtures/claude/contract/`                                             | `fixtures/codex/contract/` and the vendored schema | labelled maintainer captures, not pinned (see below)                              |
+| Capability                 | Claude dedicated                                                        | Codex dedicated                                    | ACP profile (either adapter)                                                                                                           |
+| -------------------------- | ----------------------------------------------------------------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Structured output          | yes: `--json-schema`, `structured_output`                               | not driven                                         | no: no driven ACP method carries a schema                                                                                              |
+| Interactive approvals      | no: modes and allow-lists only                                          | yes, brokered                                      | yes, when the agent sends `session/request_permission`                                                                                 |
+| Typed questions            | no                                                                      | yes (experimental upstream)                        | no: `elicitation/create` is declined                                                                                                   |
+| Permission levels          | `ReadOnly`, `Default`, `FullAccess`, and `auto` for qualifying accounts | full matrix over `approvalPolicy` and sandbox      | `Default`, `ReadOnly`; `FullAccess` only if the profile knows a mode id (none do)                                                      |
+| Resume                     | `--resume`; nonresumable after a forced kill                            | `thread/resume`                                    | `session/load`; both adapters advertise `loadSession`                                                                                  |
+| Cancellation               | SIGINT or kill, with a recorded resumability verdict                    | `turn/interrupt`                                   | `session/cancel`, then the kill grace                                                                                                  |
+| Steering                   | no                                                                      | yes                                                | no: ACP v1 has no surface; adapter extensions are not consumed                                                                         |
+| Native review              | no                                                                      | yes                                                | no: `native_review` stays false                                                                                                        |
+| Account quota, rate limits | no                                                                      | yes: `account/rateLimits/*` into `AccountLimits`   | no: `usage_update` reports the context window, not plan quota                                                                          |
+| Usage reporting            | yes: the `result` record's counts                                       | yes                                                | context-window use only                                                                                                                |
+| Model catalog flag         | yes, per build: aliases from `--model` help                             | yes: `model/list`                                  | `model_catalog` stays false; a `model` config option: `claude-agent-acp` offers one, `codex-acp` refuses `session/new` without a login |
+| Session configuration      | no: argv on a fresh child                                               | per turn                                           | yes: `session/set_config_option`                                                                                                       |
+| Session listing            | no                                                                      | yes                                                | `session/list`; both adapters advertise `sessionCapabilities.list`                                                                     |
+| Images                     | no                                                                      | yes                                                | yes: both adapters advertise `promptCapabilities.image`                                                                                |
+| MCP passthrough            | `--mcp-config`, per build                                               | per-thread `config.mcp_servers`                    | `mcpServers`; HTTP only when advertised                                                                                                |
+| Login state                | `auth status` probe                                                     | `account/read`                                     | always `Unknown`                                                                                                                       |
+| Public contract under CI   | `fixtures/claude/contract/`                                             | `fixtures/codex/contract/` and the vendored schema | labelled maintainer captures, not pinned (see below)                                                                                   |
 
 Reading the table:
 
@@ -107,7 +107,9 @@ Reading the table:
 ## What the adapter handshakes measured
 
 Captured on 2026-11-14 with `mea capture --harness acp --profile <id>`. Each sent `initialize` and
-nothing else: no `authenticate`, no `session/new`.
+nothing else: no `authenticate`, no `session/new`. The two adapters were captured again on
+2026-11-18 with `--open-session`, which also sends `session/new` once `initialize` answered
+([below](#what-session-new-measured)); the `initialize` files came out byte for byte the same.
 
 | `initialize` member                     | `claude-agent-acp` 0.107.0                                                                    | `codex-acp` 2.6.0                     |
 | --------------------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------- |
@@ -139,8 +141,54 @@ What it settles for the table above:
   native review or typed questions for Codex, and no structured output or interrupt verdict for
   Claude. `codex-acp`'s `subagents` session capability is an adapter extension that this harness
   does not consume.
-- `configOptions`, and with it the model catalog cell, stays unmeasured. An agent returns it from
-  `session/new`, and a capture never sends that: it opens no session.
+- `configOptions`, and with it the model catalog cell, comes from `session/new`, which `initialize`
+  never carries. The next section reads it.
+
+### What `session/new` measured
+
+[#453](https://github.com/juliopolycarpo/mango-external-agents/issues/453) asked whether a capture
+may send `session/new`. It may, as an opt-in: `mea capture --harness acp --profile <id> --open-session`
+sends it after `initialize` and writes `session-new.json` beside the other files. The decision:
+
+- The request is `{"cwd": <the capture workspace>, "mcpServers": []}`. The capture never calls
+  `authenticate` and reads no credential. The adapter runs under an empty `CLAUDE_CONFIG_DIR` or
+  `CODEX_HOME`, as in the recipe in [fixtures/README.md](../fixtures/README.md).
+- An adapter that wants a login answers with a JSON-RPC error. The capture records the code and the
+  redacted message in `session-new.json` and the manifest says `sessionOpened: false`. That is a
+  recorded answer, not a failed capture.
+- The record keeps ids, names, categories, types and current values, and drops the session id (it
+  changes every run), the descriptions (they carry prices and wording) and `_meta`. The manifest's
+  `probe` reads `initialize, session/new`, and `sessionOpened` is true only when a session opened.
+- It is refused for a profile the drift lane records again (`opencode`): what `session/new` answers
+  follows the machine's agent state, and a reproducible contract must not.
+- Opening a session makes the Claude adapter write its own state (`.claude.json`, a backup, empty
+  `projects`, `sessions` and `plugins` directories) under the empty `CLAUDE_CONFIG_DIR`, where its
+  `initialize` capture wrote nothing. `codex-acp` writes its SQLite state under `CODEX_HOME` for
+  either probe. Nothing else is sent, and the child is stopped after the answer.
+
+Measured on 2026-11-18, with no login on either adapter:
+
+| `session/new` member   | `claude-agent-acp` 0.107.0                                       | `codex-acp` 2.6.0                         |
+| ---------------------- | ---------------------------------------------------------------- | ----------------------------------------- |
+| Answer                 | a session                                                        | error `-32000`, "Authentication required" |
+| `modes`, current       | `auto`                                                           | none: refused                             |
+| `modes`, available ids | `default`, `acceptEdits`, `plan`, `auto`, `bypassPermissions`    | none: refused                             |
+| `configOptions` ids    | `mode`, `model`, `effort`, `fast`, `ultracode`                   | none: refused                             |
+| `model` option values  | `default`, `opus`, `fable`, `sonnet`, `haiku`; current `default` | none: refused                             |
+
+What it settles:
+
+- Claude's model catalog cell is measured: the adapter offers a `model` config option, with
+  aliases, not full model ids, and without a login. A signed-in account may be offered a different
+  list; this one is what the adapter returns to an empty configuration. `model_catalog` stays false
+  because the harness reads the live catalog at session time and invents none.
+- Claude's mode ids are now on file. `SessionModeIds` in `crates/mango-agent-acp/src/profile.rs`
+  still holds none for either profile: which of these ids means `ReadOnly`, `Default` or
+  `FullAccess` is a policy decision for a separate change, and the `Permission levels` cell above
+  stays as it is until then.
+- Codex's catalog and mode ids stay unmeasured. `codex-acp` refuses `session/new` without a login,
+  and the refusal is the recorded shape. Measuring them needs the maintainer's own signed-in
+  `CODEX_HOME`, which a capture would read state from; that is a separate decision.
 
 Criterion 2 is not met, and this is a decision rather than an oversight
 ([#454](https://github.com/juliopolycarpo/mango-external-agents/issues/454)). Both adapters install
