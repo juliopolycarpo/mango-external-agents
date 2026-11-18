@@ -79,7 +79,16 @@ Redacted whatever the value type:
   fields, so a parameter called `type`, `id` or `role` loses its value too. Numbers and booleans
   there are replaced as well, by `0` and `false`: an account number, an amount or a flag over a
   customer's data is the author's, and the replacement keeps the field's type where a `[REDACTED]`
-  string would not. A `null` stays. The names stay. A string, number, boolean or object under a name no review
+  string would not. A `null` stays. The names stay, except a key that reads as a figure (ASCII
+  digits and the separators space, `-`, `.`, `/`, `:`, `+`, `(` and `)`, with at least one digit,
+  such as a card number written `4111111111111111`, `4111-1111-1111-1111` or
+  `4111 1111 1111 1111`, or `-12.50`): a number used as a key is as much the author's as one used
+  as a value, so each digit becomes `0` and the separators stay (`4111-1111-1111-1111` is written
+  `0000-0000-0000-0000`). A date or a time used as a key is zeroed too (`2024-03-09` is written
+  `0000-00-00`); that loses nothing a replay needs and leaves nothing of the author's data. Keys
+  that collapse to the same zeros keep their entries as `0000`, `0000#2`, `0000#3`. An exponent
+  form, a word or a key with any other character is a name and
+  stays, and so does a key in the model's answer. A string, number, boolean or object under a name no review
   lists is reported as below, unless it is a direct key of the map, which the key line below lists
   (a string under a structural name or `model` is the exception, since the recorder already knows it).
   A call is the answer's when it is a `tool_use` named exactly `StructuredOutput`
