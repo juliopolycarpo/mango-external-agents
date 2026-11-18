@@ -140,6 +140,17 @@ expression or a `shell: pwsh` step, is reported as a reason the test is blocked,
 run. It still does not follow what a test script does once it starts.
 `scripts/test-check-script-tests.sh` pins each rule against a scratch workflow.
 
+The `gate` job fails on any needed job whose result is not `success`, skipped included:
+`scripts/check-gate-needs.sh` reads `toJSON(needs)` from `RESULTS` and prints
+`expected <job> result: success | received: <result>` for each one that is not.
+`scripts/test-check-gate-needs.sh` covers success, skipped, failure and cancelled against a fake
+`needs` JSON. Since a skipped need would then fail the gate, `scripts/ci-script-steps.py` also
+reports a `workflow` problem for any job in the gate's `needs` that has a job-level `if:`.
+Whether `Gate` is a required status check is a repository setting, not something the workflow can
+set; it is tracked in
+[#498](https://github.com/juliopolycarpo/mango-external-agents/issues/498), and
+`scripts/check-release-ci.sh` reads the run itself until it is required (see `docs/releasing.md`).
+
 ## Shell lint
 
 `scripts/check-shellcheck.sh` runs shellcheck over every `*.sh` under `scripts/`, the fakes in

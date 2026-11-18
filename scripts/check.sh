@@ -50,6 +50,7 @@ run scripts/test-prune-rust-caches.sh
 run scripts/test-check-actionlint.sh
 run scripts/test-install-actionlint.sh
 run scripts/check-script-tests.sh
+run scripts/test-check-gate-needs.sh
 # CI's Policy job installs shellcheck and runs the same gate; here it is optional like cargo-hack.
 if command -v shellcheck >/dev/null 2>&1; then
   run scripts/check-shellcheck.sh

@@ -21,6 +21,10 @@ as run only when every one of these holds:
   expanded per matrix combination, and no matrix `os` value names Windows);
 - the workflow triggers on `pull_request`, and has a `gate` job.
 
+The gate fails on any need whose result is not `success`, so no job in its `needs` may have a
+job-level `if:`: it would be skipped, and "skipped" must never be an intended result. Each such job
+is a `workflow` record, whether or not it runs a script test.
+
 Output, one tab-separated record per line:
 
     ok       <test>                  the test runs
@@ -704,6 +708,16 @@ def report(workflow):
     if needs is None:
         yield ("workflow", "the workflow has no `gate` job")
         needs = set()
+    # The gate fails on any need that did not succeed (scripts/check-gate-needs.sh), so a need that
+    # an `if:` can skip would fail it too; "skipped" must never be an intended result.
+    for job_id in sorted(needs):
+        job = workflow["jobs"].get(job_id)
+        if isinstance(job, dict) and "if" in job:
+            yield (
+                "workflow",
+                f"job '{job_id}' is in the needs of the gate job and has `if: {job['if']}`; "
+                "expected no job-level `if:`, because a skipped need is not a success",
+            )
     for job_id, job in workflow["jobs"].items():
         steps = job.get("steps") if isinstance(job, dict) else None
         if not isinstance(steps, list):

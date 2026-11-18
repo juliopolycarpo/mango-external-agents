@@ -58,7 +58,7 @@ workflow_fixture() {
   echo '      - uses: actions/checkout@v7'
   for name in $in_ci; do echo "      - run: scripts/$name"; done
   case "$variant" in
-    clean | shell-job | matrix-os | matrix-os-unlisted | matrix-custom | orphan-job | job-if | job-continue-on-error) ;;
+    clean | shell-job | matrix-os | matrix-os-unlisted | matrix-custom | orphan-job | job-if | job-continue-on-error | gated-job-if-no-test | ungated-job-if) ;;
     shell-step)
       echo "      - shell: '$shell_name'"
       echo "        run: scripts/$placed" ;;
@@ -146,6 +146,15 @@ workflow_fixture() {
       echo '    steps:'
       echo "      - run: scripts/$placed"
       needs='[policy, extra]' ;;
+    gated-job-if-no-test | ungated-job-if)
+      # A job under an `if:` that runs no script test: only the gate rule can object to it. It is
+      # a gate need in `gated-job-if-no-test` and outside the gate in `ungated-job-if`.
+      echo '  conditional:'
+      echo '    runs-on: ubuntu-latest'
+      echo "    if: github.ref == 'refs/heads/never'"
+      echo '    steps:'
+      echo '      - run: echo conditional'
+      [ "$variant" = gated-job-if-no-test ] && needs='[policy, conditional]' ;;
   esac
   if [ "$gate" = true ]; then
     echo '  gate:'
@@ -240,6 +249,14 @@ expect_fail 'a job missing from the gate needs' "${blocked_prefix}job 'orphan' i
 
 make_repo "$work/repo" "$base" "$without_beta" job-if
 expect_fail 'a job under an if' "${blocked_prefix}job 'extra' has \`if: github.ref == 'refs/heads/never'\`"
+
+# A skipped need passes the gate's `needs` unless the gate reads every result, so no job the gate
+# waits for may carry an `if:`, whether or not it runs a script test (issue #476).
+make_repo "$work/repo" "$base" "$base" gated-job-if-no-test
+expect_fail 'a gate need under an if that runs no test' ".github/workflows/ci.yml: job 'conditional' is in the needs of the gate job and has \`if: github.ref == 'refs/heads/never'\`; expected no job-level \`if:\`, because a skipped need is not a success"
+
+make_repo "$work/repo" "$base" "$base" ungated-job-if
+expect_pass 'a job under an if that the gate does not wait for'
 
 make_repo "$work/repo" "$base" "$without_beta" job-continue-on-error
 expect_fail 'a job that continues on error' "${blocked_prefix}job 'extra' sets \`continue-on-error: True\`"

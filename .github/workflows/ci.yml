@@ -141,6 +141,7 @@ jobs:
       - run: scripts/test-bench-runner.sh
       - run: scripts/test-check-script-tests.sh
       - run: scripts/check-script-tests.sh
+      - run: scripts/test-check-gate-needs.sh
       - run: scripts/test-check-shellcheck.sh
       - run: scripts/test-check-actionlint.sh
       - run: scripts/test-install-actionlint.sh
@@ -215,9 +216,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Fail when any job failed or was cancelled
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Every needed job has to be `success`: a skipped one (its own needs failed) fails the gate
+      # too. No needed job has an `if:`, which scripts/ci-script-steps.py enforces, so skipped is
+      # never intended. The rule lives in the script so scripts/test-check-gate-needs.sh can run it.
+      - name: Fail when any needed job did not succeed
         env:
           RESULTS: ${{ toJSON(needs) }}
-        run: |
-          echo "$RESULTS"
-          echo "$RESULTS" | grep -Eq '"result": "(failure|cancelled)"' && exit 1 || exit 0
+        run: scripts/check-gate-needs.sh
