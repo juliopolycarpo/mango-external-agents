@@ -153,7 +153,7 @@ fn print_banner() {
         "       mea turn [--harness claude|codex|acp:<profile>] [--profile ID] [--transport stdio|websocket|unix-socket|acp] [--socket PATH] [--model ID] [--json-schema FILE] [--cwd DIR] [--json] [--level read-only|default|full-access] [--cancel-after SECONDS] <prompt>"
     );
     println!(
-        "       mea capture --harness claude|codex|acp[:profile] [--profile ID] [--out DIR] [--workspace DIR] [--vendor-cli PROGRAM] [--transcripts [--model ID]]"
+        "       mea capture --harness claude|codex|acp[:profile] [--profile ID] [--out DIR] [--workspace DIR] [--vendor-cli PROGRAM] [--open-session] [--transcripts [--model ID]]"
     );
     println!(
         "       mea capture codex [--scenario NAME] [--model ID] [--out DIR] [--workspace DIR] (archival transcripts)"
@@ -488,6 +488,7 @@ async fn capture(arguments: &[String]) -> Result<(), String> {
                 &workspace.path,
                 profile.as_str(),
                 options.vendor_cli.as_deref(),
+                options.open_session,
             )
             .await
         }

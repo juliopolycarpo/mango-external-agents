@@ -2,7 +2,9 @@
 //!
 //! Transcript capture records a real conversation, so an account, a model, and a vendor release
 //! can all change its bytes. This module records only commands that need no login and the ACP
-//! handshake that opens no session. The resulting files are safe to regenerate in CI.
+//! handshake that opens no session. The resulting files are safe to regenerate in CI. The one
+//! exception is an ACP capture the operator opts into with `--open-session`: it also sends
+//! `session/new`, which is a maintainer capture and never a CI one.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,6 +20,7 @@ use mango_external_agents::{
 use serde_json::{Map, Value, json};
 
 pub mod manifest;
+mod session_new;
 
 /// The built-in ACP profile that the drift workflow installs on every operating system.
 pub const DEFAULT_ACP_CAPTURE_PROFILE: &str = "opencode";
@@ -65,12 +68,17 @@ pub async fn codex_contract(out_dir: &Path, workspace: &Path) -> Result<()> {
 
 /// Captures one built-in ACP profile's public `initialize` metadata under `out_dir/contract`.
 ///
-/// The command sends no `authenticate` or `session/new` request. `profile_id` must name a profile
-/// compiled into `mango-agent-acp`.
+/// The command sends no `authenticate` request, and no `session/new` request unless `open_session`
+/// is set. `profile_id` must name a profile compiled into `mango-agent-acp`.
 ///
 /// `vendor_cli` names the binary an adapter fronts, for the profiles whose adapter runs one
 /// (`claude-agent-acp`, `codex-acp`). Its `--version` is recorded in `version.json` as `vendorCli`.
 /// `mea` takes the name as given and never searches for the binary.
+///
+/// `open_session` also sends `session/new` once `initialize` has answered and records the mode ids
+/// and `configOptions` in `session-new.json`, or the refusal an adapter that wants a login sends
+/// instead. It is refused for a profile whose capture the drift lane records again, because an
+/// answer that depends on the machine's agent state is not reproducible.
 ///
 /// # Examples
 ///
@@ -78,24 +86,29 @@ pub async fn codex_contract(out_dir: &Path, workspace: &Path) -> Result<()> {
 ///
 /// # Errors
 ///
-/// Returns an error for an unknown profile, an unsuccessful probe, a malformed JSON-RPC answer, or a
-/// `vendor_cli` that does not print exactly one `--version` line.
+/// Returns an error for an unknown profile, an unsuccessful probe, a malformed JSON-RPC answer, a
+/// `vendor_cli` that does not print exactly one `--version` line, or `open_session` on a
+/// reproducible profile.
 pub async fn acp(
     out_dir: &Path,
     workspace: &Path,
     profile_id: &str,
     vendor_cli: Option<&str>,
+    open_session: bool,
 ) -> Result<()> {
     let profile =
         mango_agent_acp::builtin_profile(profile_id).ok_or_else(|| Error::HostConfiguration {
             expected: "a built-in ACP profile",
             received: profile_id.to_owned(),
         })?;
+    // The agent starts in the capture workspace, which is also where `session/new` names its cwd.
+    let session = open_session.then(|| workspace.to_path_buf());
     acp_with(
         &capture_host(workspace)?,
         out_dir,
         profile.as_ref(),
         vendor_cli,
+        session.as_deref(),
     )
     .await
 }
@@ -236,7 +249,23 @@ async fn acp_with(
     out_dir: &Path,
     profile: &mango_agent_acp::AcpProfile,
     vendor_cli: Option<&str>,
+    session_cwd: Option<&Path>,
 ) -> Result<()> {
+    let reproducible = manifest::is_reproducible(profile.id.as_str());
+    // Refused before any process starts: a session answer follows the machine's agent state, so a
+    // capture the drift lane records again must not carry one.
+    if session_cwd.is_some() && reproducible {
+        return Err(Error::HostConfiguration {
+            expected: "--open-session only for a maintainer capture, not a profile the drift lane records again",
+            received: format!("--open-session with profile {}", profile.id.as_str()),
+        });
+    }
+    if let Some(cwd) = session_cwd.filter(|cwd| !cwd.is_absolute()) {
+        return Err(Error::HostConfiguration {
+            expected: "an absolute --workspace for session/new, which the protocol requires as cwd",
+            received: cwd.display().to_string(),
+        });
+    }
     let version = command_output(
         host,
         profile.resolved_version_argv(&ExecutablePath::default()),
@@ -249,9 +278,12 @@ async fn acp_with(
         Some(program) => Some(vendor_cli_version(host, profile, program).await?),
         None => None,
     };
-    let response = acp_initialize(host, profile).await?;
+    let probe = acp_probe(host, profile, session_cwd).await?;
     let contract = contract_dir(out_dir);
-    write_json(&contract.join("initialize.json"), &response)?;
+    write_json(&contract.join("initialize.json"), &probe.initialize)?;
+    if let Some(session) = &probe.session_new {
+        write_json(&contract.join("session-new.json"), &session.record)?;
+    }
     let mut version_file = json!({
         "command": profile.resolved_version_argv(&ExecutablePath::default()),
         "output": version,
@@ -265,9 +297,9 @@ async fn acp_with(
         &json!({
             "format": 1,
             "profile": profile.id.as_str(),
-            "probe": "initialize",
-            "reproducible": manifest::is_reproducible(profile.id.as_str()),
-            "sessionOpened": false,
+            "probe": if probe.session_new.is_some() { "initialize, session/new" } else { "initialize" },
+            "reproducible": reproducible,
+            "sessionOpened": probe.session_new.as_ref().is_some_and(|session| session.opened),
         }),
         &version,
     )
@@ -361,10 +393,34 @@ async fn command_lines(
     })
 }
 
+/// What one ACP handshake recorded: the normalized `initialize` answer and, when asked for, the
+/// `session/new` answer.
+struct AcpProbe {
+    initialize: Value,
+    session_new: Option<session_new::SessionNewRecord>,
+}
+
+/// The `initialize` half of [`acp_probe`], which the cleanup and cancellation tests drive alone.
+#[cfg(test)]
 async fn acp_initialize(
     host: &HostContext,
     profile: &mango_agent_acp::AcpProfile,
 ) -> Result<Value> {
+    acp_probe(host, profile, None)
+        .await
+        .map(|probe| probe.initialize)
+}
+
+/// Sends `initialize` and, with `session_cwd`, `session/new` over one stdio child, then stops it.
+///
+/// `session/new` goes out only after `initialize` answered with a result, and never with an
+/// `authenticate` before it: an adapter that wants a login answers with an error, which the record
+/// keeps. The child is not asked to close the session; stopping it ends the session.
+async fn acp_probe(
+    host: &HostContext,
+    profile: &mango_agent_acp::AcpProfile,
+    session_cwd: Option<&Path>,
+) -> Result<AcpProbe> {
     let argv = profile.resolved_argv(&ExecutablePath::default());
     let transport = stdio::open(
         host,
@@ -377,45 +433,41 @@ async fn acp_initialize(
         ProcessCleanupGuard::new(transport.control, *host.limits(), CancelReason::Shutdown);
     let (mut sender, mut receiver) = transport.link.split();
     let outcome = async {
-        sender
-            .send(
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": 1,
-                        "clientCapabilities": {"fs": {}, "terminal": false},
-                        "clientInfo": {"name": "mea", "version": env!("CARGO_PKG_VERSION")},
-                    },
-                })
-                .to_string(),
-            )
-            .await?;
-        tokio::time::timeout(CONTRACT_TIMEOUT, async {
-            loop {
-                let Some(line) = receiver.recv().await? else {
-                    return Err(Error::Link {
-                        peer: profile.display_name.clone(),
-                        message: String::from("exited before answering initialize"),
-                    });
-                };
-                let Ok(frame) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                if frame.get("id") == Some(&json!(1)) {
-                    return Ok(frame);
-                }
+        let frame = acp_request(
+            sender.as_mut(),
+            receiver.as_mut(),
+            profile,
+            1,
+            "initialize",
+            json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {"fs": {}, "terminal": false},
+                "clientInfo": {"name": "mea", "version": env!("CARGO_PKG_VERSION")},
+            }),
+        )
+        .await?;
+        let initialize = normalize_acp_initialize(frame)?;
+        let session_new = match session_cwd {
+            Some(cwd) => {
+                let frame = acp_request(
+                    sender.as_mut(),
+                    receiver.as_mut(),
+                    profile,
+                    2,
+                    "session/new",
+                    json!({"cwd": cwd, "mcpServers": []}),
+                )
+                .await?;
+                Some(session_new::normalize_session_new(&frame)?)
             }
+            None => None,
+        };
+        Ok(AcpProbe {
+            initialize,
+            session_new,
         })
-        .await
-        .map_err(|_| Error::Timeout {
-            operation: format!("{} initialize", profile.display_name),
-            after: CONTRACT_TIMEOUT,
-        })?
     }
-    .await
-    .and_then(normalize_acp_initialize);
+    .await;
     let stopped = cleanup.finish().await.map(|_| ());
     crate::failure::with_cleanup(outcome, stopped, |primary| {
         eprintln!(
@@ -424,6 +476,42 @@ async fn acp_initialize(
             crate::command_failure(primary)
         );
     })
+}
+
+/// Sends one request and waits for the frame that answers `id`, skipping what the agent writes in
+/// between (logs, notifications, its own requests).
+async fn acp_request(
+    sender: &mut dyn mango_external_agents::LinkSender,
+    receiver: &mut dyn mango_external_agents::LinkReceiver,
+    profile: &mango_agent_acp::AcpProfile,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> Result<Value> {
+    sender
+        .send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string())
+        .await?;
+    tokio::time::timeout(CONTRACT_TIMEOUT, async {
+        loop {
+            let Some(line) = receiver.recv().await? else {
+                return Err(Error::Link {
+                    peer: profile.display_name.clone(),
+                    message: format!("exited before answering {method}"),
+                });
+            };
+            let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if frame.get("id") == Some(&json!(id)) && frame.get("method").is_none() {
+                return Ok(frame);
+            }
+        }
+    })
+    .await
+    .map_err(|_| Error::Timeout {
+        operation: format!("{} {method}", profile.display_name),
+        after: CONTRACT_TIMEOUT,
+    })?
 }
 
 fn normalize_acp_initialize(frame: Value) -> Result<Value> {
@@ -1081,9 +1169,15 @@ mod tests {
         let profile =
             mango_agent_acp::builtin_profile("opencode").expect("expected OpenCode profile");
 
-        acp_with(&host(Arc::clone(&launcher)), &out, profile.as_ref(), None)
-            .await
-            .expect("expected an ACP public contract capture");
+        acp_with(
+            &host(Arc::clone(&launcher)),
+            &out,
+            profile.as_ref(),
+            None,
+            None,
+        )
+        .await
+        .expect("expected an ACP public contract capture");
 
         assert_eq!(launcher.launches()[0].argv, vec!["opencode", "--version"]);
         let writes = launcher.written();
@@ -1092,6 +1186,259 @@ mod tests {
         assert!(!writes[0].contains("authenticate"));
         assert!(!writes[0].contains("session/new"));
         assert_eq!(launcher.live_children(), 0);
+        assert!(
+            !out.join("contract/session-new.json").exists(),
+            "expected no session-new.json from a capture that did not opt in"
+        );
+        let manifest = read_manifest(&out);
+        assert_eq!(manifest["probe"], "initialize");
+        assert_eq!(manifest["sessionOpened"], false);
+        std::fs::remove_dir_all(out).expect("expected temporary capture cleanup");
+    }
+
+    fn read_manifest(out: &std::path::Path) -> serde_json::Value {
+        let text = std::fs::read_to_string(out.join("contract/manifest.json"))
+            .expect("expected a manifest");
+        serde_json::from_str(&text).expect("expected manifest.json to be JSON")
+    }
+
+    /// A named fake ACP adapter: it answers `initialize`, then `session/new` either with an opened
+    /// session (modes and a model catalog beside a per-run session id) or with the login refusal
+    /// `codex-acp` sends without an account. A request it does not know fails the test by name.
+    struct SessionAgent {
+        session_reply: &'static str,
+    }
+
+    const OPENED_SESSION_REPLY: &str = r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"per-run-id","modes":{"currentModeId":"auto","availableModes":[{"id":"default","name":"Manual","description":"Always ask"},{"id":"auto","name":"Auto"}]},"configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"default","options":[{"value":"default","name":"Default","description":"$4/$20 per Mtok"}]}]}}"#;
+    const LOGIN_REFUSAL_REPLY: &str =
+        r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"Authentication required"}}"#;
+
+    impl SessionAgent {
+        fn process(&self) -> FakeProcess {
+            let session_reply = self.session_reply;
+            FakeProcess::responding(move |line| {
+                if line.contains("\"method\":\"initialize\"") {
+                    return vec![String::from(
+                        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"fake-adapter","version":"1.0.0"}}}"#,
+                    )];
+                }
+                if line.contains("\"method\":\"session/new\"") {
+                    return vec![String::from(session_reply)];
+                }
+                panic!("(session agent): expected initialize or session/new | received: {line}");
+            })
+        }
+    }
+
+    fn session_capture_launcher(agent: &SessionAgent) -> Arc<FakeLauncher> {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(FakeProcess::transcript(["fake-adapter 1.0.0"]).with_exit(success()));
+        launcher.push(agent.process());
+        launcher
+    }
+
+    fn maintainer_profile() -> std::sync::Arc<mango_agent_acp::AcpProfile> {
+        mango_agent_acp::builtin_profile("claude-agent-acp")
+            .expect("expected the claude-agent-acp profile")
+    }
+
+    #[tokio::test]
+    async fn open_session_records_mode_ids_and_the_model_catalog_without_authenticating() {
+        let launcher = session_capture_launcher(&SessionAgent {
+            session_reply: OPENED_SESSION_REPLY,
+        });
+        let out = temp_dir("acp-session");
+        let workspace = temp_dir("acp-session-workspace");
+        let profile = maintainer_profile();
+
+        acp_with(
+            &host(Arc::clone(&launcher)),
+            &out,
+            profile.as_ref(),
+            None,
+            Some(&workspace),
+        )
+        .await
+        .expect("expected a capture that opens a session");
+
+        let writes = launcher.written();
+        assert_eq!(
+            writes.len(),
+            2,
+            "expected initialize then session/new | received {writes:?}"
+        );
+        assert!(writes[0].contains("\"method\":\"initialize\""));
+        assert!(writes[1].contains("\"method\":\"session/new\""));
+        let cwd = serde_json::to_string(&workspace).expect("expected a cwd string");
+        assert!(
+            writes[1].contains(&format!("\"cwd\":{cwd}"))
+                && writes[1].contains("\"mcpServers\":[]"),
+            "expected session/new to carry the workspace cwd and no MCP servers | received {}",
+            writes[1]
+        );
+        assert!(
+            writes.iter().all(|write| !write.contains("authenticate")),
+            "expected no authenticate request | received {writes:?}"
+        );
+        let session: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(out.join("contract/session-new.json"))
+                .expect("expected session-new.json"),
+        )
+        .expect("expected session-new.json to be JSON");
+        assert_eq!(session["result"]["modes"]["currentModeId"], "auto");
+        assert_eq!(
+            session["result"]["configOptions"][0]["options"][0],
+            json!({"value": "default", "name": "Default"})
+        );
+        let text = session.to_string();
+        assert!(
+            !text.contains("per-run-id") && !text.contains("$4/$20"),
+            "expected the session id and the prices left out | received {text}"
+        );
+        let manifest = read_manifest(&out);
+        assert_eq!(manifest["probe"], "initialize, session/new");
+        assert_eq!(manifest["sessionOpened"], true);
+        assert_eq!(manifest["reproducible"], false);
+        assert!(
+            manifest["files"].get("session-new.json").is_some(),
+            "expected a digest for session-new.json | received {manifest}"
+        );
+        super::manifest::verify(&out.join("contract/manifest.json"))
+            .expect("expected the written digests to verify");
+        assert_eq!(launcher.live_children(), 0);
+        std::fs::remove_dir_all(out).expect("expected temporary capture cleanup");
+        std::fs::remove_dir_all(workspace).expect("expected temporary workspace cleanup");
+    }
+
+    #[tokio::test]
+    async fn open_session_records_a_login_refusal_and_says_no_session_opened() {
+        let launcher = session_capture_launcher(&SessionAgent {
+            session_reply: LOGIN_REFUSAL_REPLY,
+        });
+        let out = temp_dir("acp-session-refused");
+        let workspace = temp_dir("acp-session-refused-workspace");
+        let profile = maintainer_profile();
+
+        acp_with(
+            &host(Arc::clone(&launcher)),
+            &out,
+            profile.as_ref(),
+            None,
+            Some(&workspace),
+        )
+        .await
+        .expect("expected a login refusal to be a recorded answer");
+
+        let session: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(out.join("contract/session-new.json"))
+                .expect("expected session-new.json"),
+        )
+        .expect("expected session-new.json to be JSON");
+        assert_eq!(
+            session,
+            json!({"error": {"code": -32000, "message": "Authentication required"}})
+        );
+        let manifest = read_manifest(&out);
+        assert_eq!(manifest["probe"], "initialize, session/new");
+        assert_eq!(manifest["sessionOpened"], false);
+        assert_eq!(launcher.live_children(), 0);
+        std::fs::remove_dir_all(out).expect("expected temporary capture cleanup");
+        std::fs::remove_dir_all(workspace).expect("expected temporary workspace cleanup");
+    }
+
+    #[tokio::test]
+    async fn a_refused_initialize_sends_no_session_new() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(FakeProcess::transcript(["fake-adapter 1.0.0"]).with_exit(success()));
+        launcher.push(
+            RefusingInitializeAgent {
+                code: 1001,
+                message: "cannot start",
+            }
+            .process(),
+        );
+        let out = temp_dir("acp-session-no-initialize");
+        let workspace = temp_dir("acp-session-no-initialize-workspace");
+        let profile = maintainer_profile();
+
+        acp_with(
+            &host(Arc::clone(&launcher)),
+            &out,
+            profile.as_ref(),
+            None,
+            Some(&workspace),
+        )
+        .await
+        .expect_err("expected the initialize refusal to fail the capture");
+
+        let writes = launcher.written();
+        assert_eq!(
+            writes.len(),
+            1,
+            "expected only initialize on the wire | received {writes:?}"
+        );
+        assert!(!out.join("contract").exists(), "expected no fixture file");
+        assert_eq!(launcher.live_children(), 0);
+        std::fs::remove_dir_all(out).expect("expected temporary capture cleanup");
+        std::fs::remove_dir_all(workspace).expect("expected temporary workspace cleanup");
+    }
+
+    #[tokio::test]
+    async fn open_session_is_refused_for_a_profile_the_drift_lane_records_again() {
+        let launcher = Arc::new(FakeLauncher::new());
+        let out = temp_dir("acp-session-reproducible");
+        let workspace = temp_dir("acp-session-reproducible-workspace");
+        let profile =
+            mango_agent_acp::builtin_profile("opencode").expect("expected the opencode profile");
+
+        let refused = acp_with(
+            &host(Arc::clone(&launcher)),
+            &out,
+            profile.as_ref(),
+            None,
+            Some(&workspace),
+        )
+        .await
+        .expect_err("expected --open-session to be refused for a reproducible profile");
+
+        let message = refused.to_string();
+        assert!(
+            message.contains("--open-session") && message.contains("opencode"),
+            "expected the refusal to name the option and the profile | received {message}"
+        );
+        assert!(
+            launcher.launches().is_empty(),
+            "expected no process to start for a refused option"
+        );
+        std::fs::remove_dir_all(out).expect("expected temporary capture cleanup");
+        std::fs::remove_dir_all(workspace).expect("expected temporary workspace cleanup");
+    }
+
+    #[tokio::test]
+    async fn open_session_needs_an_absolute_workspace_for_the_protocol_cwd() {
+        let launcher = Arc::new(FakeLauncher::new());
+        let out = temp_dir("acp-session-relative");
+        let profile = maintainer_profile();
+
+        let refused = acp_with(
+            &host(Arc::clone(&launcher)),
+            &out,
+            profile.as_ref(),
+            None,
+            Some(std::path::Path::new("relative/workspace")),
+        )
+        .await
+        .expect_err("expected a relative workspace to be refused");
+
+        let message = refused.to_string();
+        assert!(
+            message.contains("absolute") && message.contains("relative/workspace"),
+            "expected the refusal to name the received path | received {message}"
+        );
+        assert!(
+            launcher.launches().is_empty(),
+            "expected no process to start"
+        );
         std::fs::remove_dir_all(out).expect("expected temporary capture cleanup");
     }
 
@@ -1146,6 +1493,7 @@ mod tests {
             &out,
             profile.as_ref(),
             Some(&vendor_cli),
+            None,
         )
         .await
         .expect("expected a capture that names the vendor CLI");
@@ -1189,7 +1537,7 @@ mod tests {
         let out = temp_dir("acp-no-vendor");
         let profile = mango_agent_acp::builtin_profile("opencode").expect("expected a profile");
 
-        acp_with(&host(launcher), &out, profile.as_ref(), None)
+        acp_with(&host(launcher), &out, profile.as_ref(), None, None)
             .await
             .expect("expected a capture without a vendor CLI");
 
@@ -1225,6 +1573,7 @@ mod tests {
                 &out,
                 profile.as_ref(),
                 Some(&vendor_cli),
+                None,
             )
             .await
             .expect_err("expected an unusable vendor answer to be refused");
