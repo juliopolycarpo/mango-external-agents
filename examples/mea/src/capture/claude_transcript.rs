@@ -13,7 +13,7 @@
 //! The recorder never signs in. It runs the CLI the operator already logged in, the way `mea turn`
 //! does, and refuses a signed-out one.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -223,10 +223,10 @@ async fn claude_with(
     // Redacted before anything is written or judged: what qualifies is what the file holds.
     let mut drift = DriftReport::default();
     let lines = tap.take_lines();
-    let answers = AnswerCalls::in_lines(&lines);
+    let calls = RecordedCalls::in_lines(&lines);
     let body: Vec<String> = lines
         .iter()
-        .filter_map(|line| redact_line(line, &answers, paths, &mut drift))
+        .filter_map(|line| redact_line(line, &calls, paths, &mut drift))
         .collect();
     let outcome = crate::failure::with_cleanup(conversation, closed, |primary| {
         notices.notice(&primary_failure_line(scenario.name, primary));
@@ -502,7 +502,7 @@ const CALL_INPUT_MEMBER: &str = "input";
 /// keys stay: they are opaque and random, and the same ids are kept as the values of `id` and
 /// `tool_use_id` so a call still pairs with its result).
 ///
-/// A repeat is the answer when [`AnswerCalls`] holds its id, and a tool author's data otherwise, so
+/// A repeat is the answer when [`RecordedCalls`] names its id `StructuredOutput`, and a tool author's data otherwise, so
 /// an id no `StructuredOutput` call claims is treated as data. The walk reads each repeat as that
 /// call's [`CALL_INPUT_MEMBER`].
 const WIRE_INPUTS_MEMBER: &str = "wire_tool_inputs";
@@ -520,6 +520,30 @@ const WIRE_INPUTS_MEMBER: &str = "wire_tool_inputs";
 /// named on its own line, never by value. A direct key of either member is on the key line
 /// instead, so no member name is judged twice.
 const TOOL_DATA_MEMBERS: &[&str] = &["tool_input", "tool_use_result"];
+
+/// The member of a user record that holds the tool's result, beside the `message` whose
+/// `tool_result` blocks name the call it answers.
+const TOOL_RESULT_MEMBER: &str = "tool_use_result";
+
+/// The tools Claude Code ships, whose result keys the vendor chose (`file`, `numLines`, `stdout`).
+/// An MCP tool is named `mcp__<server>__<tool>`, so no entry here can be one, and its result keys
+/// are its author's. A result whose call named a tool in this list has its direct keys judged by
+/// name like any vendor member; every other result's are user-chosen data. Reviewed like the member
+/// lists below: a tool a later Claude Code adds is treated as data until someone adds it. Sorted.
+const BUILT_IN_TOOLS: &[&str] = &[
+    "Bash",
+    "Edit",
+    "Glob",
+    "Grep",
+    "MultiEdit",
+    "NotebookEdit",
+    "Read",
+    "Task",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+    "Write",
+];
 
 /// The members of a `rate_limit_event` that identify the record rather than describe the account.
 /// The record reports plan usage (utilisation, reset times, overage state, the names of the
@@ -743,36 +767,39 @@ fn unused_key(map: &Map<String, Value>, key: String) -> String {
 ///
 /// The names of the members the walk replaced by default are noted in `drift`, never their values.
 ///
-/// `answers` names the `StructuredOutput` calls of the whole recording, because a repeat of a call's
-/// input under `wire_tool_inputs` may sit in a different record from the call.
+/// `calls` names the tool of every call in the whole recording, because a repeat of a call's input
+/// under `wire_tool_inputs` and a call's result may sit in a different record from the call.
 fn redact_line(
     raw: &str,
-    answers: &AnswerCalls,
+    calls: &RecordedCalls,
     paths: Paths<'_>,
     drift: &mut DriftReport,
 ) -> Option<String> {
     let record: Value = serde_json::from_str(raw).ok()?;
     record.is_object().then(|| {
-        redact_value(record, None, ValueContext::default(), answers, paths, drift).to_string()
+        redact_value(record, None, ValueContext::default(), calls, paths, drift).to_string()
     })
 }
 
-/// The tool-use ids of the `StructuredOutput` calls in a recording: the calls whose input is the
-/// model's answer, so that every other call's input is a tool author's data.
+/// The tool each tool-use id called, across a whole recording. It answers two questions the walk
+/// cannot settle from the line it is reading: whether a call is the `StructuredOutput` one, whose
+/// input is the model's answer and every other call's a tool author's data, and whether a result
+/// came from a built-in tool, whose result keys the vendor chose.
 ///
 /// Read from every line before any is redacted. Claude Code repeats a call's input under
-/// `wire_tool_inputs`, keyed by that id, and nothing says the repeat follows the call.
+/// `wire_tool_inputs`, keyed by that id, and nothing says the repeat follows the call; a result's
+/// tool name sits in an earlier record than the result.
 #[derive(Default)]
-struct AnswerCalls(BTreeSet<String>);
+struct RecordedCalls(BTreeMap<String, String>);
 
-impl AnswerCalls {
-    /// The ids of the `StructuredOutput` calls among `lines`, at any depth of a record except
-    /// inside data. A line that is not JSON holds none.
+impl RecordedCalls {
+    /// The calls among `lines`, at any depth of a record except inside data. A line that is not
+    /// JSON holds none.
     ///
     /// Data is every member the walk reads as a tool's or the model's own content: a tool's result,
     /// a denied call's arguments, any call's `input` and the `wire_tool_inputs` repeat, and the
-    /// structured answer. A tool author can write a block that reads like the answer's call there,
-    /// and it must not claim an id.
+    /// structured answer. A tool author can write a block that reads like a call there, and it must
+    /// not claim an id or rename one.
     fn in_lines(lines: &[String]) -> Self {
         fn is_data_member(name: &str) -> bool {
             TOOL_DATA_MEMBERS.contains(&name)
@@ -781,37 +808,69 @@ impl AnswerCalls {
                 || name == WIRE_INPUTS_MEMBER
         }
 
-        fn collect(value: &Value, ids: &mut BTreeSet<String>) {
+        fn collect(value: &Value, names: &mut BTreeMap<String, String>) {
             match value {
                 Value::Object(members) => {
                     if matches!(
                         members.get("type").and_then(Value::as_str),
                         Some("tool_use" | "server_tool_use")
-                    ) && members.get("name").and_then(Value::as_str) == Some(ANSWER_TOOL_NAME)
-                        && let Some(id) = members.get("id").and_then(Value::as_str)
+                    ) && let Some(id) = members.get("id").and_then(Value::as_str)
+                        && let Some(name) = members.get("name").and_then(Value::as_str)
                     {
-                        ids.insert(id.to_owned());
+                        // The same call shows up again in a streamed event. An id that two names
+                        // claim is nobody's: it matches no tool, so it stays user-chosen data.
+                        names
+                            .entry(id.to_owned())
+                            .and_modify(|known| {
+                                if known != name {
+                                    known.clear();
+                                }
+                            })
+                            .or_insert_with(|| name.to_owned());
                     }
                     members
                         .iter()
                         .filter(|(name, _)| !is_data_member(name))
-                        .for_each(|(_, child)| collect(child, ids));
+                        .for_each(|(_, child)| collect(child, names));
                 }
-                Value::Array(items) => items.iter().for_each(|item| collect(item, ids)),
+                Value::Array(items) => items.iter().for_each(|item| collect(item, names)),
                 _ => {}
             }
         }
-        let mut ids = BTreeSet::new();
+        let mut names = BTreeMap::new();
         for line in lines {
             if let Ok(record) = serde_json::from_str::<Value>(line) {
-                collect(&record, &mut ids);
+                collect(&record, &mut names);
             }
         }
-        Self(ids)
+        Self(names)
     }
 
-    fn contains(&self, id: &str) -> bool {
-        self.0.contains(id)
+    /// Whether the call `id` is the `StructuredOutput` one, whose input is the model's answer.
+    fn is_answer(&self, id: &str) -> bool {
+        self.0.get(id).is_some_and(|name| name == ANSWER_TOOL_NAME)
+    }
+
+    /// Whether `record` is the result of built-in tools only: every `tool_result` block of its
+    /// message names a call [`BUILT_IN_TOOLS`] lists. A record that names no call, a call the
+    /// recording does not hold or an MCP call is not, so its result keys stay user-chosen data.
+    fn is_built_in_result(&self, record: &Map<String, Value>) -> bool {
+        let mut answered = record
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+            .peekable();
+        answered.peek().is_some()
+            && answered.all(|block| {
+                block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| self.0.get(id))
+                    .is_some_and(|name| BUILT_IN_TOOLS.contains(&name.as_str()))
+            })
     }
 }
 
@@ -832,13 +891,17 @@ struct ValueContext {
     /// The value sits under a key of a [`ChildKeys::UserChosen`] map. The key is data, reported
     /// once in [`DriftReport::map_keys`], so it is not judged again as a member name.
     user_key: bool,
+    /// The value is the `tool_use_result` of a record that answers built-in tools only (see
+    /// [`RecordedCalls::is_built_in_result`]), so the vendor chose its direct keys: they are judged
+    /// by name and not listed as user-chosen.
+    built_in_result: bool,
 }
 
 fn redact_value(
     value: Value,
     member: Option<&str>,
     context: ValueContext,
-    answers: &AnswerCalls,
+    calls: &RecordedCalls,
     paths: Paths<'_>,
     drift: &mut DriftReport,
 ) -> Value {
@@ -861,9 +924,16 @@ fn redact_value(
                 && member.is_some_and(|member| MODEL_KEYED_MEMBERS.contains(&member));
             // A map whose keys a user or a tool author chose. Inside the model's answer the keys
             // are the schema's own and are not reported.
+            // A built-in tool's result is the exception: its keys are the vendor's.
             let user_chosen = !context.answer
+                && !context.built_in_result
                 && member
                     .is_some_and(|member| child_keys_of(member) == Some(ChildKeys::UserChosen));
+            // Only the recording's own frame says which tool a result came from; a `tool_use_result`
+            // written inside tool data is that tool's data.
+            let built_in_record = member.is_none()
+                && members.contains_key(TOOL_RESULT_MEMBER)
+                && calls.is_built_in_result(&members);
             // The call is the answer's when it is the `StructuredOutput` tool; its `input` is then
             // the structured answer, as is its repeat under `wire_tool_inputs`.
             let answer_call =
@@ -907,7 +977,7 @@ fn redact_value(
                     // A tool call's arguments: the answer for the `StructuredOutput` call, a tool
                     // author's data for the rest. An `input` that is not a tool call's is neither.
                     let (answer_input, tool_input) = if wire_inputs {
-                        (answers.contains(&name), !answers.contains(&name))
+                        (calls.is_answer(&name), !calls.is_answer(&name))
                     } else if tool_call && name == CALL_INPUT_MEMBER {
                         (answer_call, !answer_call)
                     } else {
@@ -929,6 +999,7 @@ fn redact_value(
                             || tool_input,
                         model_key: model_keyed,
                         user_key: user_chosen,
+                        built_in_result: built_in_record && name == TOOL_RESULT_MEMBER,
                     };
                     // Each repeat under `wire_tool_inputs` is walked as the call's own `input`, so
                     // the drift report treats it alike and the tool-use id is not read as a name.
@@ -937,7 +1008,7 @@ fn redact_value(
                     } else {
                         &name
                     };
-                    redact_value(value, Some(label), inner, answers, paths, drift)
+                    redact_value(value, Some(label), inner, calls, paths, drift)
                 };
                 redacted.insert(key, kept);
             }
@@ -948,7 +1019,7 @@ fn redact_value(
         Value::Array(items) => Value::Array(
             items
                 .into_iter()
-                .map(|item| redact_value(item, member, context, answers, paths, drift))
+                .map(|item| redact_value(item, member, context, calls, paths, drift))
                 .collect(),
         ),
         Value::String(text) => match member {
@@ -1215,9 +1286,9 @@ const REVIEWED_RETAINED_MEMBERS: &[(&str, ChildKeys)] = &[
     ("time_to_request_ms", ChildKeys::Leaf),
     ("tool_input", ChildKeys::UserChosen),
     ("tool_result_meta", ChildKeys::Vendor),
-    // A built-in tool's result has the vendor's keys (`file`, `numLines`), but an MCP tool's has
-    // whatever its author chose, and a record does not say which tool produced it, so the keys are
-    // treated as data for every tool.
+    // An MCP tool's result has whatever keys its author chose, so the keys are data. A built-in
+    // tool's has the vendor's (`file`, `numLines`): the walk judges those by name when the call
+    // that the record answers named a tool in [`BUILT_IN_TOOLS`], and this entry covers the rest.
     ("tool_use_result", ChildKeys::UserChosen),
     ("totalLines", ChildKeys::Leaf),
     ("total_cost_usd", ChildKeys::Leaf),
