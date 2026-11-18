@@ -905,7 +905,10 @@ named with `mea capture --vendor-cli` (`claude` 2.1.323 and `codex-cli` 0.166.0 
 captured against). `mea` does not find that binary, because the adapter's resolution is not a
 documented contract ([which binary an adapter runs](#which-vendor-binary-an-adapter-runs)), so the member says it was named by the operator and
 records the file name only. It shows which binary the operator pointed at, not that the adapter
-ran it. A capture made without the flag has no `vendorCli` member. The digests hold both to the tree.
+ran it. No documented surface of either adapter reports the build it runs, so the claim cannot be
+checked from the handshake
+([convergence assessment](acp-convergence.md#does-any-surface-report-the-vendor-build-an-adapter-runs)).
+A capture made without the flag has no `vendorCli` member. The digests hold both to the tree.
 
 ### Executable names and installation order
 

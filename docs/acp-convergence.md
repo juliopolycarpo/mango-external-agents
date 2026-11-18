@@ -155,6 +155,37 @@ reports additions that nothing in the library reads. The evidence is in
 `reproducible: false` and carry `capturedFrom` and `capturedAt`. The install and capture recipe,
 and when to run it, is in [fixtures/README.md](../fixtures/README.md).
 
+## Does any surface report the vendor build an adapter runs?
+
+No documented, non-secret surface does, so the `vendorCli` member stays what the operator named
+([#480](https://github.com/juliopolycarpo/mango-external-agents/issues/480)). Read on 2026-11-17
+from the npm install trees of `claude-agent-acp` 0.107.0 and `codex-acp` 2.6.0, with
+`--ignore-scripts`, empty `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `HOME`, and no login:
+
+- **`initialize` `agentInfo`** names the adapter itself. The raw reply carries
+  `{"name": "@agentclientprotocol/claude-agent-acp", "title": "Claude Agent", "version": "0.107.0"}`
+  and `{"name": "@agentclientprotocol/codex-acp", "title": "Codex", "version": "2.6.0"}`. In
+  `claude-agent-acp` the source fills the three members from its own `package.json`. Neither reply
+  has a member for the CLI beneath it, in `agentInfo` or in `_meta`.
+- **Adapter flags.** `codex-acp --version` prints `@agentclientprotocol/codex-acp 2.6.0`, again the
+  adapter. The Claude adapter documents no version flag, and its `--help` starts the server. Both
+  packages carry an undocumented passthrough to the vendor CLI (`--cli` or `cli`); a documented
+  contract would be needed before `mea` runs it, because the adapter's own resolution is not one
+  ([harness-acp.md](harness-acp.md#which-vendor-binary-an-adapter-runs)).
+- **The adapters' own documentation** (the READMEs and the pages the project reads, copied on the
+  same date) names `CLAUDE_CODE_EXECUTABLE` and `CODEX_PATH` as the overrides and says nothing about
+  reporting the result.
+- **`session/new`** returns modes and `configOptions`, not a build. It also needs a session, which a
+  capture never opens.
+
+What the record can claim is unchanged: `version.json` holds the adapter's version from `agentInfo`
+and, under `vendorCli`, the `--version` of the binary the operator named. When a capture names a
+binary other than the one the adapter resolves, nothing in the handshake shows it. Whoever reads
+`vendorCli` as "the build that ran" must check the adapter's environment themselves
+(`CLAUDE_CODE_EXECUTABLE` and `CODEX_PATH` unset means the package's bundled copy). Reopen this
+when an adapter documents a field or a flag that reports the build it spawns; a `mea` change would
+then record it beside the operator's claim and flag a mismatch.
+
 ## Decision criteria
 
 Converge a dedicated harness onto an ACP profile only when all of these hold. Each names its
