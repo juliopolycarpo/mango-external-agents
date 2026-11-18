@@ -1328,7 +1328,13 @@ it does not change the vendor wire, prompt capability checks, or per-attachment 
 - **Public ACP contract captures.** `mea capture --harness acp --profile <id>` records the installed
   CLI's version and its v1 `initialize` answer under `fixtures/acp/<id>/contract/` — committed today
   for `opencode`, `cursor` and `grok`.
-  It sends no `authenticate` or `session/new` request. The capture keeps each auth method's `type`,
+  It sends no `authenticate` request, and no `session/new` unless the operator passes
+  `--open-session` for a maintainer capture (`claude-agent-acp`, `codex-acp`), which records the mode
+  ids and `configOptions` or the login refusal in `session-new.json`
+  ([what it measured](acp-convergence.md#what-sessionnew-measured)). That capture is
+  unauthenticated by construction: `mea` runs the adapter under its own scratch `HOME`,
+  `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `XDG_*` directories and removes them afterwards, so it never
+  sees the operator's account. The capture keeps each auth method's `type`,
   `id` and `name` and the shape of `agentCapabilities`, drops `_meta` extension objects, and
   replaces every string *value* inside `agentCapabilities` with `[REDACTED]` rather than guessing
   which of them is a machine path. It ends the child immediately after the answer.

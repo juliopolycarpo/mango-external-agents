@@ -12,7 +12,8 @@ cargo run -p mea -- capture --harness acp --profile opencode --out fixtures/acp/
 
 These captures make no login request. Claude reads `--version` and `--help`. Codex reads its
 version and runs `app-server generate-json-schema`. ACP reads a version and sends `initialize`
-without `authenticate` or `session/new`. CI compares only public artifacts: the resulting
+without `authenticate` or `session/new` (a maintainer capture with `--open-session` also sends
+`session/new`, never `authenticate`). CI compares only public artifacts: the resulting
 `contract/` directories and, for Codex, the separately regenerated schema inventory. It excludes
 archival transcripts and historical help.
 
@@ -219,29 +220,33 @@ cargo run -p mea -- capture --harness acp --profile grok --out fixtures/acp/grok
 ```
 
 The two adapters are installed from npm into a fresh, empty directory at an exact version, without
-running package scripts, and captured with their config homes pointed at empty directories so
-nothing is read from a real account. The capture sends `initialize` only. Run it from a directory
-that is not the install tree:
+running package scripts. `--open-session` is unauthenticated by construction: `mea` creates empty
+scratch directories for `HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and the four `XDG_*` homes, gives
+the adapter only those, and removes them when the capture ends, error or not. Nothing is read from
+or written to the operator's own account, whatever the shell has set. The capture sends `initialize`, and with `--open-session` also
+`session/new`: the adapter answers with its mode ids and `configOptions`, or with the login refusal
+`codex-acp` gives without an account, and `session-new.json` holds either. It never sends
+`authenticate`. Without the flag the capture sends `initialize` only. Run it from a directory that
+is not the install tree:
 
 ```sh
 npm install --prefix "$ADAPTER_DIR" --ignore-scripts --no-audit --no-fund \
   @agentclientprotocol/claude-agent-acp@0.107.0
-PATH="$ADAPTER_DIR/node_modules/.bin:$PATH" CLAUDE_CONFIG_DIR="$(mktemp -d)" \
+PATH="$ADAPTER_DIR/node_modules/.bin:$PATH" \
   cargo run -p mea -- capture --harness acp --profile claude-agent-acp \
   --vendor-cli "$ADAPTER_DIR/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude" \
-  --out fixtures/acp/claude-agent-acp
+  --open-session --out fixtures/acp/claude-agent-acp
 
 npm install --prefix "$ADAPTER_DIR" --ignore-scripts --no-audit --no-fund \
   @agentclientprotocol/codex-acp@2.6.0
-PATH="$ADAPTER_DIR/node_modules/.bin:$PATH" CODEX_HOME="$(mktemp -d)" \
+PATH="$ADAPTER_DIR/node_modules/.bin:$PATH" \
   cargo run -p mea -- capture --harness acp --profile codex-acp \
   --vendor-cli "$ADAPTER_DIR/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex" \
-  --out fixtures/acp/codex-acp
+  --open-session --out fixtures/acp/codex-acp
 ```
 
-`$ADAPTER_DIR` is a different empty directory for each adapter, and each config home must exist
-(`mktemp -d` creates it): `codex-acp` answers a missing `CODEX_HOME` with a JSON-RPC error, and the
-capture reports it as invalid vendor data. Run `scripts/package-fixtures.py` afterwards.
+`$ADAPTER_DIR` is a different empty directory for each adapter. Run `scripts/package-fixtures.py`
+afterwards.
 `version.json` holds the adapter's own version, and under `vendorCli` the `--version` of the binary
 named by `--vendor-cli`. `mea` does not look for that binary: each adapter picks it by its own
 rules, which are not a documented contract. The path above is the Linux x64 platform package; other

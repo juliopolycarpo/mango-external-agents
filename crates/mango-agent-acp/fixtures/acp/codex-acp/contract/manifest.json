@@ -1,13 +1,14 @@
 {
   "format": 1,
   "profile": "codex-acp",
-  "probe": "initialize",
+  "probe": "initialize, session/new",
   "reproducible": false,
   "sessionOpened": false,
   "capturedFrom": "@agentclientprotocol/codex-acp 2.6.0",
-  "capturedAt": "2026-11-14",
+  "capturedAt": "2026-11-18",
   "files": {
     "initialize.json": "sha256:35fe3870c65d8250baf1dfda265471f8e0603b4065a35c458685b833d0ef801f",
+    "session-new.json": "sha256:08d725ef478a1a783502653c27f26cc7cfc43ee99e2d6a76e9a2485af7e2c03c",
     "version.json": "sha256:600dcef20127cdf16be5521ee7bd30998e153c85a537d7249a7b56dfbe50d930"
   }
 }

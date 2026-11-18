@@ -896,6 +896,11 @@ pub(crate) struct CaptureOptions {
     /// `--version`; `mea` never looks for it, because the adapter's own resolution is no contract.
     #[arg(long)]
     pub vendor_cli: Option<String>,
+    /// Also send `session/new` to the ACP adapter and record its mode ids and `configOptions`, or the
+    /// refusal it sends without a login. Never sends `authenticate` or reads a credential. A
+    /// maintainer capture: refused for a profile the drift lane records again.
+    #[arg(long)]
+    pub open_session: bool,
 }
 
 impl CaptureOptions {
@@ -924,6 +929,11 @@ impl CaptureOptions {
         {
             return Err(format!(
                 "(mea capture): expected --vendor-cli only with an ACP contract capture (--harness acp --profile ID) | received --vendor-cli {program:?} with --harness {selected}"
+            ));
+        }
+        if self.open_session && !matches!(selected, HarnessChoice::Acp(_)) {
+            return Err(format!(
+                "(mea capture): expected --open-session only with an ACP contract capture (--harness acp --profile ID) | received --open-session with --harness {selected}"
             ));
         }
         self.check_scenario(&selected)?;
@@ -1351,6 +1361,49 @@ mod capture_tests {
                 refused.err(),
                 Some(format!(
                     "(mea capture): expected --vendor-cli only with an ACP contract capture (--harness acp --profile ID) | received --vendor-cli {path:?} with {received}"
+                )),
+                "expected {typed:?} to be refused with the value it received"
+            );
+        }
+    }
+
+    #[test]
+    fn open_session_is_accepted_only_for_an_acp_contract_capture() {
+        let accepted = CaptureOptions::parse(&capture_arguments(&[
+            "--harness",
+            "acp",
+            "--profile",
+            "claude-agent-acp",
+            "--open-session",
+        ]))
+        .expect("expected valid capture arguments");
+        assert!(accepted.kind().is_ok());
+        assert!(accepted.open_session);
+        let without = CaptureOptions::parse(&capture_arguments(&[
+            "--harness",
+            "acp",
+            "--profile",
+            "claude-agent-acp",
+        ]))
+        .expect("expected valid capture arguments");
+        assert!(
+            !without.open_session,
+            "expected --open-session off by default"
+        );
+
+        for (words, received) in [
+            (vec!["--harness", "claude"], "--harness claude"),
+            (vec!["--harness", "codex"], "--harness codex"),
+            (vec!["codex"], "--harness codex"),
+        ] {
+            let mut typed = words.clone();
+            typed.push("--open-session");
+            let refused = CaptureOptions::parse(&capture_arguments(&typed))
+                .and_then(|options| options.kind());
+            assert_eq!(
+                refused.err(),
+                Some(format!(
+                    "(mea capture): expected --open-session only with an ACP contract capture (--harness acp --profile ID) | received --open-session with {received}"
                 )),
                 "expected {typed:?} to be refused with the value it received"
             );
