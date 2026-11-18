@@ -109,9 +109,39 @@ diff still catches a flag that ships undocumented.
 Subcommand help texts stay out of the public contracts. Each one would be a committed contract that
 the pinned job must reproduce byte for byte on Ubuntu, macOS and Windows (the `app` row of
 `codex --help` shows how platforms differ), and every wording change in a command the library never
-calls would open a drift issue. The top-level help and the documentation watch are the trigger. An
-ACP flag in a subcommand's help before any watched page names it stays unwatched:
-[#451](https://github.com/juliopolycarpo/mango-external-agents/issues/451).
+calls would open a drift issue. The top-level help and the documentation watch are the trigger, and
+a third watch covers the gap between them.
+
+## Subcommand help watch
+
+An ACP flag a release adds under `claude mcp`, `codex exec` or another subcommand shows in neither
+the top-level help nor a vendor page until a watched page names it. The Claude and Codex scheduled
+lanes therefore run `scripts/check-vendor-subcommand-help.sh` after the capture. It reads the command
+names from the `Commands:` section of the top-level help the capture just wrote (without `help` and
+without the alias after a `|`), runs `<cli> <command> --help` once for each, searches the text with
+the same `ACP_PATTERN` as the documentation watch, and discards it. Nothing is committed and no
+subcommand help is compared, so a rewording opens no issue.
+
+The probe needs no login and starts only the CLI the lane installed, with `--help` as the only
+argument, `stdin` closed and `HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and the XDG directories set to a
+scratch directory it removes. It does not read or write anyone's own configuration.
+
+| Exit | Meaning                                                                                                                                                                      |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0    | No subcommand help names ACP.                                                                                                                                                |
+| 1    | At least one does. The log and the issue body name each command and the matching lines with their numbers.                                                                   |
+| 2    | The watch could not look: no command in the top-level help, a command name that is not a plain word, or a subcommand whose `--help` exited non-zero. It is not a clean pass. |
+
+A flagged or unreadable run opens the same managed `drift(<vendor>)` issue as the other watches and
+adds a "Subcommand help watch" section to its body: the command line, the matching lines (at most
+three per command, each cut at 240 bytes, with the count shown) and at most six commands, with the
+rest named. The section holds public help text only. The step is `continue-on-error` and bounded at
+five minutes, runs only when the capture succeeded, and runs on the schedule only. Its tests use
+the named fake `scripts/test-fixtures/fake-vendor-cli.sh` and run no vendor.
+
+The check ran against the pinned `claude` 2.1.325 (18 commands) and `codex` 0.169.0 (26 commands)
+on 2026-11-17 with empty configuration directories and found no ACP mention in any of them. Treat a
+hit as the same trigger as a hit in the top-level help ([acp-convergence.md](acp-convergence.md)).
 
 ## Adapter captures: not a scheduled lane
 
