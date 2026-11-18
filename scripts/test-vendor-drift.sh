@@ -683,6 +683,7 @@ write_fake_claude_top_level_help() {
 }
 
 write_fake_codex_top_level_help() {
+  # shellcheck disable=SC2016 # the backticks are literal help text, not command substitution
   printf '%s\n' \
     'Codex CLI' \
     '' \
@@ -746,6 +747,7 @@ test_vendor_subcommand_help_watch() {
   "$watch" claude "$top" "$report" > /dev/null 2> "$error" || true
   assert_contains "$error" 'expected no ACP flag or command in claude mcp --help, received:' 'the console names the command'
   assert_contains "$error" '3:  --acp  Serve the Agent Client Protocol over stdio' 'the console names the line with its number'
+  # shellcheck disable=SC2016 # the backticks are literal Markdown, not command substitution
   assert_contains "$report" '### `claude mcp --help`' 'the report names the command line'
   assert_contains "$report" '3:  --acp  Serve the Agent Client Protocol over stdio' 'the report holds the matching line'
   assert_not_contains "$report" 'claude auth' 'a clean command is not in the report'
@@ -763,8 +765,10 @@ test_vendor_subcommand_help_watch() {
   expect_status 2 "$watch" claude "$top" "$report"
   "$watch" claude "$top" "$report" > /dev/null 2> "$error" || true
   assert_contains "$error" 'expected claude plugin --help to exit 0, received exit status 2' 'the unreadable command is named'
+  # shellcheck disable=SC2016 # the backticks are literal Markdown, not command substitution
   assert_contains "$report" '### `claude plugin --help`' 'the report names the unreadable command'
   assert_contains "$report" 'so its help was not searched' 'the report says the help was not searched'
+  # shellcheck disable=SC2016 # the backticks are literal Markdown, not command substitution
   assert_contains "$report" '### `claude auth --help`' 'the mention is reported beside the unreadable command'
   write_fake_subcommand_help "$root" plugin 'Usage: claude plugin'
 
@@ -781,6 +785,7 @@ test_vendor_subcommand_help_watch() {
     fail "a hung command must be cut off after HELP_TIMEOUT_SECONDS=1 | received $((SECONDS - started)) seconds for two runs"
   fi
   assert_contains "$error" 'expected claude mcp --help to answer within 1 seconds, received no answer' 'the hung command is named with the limit'
+  # shellcheck disable=SC2016 # the backticks are literal Markdown, not command substitution
   assert_contains "$report" '### `claude mcp --help`' 'the report names the hung command'
   assert_contains "$report" 'did not answer within 1 seconds' 'the report says the command timed out'
   assert_not_contains "$error" 'claude auth --help to answer' 'only the hung command is reported'
@@ -828,6 +833,7 @@ test_vendor_subcommand_help_watch() {
     'the Codex commands are probed and help is not'
   write_fake_subcommand_help "$root" exec '      --acp  Run over ACP'
   expect_status 1 "$watch" codex "$top" "$report"
+  # shellcheck disable=SC2016 # the backticks are literal Markdown, not command substitution
   assert_contains "$report" '### `codex exec --help`' 'the report names the Codex command line'
 
   # No command in the top-level help, an unreadable help file and an odd command name are all

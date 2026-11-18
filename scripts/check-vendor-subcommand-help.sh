@@ -73,6 +73,7 @@ help_report_section() {
     return 0
   fi
   {
+    # shellcheck disable=SC2016 # the backticks are literal Markdown, not command substitution
     printf '### `%s`\n\n%s\n' "$heading" "$sentence"
     if [ -n "$text" ]; then
       # shellcheck disable=SC2016 # the backticks are literal Markdown fence characters, not command substitution

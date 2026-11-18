@@ -13,6 +13,7 @@ if [ -z "${VENDOR_ACP_LIB_LOADED:-}" ]; then
 
   # Case-insensitive; `\b` keeps a hash or a longer word that merely contains "acp" from matching,
   # while `--acp`, `acp` and `claude-agent-acp` do match.
+  # shellcheck disable=SC2034 # read by the scripts that source this file
   readonly ACP_PATTERN='\bacp\b|agent[ -]?client[ -]?protocol'
 
   # Cuts each line of stdin at a byte limit (the first argument, default 1000) and drops a UTF-8
