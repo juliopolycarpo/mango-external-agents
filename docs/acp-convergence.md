@@ -151,8 +151,11 @@ may send `session/new`. It may, as an opt-in: `mea capture --harness acp --profi
 sends it after `initialize` and writes `session-new.json` beside the other files. The decision:
 
 - The request is `{"cwd": <the capture workspace>, "mcpServers": []}`. The capture never calls
-  `authenticate` and reads no credential. The adapter runs under an empty `CLAUDE_CONFIG_DIR` or
-  `CODEX_HOME`, as in the recipe in [fixtures/README.md](../fixtures/README.md).
+  `authenticate` and reads no credential. It is unauthenticated by construction: `mea` creates its
+  own empty `HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `XDG_*` directories, gives the adapter only
+  those whatever the shell has set, and removes them afterwards, error or not. A logged-in machine
+  therefore opens no session as its owner and writes nothing under `~/.claude` or `~/.codex`. The
+  recipe is in [fixtures/README.md](../fixtures/README.md).
 - An adapter that wants a login answers with a JSON-RPC error. The capture records the code and the
   redacted message in `session-new.json` and the manifest says `sessionOpened: false`. That is a
   recorded answer, not a failed capture.
@@ -162,7 +165,7 @@ sends it after `initialize` and writes `session-new.json` beside the other files
 - It is refused for a profile the drift lane records again (`opencode`): what `session/new` answers
   follows the machine's agent state, and a reproducible contract must not.
 - Opening a session makes the Claude adapter write its own state (`.claude.json`, a backup, empty
-  `projects`, `sessions` and `plugins` directories) under the empty `CLAUDE_CONFIG_DIR`, where its
+  `projects`, `sessions` and `plugins` directories) under the scratch `CLAUDE_CONFIG_DIR`, where its
   `initialize` capture wrote nothing. `codex-acp` writes its SQLite state under `CODEX_HOME` for
   either probe. Nothing else is sent, and the child is stopped after the answer.
 
@@ -188,7 +191,7 @@ What it settles:
   stays as it is until then.
 - Codex's catalog and mode ids stay unmeasured. `codex-acp` refuses `session/new` without a login,
   and the refusal is the recorded shape. Measuring them needs the maintainer's own signed-in
-  `CODEX_HOME`, which a capture would read state from; that is a separate decision.
+  `CODEX_HOME`, and `--open-session` deliberately never reads one; that is a separate decision.
 
 Criterion 2 is not met, and this is a decision rather than an oversight
 ([#454](https://github.com/juliopolycarpo/mango-external-agents/issues/454)). Both adapters install
