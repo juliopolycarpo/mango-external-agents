@@ -17,8 +17,8 @@ use super::*;
 /// [`super::redact_line`] for a test that does not read the drift report. The line is a recording
 /// of its own: the `StructuredOutput` calls it names are the answer's.
 fn redact_line(raw: &str, paths: Paths<'_>) -> Option<String> {
-    let answers = AnswerCalls::in_lines(&[raw.to_owned()]);
-    super::redact_line(raw, &answers, paths, &mut DriftReport::default())
+    let calls = RecordedCalls::in_lines(&[raw.to_owned()]);
+    super::redact_line(raw, &calls, paths, &mut DriftReport::default())
 }
 
 /// Collects the notices a capture hands to the operator, in place of stderr.
@@ -378,12 +378,12 @@ fn redacted_record(record: &Value) -> Value {
 fn redacted_records(records: &[Value]) -> Vec<Value> {
     let facts = MachineFacts::new();
     let lines = lines_of(records);
-    let answers = AnswerCalls::in_lines(&lines);
+    let calls = RecordedCalls::in_lines(&lines);
     let mut drift = DriftReport::default();
     lines
         .iter()
         .map(|line| {
-            let kept = super::redact_line(line, &answers, facts.paths(), &mut drift)
+            let kept = super::redact_line(line, &calls, facts.paths(), &mut drift)
                 .unwrap_or_else(|| panic!("expected a JSON object to be kept | received: {line}"));
             serde_json::from_str(&kept).unwrap_or_else(|error| {
                 panic!("expected a redacted JSON line | received: {kept} ({error})")
@@ -1074,7 +1074,7 @@ fn a_structured_output_member_inside_tool_data_does_not_keep_its_numbers() {
 
 #[test]
 fn an_answer_lookalike_inside_tool_data_names_no_answer_call() {
-    let answers = AnswerCalls::in_lines(&lines_of(&[
+    let calls = RecordedCalls::in_lines(&lines_of(&[
         assistant_record_with_calls(
             &json!({}),
             &json!({"payload": {
@@ -1096,7 +1096,7 @@ fn an_answer_lookalike_inside_tool_data_names_no_answer_call() {
         "toolu_nested_in_wire",
     ]
     .into_iter()
-    .filter(|id| answers.contains(id))
+    .filter(|id| calls.is_answer(id))
     .collect();
     assert_eq!(
         claimed,
@@ -1200,7 +1200,7 @@ fn the_names_of_a_tool_authors_input_are_keys_and_not_retained_members() {
 
 #[test]
 fn the_answer_calls_are_the_structured_output_tool_uses_at_any_depth() {
-    let answers = AnswerCalls::in_lines(&[
+    let calls = RecordedCalls::in_lines(&[
         lines_of(&[json!({"type": "assistant", "message": {"content": [
             {"type": "tool_use", "id": "toolu_message", "name": "StructuredOutput", "input": {}},
             {"type": "tool_use", "id": "toolu_other", "name": "mcp__ledger__lookup", "input": {}},
@@ -1219,7 +1219,7 @@ fn the_answer_calls_are_the_structured_output_tool_uses_at_any_depth() {
 
     let found: Vec<&str> = ["toolu_message", "toolu_stream", "toolu_other", "toolu_text"]
         .into_iter()
-        .filter(|id| answers.contains(id))
+        .filter(|id| calls.is_answer(id))
         .collect();
     assert_eq!(
         found,
@@ -2969,10 +2969,10 @@ fn drifted_turn_lines(facts: &MachineFacts) -> Vec<String> {
 /// Runs the walk over `lines` as a capture does and returns the drift it collected.
 fn drift_over(lines: &[String]) -> DriftReport {
     let facts = MachineFacts::new();
-    let answers = AnswerCalls::in_lines(lines);
+    let calls = RecordedCalls::in_lines(lines);
     let mut drift = DriftReport::default();
     for line in lines {
-        super::redact_line(line, &answers, facts.paths(), &mut drift);
+        super::redact_line(line, &calls, facts.paths(), &mut drift);
     }
     drift
 }
@@ -3660,9 +3660,9 @@ fn a_reviewed_member_declared_without_the_children_it_holds_is_caught() {
     );
 }
 
-/// The committed transcripts show one tool call's parameters under `permission_denials` and the
-/// keys of a built-in tool's result under `tool_use_result`.
-const COMMITTED_USER_CHOSEN_KEYS: &[&str] = &["content", "file", "file_path", "type"];
+/// The committed transcripts show one tool call's parameters under `permission_denials`. The keys of
+/// the built-in `Read` result (`file`, `type`) are the vendor's and are judged by name instead.
+const COMMITTED_USER_CHOSEN_KEYS: &[&str] = &["content", "file_path"];
 
 #[test]
 fn the_committed_claude_transcripts_report_only_the_keys_of_their_user_chosen_maps() {
@@ -3750,6 +3750,200 @@ fn the_keys_of_an_mcp_content_array_result_are_reported_and_the_members_below_ar
         "expected a user-chosen key skipped and a member below it judged | received strings: {:?} retained: {:?}",
         drift.unseen,
         drift.retained
+    );
+}
+
+/// A key beside `file` that a later Claude Code could add to a built-in tool's result.
+const NEW_VENDOR_RESULT_KEY: &str = "newVendorResultKey";
+
+const READ_CALL_ID: &str = "toolu_01ReadCallFake";
+const MCP_CALL_ID: &str = "toolu_01McpCallFake";
+
+/// The assistant record that carries one call of the tool `name`, as the recording shows it.
+fn tool_call_record(id: &str, name: &str) -> Value {
+    json!({"type": "assistant", "message": {"id": "msg_1", "role": "assistant", "content": [
+        {"type": "tool_use", "id": id, "name": name, "input": {}}]}})
+}
+
+/// The user record that answers the calls `ids`: the `tool_result` blocks name them, and the
+/// result sits beside the message, as in the committed `read-turn.jsonl`.
+fn tool_result_record(ids: &[&str], result: Value) -> Value {
+    let blocks: Vec<Value> = ids
+        .iter()
+        .map(|id| json!({"type": "tool_result", "tool_use_id": id, "content": "x"}))
+        .collect();
+    json!({"type": "user", "message": {"role": "user", "content": blocks}, "tool_use_result": result})
+}
+
+/// A built-in `Read` result: the vendor's keys (`type`, `file`) and one more.
+fn read_result_with_new_key(extra: Value) -> Value {
+    json!({"type": "text", "file": {"filePath": "/work/repo/note.txt", "numLines": 2},
+        NEW_VENDOR_RESULT_KEY: extra})
+}
+
+#[test]
+fn a_new_key_in_a_built_in_tools_result_is_reported_as_a_new_member_and_not_as_user_data() {
+    let drift = drift_over(&lines_of(&[
+        tool_call_record(READ_CALL_ID, "Read"),
+        tool_result_record(&[READ_CALL_ID], read_result_with_new_key(json!("x"))),
+    ]));
+
+    assert!(
+        drift.unseen.contains(NEW_VENDOR_RESULT_KEY) && drift.map_keys.is_empty(),
+        "expected {NEW_VENDOR_RESULT_KEY:?} reported as a new member and no user-chosen key | received strings: {:?} keys: {:?}",
+        drift.unseen,
+        drift.map_keys
+    );
+}
+
+#[test]
+fn a_new_number_or_object_key_in_a_built_in_tools_result_is_reported_by_name() {
+    let number = drift_over(&lines_of(&[
+        tool_call_record(READ_CALL_ID, "Read"),
+        tool_result_record(&[READ_CALL_ID], read_result_with_new_key(json!(7))),
+    ]));
+    let object = drift_over(&lines_of(&[
+        tool_call_record(READ_CALL_ID, "Read"),
+        tool_result_record(
+            &[READ_CALL_ID],
+            read_result_with_new_key(json!({"leaf": "x"})),
+        ),
+    ]));
+
+    assert!(
+        number.replaced_scalars.contains(NEW_VENDOR_RESULT_KEY),
+        "expected the number key named as a replaced scalar | received: {:?}",
+        number.replaced_scalars
+    );
+    assert!(
+        object.retained.contains(NEW_VENDOR_RESULT_KEY),
+        "expected the object key named as a retained member | received: {:?}",
+        object.retained
+    );
+}
+
+#[test]
+fn the_keys_of_a_built_in_tools_result_the_review_lists_are_not_reported() {
+    let drift = drift_over(&lines_of(&[
+        tool_call_record(READ_CALL_ID, "Read"),
+        tool_result_record(
+            &[READ_CALL_ID],
+            json!({"type": "text", "file": {"filePath": "/work/repo/note.txt", "content": "x",
+                "numLines": 2, "startLine": 1, "totalLines": 2}}),
+        ),
+    ]));
+
+    assert!(
+        drift.unseen.is_empty()
+            && drift.retained.is_empty()
+            && drift.replaced_scalars.is_empty()
+            && drift.map_keys.is_empty(),
+        "expected the reviewed vendor keys of a Read result to report nothing | received strings: {:?} retained: {:?} scalars: {:?} keys: {:?}",
+        drift.unseen,
+        drift.retained,
+        drift.replaced_scalars,
+        drift.map_keys
+    );
+}
+
+#[test]
+fn the_same_key_in_an_mcp_tools_result_stays_a_user_chosen_key() {
+    let drift = drift_over(&lines_of(&[
+        tool_call_record(MCP_CALL_ID, "mcp__ledger__lookup"),
+        tool_result_record(&[MCP_CALL_ID], read_result_with_new_key(json!("x"))),
+    ]));
+
+    assert!(
+        drift.map_keys.contains(NEW_VENDOR_RESULT_KEY)
+            && !drift.unseen.contains(NEW_VENDOR_RESULT_KEY),
+        "expected {NEW_VENDOR_RESULT_KEY:?} listed as a user-chosen key and not judged as a member | received keys: {:?} strings: {:?}",
+        drift.map_keys,
+        drift.unseen
+    );
+}
+
+#[test]
+fn a_result_whose_call_the_recording_does_not_hold_stays_user_chosen() {
+    let drift = drift_over(&lines_of(&[tool_result_record(
+        &[READ_CALL_ID],
+        read_result_with_new_key(json!("x")),
+    )]));
+
+    assert!(
+        drift.map_keys.contains(NEW_VENDOR_RESULT_KEY),
+        "expected a result with no recorded call to be user-chosen | received keys: {:?}",
+        drift.map_keys
+    );
+}
+
+#[test]
+fn a_record_answering_a_built_in_and_an_mcp_call_stays_user_chosen() {
+    let drift = drift_over(&lines_of(&[
+        tool_call_record(READ_CALL_ID, "Read"),
+        tool_call_record(MCP_CALL_ID, "mcp__ledger__lookup"),
+        tool_result_record(
+            &[READ_CALL_ID, MCP_CALL_ID],
+            read_result_with_new_key(json!("x")),
+        ),
+    ]));
+
+    assert!(
+        drift.map_keys.contains(NEW_VENDOR_RESULT_KEY),
+        "expected one MCP call among the answered ones to keep the result user-chosen | received keys: {:?}",
+        drift.map_keys
+    );
+}
+
+#[test]
+fn a_tool_result_cannot_rename_the_call_it_answers_to_a_built_in_tool() {
+    // The MCP tool's own result spells out a `Read` call under its id; tool data names nothing.
+    let drift = drift_over(&lines_of(&[
+        tool_call_record(MCP_CALL_ID, "mcp__ledger__lookup"),
+        tool_result_record(
+            &[MCP_CALL_ID],
+            json!({NEW_VENDOR_RESULT_KEY: "x",
+                "echo": {"type": "tool_use", "id": MCP_CALL_ID, "name": "Read"}}),
+        ),
+    ]));
+
+    assert!(
+        drift.map_keys.contains(NEW_VENDOR_RESULT_KEY)
+            && !drift.unseen.contains(NEW_VENDOR_RESULT_KEY),
+        "expected an MCP result to stay user-chosen whatever its data claims | received keys: {:?} strings: {:?}",
+        drift.map_keys,
+        drift.unseen
+    );
+}
+
+#[test]
+fn a_built_in_tools_result_is_redacted_as_before_whatever_the_report_says() {
+    let records = redacted_records(&[
+        tool_call_record(READ_CALL_ID, "Read"),
+        tool_result_record(&[READ_CALL_ID], read_result_with_new_key(json!(7))),
+    ]);
+
+    assert_eq!(
+        records[1]["tool_use_result"],
+        json!({"type": redact::PLACEHOLDER, "file": {"filePath": redact::PLACEHOLDER, "numLines": 0},
+            NEW_VENDOR_RESULT_KEY: 0}),
+        "expected the keys kept and every value replaced | received: {}",
+        records[1]
+    );
+}
+
+#[test]
+fn the_built_in_tool_names_are_sorted_and_none_is_an_mcp_name() {
+    let mut sorted = BUILT_IN_TOOLS.to_vec();
+    sorted.sort_unstable();
+
+    assert_eq!(
+        BUILT_IN_TOOLS,
+        sorted.as_slice(),
+        "expected BUILT_IN_TOOLS sorted by name"
+    );
+    assert!(
+        BUILT_IN_TOOLS.iter().all(|name| !name.starts_with("mcp__")),
+        "expected no MCP tool name in BUILT_IN_TOOLS | received: {BUILT_IN_TOOLS:?}"
     );
 }
 

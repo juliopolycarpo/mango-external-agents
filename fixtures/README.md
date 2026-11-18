@@ -164,12 +164,16 @@ member that is redacted without anyone noticing. After it writes the transcript 
   tool call that a tool author named) and `tool_use_result` (the tool's output). A key there is
   data, so no list can review it: every key is listed on every run that has one, a name a reviewed
   list holds included, and is not also judged as a member name. Only the direct keys are listed;
-  the members below them are judged by name. `tool_use_result` is declared this way for every
-  tool: a built-in tool's result has the vendor's keys (`file`, `numLines`), but an MCP tool's has
-  whatever its author chose, and the record does not say which tool wrote it. The cost is that a
-  new vendor key in a built-in result is listed beside the others and not reported as new. The
-  committed transcripts show `content`, `file`, `file_path` and `type` on this line, and a `mea`
-  test pins that.
+  the members below them are judged by name. `tool_use_result` is declared this way because an MCP
+  tool's result has whatever keys its author chose. The record that holds a result does not name
+  the tool, so the recorder reads each `tool_use_id` to tool name pair from the whole recording
+  before it redacts a line. A result whose record answers built-in tools only (`BUILT_IN_TOOLS` in
+  `claude_transcript.rs`, a fixed list reviewed like the member lists) has the vendor's keys
+  (`file`, `numLines`), so its direct keys are judged by name like any vendor member: a new one is
+  reported on the lines above and not listed here. A result whose call the recording does not
+  hold, an MCP call, or a record that answers both kinds stays user-chosen. The committed
+  transcripts show `content` and `file_path` on this line, from a denied call's parameters, and a
+  `mea` test pins that.
 
 `REVIEWED_RETAINED_MEMBERS` states for each member who chose the keys under it: `Leaf` (a number or
 a boolean), `Vendor` (the vendor's structure, judged by name as above), `ModelIds` (a map keyed by
