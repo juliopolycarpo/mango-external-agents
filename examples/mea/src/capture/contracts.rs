@@ -4,7 +4,8 @@
 //! can all change its bytes. This module records only commands that need no login and the ACP
 //! handshake that opens no session. The resulting files are safe to regenerate in CI. The one
 //! exception is an ACP capture the operator opts into with `--open-session`: it also sends
-//! `session/new`, which is a maintainer capture and never a CI one.
+//! `session/new`, which is a maintainer capture and never a CI one, and which runs the adapter
+//! under a scratch home so that it stays unauthenticated.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,10 +16,11 @@ use mango_external_agents::launcher::TokioLauncher;
 use mango_external_agents::transports::stdio;
 use mango_external_agents::{
     CancelReason, EnvSource, ErrorCode, ExecutablePath, HostContext, JsonRpcError,
-    ProcessCleanupGuard, StdioSpec,
+    ProcessCleanupGuard, ProcessLauncher, StdioSpec,
 };
 use serde_json::{Map, Value, json};
 
+mod agent_home;
 pub mod manifest;
 mod session_new;
 
@@ -80,6 +82,12 @@ pub async fn codex_contract(out_dir: &Path, workspace: &Path) -> Result<()> {
 /// instead. It is refused for a profile whose capture the drift lane records again, because an
 /// answer that depends on the machine's agent state is not reproducible.
 ///
+/// With `open_session`, every process of the capture runs under a scratch `HOME`,
+/// `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and XDG directories that `mea` creates empty and removes
+/// afterwards, error or not. The capture is unauthenticated by construction: it never sees the
+/// operator's account, never writes into `~/.claude` or `~/.codex`, and what it records cannot
+/// reflect the operator's subscription.
+///
 /// # Examples
 ///
 /// `mea capture --harness acp --profile opencode --out fixtures/acp/opencode --workspace /tmp/mea-capture`
@@ -96,6 +104,29 @@ pub async fn acp(
     vendor_cli: Option<&str>,
     open_session: bool,
 ) -> Result<()> {
+    acp_under(
+        Arc::new(TokioLauncher::new()),
+        EnvSource::from_process(),
+        out_dir,
+        workspace,
+        profile_id,
+        vendor_cli,
+        open_session,
+    )
+    .await
+}
+
+/// [`acp`] with the launcher and the operator's environment named, so a test can watch what the
+/// adapter is given.
+async fn acp_under(
+    launcher: Arc<dyn ProcessLauncher>,
+    operator_environment: EnvSource,
+    out_dir: &Path,
+    workspace: &Path,
+    profile_id: &str,
+    vendor_cli: Option<&str>,
+    open_session: bool,
+) -> Result<()> {
     let profile =
         mango_agent_acp::builtin_profile(profile_id).ok_or_else(|| Error::HostConfiguration {
             expected: "a built-in ACP profile",
@@ -103,8 +134,20 @@ pub async fn acp(
         })?;
     // The agent starts in the capture workspace, which is also where `session/new` names its cwd.
     let session = open_session.then(|| workspace.to_path_buf());
+    // `session/new` makes the adapter start its backend, which reads and writes the account under
+    // HOME, CLAUDE_CONFIG_DIR and CODEX_HOME. An opened session must never be the operator's, so
+    // every command of this capture sees empty scratch directories instead. `home` stays alive to
+    // the end of this function, so it is removed on success and on every error path alike.
+    let home = open_session
+        .then(agent_home::AgentHome::create)
+        .transpose()?;
+    let environment = match &home {
+        Some(home) => home.environment(&operator_environment),
+        None => operator_environment,
+    };
+    let host = capture_host_with(launcher, environment, workspace)?;
     acp_with(
-        &capture_host(workspace)?,
+        &host,
         out_dir,
         profile.as_ref(),
         vendor_cli,
@@ -306,10 +349,22 @@ async fn acp_with(
 }
 
 fn capture_host(workspace: &Path) -> Result<HostContext> {
+    capture_host_with(
+        Arc::new(TokioLauncher::new()),
+        EnvSource::from_process(),
+        workspace,
+    )
+}
+
+fn capture_host_with(
+    launcher: Arc<dyn ProcessLauncher>,
+    environment: EnvSource,
+    workspace: &Path,
+) -> Result<HostContext> {
     HostContext::builder()
-        .launcher(Arc::new(TokioLauncher::new()))
+        .launcher(launcher)
         .cwd(workspace.to_path_buf())
-        .environment(EnvSource::from_process())
+        .environment(environment)
         .client_info("mea", env!("CARGO_PKG_VERSION"))
         .build()
 }
@@ -1440,6 +1495,187 @@ mod tests {
             "expected no process to start"
         );
         std::fs::remove_dir_all(out).expect("expected temporary capture cleanup");
+    }
+
+    /// A named fake of an operator's process environment on a logged-in machine: every location an
+    /// agent resolves its account or state from points at the operator's own directories.
+    fn logged_in_operator_environment() -> EnvSource {
+        EnvSource::from_pairs([
+            ("PATH", "/fake/bin"),
+            ("HOME", "/real/operator/home"),
+            ("XDG_CONFIG_HOME", "/real/operator/xdg/config"),
+            ("XDG_DATA_HOME", "/real/operator/xdg/data"),
+            ("XDG_STATE_HOME", "/real/operator/xdg/state"),
+            ("XDG_CACHE_HOME", "/real/operator/xdg/cache"),
+            ("CLAUDE_CONFIG_DIR", "/real/operator/claude"),
+            ("CODEX_HOME", "/real/operator/codex"),
+        ])
+    }
+
+    /// The scratch home an `--open-session` child was given, read back from its environment.
+    fn scratch_home_of(launch: &LaunchSpec) -> std::path::PathBuf {
+        let home = launch.env.get("HOME").unwrap_or_else(|| {
+            panic!(
+                "expected HOME in the child environment | received {:?}",
+                launch.env.keys().collect::<Vec<_>>()
+            )
+        });
+        std::path::Path::new(home)
+            .parent()
+            .expect("expected the scratch HOME to sit inside a scratch root")
+            .to_owned()
+    }
+
+    fn assert_child_saw_only_scratch_locations(launches: &[LaunchSpec]) -> std::path::PathBuf {
+        assert!(
+            !launches.is_empty(),
+            "expected the capture to launch the adapter"
+        );
+        let root = scratch_home_of(&launches[0]);
+        for launch in launches {
+            for (key, value) in &launch.env {
+                assert!(
+                    !value.starts_with("/real/operator"),
+                    "(child env {:?}): expected no value from the operator's own directories | received {key}={value}",
+                    launch.program()
+                );
+            }
+            for key in [
+                "HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_STATE_HOME",
+                "XDG_CACHE_HOME",
+            ] {
+                let value = launch.env.get(key).unwrap_or_else(|| {
+                    panic!("(child env {:?}): expected {key} set to a scratch directory | received none", launch.program())
+                });
+                assert!(
+                    std::path::Path::new(value).starts_with(&root),
+                    "(child env {:?}): expected {key} inside {root:?} | received {value}",
+                    launch.program()
+                );
+            }
+        }
+        root
+    }
+
+    #[tokio::test]
+    async fn open_session_runs_the_adapter_under_a_scratch_home_never_the_operators() {
+        for (profile_id, vendor_key) in [
+            ("claude-agent-acp", "CLAUDE_CONFIG_DIR"),
+            ("codex-acp", "CODEX_HOME"),
+        ] {
+            let launcher = session_capture_launcher(&SessionAgent {
+                session_reply: OPENED_SESSION_REPLY,
+            });
+            let out = temp_dir("acp-session-scratch-home");
+            let workspace = temp_dir("acp-session-scratch-home-workspace");
+
+            super::acp_under(
+                launcher.clone(),
+                logged_in_operator_environment(),
+                &out,
+                &workspace,
+                profile_id,
+                None,
+                true,
+            )
+            .await
+            .expect("expected a capture that opens a session");
+
+            let launches = launcher.launches();
+            let root = assert_child_saw_only_scratch_locations(&launches);
+            let adapter = launches.last().expect("expected the adapter launch");
+            let vendor_home = adapter.env.get(vendor_key).unwrap_or_else(|| {
+                panic!("({profile_id}): expected {vendor_key} set for the adapter | received none")
+            });
+            assert!(
+                std::path::Path::new(vendor_home).starts_with(&root),
+                "({profile_id}): expected {vendor_key} inside {root:?} | received {vendor_home}"
+            );
+            assert_eq!(
+                adapter.env.get("PATH").map(String::as_str),
+                Some("/fake/bin")
+            );
+            assert!(
+                !root.exists(),
+                "({profile_id}): expected the scratch home {root:?} removed after the capture"
+            );
+            std::fs::remove_dir_all(out).expect("expected temporary capture cleanup");
+            std::fs::remove_dir_all(workspace).expect("expected temporary workspace cleanup");
+        }
+    }
+
+    #[tokio::test]
+    async fn open_session_removes_the_scratch_home_when_the_capture_fails() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(FakeProcess::transcript(["fake-adapter 1.0.0"]).with_exit(success()));
+        launcher.push(
+            RefusingInitializeAgent {
+                code: 1001,
+                message: "cannot start",
+            }
+            .process(),
+        );
+        let out = temp_dir("acp-session-scratch-home-error");
+        let workspace = temp_dir("acp-session-scratch-home-error-workspace");
+
+        super::acp_under(
+            launcher.clone(),
+            logged_in_operator_environment(),
+            &out,
+            &workspace,
+            "claude-agent-acp",
+            None,
+            true,
+        )
+        .await
+        .expect_err("expected the initialize refusal to fail the capture");
+
+        let root = assert_child_saw_only_scratch_locations(&launcher.launches());
+        assert!(
+            !root.exists(),
+            "expected the scratch home {root:?} removed after a failed capture"
+        );
+        std::fs::remove_dir_all(out).expect("expected temporary capture cleanup");
+        std::fs::remove_dir_all(workspace).expect("expected temporary workspace cleanup");
+    }
+
+    #[tokio::test]
+    async fn a_capture_without_open_session_keeps_the_operators_environment() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(FakeProcess::transcript(["1.18.30"]).with_exit(success()));
+        launcher.push(FakeProcess::responding(|line| {
+            if line.contains("\"method\":\"initialize\"") {
+                return vec![String::from(
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}"#,
+                )];
+            }
+            Vec::new()
+        }));
+        let out = temp_dir("acp-no-session-env");
+        let workspace = temp_dir("acp-no-session-env-workspace");
+
+        super::acp_under(
+            launcher.clone(),
+            logged_in_operator_environment(),
+            &out,
+            &workspace,
+            "opencode",
+            None,
+            false,
+        )
+        .await
+        .expect("expected an initialize-only capture");
+
+        assert_eq!(
+            launcher.launches()[0].env.get("HOME").map(String::as_str),
+            Some("/real/operator/home"),
+            "expected the reproducible capture, which opens no session, to run as before"
+        );
+        std::fs::remove_dir_all(out).expect("expected temporary capture cleanup");
+        std::fs::remove_dir_all(workspace).expect("expected temporary workspace cleanup");
     }
 
     /// A fake launcher that answers the adapter version, the named vendor version, then `initialize`.
