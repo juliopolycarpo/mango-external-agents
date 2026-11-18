@@ -126,11 +126,15 @@ The probe needs no login and starts only the CLI the lane installed, with `--hel
 argument, `stdin` closed and `HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and the XDG directories set to a
 scratch directory it removes. It does not read or write anyone's own configuration.
 
-| Exit | Meaning                                                                                                                                                                      |
-| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 0    | No subcommand help names ACP.                                                                                                                                                |
-| 1    | At least one does. The log and the issue body name each command and the matching lines with their numbers.                                                                   |
-| 2    | The watch could not look: no command in the top-level help, a command name that is not a plain word, or a subcommand whose `--help` exited non-zero. It is not a clean pass. |
+| Exit | Meaning                                                                                                                                                                                                |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 0    | No subcommand help names ACP.                                                                                                                                                                          |
+| 1    | At least one does. The log and the issue body name each command and the matching lines with their numbers.                                                                                             |
+| 2    | The watch could not look: no command in the top-level help, a command name that is not a plain word, or a subcommand whose `--help` exited non-zero or did not answer in time. It is not a clean pass. |
+
+Each `--help` runs under `timeout` with a 30 second limit (`HELP_TIMEOUT_SECONDS`, TERM and then
+KILL five seconds later), so a CLI that waits on a prompt or the network is reported by name as
+"did not answer" and cannot hold the lane until the step's own limit.
 
 A flagged or unreadable run opens the same managed `drift(<vendor>)` issue as the other watches and
 adds a "Subcommand help watch" section to its body: the command line, the matching lines (at most

@@ -20,10 +20,11 @@
 #
 # Exit status 0: no subcommand help names ACP. 1: at least one does. 2: the watch could not verify:
 # the top-level help lists no command, a command name is not one, or a subcommand's help could not
-# be read. A watch that could not look is not a clean one.
+# be read or did not answer in time. A watch that could not look is not a clean one.
 #
 # VENDOR_HELP_CLI names the program to run in place of the vendor's own name; tests point it at a
-# named fake.
+# named fake. HELP_TIMEOUT_SECONDS (default 30) bounds each `--help`, so a CLI that waits on a
+# prompt or the network cannot hold the lane until the workflow step's own limit.
 #
 # Usage: scripts/check-vendor-subcommand-help.sh <claude|codex> <top-level-help-file> [report-file]
 set -euo pipefail
@@ -81,14 +82,18 @@ help_report_section() {
   } >> "$report_file"
 }
 
-# Runs `<cli> <command> --help` under the scratch home and leaves its output in $4. Returns the
-# CLI's exit status, or 127 when it could not be started.
+# Runs `<cli> <command> --help` under the scratch home, for at most $5 seconds, and leaves its
+# output in $4. Returns the CLI's exit status, 124 or 137 when the limit cut it off, or 127 when it
+# could not be started.
 run_subcommand_help() {
   local cli="$1"
   local command="$2"
   local scratch="$3"
   local output="$4"
-  env HOME="$scratch/home" \
+  local limit="$5"
+  # `timeout` ends a command that never answers (a CLI waiting on a prompt or the network): TERM
+  # after the limit, then KILL five seconds later. It exits 124 for the first and 137 for the second.
+  timeout --kill-after=5 "$limit" env HOME="$scratch/home" \
     CLAUDE_CONFIG_DIR="$scratch/claude" \
     CODEX_HOME="$scratch/codex" \
     XDG_CONFIG_HOME="$scratch/xdg/config" \
@@ -105,6 +110,7 @@ check_subcommand_help() {
   local help_file="$2"
   local report_file="${3:-}"
   local cli="${VENDOR_HELP_CLI:-$vendor}"
+  local limit="${HELP_TIMEOUT_SECONDS:-30}"
   local commands
   local command
   local scratch
@@ -123,6 +129,14 @@ check_subcommand_help() {
       return 2
       ;;
   esac
+  if ! [[ "$limit" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'expected HELP_TIMEOUT_SECONDS to be a whole number of seconds above zero, received %s\n' "$limit" >&2
+    return 2
+  fi
+  if ! command -v timeout > /dev/null 2>&1; then
+    printf 'expected the timeout command (GNU coreutils) to bound each --help, received none on PATH\n' >&2
+    return 2
+  fi
   if [ ! -f "$help_file" ]; then
     printf 'expected the top-level help file %s, received none\n' "$help_file" >&2
     return 2
@@ -158,10 +172,17 @@ check_subcommand_help() {
   output="$scratch/help.txt"
 
   while IFS= read -r command; do
-    if run_subcommand_help "$cli" "$command" "$scratch" "$output"; then
+    if run_subcommand_help "$cli" "$command" "$scratch" "$output" "$limit"; then
       status=0
     else
       status=$?
+    fi
+    if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+      printf 'expected %s %s --help to answer within %s seconds, received no answer\n' "$vendor" "$command" "$limit" >&2
+      help_report_section "$report_file" "$vendor $command --help" \
+        "The command did not answer within $limit seconds, so its help was not searched."
+      worst=2
+      continue
     fi
     if [ "$status" -ne 0 ]; then
       printf 'expected %s %s --help to exit 0, received exit status %s\n' "$vendor" "$command" "$status" >&2

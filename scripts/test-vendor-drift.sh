@@ -771,6 +771,24 @@ test_vendor_subcommand_help_watch() {
   # A CLI that cannot be started is also unverified.
   VENDOR_HELP_CLI="$test_root/no-such-vendor-cli" expect_status 2 "$watch" claude "$top" "$report"
 
+  # A command that never answers is cut off after the limit, named, and is "could not verify" (2),
+  # not a hung lane. The fake CLI hangs for `mcp` when a .hang file stands beside its help pages.
+  : > "$root/mcp.hang"
+  local started=$SECONDS
+  HELP_TIMEOUT_SECONDS=1 expect_status 2 "$watch" claude "$top" "$report"
+  HELP_TIMEOUT_SECONDS=1 "$watch" claude "$top" "$report" > /dev/null 2> "$error" || true
+  if [ $((SECONDS - started)) -gt 30 ]; then
+    fail "a hung command must be cut off after HELP_TIMEOUT_SECONDS=1 | received $((SECONDS - started)) seconds for two runs"
+  fi
+  assert_contains "$error" 'expected claude mcp --help to answer within 1 seconds, received no answer' 'the hung command is named with the limit'
+  assert_contains "$report" '### `claude mcp --help`' 'the report names the hung command'
+  assert_contains "$report" 'did not answer within 1 seconds' 'the report says the command timed out'
+  assert_not_contains "$error" 'claude auth --help to answer' 'only the hung command is reported'
+  rm -f -- "$root/mcp.hang"
+  # The default limit is long enough for a real CLI and a plain number of seconds.
+  assert_contains "$watch" 'HELP_TIMEOUT_SECONDS:-30' 'the default limit is 30 seconds'
+  HELP_TIMEOUT_SECONDS=soon expect_status 2 "$watch" claude "$top" "$report"
+
   # More flagged commands than the report shows are counted and named, so the report stays bounded.
   for command in attach auth mcp plugin update; do
     write_fake_subcommand_help "$root" "$command" '  --acp  Serve ACP'
@@ -867,7 +885,8 @@ EXPECTED
   # A probe that wrote no detail says so, and the mode needs its three arguments.
   rm -f -- "$report"
   "$repo_root/scripts/write-vendor-drift-report.sh" --help-probe claude "$probe_report.missing" "$report"
-  assert_contains "$report" 'The watch wrote no page detail. Inspect this workflow run for its output.' 'a missing probe report is explained'
+  assert_contains "$report" 'The watch wrote no command detail. Inspect this workflow run for its output.' 'a missing probe report is explained'
+  assert_not_contains "$report" 'page detail' 'the help watch reads no pages'
   expect_status 2 "$repo_root/scripts/write-vendor-drift-report.sh" --help-probe claude "$probe_report"
 }
 

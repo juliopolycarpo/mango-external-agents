@@ -106,7 +106,8 @@ write_failure_report() {
 # another watch) keeps its text and gains a section; otherwise this writes a new report. `watch_report`
 # is what the watch wrote: public page or help lines and the names of what was read. When the watch
 # failed before it wrote one (a malformed allowlist), the section says so and points at the run.
-# The three sentences are the section heading and the two lines under it.
+# The texts are the section heading, the two lines under it, and the note for a missing report,
+# which says what that watch reads (pages or commands).
 append_watch_report() {
   local vendor="$1"
   local watch_report="$2"
@@ -114,6 +115,7 @@ append_watch_report() {
   local heading="$4"
   local first_line="$5"
   local second_line="$6"
+  local missing_detail="$7"
 
   mkdir -p "$(dirname "$report")"
   if [ ! -f "$report" ]; then
@@ -132,7 +134,7 @@ append_watch_report() {
     if [ -f "$watch_report" ] && [ ! -L "$watch_report" ]; then
       cat -- "$watch_report"
     else
-      echo "The watch wrote no page detail. Inspect this workflow run for its output."
+      echo "$missing_detail"
     fi
   } >> "$report"
 }
@@ -141,14 +143,16 @@ append_watch_report() {
 write_docs_report() {
   append_watch_report "$1" "$2" "$3" 'Documentation watch' \
     'The documentation watch for an ACP page or command failed in this run: a vendor document' \
-    'now mentions ACP outside the reviewed allowlist, or could not be read.'
+    'now mentions ACP outside the reviewed allowlist, or could not be read.' \
+    'The watch wrote no page detail. Inspect this workflow run for its output.'
 }
 
 # The subcommand help watch result: what `check-vendor-subcommand-help.sh` wrote.
 write_help_probe_report() {
   append_watch_report "$1" "$2" "$3" 'Subcommand help watch' \
     'The subcommand help watch for an ACP flag or command failed in this run: the help of a' \
-    'subcommand now names ACP, or could not be read.'
+    'subcommand now names ACP, or could not be read.' \
+    'The watch wrote no command detail. Inspect this workflow run for its output.'
 }
 
 main() {
