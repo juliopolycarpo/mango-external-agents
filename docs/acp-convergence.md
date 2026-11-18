@@ -109,7 +109,7 @@ Reading the table:
 Captured on 2026-11-14 with `mea capture --harness acp --profile <id>`. Each sent `initialize` and
 nothing else: no `authenticate`, no `session/new`. The two adapters were captured again on
 2026-11-18 with `--open-session`, which also sends `session/new` once `initialize` answered
-([below](#what-session-new-measured)); the `initialize` files came out byte for byte the same.
+([below](#what-sessionnew-measured)); the `initialize` files came out byte for byte the same.
 
 | `initialize` member                     | `claude-agent-acp` 0.107.0                                                                    | `codex-acp` 2.6.0                     |
 | --------------------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------- |
@@ -227,7 +227,8 @@ from the npm install trees of `claude-agent-acp` 0.107.0 and `codex-acp` 2.6.0, 
   same date) names `CLAUDE_CODE_EXECUTABLE` and `CODEX_PATH` as the overrides and says nothing about
   reporting the result.
 - **`session/new`** returns modes and `configOptions`, not a build. It also needs a session, which a
-  capture never opens.
+  capture opens only with `--open-session`, under a scratch home, and which records no build either
+  ([what it measured](#what-sessionnew-measured)).
 
 What the record can claim is unchanged: `version.json` holds the adapter's version from `agentInfo`
 and, under `vendorCli`, the `--version` of the binary the operator named. When a capture names a
