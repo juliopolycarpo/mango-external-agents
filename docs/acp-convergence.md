@@ -274,27 +274,27 @@ The weekly `latest-capture` job in [vendor-drift.yml](../.github/workflows/vendo
 installs the newest Claude Code and Codex, regenerates the public contracts and opens the managed
 `drift(claude)` or `drift(codex)` issue when the diff is not empty
 ([vendor-drift.md](vendor-drift.md)). The contracts record each CLI's own help text, so a native ACP
-mode surfaces there, or in the documentation watch below.
+mode surfaces there, in the documentation watch or in the subcommand help watch below.
 
 - **Trigger:** a `drift(claude)` or `drift(codex)` issue that shows one of:
   - a diff that adds an `acp` command, an ACP-named flag, or an ACP entry in
     `codex app-server --listen`;
   - a failed documentation watch (`scripts/check-vendor-acp-docs.sh`) where the vendor's
     documentation index or CLI reference now mentions ACP. The issue body names the page and the
-    line ([vendor-drift.md](vendor-drift.md)).
+    line ([vendor-drift.md](vendor-drift.md));
+  - a failed subcommand help watch (`scripts/check-vendor-subcommand-help.sh`) where a
+    subcommand's own `--help` now names ACP. The issue body names the command and the line.
 - **Not a trigger:** the same watch failing because a page could not be read or no longer has its
-  anchor phrase, or because a reviewed allowlist entry matches no line any more. Those are a broken
-  watch to repair or an entry to delete, not a vendor signal.
+  anchor phrase, or because a reviewed allowlist entry matches no line any more, or the subcommand
+  help watch exiting 2 because a command's help could not be read. Those are a broken watch to
+  repair or an entry to delete, not a vendor signal.
 - **Action:** whoever triages it reopens this assessment: cite the vendor document that describes
   the mode, re-read the capability table against a fresh `initialize` capture, decide criterion by
   criterion, and record the outcome here with a new read date. A documentation page without a
   shipped command does not meet criterion 1.
 
-The lane does not watch two things:
+The lane does not watch one thing:
 
-- An ACP flag under another subcommand's help before any watched page names it. Subcommand help is
-  kept out of the public contracts ([vendor-drift.md](vendor-drift.md)):
-  [#451](https://github.com/juliopolycarpo/mango-external-agents/issues/451).
 - An adapter's own `initialize` answer. It is captured once and no lane records it again. That is a
   decision, not a limit: it moves between adapter releases, and nothing the library reads has moved
   across the versions compared (see above).

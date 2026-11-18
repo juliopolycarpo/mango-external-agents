@@ -130,6 +130,20 @@ jobs:
               ;;
             acp-opencode) cargo run --locked -p mea -- capture --harness acp:opencode --out "$capture_dir/acp/opencode" ;;
           esac
+      - name: Watch the subcommand help for an ACP flag
+        id: subcommand-help
+        if: (matrix.vendor == 'claude' || matrix.vendor == 'codex') && steps.capture.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          # The top-level help the capture just wrote names the commands to ask. Nothing the
+          # probe reads is committed or uploaded: only its report, when it fails.
+          capture_dir="$RUNNER_TEMP/vendor-contract"
+          case "${{ matrix.vendor }}" in
+            claude) help_file="$capture_dir/claude/contract/help.txt" ;;
+            codex) help_file="$capture_dir/observed/contract/help.txt" ;;
+          esac
+          scripts/check-vendor-subcommand-help.sh "${{ matrix.vendor }}" "$help_file" "$RUNNER_TEMP/vendor-drift-result/${{ matrix.vendor }}/subcommand-help.md"
       - name: Create the drift result
         if: always()
         run: |
@@ -143,27 +157,39 @@ jobs:
             echo drift > "$state"
             exit 0
           fi
-          # The documentation watch result joins every report below, including the early exits, and
-          # does not return early itself: the contract comparison still runs, so a drift issue about
-          # an ACP page carries the help diff when there is one.
+          # The documentation watch and subcommand help watch results join every report below,
+          # including the early exits, and do not return early themselves: the contract comparison
+          # still runs, so a drift issue about an ACP page or subcommand flag carries the help diff
+          # when there is one.
           docs_failed=false
           docs_report="$result_dir/acp-docs.md"
           if [ "$vendor" != 'acp-opencode' ] && [ "${{ steps.acp-docs.outcome }}" != 'success' ]; then
             docs_failed=true
           fi
-          if [ "$vendor" = 'claude' ] && [ "${{ steps.bare-reference.outcome }}" != 'success' ]; then
-            scripts/write-vendor-drift-report.sh --failure "$vendor" 'the documented --bare default reference watch' "$report"
+          # The subcommand help watch needs the capture's help text, so it is skipped when the
+          # capture failed and fails the lane only when it ran and did not pass.
+          probe_failed=false
+          probe_report="$result_dir/subcommand-help.md"
+          if [ "${{ steps.subcommand-help.outcome }}" = 'failure' ]; then
+            probe_failed=true
+          fi
+          append_watch_reports() {
             if [ "$docs_failed" = true ]; then
               scripts/write-vendor-drift-report.sh --docs "$vendor" "$docs_report" "$report"
             fi
+            if [ "$probe_failed" = true ]; then
+              scripts/write-vendor-drift-report.sh --help-probe "$vendor" "$probe_report" "$report"
+            fi
+          }
+          if [ "$vendor" = 'claude' ] && [ "${{ steps.bare-reference.outcome }}" != 'success' ]; then
+            scripts/write-vendor-drift-report.sh --failure "$vendor" 'the documented --bare default reference watch' "$report"
+            append_watch_reports
             echo drift > "$state"
             exit 0
           fi
           if [ "${{ steps.capture.outcome }}" != 'success' ]; then
             scripts/write-vendor-drift-report.sh --failure "$vendor" 'public contract capture' "$report"
-            if [ "$docs_failed" = true ]; then
-              scripts/write-vendor-drift-report.sh --docs "$vendor" "$docs_report" "$report"
-            fi
+            append_watch_reports
             echo drift > "$state"
             exit 0
           fi
@@ -193,16 +219,14 @@ jobs:
             exit "$status"
           fi
           if [ "$status" -eq 0 ]; then
-            if [ "$docs_failed" = false ]; then
+            if [ "$docs_failed" = false ] && [ "$probe_failed" = false ]; then
               echo "no $vendor drift"
               echo no-drift > "$state"
               exit 0
             fi
           fi
-          if [ "$docs_failed" = true ]; then
-            # Appends to the contract diff report when there is one, and writes the report otherwise.
-            scripts/write-vendor-drift-report.sh --docs "$vendor" "$docs_report" "$report"
-          fi
+          # Each appends to the contract diff report when there is one, and writes the report otherwise.
+          append_watch_reports
           echo drift > "$state"
       - name: Bound the drift result
         id: bound

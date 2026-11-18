@@ -7,6 +7,7 @@
 # Usage: scripts/write-vendor-drift-report.sh <vendor> <committed-path> <observed-path> <report-file>
 #        scripts/write-vendor-drift-report.sh --failure <vendor> <stage> <report-file>
 #        scripts/write-vendor-drift-report.sh --docs <vendor> <docs-report> <report-file>
+#        scripts/write-vendor-drift-report.sh --help-probe <vendor> <probe-report> <report-file>
 set -euo pipefail
 
 # The diff shares the 65536-byte report bound the drift workflow enforces with the documentation
@@ -21,6 +22,7 @@ usage() {
   echo "usage: scripts/write-vendor-drift-report.sh <vendor> <committed-path> <observed-path> <report-file>" >&2
   echo "       scripts/write-vendor-drift-report.sh --failure <vendor> <stage> <report-file>" >&2
   echo "       scripts/write-vendor-drift-report.sh --docs <vendor> <docs-report> <report-file>" >&2
+  echo "       scripts/write-vendor-drift-report.sh --help-probe <vendor> <probe-report> <report-file>" >&2
 }
 
 write_report() {
@@ -100,14 +102,20 @@ write_failure_report() {
   } > "$report"
 }
 
-# Adds the documentation watch result to the report file. A report that already exists (the
-# contract diff) keeps its text and gains a section; otherwise this writes a new report. The docs
-# report is what `check-vendor-acp-docs.sh` wrote: page URLs and public page lines. When the watch
+# Adds one watch result to the report file. A report that already exists (the contract diff, or
+# another watch) keeps its text and gains a section; otherwise this writes a new report. `watch_report`
+# is what the watch wrote: public page or help lines and the names of what was read. When the watch
 # failed before it wrote one (a malformed allowlist), the section says so and points at the run.
-write_docs_report() {
+# The texts are the section heading, the two lines under it, and the note for a missing report,
+# which says what that watch reads (pages or commands).
+append_watch_report() {
   local vendor="$1"
-  local docs_report="$2"
+  local watch_report="$2"
   local report="$3"
+  local heading="$4"
+  local first_line="$5"
+  local second_line="$6"
+  local missing_detail="$7"
 
   mkdir -p "$(dirname "$report")"
   if [ ! -f "$report" ]; then
@@ -118,17 +126,33 @@ write_docs_report() {
   fi
   {
     echo
-    echo "## Documentation watch"
+    echo "## $heading"
     echo
-    echo "The documentation watch for an ACP page or command failed in this run: a vendor document"
-    echo "now mentions ACP outside the reviewed allowlist, or could not be read."
+    echo "$first_line"
+    echo "$second_line"
     echo
-    if [ -f "$docs_report" ] && [ ! -L "$docs_report" ]; then
-      cat -- "$docs_report"
+    if [ -f "$watch_report" ] && [ ! -L "$watch_report" ]; then
+      cat -- "$watch_report"
     else
-      echo "The watch wrote no page detail. Inspect this workflow run for its output."
+      echo "$missing_detail"
     fi
   } >> "$report"
+}
+
+# The documentation watch result: what `check-vendor-acp-docs.sh` wrote.
+write_docs_report() {
+  append_watch_report "$1" "$2" "$3" 'Documentation watch' \
+    'The documentation watch for an ACP page or command failed in this run: a vendor document' \
+    'now mentions ACP outside the reviewed allowlist, or could not be read.' \
+    'The watch wrote no page detail. Inspect this workflow run for its output.'
+}
+
+# The subcommand help watch result: what `check-vendor-subcommand-help.sh` wrote.
+write_help_probe_report() {
+  append_watch_report "$1" "$2" "$3" 'Subcommand help watch' \
+    'The subcommand help watch for an ACP flag or command failed in this run: the help of a' \
+    'subcommand now names ACP, or could not be read.' \
+    'The watch wrote no command detail. Inspect this workflow run for its output.'
 }
 
 main() {
@@ -138,6 +162,14 @@ main() {
       return 2
     fi
     write_docs_report "$2" "$3" "$4"
+    return
+  fi
+  if [ $# -gt 0 ] && [ "$1" = '--help-probe' ]; then
+    if [ $# -ne 4 ]; then
+      usage
+      return 2
+    fi
+    write_help_probe_report "$2" "$3" "$4"
     return
   fi
   if [ $# -gt 0 ] && [ "$1" = '--failure' ]; then

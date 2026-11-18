@@ -22,25 +22,15 @@
 # Usage: scripts/check-vendor-acp-docs.sh <claude|codex> [report-file]
 set -euo pipefail
 
-# Case-insensitive; `\b` keeps a hash or a longer word that merely contains "acp" from matching,
-# while `--acp`, `acp` and `claude-agent-acp` do match.
-readonly ACP_PATTERN='\bacp\b|agent[ -]?client[ -]?protocol'
+# ACP_PATTERN and cut_lines_to_report_bytes, which the subcommand help watch uses as well.
+# shellcheck source=vendor-acp-lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/vendor-acp-lib.sh"
 
 # The most bytes of one reported page line (its line number included). An allowlist entry is a
 # whole page line, so this is long enough for an llms.txt index line; it stays a bound because the
 # report shares the 65536 bytes the drift workflow allows with the contract diff, which
 # write-vendor-drift-report.sh caps well below that. Counted in bytes, whatever the locale.
 readonly ACP_LINE_CUT=1000
-
-# Cuts each line of stdin at ACP_LINE_CUT bytes and drops a UTF-8 character the cut split, so the
-# report never carries a lone lead byte (an issue body with one is not valid UTF-8). The cut keeps
-# the first bytes, so the dropped tail is the lead byte and the continuation bytes before the cut:
-# `[C2-DF]`, `[E0-EF]` plus at most one `[80-BF]`, or `[F0-F4]` plus at most two. A complete
-# character has all its bytes and does not match. GNU sed reads `\xHH` in a bracket expression.
-cut_lines_to_report_bytes() {
-  LC_ALL=C cut -c "1-$ACP_LINE_CUT" \
-    | LC_ALL=C sed -E 's/([\xc2-\xdf]|[\xe0-\xef][\x80-\xbf]?|[\xf0-\xf4][\x80-\xbf]{0,2})$//'
-}
 
 # Reviewed mentions: `vendor<TAB>exact line text<TAB>reason`; `#` starts a comment. Tests point
 # ACP_DOCS_ALLOWLIST at their own file.
@@ -194,7 +184,7 @@ validate_document() {
     if [ "${#unaccepted[@]}" -lt "$shown" ]; then
       shown="${#unaccepted[@]}"
     fi
-    matches=$(printf '%s\n' "${unaccepted[@]:0:3}" | cut_lines_to_report_bytes)
+    matches=$(printf '%s\n' "${unaccepted[@]:0:3}" | cut_lines_to_report_bytes "$ACP_LINE_CUT")
     printf 'expected no ACP page or command in %s, received:\n%s\n' "$url" "$matches" >&2
     report_section "$report_file" "$url" \
       "Lines naming ACP that no reviewed allowlist entry accepts, with their line numbers (showing $shown of ${#unaccepted[@]}; each line is cut at $ACP_LINE_CUT bytes):" "$matches"

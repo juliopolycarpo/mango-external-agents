@@ -652,6 +652,250 @@ EXPECTED
   assert_contains "$report" '<!-- vendor-drift:claude -->' 'the --docs mode writes the report'
 }
 
+# Writes the help of one command of the named fake vendor CLI: the file the fake serves for
+# `<command> --help`. Each further argument is one line.
+write_fake_subcommand_help() {
+  local root="$1"
+  local command="$2"
+  shift 2
+  mkdir -p "$root"
+  printf '%s\n' "$@" > "$root/$command.help"
+}
+
+# A top-level help in the two shapes the CLIs print: Claude's commander layout, with aliases, an
+# argument placeholder and wrapped descriptions, and Codex's clap layout, with a `help` entry and
+# an option list after the commands.
+write_fake_claude_top_level_help() {
+  printf '%s\n' \
+    'Usage: claude [options] [command] [prompt]' \
+    '' \
+    'Options:' \
+    '  --print  Print and exit' \
+    '' \
+    'Commands:' \
+    '  attach <id|name>                      Open a background session in this' \
+    '                                        terminal. Part of the session name' \
+    '                                        works too' \
+    '  auth                                  Manage authentication' \
+    '  mcp                                   Configure and manage MCP servers' \
+    '  plugin|plugins                        Manage Claude Code plugins' \
+    '  update|upgrade                        Check for updates' > "$1"
+}
+
+write_fake_codex_top_level_help() {
+  # shellcheck disable=SC2016 # the backticks are literal help text, not command substitution
+  printf '%s\n' \
+    'Codex CLI' \
+    '' \
+    'Commands:' \
+    '  exec              Run Codex non-interactively [aliases: e]' \
+    '  mcp               Manage external MCP servers for Codex' \
+    '  apply             Apply the latest diff produced by Codex agent as a `git apply` to your local' \
+    '                    working tree [aliases: a]' \
+    '  help              Print this message or the help of the given subcommand(s)' \
+    '' \
+    'Options:' \
+    '  -h, --help  Print help' > "$1"
+}
+
+test_vendor_subcommand_help_watch() {
+  local watch="$repo_root/scripts/check-vendor-subcommand-help.sh"
+  local fake_cli="$repo_root/scripts/test-fixtures/fake-vendor-cli.sh"
+  local root="$test_root/subcommand-help-root"
+  local log="$test_root/subcommand-help.log"
+  local top="$test_root/subcommand-top-help.txt"
+  local report="$test_root/subcommand-help-report/subcommand-help.md"
+  local error="$test_root/subcommand-help.error"
+  local command
+  export VENDOR_HELP_CLI="$fake_cli"
+  export FAKE_VENDOR_CLI_ROOT="$root"
+  export FAKE_VENDOR_CLI_LOG="$log"
+
+  # A clean Claude surface passes: every listed command is asked for `--help` once and for nothing
+  # else, the alias after `|` and the wrapped description lines are not commands, and a passing
+  # watch writes no report and removes one left by an earlier run. The macpherson and acpi words
+  # are not ACP.
+  write_fake_claude_top_level_help "$top"
+  rm -rf -- "$root"
+  for command in attach auth mcp plugin update; do
+    write_fake_subcommand_help "$root" "$command" "Usage: claude $command" 'Options:' '  --verbose  The macpherson and acpi names are unrelated.'
+  done
+  : > "$log"
+  mkdir -p "$(dirname "$report")"
+  printf 'left over from an earlier run\n' > "$report"
+  "$watch" claude "$top" "$report" > /dev/null 2> "$error" || fail "a clean Claude surface must pass; received $(cat "$error")"
+  assert_eq "$(sed 's/ HOME=.*//' "$log" | sort | tr '\n' ',')" \
+    'argv=attach --help,argv=auth --help,argv=mcp --help,argv=plugin --help,argv=update --help,' \
+    'the watch asks each listed command for --help and nothing else'
+  if [ -e "$report" ]; then
+    fail "a passing watch must not leave a report; received $(tr '\n' '|' < "$report")"
+  fi
+
+  # The CLI runs under a scratch home, never the caller's own.
+  assert_not_contains "$log" "HOME=$HOME " 'the CLI must not run under the caller home'
+  assert_not_contains "$log" 'HOME= ' 'the CLI runs under a home'
+  assert_contains "$log" 'CLAUDE_CONFIG_DIR=' 'the CLI runs under a scratch Claude configuration'
+  assert_not_contains "$log" 'CLAUDE_CONFIG_DIR= ' 'the Claude configuration directory is set'
+  if grep -Eq 'CODEX_HOME=$' "$log"; then
+    fail "the Codex home must be set to a scratch directory; received $(tr '\n' '|' < "$log")"
+  fi
+
+  # A flag under one subcommand is a failed watch (1) that names the command and the line with its
+  # number, in the console and in the report, and leaves the other commands out of the report.
+  write_fake_subcommand_help "$root" mcp 'Usage: claude mcp' 'Options:' '  --acp  Serve the Agent Client Protocol over stdio'
+  expect_status 1 "$watch" claude "$top" "$report"
+  "$watch" claude "$top" "$report" > /dev/null 2> "$error" || true
+  assert_contains "$error" 'expected no ACP flag or command in claude mcp --help, received:' 'the console names the command'
+  assert_contains "$error" '3:  --acp  Serve the Agent Client Protocol over stdio' 'the console names the line with its number'
+  # shellcheck disable=SC2016 # the backticks are literal Markdown, not command substitution
+  assert_contains "$report" '### `claude mcp --help`' 'the report names the command line'
+  assert_contains "$report" '3:  --acp  Serve the Agent Client Protocol over stdio' 'the report holds the matching line'
+  assert_not_contains "$report" 'claude auth' 'a clean command is not in the report'
+  assert_not_contains "$report" 'Usage: claude mcp' 'only the matching line of the help is reported'
+
+  # A word match, not a substring: "Agent Client Protocols" and "--acp" match, "macpherson" does not.
+  write_fake_subcommand_help "$root" mcp 'agent-client-protocol bridge'
+  expect_status 1 "$watch" claude "$top" "$report"
+  write_fake_subcommand_help "$root" mcp 'The macpherson and acpi names are unrelated.'
+  expect_status 0 "$watch" claude "$top" "$report"
+
+  # A command whose help cannot be read is "could not verify" (2), and outranks a mention.
+  write_fake_subcommand_help "$root" auth '  --acp  Serve ACP'
+  rm -f -- "$root/plugin.help"
+  expect_status 2 "$watch" claude "$top" "$report"
+  "$watch" claude "$top" "$report" > /dev/null 2> "$error" || true
+  assert_contains "$error" 'expected claude plugin --help to exit 0, received exit status 2' 'the unreadable command is named'
+  # shellcheck disable=SC2016 # the backticks are literal Markdown, not command substitution
+  assert_contains "$report" '### `claude plugin --help`' 'the report names the unreadable command'
+  assert_contains "$report" 'so its help was not searched' 'the report says the help was not searched'
+  # shellcheck disable=SC2016 # the backticks are literal Markdown, not command substitution
+  assert_contains "$report" '### `claude auth --help`' 'the mention is reported beside the unreadable command'
+  write_fake_subcommand_help "$root" plugin 'Usage: claude plugin'
+
+  # A CLI that cannot be started is also unverified.
+  VENDOR_HELP_CLI="$test_root/no-such-vendor-cli" expect_status 2 "$watch" claude "$top" "$report"
+
+  # A command that never answers is cut off after the limit, named, and is "could not verify" (2),
+  # not a hung lane. The fake CLI hangs for `mcp` when a .hang file stands beside its help pages.
+  : > "$root/mcp.hang"
+  local started=$SECONDS
+  HELP_TIMEOUT_SECONDS=1 expect_status 2 "$watch" claude "$top" "$report"
+  HELP_TIMEOUT_SECONDS=1 "$watch" claude "$top" "$report" > /dev/null 2> "$error" || true
+  if [ $((SECONDS - started)) -gt 30 ]; then
+    fail "a hung command must be cut off after HELP_TIMEOUT_SECONDS=1 | received $((SECONDS - started)) seconds for two runs"
+  fi
+  assert_contains "$error" 'expected claude mcp --help to answer within 1 seconds, received no answer' 'the hung command is named with the limit'
+  # shellcheck disable=SC2016 # the backticks are literal Markdown, not command substitution
+  assert_contains "$report" '### `claude mcp --help`' 'the report names the hung command'
+  assert_contains "$report" 'did not answer within 1 seconds' 'the report says the command timed out'
+  assert_not_contains "$error" 'claude auth --help to answer' 'only the hung command is reported'
+  rm -f -- "$root/mcp.hang"
+  # The default limit is long enough for a real CLI and a plain number of seconds.
+  assert_contains "$watch" 'HELP_TIMEOUT_SECONDS:-30' 'the default limit is 30 seconds'
+  HELP_TIMEOUT_SECONDS=soon expect_status 2 "$watch" claude "$top" "$report"
+
+  # More flagged commands than the report shows are counted and named, so the report stays bounded.
+  for command in attach auth mcp plugin update; do
+    write_fake_subcommand_help "$root" "$command" '  --acp  Serve ACP'
+  done
+  printf '%s\n' 'Commands:' '  one  x' '  two  x' '  three  x' '  four  x' '  five  x' '  six  x' '  seven  x' '  eight  x' > "$top"
+  for command in one two three four five six seven eight; do
+    write_fake_subcommand_help "$root" "$command" '  --acp  Serve ACP'
+  done
+  expect_status 1 "$watch" claude "$top" "$report"
+  assert_eq "$(grep -c '^### ' "$report")" '7' 'six commands and one note for the rest'
+  assert_contains "$report" 'Also naming ACP, not shown here: seven eight.' 'the commands past the bound are named'
+
+  # A long help line is cut at 240 bytes and a split UTF-8 character is dropped, as in the docs watch.
+  write_fake_claude_top_level_help "$top"
+  for command in attach auth plugin update; do
+    write_fake_subcommand_help "$root" "$command" 'clean'
+  done
+  # The line is "1:ACP " plus 233 x, so byte 240 is the first byte of the two-byte é.
+  write_fake_subcommand_help "$root" mcp "ACP $(printf 'x%.0s' $(seq 1 233))é$(printf 'y%.0s' $(seq 1 50))"
+  expect_status 1 "$watch" claude "$top" "$report"
+  assert_contains "$report" "ACP $(printf 'x%.0s' $(seq 1 233))" 'the reported help line keeps its first bytes'
+  assert_not_contains "$report" 'yyy' 'a reported help line is cut at 240 bytes'
+  if LC_ALL=C grep -q $'\xc3$' "$report"; then
+    fail 'a cut must not leave half a UTF-8 character in the report'
+  fi
+
+  # Codex's layout: `help` is not probed, a wrapped description is not a command, and the same
+  # fake serves the vendor name as the report heading.
+  write_fake_codex_top_level_help "$top"
+  rm -rf -- "$root"
+  for command in exec mcp apply; do
+    write_fake_subcommand_help "$root" "$command" "Usage: codex $command"
+  done
+  : > "$log"
+  "$watch" codex "$top" "$report" > /dev/null
+  assert_eq "$(sed 's/ HOME=.*//' "$log" | sort | tr '\n' ',')" 'argv=apply --help,argv=exec --help,argv=mcp --help,' \
+    'the Codex commands are probed and help is not'
+  write_fake_subcommand_help "$root" exec '      --acp  Run over ACP'
+  expect_status 1 "$watch" codex "$top" "$report"
+  # shellcheck disable=SC2016 # the backticks are literal Markdown, not command substitution
+  assert_contains "$report" '### `codex exec --help`' 'the report names the Codex command line'
+
+  # No command in the top-level help, an unreadable help file and an odd command name are all
+  # "could not verify", and the watch runs no CLI for them.
+  : > "$log"
+  printf 'Usage: claude\n\nOptions:\n  --print\n' > "$top"
+  expect_status 2 "$watch" claude "$top" "$report"
+  assert_contains "$report" 'The top-level help lists no subcommand' 'a help with no commands is explained'
+  expect_status 2 "$watch" claude "$top.missing" "$report"
+  printf 'Commands:\n  mcp  x\n  --acp  x\n' > "$top"
+  expect_status 2 "$watch" claude "$top" "$report"
+  assert_eq "$(wc -c < "$log" | tr -d ' ')" '0' 'a top-level help that cannot be read runs no CLI'
+  expect_status 2 "$watch" opencode "$top" "$report"
+  expect_status 2 "$watch" claude
+  unset VENDOR_HELP_CLI FAKE_VENDOR_CLI_ROOT FAKE_VENDOR_CLI_LOG
+}
+
+test_help_probe_drift_report() {
+  local probe_report="$test_root/help-probe-fragment.md"
+  local report="$test_root/help-probe-report/report.md"
+  local expected="$test_root/help-probe-expected.md"
+  # shellcheck disable=SC2016 # the backticks are literal Markdown in the fake report, not command substitution
+  printf '### `claude mcp --help`\n\nLines naming ACP:\n\n```text\n3:  --acp  Serve ACP\n```\n\n' > "$probe_report"
+
+  # With no other difference the probe result is the whole report, led by the managed marker.
+  rm -rf -- "$(dirname "$report")"
+  "$repo_root/scripts/write-vendor-drift-report.sh" --help-probe claude "$probe_report" "$report"
+  cat > "$expected" <<'EXPECTED'
+<!-- vendor-drift:claude -->
+# Vendor drift: claude
+
+## Subcommand help watch
+
+The subcommand help watch for an ACP flag or command failed in this run: the help of a
+subcommand now names ACP, or could not be read.
+
+### `claude mcp --help`
+
+Lines naming ACP:
+
+```text
+3:  --acp  Serve ACP
+```
+
+EXPECTED
+  assert_eq "$(cat "$report")" "$(cat "$expected")" 'probe-only drift report shape'
+
+  # Beside the documentation watch the marker stays once and both sections remain.
+  printf '### https://example.test/reference.md\n\nLines naming ACP:\n' > "$test_root/help-probe-docs.md"
+  "$repo_root/scripts/write-vendor-drift-report.sh" --docs claude "$test_root/help-probe-docs.md" "$report"
+  assert_contains "$report" '## Documentation watch' 'the docs section is kept'
+  assert_contains "$report" '## Subcommand help watch' 'the probe section follows the docs section'
+  assert_eq "$(grep -c 'vendor-drift:' "$report")" '1' 'the marker appears once'
+
+  # A probe that wrote no detail says so, and the mode needs its three arguments.
+  rm -f -- "$report"
+  "$repo_root/scripts/write-vendor-drift-report.sh" --help-probe claude "$probe_report.missing" "$report"
+  assert_contains "$report" 'The watch wrote no command detail. Inspect this workflow run for its output.' 'a missing probe report is explained'
+  assert_not_contains "$report" 'page detail' 'the help watch reads no pages'
+  expect_status 2 "$repo_root/scripts/write-vendor-drift-report.sh" --help-probe claude "$probe_report"
+}
+
 test_vendor_acp_allowlist_entries() {
   local allowlist="$test_root/acp-allowlist.txt"
   local error="$test_root/acp-allowlist.error"
@@ -931,6 +1175,8 @@ test_vendor_acp_docs_report
 test_vendor_acp_docs_report_long_lines
 test_vendor_acp_docs_tests_ignore_the_inherited_allowlist
 test_docs_drift_report
+test_vendor_subcommand_help_watch
+test_help_probe_drift_report
 test_vendor_acp_allowlist_entries
 test_vendor_acp_document_allowlist
 test_vendor_acp_docs_allowlist_watch
