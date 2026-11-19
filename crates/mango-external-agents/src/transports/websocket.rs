@@ -15,6 +15,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_conf
 
 use super::socket::{self, peer_label, ws_reason};
 use crate::error::{Error, Result};
+use crate::host::Limits;
 use crate::link::Link;
 use crate::process::LineLimits;
 use crate::transport::WsSpec;
@@ -32,11 +33,38 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// handshake and nowhere else. The library never reads, stores or derives one: a vendor login is
 /// not a source for it, because the library does not handle logins.
 ///
+/// This carries no deadline: a peer that accepts the connection and never answers the upgrade
+/// holds the future. Wrap it in a timeout, or call [`dial_bounded`].
+///
 /// # Errors
 ///
 /// [`Error::Link`] when the URL is unusable, the bearer is not a valid header value, or the
 /// handshake failed.
 pub async fn dial(spec: &WsSpec, limits: LineLimits) -> Result<Link> {
+    dial_unbounded(spec, limits).await
+}
+
+/// [`dial`] bounded by the host's [`Limits::request_timeout`], the bound
+/// [`unix_socket::open`](super::unix_socket) puts on connecting and upgrading.
+///
+/// A peer that accepts the connection and never answers the upgrade would otherwise hold the
+/// caller until the operating system gave up, which for a silent peer is never. The line caps are
+/// `limits.line`.
+///
+/// # Errors
+///
+/// [`Error::Timeout`] when the connect and the upgrade do not finish within the bound; otherwise
+/// the errors of [`dial`].
+pub async fn dial_bounded(spec: &WsSpec, limits: &Limits) -> Result<Link> {
+    tokio::time::timeout(limits.request_timeout, dial_unbounded(spec, limits.line))
+        .await
+        .map_err(|_| Error::Timeout {
+            operation: String::from("WebSocket connect and upgrade"),
+            after: limits.request_timeout,
+        })?
+}
+
+async fn dial_unbounded(spec: &WsSpec, limits: LineLimits) -> Result<Link> {
     let mut request = spec
         .url
         .as_str()
@@ -82,10 +110,12 @@ fn link_error(spec: &WsSpec, error: &WsError) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{dial, from_socket, peer_label};
+    use super::{dial, dial_bounded, from_socket, peer_label};
+    use crate::host::Limits;
     use crate::process::LineLimits;
     use crate::transport::WsSpec;
     use futures_util::{SinkExt, StreamExt};
+    use std::time::Duration;
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
     use tokio_tungstenite::tungstenite::Message;
@@ -288,6 +318,59 @@ mod tests {
                 .to_string()
                 .contains("a socket failure (ConnectionRefused)"),
             "expected the io error kind rather than the dialled URL, received {error}"
+        );
+    }
+
+    /// A listener that accepts connections and never answers the upgrade.
+    async fn silent_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("expected a listener");
+        let port = listener.local_addr().expect("expected an address").port();
+        let held = tokio::spawn(async move {
+            let _stream = listener.accept().await;
+            std::future::pending::<()>().await;
+        });
+        (format!("ws://127.0.0.1:{port}"), held)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_never_answers_the_upgrade_times_out_at_the_request_timeout() {
+        let (url, held) = silent_server().await;
+        let limits = Limits {
+            request_timeout: Duration::from_secs(7),
+            ..Limits::default()
+        };
+
+        let error = dial_bounded(&WsSpec::new(url), &limits)
+            .await
+            .expect_err("expected a timeout, received a link");
+
+        assert!(
+            matches!(
+                &error,
+                crate::Error::Timeout { after, .. } if *after == Duration::from_secs(7)
+            ),
+            "expected Error::Timeout after 7s | received: {error:?}"
+        );
+        held.abort();
+    }
+
+    #[tokio::test]
+    async fn a_bounded_dial_round_trips_when_the_peer_answers() {
+        let url = echo_server().await;
+        let link = dial_bounded(&WsSpec::new(url), &Limits::default())
+            .await
+            .expect("expected the dial to land");
+        let (mut sender, mut receiver) = link.split();
+
+        sender
+            .send(String::from("hi"))
+            .await
+            .expect("expected the send to land");
+        assert_eq!(
+            receiver.recv().await.expect("expected a message"),
+            Some(String::from("echo:hi"))
         );
     }
 
