@@ -45,7 +45,8 @@ pub async fn dial(spec: &WsSpec, limits: LineLimits) -> Result<Link> {
 }
 
 /// [`dial`] bounded by the host's [`Limits::request_timeout`], the bound
-/// [`unix_socket::open`](super::unix_socket) puts on connecting and upgrading.
+/// `unix_socket::open` puts on connecting and upgrading. (Plain text, not a link: that module
+/// exists only on Unix, so a link breaks the Windows docs build.)
 ///
 /// A peer that accepts the connection and never answers the upgrade would otherwise hold the
 /// caller until the operating system gave up, which for a silent peer is never. The line caps are
