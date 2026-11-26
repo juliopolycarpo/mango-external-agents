@@ -28,7 +28,7 @@ mango-external-agents = { path = "crates/mango-external-agents", version = "0.11
 # `agent-client-protocol-schema` is absent on purpose. It stays inside mango-agent-acp, pinned
 # exactly, and no other member may take it.
 async-trait = "0.1.92"
-base64 = { version = "0.22", default-features = false }
+base64 = { version = "0.23.1", default-features = false }
 clap = "4.6.6"
 futures-util = { version = "0.3.34", default-features = false }
 http = "1.4.0"

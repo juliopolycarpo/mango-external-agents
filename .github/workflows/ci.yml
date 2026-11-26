@@ -43,7 +43,7 @@ jobs:
         with:
           shared-key: rust
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-nextest
       - run: cargo fmt --all -- --check
@@ -95,7 +95,7 @@ jobs:
         with:
           shared-key: powerset
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-hack
       # The powerset runs in a copy of the tree that cargo resolves offline, so the registry
@@ -112,7 +112,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-deny,dprint,git-cliff,shellcheck@0.11.0
       # install-action has no actionlint manifest; the installer checks the pinned SHA-256 and adds
@@ -170,7 +170,7 @@ jobs:
           key: msrv
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # The driver runs the feature matrix through cargo-hack, which any toolchain can host.
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-hack
       # Every workspace member at once, so Cargo unifies features across them: this proves the
