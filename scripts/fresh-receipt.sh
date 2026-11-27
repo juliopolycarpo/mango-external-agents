@@ -9,6 +9,9 @@
 #   gates-failed       a fresh lock exists and at least one gate after it failed
 #   lock-mutated       the gates changed Cargo.lock after the snapshot, so the kept lock is not
 #                      the graph that was tested
+#   evidence-missing   everything passed, but the `cargo update` output is not a readable file, so
+#                      the receipt cannot say which Rust version the resolver held to or what it
+#                      held back; `finish` then exits 1 after writing the receipt
 # or `cancelled` (no gate failed, but some did not finish: cancelled, or skipped because the run
 # was cancelled before they started) / `passed`. Gate steps are the workflow steps whose id starts with `gate_`; the
 # step with id `resolve` is the resolution.
@@ -86,10 +89,15 @@ finish() {
   fi
 
   toolchain_report > "$RECEIPT_DIR/rustc-Vv.txt" 2>&1 || true
-  # The resolver's own account of which Rust version it resolved for, and what it held back.
-  local policy held
-  policy=$(grep -E '^\s*Locking [0-9]+ packages? to ' "${UPDATE_LOG:-/dev/null}" 2>/dev/null | head -n 1 | sed 's/^\s*//' || true)
-  held=$(grep -E 'requires Rust' "${UPDATE_LOG:-/dev/null}" 2>/dev/null | sed 's/^\s*//' || true)
+  # The resolver's own account of which Rust version it resolved for, and what it held back. A
+  # successful resolution always wrote that output, so an unreadable log is missing evidence, not
+  # an empty account.
+  local policy='' held='' log_present=false
+  if [ -n "${UPDATE_LOG:-}" ] && [ -f "$UPDATE_LOG" ] && [ -r "$UPDATE_LOG" ]; then
+    log_present=true
+    policy=$(grep -E '^\s*Locking [0-9]+ packages? to ' "$UPDATE_LOG" | head -n 1 | sed 's/^\s*//' || true)
+    held=$(grep -E 'requires Rust' "$UPDATE_LOG" | sed 's/^\s*//' || true)
+  fi
 
   jq -n \
     --argjson steps "$STEPS_JSON" \
@@ -98,6 +106,7 @@ finish() {
     --arg resolved_hash "$resolved_hash" \
     --arg committed_hash "$committed_hash" \
     --argjson stable "$stable" \
+    --argjson log_present "$log_present" \
     --arg policy "$policy" \
     --arg held "$held" \
     --arg incompatible "${CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS:-}" \
@@ -120,6 +129,7 @@ finish() {
           elif $stable == false then "lock-mutated"
           elif ([$gates[]] | any(. == "failure")) then "gates-failed"
           elif ($not_passed | length) > 0 then "cancelled"
+          elif ($log_present | not) then "evidence-missing"
           else "passed" end),
         resolution: $resolution,
         gates: $gates,
@@ -165,6 +175,10 @@ finish() {
     } >> "$GITHUB_STEP_SUMMARY"
   fi
   jq . "$RECEIPT_DIR/receipt.json"
+  if [ "$resolution" = success ] && [ "$log_present" = false ]; then
+    echo "expected UPDATE_LOG to name the readable cargo update output of the successful resolution, received '${UPDATE_LOG:-}'" >&2
+    return 1
+  fi
 }
 
 "$mode"

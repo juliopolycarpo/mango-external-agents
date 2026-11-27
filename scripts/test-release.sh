@@ -874,6 +874,37 @@ case "$output" in
     exit 1
     ;;
 esac
+# A library crate missing from [workspace.dependencies] is refused by name: the lockstep loop
+# compares only the entries it finds, so an emptied table used to pass.
+rm -rf "$readme_fixture/tree/crates/other"
+printf '[workspace.package]\nversion = "0.3.1"\n\n[workspace.dependencies]\n' > "$readme_fixture/tree/Cargo.toml"
+if output=$("$readme_fixture/tree/scripts/check-versions.sh" 2>&1); then
+  echo 'expected check-versions.sh to refuse a workspace with no entry for its crate, received success' >&2
+  exit 1
+fi
+case "$output" in
+  *'workspace dependency mango-demo: expected a [workspace.dependencies] entry at version "0.3.1" for crates/demo/Cargo.toml, received none'*) ;;
+  *)
+    echo 'expected check-versions.sh to name the unlisted crate mango-demo, received:' >&2
+    echo "$output" >&2
+    exit 1
+    ;;
+esac
+# A crate that writes its own version is refused with the line it wrote.
+set_workspace_version 0.3.1
+printf '[package]\nname = "mango-demo"\nversion = "0.2.9"\n' > "$readme_fixture/tree/crates/demo/Cargo.toml"
+if output=$("$readme_fixture/tree/scripts/check-versions.sh" 2>&1); then
+  echo 'expected check-versions.sh to refuse a crate with its own version, received success' >&2
+  exit 1
+fi
+case "$output" in
+  *"crates/demo/Cargo.toml: expected 'version.workspace = true', received: version = \"0.2.9\""*) ;;
+  *)
+    echo 'expected check-versions.sh to name the version the crate wrote, received:' >&2
+    echo "$output" >&2
+    exit 1
+    ;;
+esac
 rm -rf "$readme_fixture"
 trap - EXIT
 echo 'README install requirement checks passed'
