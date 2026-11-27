@@ -47,6 +47,7 @@ run scripts/test-run-without-self-dev-dependency.sh
 run scripts/test-check-script-tests.sh
 run scripts/test-check-shellcheck.sh
 run scripts/test-prune-rust-caches.sh
+run scripts/test-prune-rust-toolchains.sh
 run scripts/test-check-actionlint.sh
 run scripts/test-install-actionlint.sh
 run scripts/check-script-tests.sh

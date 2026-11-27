@@ -93,11 +93,12 @@ powerset_job_problem() {
       return
       ;;
   esac
-  # rust-cache hashes the installed toolchains into its key, so the toolchain step comes first.
-  toolchain_line=$(grep -nxE ' +- run: rustup show active-toolchain' <<<"$job" | head -n 1 | cut -d: -f1 || true)
+  # rust-cache hashes the installed toolchains into its key, so the step that installs the pinned
+  # one and removes the image's own comes first.
+  toolchain_line=$(grep -nxE ' +- run: scripts/prune-rust-toolchains\.sh' <<<"$job" | head -n 1 | cut -d: -f1 || true)
   cache_line=$(grep -nE '^ +- uses: Swatinem/rust-cache@' <<<"$job" | head -n 1 | cut -d: -f1 || true)
   if [ -z "$toolchain_line" ] || [ -z "$cache_line" ] || [ "$toolchain_line" -ge "$cache_line" ]; then
-    echo "expected the 'powerset' job in $workflow to run 'rustup show active-toolchain' before the rust-cache step | received the toolchain step at job line ${toolchain_line:-none}, the cache step at ${cache_line:-none}"
+    echo "expected the 'powerset' job in $workflow to run 'scripts/prune-rust-toolchains.sh' before the rust-cache step | received the toolchain step at job line ${toolchain_line:-none}, the cache step at ${cache_line:-none}"
     return
   fi
   # Its own cache, saved on main only: a cache the `rust` job saved would lack the dependency
@@ -171,7 +172,7 @@ expect_powerset_refusal 'a cache every ref saves' "'shared-key: powerset' and sa
 expect_powerset_refusal 'a cache under the rust key' "'shared-key: powerset' and save on refs/heads/main only" \
   -e "${in_powerset}s/shared-key: powerset/shared-key: rust/"
 expect_powerset_refusal 'a toolchain step after the cache' 'before the rust-cache step' \
-  -e "${in_powerset}{/- run: rustup show active-toolchain/d;/save-if: /a\\      - run: rustup show active-toolchain" -e '}'
+  -e "${in_powerset}{/- run: scripts\\/prune-rust-toolchains\\.sh/d;/save-if: /a\\      - run: scripts/prune-rust-toolchains.sh" -e '}'
 expect_powerset_refusal 'an unpinned cache action' 'the same pinned Swatinem/rust-cache@ step' \
   -e "${in_powerset}s|Swatinem/rust-cache@[0-9a-f]* # v2.9.3|Swatinem/rust-cache@v2|"
 expect_powerset_refusal 'no cargo-hack install' 'install cargo-hack' \

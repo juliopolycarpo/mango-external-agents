@@ -34,7 +34,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup show active-toolchain
+      # rust-cache hashes every installed toolchain into its key, the image's own stable included.
+      # This installs the pinned one and removes the rest, so an image update cannot empty the cache.
+      - run: scripts/prune-rust-toolchains.sh
       # Only main saves. A pull request's cache is visible to that pull request alone, so a save
       # there stores one more copy per open pull request and is restored by nothing else. `rust` is
       # the key the `powerset` job and the vendor-drift lanes restore; the vendor-drift lanes build a
@@ -76,8 +78,7 @@ jobs:
   # targets. It is the longest step of `rust`, so it runs beside it instead of after it. It runs on
   # all three systems because the platform code is `cfg(windows)` and `cfg(unix)`. It keeps its own
   # cache, saved on main only: the powerset builds dependencies with feature sets the `rust` job
-  # never selects, and a cache `rust` saved would not hold them. rust-cache hashes every installed
-  # toolchain into the key, so the toolchain step runs before the cache step.
+  # never selects, and a cache `rust` saved would not hold them.
   powerset:
     name: Feature powerset (${{ matrix.os }})
     timeout-minutes: 30
@@ -90,7 +91,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup show active-toolchain
+      - run: scripts/prune-rust-toolchains.sh
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: powerset
@@ -147,6 +148,7 @@ jobs:
       - run: scripts/test-install-actionlint.sh
       - run: scripts/check-shellcheck.sh
       - run: scripts/test-prune-rust-caches.sh
+      - run: scripts/test-prune-rust-toolchains.sh
       - run: scripts/check-actionlint.sh
       - run: dprint check
 
@@ -165,6 +167,7 @@ jobs:
           toolchain=$(scripts/check-features.sh --print-toolchain)
           echo "MSRV_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
           rustup toolchain install "$toolchain" 1.96.0 --profile minimal
+      - run: scripts/prune-rust-toolchains.sh "$MSRV_TOOLCHAIN" 1.96.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: msrv
@@ -203,6 +206,7 @@ jobs:
           toolchain=$(scripts/check-features.sh --print-toolchain)
           echo "MSRV_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
           rustup toolchain install "$toolchain" --profile minimal
+      - run: scripts/prune-rust-toolchains.sh "$MSRV_TOOLCHAIN"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: msrv-windows
