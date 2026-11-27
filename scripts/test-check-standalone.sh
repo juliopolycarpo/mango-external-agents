@@ -111,7 +111,7 @@ sed -i.bak 's/^mango-external-agents = { version = "=[^"]*"/mango-external-agent
 rm "$tree/tests/standalone-current/Cargo.toml.bak"
 run_check --changed-since "$base"
 assert_status 1
-grep -q "expected one exact '=x.y.z' mango-external-agents pin" "$work/err" || fail "expected the pin shape refused | received: $(cat "$work/err")"
+grep -q "expected one exact '=x.y.z' mango-external-agents pin, received: mango-external-agents = { version = \"9\"" "$work/err" || fail "expected the pin shape refused | received: $(cat "$work/err")"
 reset_tree
 
 # A committed change to one consumer builds that one only.

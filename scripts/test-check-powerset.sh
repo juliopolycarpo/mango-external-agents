@@ -329,6 +329,28 @@ case "$toolchain" in
   1.[0-9]*.0) ;;
   *) fail "expected --print-toolchain to print a full minimum toolchain like 1.97.0 | received: $toolchain" ;;
 esac
+# A manifest named after the flag is read under [package]; two or three components are a
+# toolchain, anything else is refused with the value as written.
+printf '[package]\nname = "consumer"\nrust-version = "1.96"\n' > "$work/two-part.toml"
+printf '[package]\nname = "consumer"\nrust-version = "1.96.1"\n' > "$work/three-part.toml"
+printf '[package]\nname = "consumer"\nrust-version = "stable"\n' > "$work/malformed.toml"
+printf '[package]\nname = "consumer"\n' > "$work/undeclared.toml"
+for expectation in 'two-part 1.96.0' 'three-part 1.96.1'; do
+  received=$(scripts/check-features.sh --print-toolchain "$work/${expectation% *}.toml")
+  [ "$received" = "${expectation#* }" ] || fail "expected --print-toolchain ${expectation% *}.toml to print ${expectation#* } | received: $received"
+done
+for expectation in 'malformed received "stable"' 'undeclared received none' 'no-such-file received no file at'; do
+  if received=$(scripts/check-features.sh --print-toolchain "$work/${expectation%% *}.toml" 2>&1); then
+    fail "expected --print-toolchain ${expectation%% *}.toml to be refused | received: $received"
+  fi
+  case "$received" in
+    *"${expectation#* }"*) ;;
+    *) fail "expected the refusal of ${expectation%% *}.toml to say '${expectation#* }' | received: $received" ;;
+  esac
+done
+if received=$(scripts/check-features.sh --print-toolchain one.toml two.toml 2>&1); then
+  fail "expected two manifests after --print-toolchain to be refused | received: $received"
+fi
 : > "$work/cargo.log"
 status=0
 (

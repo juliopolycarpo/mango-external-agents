@@ -113,6 +113,13 @@ expect_tag_refusal 1 'expected tag v0.4.0 to be signed and verified by GitHub, r
   FAKE_TAG_VERIFIED=false FAKE_TAG_REASON=unsigned
 expect_tag_refusal 1 'received verified=false reason=unknown_key' \
   FAKE_TAG_VERIFIED=false FAKE_TAG_REASON=unknown_key
+# An empty reason stays in its own field: the tag name and the commit after it keep their names.
+expect_tag_refusal 1 'expected tag v0.4.0 to be signed and verified by GitHub, received verified=false reason=none' \
+  FAKE_TAG_VERIFIED=false FAKE_TAG_REASON=
+check_tag FAKE_TAG_VERIFIED=true FAKE_TAG_REASON= >/dev/null || {
+  echo 'expected a verified annotated tag with an empty reason to pass, received a refusal' >&2
+  exit 1
+}
 expect_tag_refusal 1 'expected v0.4.0 to be an annotated signed tag, received a commit object' \
   FAKE_TAG_OBJECT=commit
 expect_tag_refusal 1 'expected tag v0.4.0 to be signed under that name, received a signature over the name candidate' \

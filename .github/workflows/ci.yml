@@ -134,8 +134,15 @@ jobs:
       # Before the tests below so their real-tool cases run in CI.
       - run: scripts/install-actionlint.sh "$RUNNER_TEMP/actionlint-bin"
       # scripts/check-script-tests.sh parses this file with PyYAML. Declared here so the lane does
-      # not depend on what the runner image happens to ship; a no-op when it is already installed.
-      - run: sudo apt-get install --yes --no-install-recommends python3-yaml
+      # not depend on what the runner image happens to ship. The image has it today, so nothing is
+      # installed; when one drops it, the package lists are refreshed first, since the image's
+      # own are stale.
+      - name: PyYAML for python3
+        run: |
+          if ! python3 -c 'import yaml' 2>/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends python3-yaml
+          fi
       - run: cargo deny check -D unmatched-skip -D unnecessary-skip
       - run: scripts/test-check-deny.sh
       - run: python3 scripts/test-check-tool-pins.py
@@ -178,13 +185,16 @@ jobs:
           persist-credentials: false
           fetch-depth: 2 # CHANGED_SINCE
       # The compiler comes from `rust-version` in Cargo.toml, so the lane cannot drift from the
-      # declared minimum. 1.96.0 is only the historical registry consumer's own compiler.
-      - name: Install the declared minimum toolchain
+      # declared minimum. The second toolchain is only the historical registry consumer's own
+      # compiler, read from its manifest the same way.
+      - name: Install the declared minimum toolchains
         run: |
           toolchain=$(scripts/check-features.sh --print-toolchain)
+          historical=$(scripts/check-features.sh --print-toolchain tests/standalone-historical/Cargo.toml)
           echo "MSRV_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
-          rustup toolchain install "$toolchain" 1.96.0 --profile minimal
-      - run: scripts/prune-rust-toolchains.sh "$MSRV_TOOLCHAIN" 1.96.0
+          echo "HISTORICAL_TOOLCHAIN=$historical" >> "$GITHUB_ENV"
+          rustup toolchain install "$toolchain" "$historical" --profile minimal
+      - run: scripts/prune-rust-toolchains.sh "$MSRV_TOOLCHAIN" "$HISTORICAL_TOOLCHAIN"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: msrv
@@ -206,7 +216,7 @@ jobs:
       - run: RUSTUP_TOOLCHAIN="$MSRV_TOOLCHAIN" scripts/check-standalone.sh --test-only --also-input Cargo.toml ${CHANGED_SINCE:+--changed-since "$CHANGED_SINCE"} current
       # HISTORICAL control. It pins the =0.3.1 crates and declares its own older minimum, so it is
       # checked with the compiler it names. It says nothing about 0.4.x or about this checkout.
-      - run: cargo +1.96.0 check --manifest-path tests/standalone-historical/Cargo.toml --all-targets --all-features --locked
+      - run: cargo +"$HISTORICAL_TOOLCHAIN" check --manifest-path tests/standalone-historical/Cargo.toml --all-targets --all-features --locked
 
   # The `cfg(windows)` dependency edges are compiled by no Linux lane: `process-wrap`, `win32job` and
   # `windows` behind the core's `launcher-tokio`. A workspace `check` at the minimum reaches all of
