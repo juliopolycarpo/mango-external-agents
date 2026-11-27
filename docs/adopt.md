@@ -23,7 +23,10 @@ and approval UI. Ctrl+C cancels an active turn; events continue through its term
 
 `scripts/check-standalone.sh` copies each consumer outside the repository, verifies registry sources
 and the absence of product dependencies, then tests with and without the bundled launcher. CI runs
-the current consumer on the declared minimum Rust version. A second consumer,
+the current consumer on the declared minimum Rust version. The consumers build the published
+release, not the checkout, so CI and `scripts/check.sh` rebuild one only when its directory, the
+pinned toolchain or the script changed (`--changed-since`); a weekly CI run on `main` rebuilds both
+whatever changed. A second consumer,
 [`tests/standalone-historical`](../tests/standalone-historical/README.md), stays at `=0.3.1` on its
 own older minimum as a fixed control; it is not evidence for any later release.
 These deterministic consumers prove independent compilation and harness integration, including

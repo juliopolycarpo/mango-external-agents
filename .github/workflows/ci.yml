@@ -5,6 +5,11 @@ on:
     branches: [main]
   push:
     branches: [main]
+  # Weekly on main, with nothing skipped: the run that notices a runner image, a tool or a registry
+  # change that no commit made. Scheduled runs start hours late on this account; no step depends
+  # on the time.
+  schedule:
+    - cron: "43 5 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -16,6 +21,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # The commit this run is compared with by the checks that depend on a few paths only
+  # (scripts/check-standalone.sh): the base of a pull request's merge commit, or the commit main
+  # was at before a push. Both need `fetch-depth: 2`. Empty on the weekly and manual runs.
+  CHANGED_SINCE: ${{ github.event_name == 'pull_request' && 'HEAD^1' || github.event_name == 'push' && github.event.before || '' }}
 
 defaults:
   run:
@@ -34,6 +43,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 2 # CHANGED_SINCE
       # rust-cache hashes every installed toolchain into its key, the image's own stable included.
       # This installs the pinned one and removes the rest, so an image update cannot empty the cache.
       - run: scripts/prune-rust-toolchains.sh
@@ -72,7 +82,9 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - run: scripts/test-check-tls.sh
       - run: scripts/check-tls.sh
-      - run: scripts/check-standalone.sh
+      # The registry consumers build the published release, not this checkout, so they are built
+      # only when their own inputs changed; the fixture and pin comparisons run every time.
+      - run: scripts/check-standalone.sh ${CHANGED_SINCE:+--changed-since "$CHANGED_SINCE"}
 
   # The depth-2 feature powerset is clippy over every feature pair of the four library crates, all
   # targets. It is the longest step of `rust`, so it runs beside it instead of after it. It runs on
@@ -149,6 +161,7 @@ jobs:
       - run: scripts/check-shellcheck.sh
       - run: scripts/test-prune-rust-caches.sh
       - run: scripts/test-prune-rust-toolchains.sh
+      - run: scripts/test-check-standalone.sh
       - run: scripts/check-actionlint.sh
       - run: dprint check
 
@@ -160,6 +173,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 2 # CHANGED_SINCE
       # The compiler comes from `rust-version` in Cargo.toml, so the lane cannot drift from the
       # declared minimum. 1.96.0 is only the historical registry consumer's own compiler.
       - name: Install the declared minimum toolchain
@@ -185,7 +199,8 @@ jobs:
       # The current registry consumer: the published release from crates.io only, own manifest and
       # lock, no path dependency, running the lifecycle tests on the declared minimum compiler. It
       # is evidence for the release the pin names, not for the unpublished code in this checkout.
-      - run: RUSTUP_TOOLCHAIN="$MSRV_TOOLCHAIN" scripts/check-standalone.sh --test-only current
+      # Cargo.toml is an input here because it names the compiler.
+      - run: RUSTUP_TOOLCHAIN="$MSRV_TOOLCHAIN" scripts/check-standalone.sh --test-only --also-input Cargo.toml ${CHANGED_SINCE:+--changed-since "$CHANGED_SINCE"} current
       # HISTORICAL control. It pins the =0.3.1 crates and declares its own older minimum, so it is
       # checked with the compiler it names. It says nothing about 0.4.x or about this checkout.
       - run: cargo +1.96.0 check --manifest-path tests/standalone-historical/Cargo.toml --all-targets --all-features --locked

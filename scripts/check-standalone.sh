@@ -15,23 +15,58 @@
 # The consumer's declared `rust-version` must be what the pinned release declares on the registry,
 # so a consumer cannot claim a minimum its crates do not.
 #
-# Usage: scripts/check-standalone.sh [--test-only] [current|historical|all]   # default: all
+# A consumer's result depends only on its own directory, the pinned toolchain and this script, never
+# on the workspace sources: `--changed-since <rev>` skips the build of a consumer whose inputs are
+# the same in the working tree as at <rev>. The fixture comparison and the pin shape are checked
+# either way, since they read the checkout. A <rev> this clone does not have builds, so a shallow
+# clone or a first push can only err towards building. `--also-input <path>` adds an input, for a
+# caller whose compiler comes from somewhere else (the MSRV lane reads it from Cargo.toml). CI
+# passes the flag on pull requests and pushes and omits it on its weekly run, which is what
+# notices a runner image or registry change; so does a bare local call.
+#
+# Usage: scripts/check-standalone.sh [--test-only] [--changed-since <rev>] [--also-input <path>]...
+#                                    [current|historical|all]   # default: all
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+usage='expected --test-only, --changed-since <rev>, --also-input <path>, current, historical or all'
 test_only=false
 selection=all
-for arg in "$@"; do
-  case "$arg" in
+changed_since=''
+shared_inputs=(rust-toolchain.toml scripts/check-standalone.sh)
+while [ $# -gt 0 ]; do
+  case "$1" in
     --test-only) test_only=true ;;
-    current | historical | all) selection=$arg ;;
-    *) echo "unknown argument: $arg (expected --test-only, current, historical or all)" >&2; exit 2 ;;
+    --changed-since | --also-input)
+      if [ $# -lt 2 ] || [ -z "$2" ]; then
+        echo "expected a value after $1, received none ($usage)" >&2
+        exit 2
+      fi
+      if [ "$1" = --changed-since ]; then changed_since=$2; else shared_inputs+=("$2"); fi
+      shift
+      ;;
+    current | historical | all) selection=$1 ;;
+    *) echo "unknown argument: $1 ($usage)" >&2; exit 2 ;;
   esac
+  shift
 done
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/independent-agent-host.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 target_base="${CARGO_TARGET_DIR:-$PWD/target}"
+
+# inputs_unchanged NAME -> success when --changed-since was given and no input of the consumer
+# differs between that commit and the working tree, untracked files included.
+inputs_unchanged() {
+  local inputs=("tests/standalone-$1" "${shared_inputs[@]}")
+  [ -n "$changed_since" ] || return 1
+  if ! git rev-parse --verify --quiet "$changed_since^{commit}" >/dev/null; then
+    echo "· $1 registry consumer: $changed_since is not a commit in this clone, so its inputs cannot be compared; building"
+    return 1
+  fi
+  git diff --quiet "$changed_since" -- "${inputs[@]}" || return 1
+  [ -z "$(git ls-files --others --exclude-standard -- "${inputs[@]}")" ]
+}
 
 check_consumer() {
   local name=$1 source="tests/standalone-$1" pin consumer
@@ -41,6 +76,11 @@ check_consumer() {
   if [ -z "$pin" ] || [ "$(printf '%s\n' "$pin" | grep -c .)" -ne 1 ]; then
     echo "$source/Cargo.toml: expected one exact '=x.y.z' mango-external-agents pin, received '${pin//$'\n'/ }'" >&2
     return 1
+  fi
+
+  if inputs_unchanged "$name"; then
+    echo "✓ $name registry consumer (=$pin): inputs unchanged since $changed_since ($source ${shared_inputs[*]}); not rebuilt"
+    return 0
   fi
 
   consumer="$scratch/$name"
@@ -97,4 +137,4 @@ case "$selection" in
     check_consumer historical
     ;;
 esac
-echo "✓ independent registry consumers passed"
+echo "✓ independent registry consumer checks passed"
