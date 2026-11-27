@@ -32,6 +32,8 @@ a `tests/<name>.rs` beside it.
   change to one file recompiles the whole binary.
 - `nextest` still runs each test in its own process, so tests do not share statics. `cargo test`
   runs a binary's tests as threads of one process; do not rely on that.
+- `.config/nextest.toml` ends a test that is still running after three minutes and reports it as a
+  timeout. The suite takes about 40 s; raise the limit there if a test ever needs longer.
 
 ## The entry
 
