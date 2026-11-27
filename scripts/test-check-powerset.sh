@@ -202,7 +202,7 @@ for file in .github/workflows/ci.yml .github/workflows/fresh-dependencies.yml sc
     fail "expected $file to run the workspace clippy with --no-default-features once, through scripts/run-without-self-dev-dependency.sh | received $bare run(s), $wrapped wrapped"
   fi
 done
-expected_powerset="cargo hack clippy --feature-powerset --depth 2 --all-targets --locked $packages -- -D warnings"
+expected_powerset="cargo hack clippy --feature-powerset --depth 2 --skip default --all-targets --locked $packages -- -D warnings"
 # The lanes that select test targets run inside the copy without the self dev-dependency; the
 # wrapper's own log line is how this test sees that, since FakeWithoutSelf only logs and execs.
 wrapper_prefix='without-self-dev-dependency:'

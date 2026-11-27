@@ -5,7 +5,9 @@
 #
 #   powerset  the development toolchain from rust-toolchain.toml. Clippy over every feature pair
 #             (depth 2) of each crate, all targets, warnings denied, in a copy without the crates'
-#             self dev-dependency (see below). Run by CI's `powerset` job on Linux, macOS and
+#             self dev-dependency (see below). `default` is left out of the pairs: it is `stdio`
+#             for the core and empty for the harness crates, so every pair with it repeats one
+#             without it (36 runs, 24 distinct). Run by CI's `powerset` job on Linux, macOS and
 #             Windows, and by scripts/check.sh. A release does not rerun it: it requires the CI run
 #             of the tagged commit, whose `powerset` job ran it.
 #   msrv      the workspace `rust-version`, not the development toolchain. A compile check of
@@ -88,7 +90,7 @@ done
 run() { echo "▶ $*"; "$@"; }
 
 if [ "$lane" = powerset ]; then
-  run scripts/run-without-self-dev-dependency.sh cargo hack clippy --feature-powerset --depth 2 --all-targets ${extra[@]+"${extra[@]}"} "${packages[@]}" -- -D warnings
+  run scripts/run-without-self-dev-dependency.sh cargo hack clippy --feature-powerset --depth 2 --skip default --all-targets ${extra[@]+"${extra[@]}"} "${packages[@]}" -- -D warnings
   exit 0
 fi
 
