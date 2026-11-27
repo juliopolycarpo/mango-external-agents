@@ -67,7 +67,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
-          tool: cargo-nextest,cargo-deny,cargo-hack
+          tool: cargo-nextest@0.9.152,cargo-deny@0.22.0,cargo-hack@0.6.46
       - id: resolve
         name: Resolve every dependency to its newest compatible release
         # No colour: the workflow-wide `always` puts escape codes in front of the status words the

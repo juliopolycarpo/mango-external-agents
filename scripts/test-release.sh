@@ -189,7 +189,7 @@ check_release_workflow() {
       cargo-deny) step_marker='cargo deny check advisories'; step_name='the advisory check' ;;
       *) step_marker='scripts/check-publish.sh --list'; step_name='the publication gate' ;;
     esac
-    install_line=$(grep -nE "^[[:space:]]+tool:[[:space:]]*([^,]+,)*$tool(,|[[:space:]]*\$)" <<<"$verify" | head -n 1 || true)
+    install_line=$(grep -nE "^[[:space:]]+tool:[[:space:]]*([^,]+,)*$tool(@[0-9.]+)?(,|[[:space:]]*\$)" <<<"$verify" | head -n 1 || true)
     if [ -z "$install_line" ]; then
       echo "expected the release verify job in $file to install $tool before the steps that run it, received no $tool tool entry" >&2
       return 1
@@ -330,17 +330,17 @@ expect_workflow_refusal 'to need the verify job'
 # shellcheck disable=SC2016 # the workflow line must contain the literal $GITHUB_ENV
 { cat "$release_workflow"; printf '      - run: echo "RUSTUP_TOOLCHAIN=1.97.0" >> "$GITHUB_ENV"\n'; } > "$workflow_dir/release.yml"
 expect_workflow_refusal 'to leave the pinned toolchain selected for every other step'
-sed 's/,cargo-hack//' "$release_workflow" > "$workflow_dir/release.yml"
+sed 's/,cargo-hack@[0-9.]*//' "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal 'to install cargo-hack before the steps that run it'
 sed 's/cargo-hack/cargo-hacker/' "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal 'to install cargo-hack before the steps that run it'
-sed 's/cargo-nextest,//' "$release_workflow" > "$workflow_dir/release.yml"
+sed 's/cargo-nextest@[0-9.]*,//' "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal 'to install cargo-nextest before the steps that run it'
 awk '/^[[:space:]]+tool:/ { held = $0; next } { print } /run: scripts\/check-publish[.]sh --list$/ { print held }' \
   "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal 'installation before the publication gate'
 # The advisory check runs on the tag, with cargo-deny installed first.
-sed 's/,cargo-deny$//' "$release_workflow" > "$workflow_dir/release.yml"
+sed 's/,cargo-deny@[0-9.]*$//' "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal 'to install cargo-deny before the steps that run it'
 grep -v 'cargo deny check advisories' "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal "to run 'cargo deny check advisories' on the tag"
@@ -356,9 +356,9 @@ sed 's/^      - name: No open advisories at release time$/&\n        if: always(
 expect_workflow_refusal "step holding 'cargo deny check advisories' in $workflow_dir/release.yml to run unconditionally and to fail the job, received:         if: always()"
 sed 's/^        run: cargo deny check advisories$/& || true/' "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal "step holding 'cargo deny check advisories' in $workflow_dir/release.yml to run unconditionally and to fail the job, received:         run: cargo deny check advisories || true"
-sed 's/^          tool: cargo-nextest,cargo-hack,cargo-deny$/&\n        continue-on-error: true/' "$release_workflow" > "$workflow_dir/release.yml"
+sed 's/^          tool: cargo-nextest@[0-9.]*,cargo-hack@[0-9.]*,cargo-deny@[0-9.]*$/&\n        continue-on-error: true/' "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal "step holding 'cargo-deny' in $workflow_dir/release.yml to run unconditionally and to fail the job, received:         continue-on-error: true"
-sed 's/^          tool: cargo-nextest,cargo-hack,cargo-deny$/&\n        if: always()/' "$release_workflow" > "$workflow_dir/release.yml"
+sed 's/^          tool: cargo-nextest@[0-9.]*,cargo-hack@[0-9.]*,cargo-deny@[0-9.]*$/&\n        if: always()/' "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal "step holding 'cargo-deny' in $workflow_dir/release.yml to run unconditionally and to fail the job, received:         if: always()"
 sed 's/^        run: cargo deny check advisories$/        run: cargo deny check advisories || :/' "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal "to run unconditionally and to fail the job, received:         run: cargo deny check advisories || :"

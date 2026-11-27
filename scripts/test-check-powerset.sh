@@ -115,7 +115,7 @@ powerset_job_problem() {
       return
     fi
   done
-  if ! grep -qE '^ +tool: ([^,]+,)*cargo-hack(,|$)' <<<"$job"; then
+  if ! grep -qE '^ +tool: ([^,]+,)*cargo-hack(@[0-9.]+)?(,|$)' <<<"$job"; then
     echo "expected the 'powerset' job in $workflow to install cargo-hack through taiki-e/install-action | received: $(grep -E '^ +tool:' <<<"$job" | sed 's/^ *//' || echo no tool entry)"
     return
   fi
