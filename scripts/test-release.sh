@@ -280,11 +280,11 @@ check_release_workflow() {
     fi
   done
   cache_line=$(grep -nE '^[[:space:]]+- uses:[[:space:]]*Swatinem/rust-cache@' <<<"$verify" | head -n 1)
-  # rust-cache would otherwise trigger the pinned toolchain's install itself, through rustup's
-  # deprecated auto-install; without it the key lacks that toolchain and never matches main's.
-  found=$(grep -nE '^[[:space:]]+- run:[[:space:]]*rustup show active-toolchain[[:space:]]*$' <<<"$verify" | head -n 1 || true)
+  # The prune step installs the pinned toolchain and removes the image's own, with no toolchain
+  # named: the same set ci.yml's `rust` job has when it saves the key this job restores.
+  found=$(grep -nE '^[[:space:]]+- run:[[:space:]]*scripts/prune-rust-toolchains\.sh[[:space:]]*$' <<<"$verify" | head -n 1 || true)
   if [ -z "$found" ] || [ "${found%%:*}" -ge "${cache_line%%:*}" ]; then
-    echo "expected the release verify job in $file to run 'rustup show active-toolchain' before the Rust cache step, received ${found:-no such step} and the cache step at verify line ${cache_line%%:*}" >&2
+    echo "expected the release verify job in $file to run 'scripts/prune-rust-toolchains.sh' with no toolchain named before the Rust cache step, received ${found:-no such step} and the cache step at verify line ${cache_line%%:*}" >&2
     return 1
   fi
   install_line=$(grep -nF -- 'rustup toolchain install' <<<"$verify" | head -n 1)
@@ -393,10 +393,13 @@ expect_workflow_refusal "to set 'shared-key: rust' and 'save-if: false', receive
 awk '/Swatinem\/rust-cache@/ && !moved { print "      - name: Install the declared minimum toolchain"; print "        run: rustup toolchain install \"$(scripts/check-features.sh --print-toolchain)\" --profile minimal"; moved = 1 } { print }' \
   "$release_workflow" > "$workflow_dir/release.yml"
 expect_workflow_refusal 'to restore the Rust cache before installing the minimum toolchain'
-# Move the first `rustup show active-toolchain`, the verify job's, below its cache step.
-awk '/rustup show active-toolchain/ && !held { held = $0; next } { print } /save-if: false/ && held != "" && !put { print held; put = 1 }' \
+# Move the first toolchain prune, the verify job's, below its cache step.
+awk '/scripts\/prune-rust-toolchains\.sh/ && !held { held = $0; next } { print } /save-if: false/ && held != "" && !put { print held; put = 1 }' \
   "$release_workflow" > "$workflow_dir/release.yml"
-expect_workflow_refusal "to run 'rustup show active-toolchain' before the Rust cache step"
+expect_workflow_refusal "to run 'scripts/prune-rust-toolchains.sh' with no toolchain named before the Rust cache step"
+# Name a toolchain to keep: the key would then cover one the main cache was saved without.
+sed 's|^\(  *- run: scripts/prune-rust-toolchains\.sh\)$|\1 1.98.0|' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal "to run 'scripts/prune-rust-toolchains.sh' with no toolchain named before the Rust cache step"
 rm -rf "$workflow_dir"
 trap - EXIT
 echo 'release workflow checks passed'
