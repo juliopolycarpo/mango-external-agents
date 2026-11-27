@@ -5,7 +5,8 @@
 # once, skips that gate and returns the status of the others.
 #
 # Only CI covers: the macOS and Windows builds, the minimum Rust version (run it here with
-# scripts/check-features.sh msrv --locked), the scheduled fresh-dependency and vendor-drift lanes,
+# scripts/check-features.sh msrv --locked), the weekly run that rebuilds the registry consumers
+# whatever changed, the scheduled fresh-dependency and vendor-drift lanes,
 # the pull request title check (scripts/check-pr-title.sh) and the release workflow's publication
 # gate.
 # Usage: scripts/check.sh [--skip-format]
@@ -65,7 +66,12 @@ else
   echo "warning: actionlint or shellcheck not found on PATH; skipped the workflow lint that CI runs (scripts/install-actionlint.sh <bin-dir>, see docs/testing.md)" >&2
 fi
 run scripts/test-check-tls.sh
-run scripts/check-standalone.sh
+run scripts/test-check-standalone.sh
+# The registry consumers build the published release, so they are rebuilt only when this branch or
+# the working tree changed their inputs, as in CI. Without an origin/main to compare with, and in a
+# bare `scripts/check-standalone.sh`, they always are.
+standalone_base=$(git merge-base origin/main HEAD 2>/dev/null || true)
+run scripts/check-standalone.sh ${standalone_base:+--changed-since "$standalone_base"}
 run cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 # Selects test targets, so it runs in the copy without the crates' self dev-dependency.
 run scripts/run-without-self-dev-dependency.sh cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
