@@ -1,0 +1,6 @@
+# The whole suite runs in about 40 s and no test takes 5 s, so a test still running after three
+# minutes is hung. Without this a hang held its runner until the job's 30-minute timeout, on
+# all three operating systems at once. nextest reports the test as SLOW each minute and ends it
+# as a timeout failure at the third.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 3 }
