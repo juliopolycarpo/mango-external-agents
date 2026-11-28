@@ -5,7 +5,8 @@
 #   FAKE_TAG_NAME         the only tag ref that exists (`v0.4.0`); any other ref is a 404
 #   FAKE_TAG_OBJECT       `tag` for an annotated tag, `commit` for a lightweight one
 #   FAKE_TAG_VERIFIED     `true` or `false`, as the tag object's verification reports
-#   FAKE_TAG_REASON       the verification reason (`valid`, `unsigned`, `unknown_key`, ...)
+#   FAKE_TAG_REASON       the verification reason (`valid`, `unsigned`, `unknown_key`, ...);
+#                         set but empty sends an empty reason
 #   FAKE_TAG_SIGNED_NAME  the name inside the tag object; defaults to FAKE_TAG_NAME
 #   FAKE_TAG_COMMIT       the commit the tag object points at
 set -euo pipefail
@@ -34,7 +35,7 @@ case "$endpoint" in
       '{object: {type: $type, sha: $sha}}' | jq -r "$jq_filter"
     ;;
   "repos/owner/repository/git/tags/$object_sha")
-    jq -n -c --argjson verified "${FAKE_TAG_VERIFIED:-true}" --arg reason "${FAKE_TAG_REASON:-valid}" \
+    jq -n -c --argjson verified "${FAKE_TAG_VERIFIED:-true}" --arg reason "${FAKE_TAG_REASON-valid}" \
       --arg tag "${FAKE_TAG_SIGNED_NAME:-$name}" --arg commit "$commit" \
       '{tag: $tag, verification: {verified: $verified, reason: $reason}, object: {type: "commit", sha: $commit}}' |
       jq -r "$jq_filter"

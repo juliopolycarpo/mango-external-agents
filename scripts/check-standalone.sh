@@ -69,12 +69,14 @@ inputs_unchanged() {
 }
 
 check_consumer() {
-  local name=$1 source="tests/standalone-$1" pin consumer
+  local name=$1 source="tests/standalone-$1" pin consumer declared
   cmp fixtures/claude/help/2.1.260.txt "$source/tests/fixtures/claude-help.txt"
   cmp fixtures/claude/transcripts/read-turn.jsonl "$source/tests/fixtures/claude-turn.jsonl"
   pin=$(sed -n 's/^mango-external-agents = { version = "=\([^"]*\)".*/\1/p' "$source/Cargo.toml" | sort -u)
   if [ -z "$pin" ] || [ "$(printf '%s\n' "$pin" | grep -c .)" -ne 1 ]; then
-    echo "$source/Cargo.toml: expected one exact '=x.y.z' mango-external-agents pin, received '${pin//$'\n'/ }'" >&2
+    # The entries as written: a requirement that is not an exact pin matches nothing above.
+    declared=$(grep '^mango-external-agents = ' "$source/Cargo.toml" | paste -sd';' - || true)
+    echo "$source/Cargo.toml: expected one exact '=x.y.z' mango-external-agents pin, received: ${declared:-no mango-external-agents entry}" >&2
     return 1
   fi
 

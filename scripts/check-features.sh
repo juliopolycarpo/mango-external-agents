@@ -33,8 +33,11 @@
 # resolved one). A missing cargo-hack or toolchain is an error here; only scripts/check.sh chooses
 # to skip the powerset when cargo-hack is absent.
 #
+# `--print-toolchain` prints the minimum a manifest declares as a full toolchain name: the
+# workspace's by default, or that of the manifest named (a registry consumer has its own).
+#
 # Usage: scripts/check-features.sh (powerset|msrv) [cargo args...]
-#        scripts/check-features.sh --print-toolchain
+#        scripts/check-features.sh --print-toolchain [manifest]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -42,17 +45,27 @@ cd "$(dirname "$0")/.."
 library_crates=(mango-external-agents mango-agent-claude mango-agent-codex mango-agent-acp)
 core_crate=mango-external-agents
 
-usage="usage: scripts/check-features.sh (powerset|msrv) [cargo args...] | --print-toolchain"
+usage="usage: scripts/check-features.sh (powerset|msrv) [cargo args...] | --print-toolchain [manifest]"
 
-# The declared minimum Rust, as a full toolchain name (`1.98` in Cargo.toml is `1.98.0`).
+# msrv_toolchain [MANIFEST] -> the minimum Rust the manifest declares, as a full toolchain name
+# (`1.98` is `1.98.0`). The workspace manifest declares it under [workspace.package], any other
+# under [package].
 msrv_toolchain() {
-  local rust_version
-  rust_version=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^rust-version = "\([0-9][0-9]*\.[0-9][0-9]*\)"/\1/p;}' Cargo.toml)
-  if [ -z "$rust_version" ]; then
-    echo "expected [workspace.package] rust-version = \"1.x\" in Cargo.toml, received none" >&2
+  local manifest=${1:-Cargo.toml} table='package' declared
+  if [ $# -eq 0 ]; then table='workspace\.package'; fi
+  if [ ! -f "$manifest" ]; then
+    echo "expected a manifest to read rust-version from, received no file at $manifest" >&2
     exit 1
   fi
-  echo "$rust_version.0"
+  declared=$(sed -n "/^\\[$table\\]/,/^\\[/{s/^rust-version = \"\\([^\"]*\\)\".*/\\1/p;}" "$manifest")
+  if [[ "$declared" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    echo "$declared.0"
+  elif [[ "$declared" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "$declared"
+  else
+    echo "expected [${table/\\/}] rust-version = \"1.x\" or \"1.x.y\" in $manifest, received ${declared:+\"$declared\"}${declared:-none}" >&2
+    exit 1
+  fi
 }
 
 lane=${1:-}
@@ -65,7 +78,11 @@ shift
 extra=("$@")
 
 if [ "$lane" = "--print-toolchain" ]; then
-  msrv_toolchain
+  if [ $# -gt 1 ]; then
+    echo "expected at most one manifest after --print-toolchain, received: $*; $usage" >&2
+    exit 2
+  fi
+  msrv_toolchain "$@"
   exit 0
 fi
 

@@ -55,10 +55,13 @@ EOF
     return 1
   fi
   if ! verdict=$(gh api "repos/$repository/git/tags/$object_sha" \
-    --jq '[.verification.verified, .verification.reason, .tag, .object.sha] | @tsv'); then
+    --jq '[.verification.verified, .verification.reason, .tag, .object.sha]
+          | map(if . == null or . == "" then "none" else tostring end) | @tsv'); then
     printf 'expected the tag object %s of %s to be readable, could not read it\n' "$object_sha" "$tag" >&2
     return 2
   fi
+  # `read` folds consecutive tabs into one, so an empty field would shift the ones after it into
+  # the wrong names; the filter above writes `none` for it instead.
   IFS=$'\t' read -r verified reason signed_name tagged_commit <<EOF
 $verdict
 EOF
