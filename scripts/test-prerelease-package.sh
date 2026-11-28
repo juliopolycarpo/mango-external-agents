@@ -3,10 +3,18 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 repo=$PWD
-mkdir -p target
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/mango-prerelease.XXXXXX")
-target=$(mktemp -d "$repo/target/prerelease-tests.XXXXXX")
-trap 'rm -rf -- "$scratch" "$target"' EXIT
+# The target directory outlives the run, so a second run compiles only what changed: the
+# dependencies of the packaged crate are the workspace's, and building them took most of the run.
+# The archive is extracted to the same path every time, outside the repository so Cargo does not
+# take it for a workspace member. Cargo keys a path package's artifacts on its path, so a fresh
+# path per run would add a full set of them to the directory each time. The path is derived from
+# the checkout, so two checkouts do not share one.
+target="$repo/target/prerelease-tests"
+scratch="${TMPDIR:-/tmp}/mango-prerelease-$(printf '%s' "$repo" | cksum | cut -d' ' -f1)"
+mkdir -p "$target"
+rm -rf -- "$scratch" "$target/package"
+mkdir "$scratch"
+trap 'rm -rf -- "$scratch"' EXIT
 export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-$(rustup show active-toolchain | awk '{print $1}')}"
 export CARGO_TARGET_DIR="$target"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
