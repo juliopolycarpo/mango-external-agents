@@ -134,6 +134,33 @@ run_case cancelled_resolution "$interrupted"
 expect cancelled_resolution .result cancelled
 expect cancelled_resolution .lock null
 
+# A successful resolution whose `cargo update` output is gone: the receipt says the evidence is
+# missing instead of `passed` with an empty resolver account, and finish fails naming the path. An
+# unset UPDATE_LOG is the same case.
+for missing in "$work/no-such-update.log" ''; do
+  export RECEIPT_DIR=$work/evidence_missing UPDATE_LOG=$missing FRESH_ROOT=$repo STEPS_JSON=$passed
+  rm -rf "$RECEIPT_DIR"
+  "$script" snapshot
+  if out=$("$script" finish 2>&1); then
+    fail "case evidence_missing: expected finish to fail without the update log '$missing', received success"
+  fi
+  case "$out" in
+    *"expected UPDATE_LOG to name the readable cargo update output of the successful resolution, received '$missing'"*) ;;
+    *) fail "case evidence_missing: expected the diagnostic to name the log '$missing', received: $out" ;;
+  esac
+  expect evidence_missing .result evidence-missing
+  expect evidence_missing .resolver.log_line null
+  expect evidence_missing .lock.sha256 "$resolved_hash"
+done
+# A failed gate still outranks it, and a failed resolution needs no log at all.
+failed_gate=$(jq -c '.gate_clippy.outcome = "failure"' <<< "$passed")
+export RECEIPT_DIR=$work/gate_failure_without_log UPDATE_LOG=$work/no-such-update.log STEPS_JSON=$failed_gate
+"$script" snapshot
+if "$script" finish > /dev/null 2>&1; then fail "case gate_failure_without_log: expected finish to fail, received success"; fi
+expect gate_failure_without_log .result gates-failed
+run_case resolution_failure_without_log '{"resolve":{"outcome":"failure"}}' "$work/no-such-update.log"
+expect resolution_failure_without_log .result resolution-failed
+
 # Refusals name the value they received.
 if out=$("$script" bogus 2>&1); then fail "expected rejection of mode 'bogus', received success"; fi
 case "$out" in *"received 'bogus'"*) ;; *) fail "expected the diagnostic to name 'bogus', received: $out" ;; esac

@@ -22,7 +22,22 @@ fi
 
 for manifest in crates/*/Cargo.toml examples/*/Cargo.toml; do
   if ! grep -q '^version.workspace = true' "$manifest"; then
-    echo "$manifest: expected 'version.workspace = true', received its own version" >&2
+    echo "$manifest: expected 'version.workspace = true', received: $(grep -m 1 '^version' "$manifest" || echo 'no version key')" >&2
+    status=1
+  fi
+done
+
+workspace_dependencies=$(sed -n '/^\[workspace\.dependencies\]/,/^\[/p' Cargo.toml)
+
+# Every library crate has to be listed: the loop below only compares the entries it finds, so a
+# table that lost one, or all of them, would otherwise read as in lockstep.
+for manifest in crates/*/Cargo.toml; do
+  crate=$(sed -n '/^\[package\]/,/^\[/{s/^name = "\([^"]*\)".*/\1/p;}' "$manifest")
+  if [ -z "$crate" ]; then
+    echo "$manifest: expected [package] name = \"...\", received none" >&2
+    status=1
+  elif ! grep -q "^$crate = " <<<"$workspace_dependencies"; then
+    echo "workspace dependency $crate: expected a [workspace.dependencies] entry at version \"$workspace_version\" for $manifest, received none" >&2
     status=1
   fi
 done
@@ -34,7 +49,7 @@ while IFS= read -r line; do
     echo "workspace dependency $name: expected version \"$workspace_version\", received \"$dep_version\"" >&2
     status=1
   fi
-done < <(sed -n '/^\[workspace\.dependencies\]/,/^\[/p' Cargo.toml | grep -E '^mango-' || true)
+done < <(grep -E '^mango-' <<<"$workspace_dependencies" || true)
 
 # A member that writes its own version of a dependency is a second requirement that can drift.
 python3 scripts/check-workspace-dependencies.py Cargo.toml crates/*/Cargo.toml examples/*/Cargo.toml || status=1
