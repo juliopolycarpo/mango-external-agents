@@ -83,6 +83,9 @@ These lanes run through it:
 
 - `scripts/check-features.sh powerset`: clippy over every feature pair, all targets. CI runs it in
   the `powerset` job, a matrix of Linux, macOS and Windows beside the `rust` job, not as a step of it.
+  The pairs leave `default` out (`--skip default`): it is `stdio` for the core and empty for the
+  harness crates, so a pair with it builds what a pair without it builds. That is 24 runs instead
+  of 36.
 - The bare core with all targets, the last line of `scripts/check-features.sh msrv`.
 - `cargo clippy --workspace --all-targets --no-default-features` in `scripts/check.sh`, `ci.yml`
   and `fresh-dependencies.yml`.
