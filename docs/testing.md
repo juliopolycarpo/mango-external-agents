@@ -156,6 +156,16 @@ set; it is tracked in
 [#498](https://github.com/juliopolycarpo/mango-external-agents/issues/498), and
 `scripts/check-release-ci.sh` reads the run itself until it is required (see `docs/releasing.md`).
 
+## Tool versions
+
+Every tool a workflow installs through `taiki-e/install-action` names an exact version
+(`cargo-nextest@0.9.152`), and a tool has the same version in every workflow.
+`scripts/check-tool-pins.py` refuses an entry without one and a tool at two versions, so a tool
+release cannot change a verdict on a commit that touched nothing. Dependabot does not read `tool:`
+strings: bump a version by hand in every workflow, in the same pull request that adapts to it.
+`scripts/check-tool-pins.py --list` prints the set, one `name version` per line, to install what CI
+runs: `cargo install --locked cargo-hack@0.6.46`.
+
 ## Shell lint
 
 `scripts/check-shellcheck.sh` runs shellcheck over every `*.sh` under `scripts/`, the fakes in

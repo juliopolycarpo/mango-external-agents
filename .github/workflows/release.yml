@@ -100,7 +100,7 @@ jobs:
         run: rustup toolchain install "$(scripts/check-features.sh --print-toolchain)" --profile minimal
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
-          tool: cargo-nextest,cargo-hack,cargo-deny
+          tool: cargo-nextest@0.9.152,cargo-hack@0.6.46,cargo-deny@0.22.0
       - name: Manifests match the tag
         env:
           VERSION: ${{ steps.resolve.outputs.version }}
@@ -199,7 +199,7 @@ jobs:
           persist-credentials: false
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
-          tool: git-cliff
+          tool: git-cliff@2.14.2
       - name: Release notes for this tag
         run: git-cliff --config cliff.toml --current --strip header --output release-notes.md
       # The step still runs on a full rerun; only creating the release is skipped when it exists.

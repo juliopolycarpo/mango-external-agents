@@ -45,6 +45,8 @@ run scripts/test-consumer-pin.sh
 run scripts/test-fresh-receipt.sh
 run scripts/test-check-powerset.sh
 run scripts/test-run-without-self-dev-dependency.sh
+run python3 scripts/test-check-tool-pins.py
+run scripts/check-tool-pins.py
 run scripts/test-check-script-tests.sh
 run scripts/test-check-shellcheck.sh
 run scripts/test-prune-rust-caches.sh
